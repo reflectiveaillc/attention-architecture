@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Sense Calibrate — Tilt</title>
+<!--
+  LOOP / attention-architecture — Sense Calibrate
+  Circuits: 01-rpe (variable reward per alignment), 05-ease (calm resolution),
+            06-zeigarnik (one more tone).
+  Engine: calm — J.calm() only, no tension/death.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA card → __demoDone=true
+    ?bot=1&runs=N&seed=5   imperfect autopilot, N runs → __botDone=true
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'sense-calibrate';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL_D = '#1a9e91', SOFT = 'rgba(46,197,182,0.18)';
+
+  // ---- tone sequence (8 tones) ----
+  // frequencies in Hz, ordered for a pleasant range
+  var TONE_FREQS = [220, 261.6, 293.7, 329.6, 392, 440, 523.3, 587.3];
+  var TOTAL_TONES = 8;
+  // perfect alignment tolerance (dial fraction 0..1)
+  var PERFECT_TOL = 0.012;
+  var NEAR_TOL    = 0.045;
+
+  // ---- state ----
+  var state, runStartTs, flashes;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('sc_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',   // title | play | over | cta
+      toneIdx: 0,        // which tone we're calibrating (0-7)
+      // dial value 0..1
+      dial:  0.5,
+      // target for this tone (fraction 0..1)
+      target: 0.5,
+      // score: sum of per-tone scores (0-100 each)
+      score: 0,
+      totalScore: 0,
+      // animation
+      toneStartTs: 0,
+      tonePhase: 'listen', // listen | slide | result
+      resultTimer: 0,
+      resultLabel: '',
+      resultColor: TEAL,
+      toneScores: [],       // filled as tones complete
+      overAt: 0,
+      // chord playback at end
+      chordPlaying: false,
+    };
+    flashes = [];
+    // generate targets for all 8 tones
+    state.targets = [];
+    for (var i = 0; i < TOTAL_TONES; i++) {
+      // avoid trivial targets near edges
+      state.targets.push(0.15 + rng() * 0.70);
+    }
+    state.target = state.targets[0];
+
+    if (DEMO) { startRun(); return; }
+    if (BOT)  { startRun(); return; }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.tonePhase = 'listen';
+    state.toneIdx = 0;
+    state.target = state.targets[0];
+    state.dial = 0.5;
+    state.score = 0;
+    state.toneScores = [];
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    playCurrentTone();
+  }
+
+  function playCurrentTone() {
+    state.tonePhase = 'listen';
+    state.toneStartTs = performance.now();
+    if (window.J) J.calm(state.toneIdx);
+  }
+
+  function commitDial() {
+    if (state.phase !== 'play' || state.tonePhase !== 'listen') return;
+    var diff = Math.abs(state.dial - state.target);
+    var toneScore;
+    var label, color;
+    if (diff <= PERFECT_TOL) {
+      toneScore = 100;
+      label = 'PERFECT'; color = TEAL;
+      hitStop = 4; zoom = 1.025;
+      if (window.J) J.calm(state.toneIdx + 1);
+    } else if (diff <= NEAR_TOL) {
+      toneScore = Math.round(100 * (1 - diff / NEAR_TOL) * 0.5 + 50);
+      label = 'CLOSE'; color = GOLD;
+      if (window.J) J.calm(state.toneIdx);
+    } else {
+      toneScore = Math.max(0, Math.round(100 * (1 - diff / 0.5)));
+      label = 'OFF'; color = 'rgba(255,255,255,0.5)';
+    }
+    state.toneScores.push(toneScore);
+    state.score += toneScore;
+    state.tonePhase = 'result';
+    state.resultTimer = 0;
+    state.resultLabel = label;
+    state.resultColor = color;
+    flash(label, color, 36);
+    if (diff <= NEAR_TOL && diff > PERFECT_TOL) {
+      if (window.LOOP) LOOP.emit('near_miss', { tone: state.toneIdx, diff: +diff.toFixed(4) });
+    }
+    if (window.LOOP) LOOP.emit('tone_calibrated', { tone: state.toneIdx, score: toneScore, diff: +diff.toFixed(4) });
+  }
+
+  function advanceTone() {
+    state.toneIdx++;
+    if (state.toneIdx >= TOTAL_TONES) {
+      endGame();
+      return;
+    }
+    state.target = state.targets[state.toneIdx];
+    state.dial = 0.5;
+    playCurrentTone();
+  }
+
+  function endGame() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var totalScore = state.score;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = totalScore > best;
+    if (newBest) { best = totalScore; try { localStorage.setItem('sc_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: totalScore, dur_s: +dur.toFixed(1) });
+    // play chord
+    if (window.J) {
+      J.calm(7);
+      state.chordPlaying = true;
+    }
+    if (DEMO) {
+      window.__demoScore = totalScore;
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () {
+          if (window.LOOP) LOOP.emit('restart', {});
+          rng = mulberry32(SEED + botRunsDone);
+          newGame();
+          startRun();
+        }, 800);
+      }
+    }
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 120, y: 490, w: 240, h: 44 };
+  var DIAL_Y  = 520;
+  var DIAL_X  = 50, DIAL_W = W - 100;
+
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  var dragging = false, dragStartX = 0, dragStartDial = 0;
+
+  function pointerDown(x, y) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play' && state.tonePhase === 'listen') {
+      // start dragging on dial area
+      if (y >= DIAL_Y - 50 && y <= DIAL_Y + 80) {
+        dragging = true;
+        dragStartX = x;
+        dragStartDial = state.dial;
+        // snap dial to finger position
+        state.dial = Math.max(0, Math.min(1, (x - DIAL_X) / DIAL_W));
+      }
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'pts' }); return;
+      }
+      if (window.LOOP) LOOP.emit('restart', {});
+      rng = mulberry32(SEED);
+      newGame();
+    }
+  }
+
+  function pointerMove(x, y) {
+    if (DEMO || BOT || !dragging) return;
+    if (state.phase === 'play' && state.tonePhase === 'listen') {
+      state.dial = Math.max(0, Math.min(1, (x - DIAL_X) / DIAL_W));
+    }
+  }
+
+  function pointerUp(x, y) {
+    if (DEMO || BOT) return;
+    if (dragging) {
+      dragging = false;
+      if (state.phase === 'play' && state.tonePhase === 'listen') {
+        commitDial();
+      }
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointermove', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+
+  // ---- demo / bot autopilots ----
+  var botRunsDone = 0;
+
+  // Demo script: offsets from target (fraction). Near-perfection itch: almost flat, one hair off.
+  // Arc: settle → deepen → resolve. First tones: near but not perfect. Tone 4: one hair off.
+  // Then tones 5-6 very close. Tone 7: nearly perfect resolution.
+  var demoOffsets = [0.06, -0.04, 0.035, -0.018, 0.009, -0.005, 0.014, -0.003];
+  var demoWaits   = [55, 48, 60, 70, 52, 45, 58, 40]; // frames to "hesitate" before committing
+  var demoWaitCounter = 0;
+  var demoDialSpeed = 0;  // auto-dial velocity
+  var demoDialTarget = 0.5;
+
+  function updateDemoDialTarget() {
+    var idx = state.toneIdx;
+    var offset = demoOffsets[Math.min(idx, demoOffsets.length - 1)];
+    demoDialTarget = Math.max(0.02, Math.min(0.98, state.target + offset));
+    demoWaitCounter = demoWaits[Math.min(idx, demoWaits.length - 1)];
+  }
+
+  function autopilot(dt) {
+    if (state.phase !== 'play') return;
+
+    if (state.tonePhase === 'listen') {
+      // first frame of new tone: set target
+      if (state.toneIdx !== autopilot._lastTone) {
+        autopilot._lastTone = state.toneIdx;
+        if (DEMO) updateDemoDialTarget();
+        else {
+          // BOT: imperfect aim — within 0.01-0.08 of target
+          var botErr = (rng() - 0.5) * 0.12;
+          demoDialTarget = Math.max(0.02, Math.min(0.98, state.target + botErr));
+          demoWaitCounter = 20 + Math.floor(rng() * 30);
+        }
+      }
+
+      // smoothly move dial toward target
+      var diff = demoDialTarget - state.dial;
+      var step = diff * 0.04 * dt;
+      state.dial += step;
+
+      if (DEMO) {
+        demoWaitCounter -= dt;
+        // commit when close enough AND wait is done
+        if (Math.abs(state.dial - demoDialTarget) < 0.003 && demoWaitCounter <= 0) {
+          commitDial();
+        }
+      } else {
+        demoWaitCounter -= dt;
+        if (Math.abs(state.dial - demoDialTarget) < 0.004 && demoWaitCounter <= 0) {
+          commitDial();
+        }
+      }
+    } else if (state.tonePhase === 'result') {
+      // wait handled in result phase below
+    }
+  }
+  autopilot._lastTone = -1;
+
+  // ---- waveform helper ----
+  // deviation from target: 0=flat (aligned), 1=max waves
+  function drawWaveform(deviation, alpha) {
+    var waveX = 50, waveW = W - 100, waveY = 430, waveH = 60;
+    var amp = deviation * waveH * 0.46;
+    var freq = 3.5 + deviation * 4;   // more waves when off
+    cx.save();
+    cx.globalAlpha = alpha;
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 2.2;
+    cx.beginPath();
+    var pts = 120;
+    for (var i = 0; i <= pts; i++) {
+      var px = waveX + (i / pts) * waveW;
+      var phase = (i / pts) * Math.PI * 2 * freq;
+      var py = waveY + Math.sin(phase) * amp;
+      if (i === 0) cx.moveTo(px, py);
+      else cx.lineTo(px, py);
+    }
+    cx.stroke();
+    cx.restore();
+  }
+
+  // ---- render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // autopilot tick
+    if ((DEMO || BOT) && state.phase === 'play' && state.tonePhase === 'listen') {
+      if (hitStop > 0) hitStop -= dt;
+      else autopilot(dt);
+    } else if (hitStop > 0) {
+      hitStop -= dt;
+    }
+
+    // result phase timer: advance to next tone after brief pause
+    if (state.phase === 'play' && state.tonePhase === 'result') {
+      state.resultTimer += dt;
+      if (state.resultTimer > 55) {
+        advanceTone();
+      }
+    }
+
+    // juice decay
+    if (shakeAmt > 0.2) shakeAmt *= Math.pow(0.85, dt); else shakeAmt = 0;
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // ---- draw ----
+    cx.save();
+    // juice transforms
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(242,177,52,0.03)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- title screen ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 38px -apple-system, Helvetica, Arial';
+      cx.fillText('SENSE CALIBRATE', W / 2, 260);
+      cx.fillStyle = 'rgba(46,197,182,0.8)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('slide to match the tone', W / 2, 300);
+      // animated waveform preview
+      var t = now / 1000;
+      var previewAmp = 18 + 8 * Math.sin(t * 1.2);
+      cx.save();
+      cx.strokeStyle = TEAL; cx.lineWidth = 2; cx.globalAlpha = 0.6;
+      cx.beginPath();
+      for (var i = 0; i <= 100; i++) {
+        var px = 60 + (i / 100) * (W - 120);
+        var py = 380 + Math.sin((i / 100) * Math.PI * 2 * 4 + t * 2) * previewAmp;
+        if (i === 0) cx.moveTo(px, py); else cx.lineTo(px, py);
+      }
+      cx.stroke(); cx.restore();
+      // tap prompt
+      var pulse = 0.55 + 0.45 * Math.sin(now / 400);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, 460);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- play screen ----
+    if (state.phase === 'play') {
+      // tone counter
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px Menlo, monospace';
+      cx.fillText('TONE ' + (state.toneIdx + 1) + ' / ' + TOTAL_TONES, W / 2, 60);
+
+      // score running total
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '700 48px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 120);
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 140);
+
+      // tone progress dots
+      var dotR = 6, dotGap = 18, dotY = 190;
+      var dotTotal = TOTAL_TONES;
+      var dotStartX = W / 2 - ((dotTotal - 1) * dotGap) / 2;
+      for (var d = 0; d < dotTotal; d++) {
+        cx.beginPath();
+        cx.arc(dotStartX + d * dotGap, dotY, dotR, 0, Math.PI * 2);
+        if (d < state.toneIdx) {
+          cx.fillStyle = TEAL;
+        } else if (d === state.toneIdx) {
+          var pulse2 = 0.7 + 0.3 * Math.sin(now / 300);
+          cx.fillStyle = 'rgba(46,197,182,' + pulse2 + ')';
+        } else {
+          cx.fillStyle = 'rgba(255,255,255,0.15)';
+        }
+        cx.fill();
+      }
+
+      // listen label
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 13px Menlo, monospace';
+      cx.fillText('SLIDE TO MATCH', W / 2, 270);
+
+      // waveform — deviation from target drives amplitude
+      var deviation = Math.abs(state.dial - state.target);
+      var normDev = Math.min(1, deviation / 0.5);
+      // show waveform pulsing during result phase too
+      var waveAlpha = state.tonePhase === 'result' ? 0.4 : 0.85;
+      if (state.tonePhase === 'result' && state.resultLabel === 'PERFECT') normDev = 0;
+      drawWaveform(normDev, waveAlpha);
+
+      // flatness label (near-perfect itch: "one hair to the left")
+      if (state.tonePhase === 'listen') {
+        var flatness = 1 - normDev;
+        var flatLabel, flatColor;
+        if (flatness > 0.975) { flatLabel = 'ALIGNED'; flatColor = TEAL; }
+        else if (flatness > 0.91) { flatLabel = 'almost...'; flatColor = 'rgba(46,197,182,0.7)'; }
+        else if (flatness > 0.70) { flatLabel = ''; flatColor = TEAL; }
+        else { flatLabel = ''; flatColor = TEAL; }
+
+        if (flatLabel) {
+          cx.fillStyle = flatColor;
+          cx.font = '600 14px -apple-system, Helvetica, Arial';
+          cx.fillText(flatLabel, W / 2, 410);
+        }
+      }
+
+      // dial track
+      var dialY = DIAL_Y, dialX = DIAL_X, dialW = DIAL_W;
+      // track
+      cx.fillStyle = 'rgba(255,255,255,0.1)';
+      cx.beginPath();
+      cx.roundRect ? cx.roundRect(dialX, dialY - 4, dialW, 8, 4) : cx.rect(dialX, dialY - 4, dialW, 8);
+      cx.fill();
+      // track fill
+      cx.fillStyle = SOFT;
+      cx.beginPath();
+      cx.roundRect ? cx.roundRect(dialX, dialY - 4, state.dial * dialW, 8, 4) : cx.rect(dialX, dialY - 4, state.dial * dialW, 8);
+      cx.fill();
+
+      // dial thumb
+      var thumbX = dialX + state.dial * dialW;
+      // outer glow
+      cx.save();
+      cx.shadowBlur = 16;
+      cx.shadowColor = TEAL;
+      cx.beginPath();
+      cx.arc(thumbX, dialY, 18, 0, Math.PI * 2);
+      cx.fillStyle = TEAL;
+      cx.fill();
+      cx.restore();
+      // inner circle
+      cx.beginPath();
+      cx.arc(thumbX, dialY, 10, 0, Math.PI * 2);
+      cx.fillStyle = '#fff';
+      cx.fill();
+
+      // frequency labels (low / high)
+      cx.fillStyle = 'rgba(255,255,255,0.25)';
+      cx.font = '500 11px Menlo, monospace';
+      cx.textAlign = 'left';  cx.fillText('LOW',  dialX, dialY + 38);
+      cx.textAlign = 'right'; cx.fillText('HIGH', dialX + dialW, dialY + 38);
+      cx.textAlign = 'center';
+
+      // result overlay label
+      if (state.tonePhase === 'result') {
+        var a2 = Math.max(0, 1 - state.resultTimer / 55);
+        cx.globalAlpha = a2;
+        cx.fillStyle = state.resultColor;
+        cx.font = '800 28px -apple-system, Helvetica, Arial';
+        cx.fillText(state.resultLabel, W / 2, 620);
+        cx.globalAlpha = 1;
+      }
+
+      // commit hint
+      if (state.tonePhase === 'listen' && !DEMO && !BOT) {
+        cx.fillStyle = 'rgba(255,255,255,0.2)';
+        cx.font = '500 12px -apple-system, Helvetica, Arial';
+        cx.fillText('release to lock in', W / 2, 640);
+      }
+    }
+
+    // ---- game over ----
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '800 36px -apple-system, Helvetica, Arial';
+      cx.fillText('CALIBRATED', W / 2, 250);
+      cx.fillStyle = '#fff';
+      cx.font = '700 64px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 330);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('out of ' + (TOTAL_TONES * 100), W / 2, 356);
+      cx.fillStyle = GOLD;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pct = Math.round((state.score / (TOTAL_TONES * 100)) * 100);
+      cx.fillText(pct + '% PRECISION', W / 2, 395);
+
+      // tone bar breakdown
+      var barY = 420, barH = 6, barGap = 10;
+      var barTotalW = W - 80, barW = (barTotalW - barGap * (TOTAL_TONES - 1)) / TOTAL_TONES;
+      for (var b = 0; b < state.toneScores.length; b++) {
+        var bx = 40 + b * (barW + barGap);
+        cx.fillStyle = 'rgba(255,255,255,0.12)';
+        cx.fillRect(bx, barY, barW, barH);
+        var fill = (state.toneScores[b] / 100) * barW;
+        cx.fillStyle = state.toneScores[b] >= 90 ? TEAL : state.toneScores[b] >= 60 ? GOLD : 'rgba(255,255,255,0.4)';
+        cx.fillRect(bx, barY, fill, barH);
+      }
+
+      if (!DEMO && !BOT) {
+        var pulse3 = 0.6 + 0.4 * Math.sin(now / 320);
+        cx.globalAlpha = pulse3;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — TRY AGAIN', W / 2, 470);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 22) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 28);
+      }
+    }
+
+    // ---- demo CTA card ----
+    if (state.phase === 'cta') {
+      var t2 = (now - state.ctaAt) / 1000;
+      var ease = Math.min(1, t2 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 34px -apple-system, Helvetica, Arial';
+      cx.fillText('SENSE CALIBRATE', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('how well tuned are yours?', W / 2, 325);
+      var p4 = 0.72 + 0.28 * Math.sin(now / 260);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p4;
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 390);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 422);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- floating flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 36);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 300 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // ---- mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

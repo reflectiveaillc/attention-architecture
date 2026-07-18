@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Pipeline Trace — Tilt</title>
+<!--
+  LOOP / attention-architecture — Pipeline Trace
+  Circuits: 06-zeigarnik, 05-ease, 08-investment
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7    scripted calm arc ~16s → soft CTA → __demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'pipeline-trace';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL2 = '#1a9e96'; // darker teal for pipes
+
+  // ---- Grid config ----
+  var COLS = 6, ROWS = 7;
+  var CELL = 54; // cell size px
+  var GRID_X = Math.floor((W - COLS * CELL) / 2);
+  var GRID_Y = 160;
+
+  // Pipe segment types (which exits a cell has, by rotation)
+  // Stored as arrays of exit directions: 0=N, 1=E, 2=S, 3=W
+  // Base shapes:
+  //   straight: [0,2]  (N-S)
+  //   elbow:    [0,1]  (N-E)
+  //   tee:      [0,1,2]
+  //   cross:    [0,1,2,3]
+  //   cap:      [0]    (dead end, only at source/drain)
+
+  var SHAPES = {
+    straight: [[0,2],[1,3]],           // 2 rotations
+    elbow:    [[0,1],[1,2],[2,3],[3,0]], // 4 rotations
+    tee:      [[0,1,2],[1,2,3],[2,3,0],[3,0,1]], // 4 rotations
+    cross:    [[0,1,2,3]]              // 1 rotation (symmetric)
+  };
+
+  // opposite direction helper
+  function opp(d) { return (d + 2) % 4; }
+  // direction to [dx, dy]
+  var DX = [0,1,0,-1], DY = [-1,0,1,0];
+
+  // ---- Puzzle state ----
+  var puzzle, phase, score, runStartTs, ctaAt, overlayAlpha;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  var flowAnim = 0; // animation timer for flowing water
+  var botRunsDone = 0;
+  var demoStepIdx = 0, demoTimer = 0, demoPhase = 'play';
+
+  // A cell: { shape, rotIdx, exits (computed), fixed (bool - source/drain), glow, flowFrac }
+  function computeExits(shape, rotIdx) {
+    var base = SHAPES[shape][rotIdx % SHAPES[shape].length];
+    return base.slice();
+  }
+
+  function hasExit(cell, dir) {
+    return cell.exits.indexOf(dir) !== -1;
+  }
+
+  // Generate a solvable puzzle
+  // Strategy: carve a path from source to drain, then fill rest with random pipes
+  function generatePuzzle(seed) {
+    var r = mulberry32(seed);
+    var grid = [];
+    var i, j;
+    for (i = 0; i < ROWS; i++) {
+      grid[i] = [];
+      for (j = 0; j < COLS; j++) {
+        grid[i][j] = null;
+      }
+    }
+
+    // source at top row, drain at bottom row
+    var srcCol = Math.floor(r() * COLS);
+    var dstCol = Math.floor(r() * COLS);
+    // ensure at least 2 cols apart
+    while (Math.abs(dstCol - srcCol) < 2) { dstCol = Math.floor(r() * COLS); }
+    var srcR = 0, dstR = ROWS - 1;
+
+    // Carve a winding path
+    var path = [{row: srcR, col: srcCol}];
+    var visited = {};
+    visited[srcR + ',' + srcCol] = true;
+    var cur = {row: srcR, col: srcCol};
+    var maxIter = 200;
+    while (!(cur.row === dstR && cur.col === dstCol) && maxIter-- > 0) {
+      // prefer moving toward destination
+      var dr = dstR - cur.row, dc = dstCol - cur.col;
+      var dirs = [];
+      if (dr > 0) dirs.push(2); // S
+      if (dr < 0) dirs.push(0); // N
+      if (dc > 0) dirs.push(1); // E
+      if (dc < 0) dirs.push(3); // W
+      // shuffle and try
+      var allDirs = [0,1,2,3];
+      // weighted: preferred dirs twice
+      var pool = dirs.concat(dirs).concat(allDirs);
+      var tried = {};
+      var moved = false;
+      for (var t = 0; t < pool.length * 2 && !moved; t++) {
+        var pick = pool[Math.floor(r() * pool.length)];
+        if (tried[pick]) continue;
+        tried[pick] = true;
+        var nr = cur.row + DY[pick], nc = cur.col + DX[pick];
+        if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) continue;
+        var key = nr + ',' + nc;
+        if (visited[key] && !(nr === dstR && nc === dstCol)) continue;
+        visited[key] = true;
+        cur = {row: nr, col: nc};
+        path.push({row: nr, col: nc});
+        moved = true;
+      }
+      if (!moved) break;
+    }
+    // Ensure path ends at dst
+    if (cur.row !== dstR || cur.col !== dstCol) {
+      // force straight down to dst row then across
+      while (cur.row < dstR) { cur = {row: cur.row+1, col: cur.col}; path.push({row: cur.row, col: cur.col}); }
+      while (cur.col < dstCol) { cur = {row: cur.row, col: cur.col+1}; path.push({row: cur.row, col: cur.col}); }
+      while (cur.col > dstCol) { cur = {row: cur.row, col: cur.col-1}; path.push({row: cur.row, col: cur.col}); }
+    }
+
+    // Assign pipe shapes along path
+    var pathSet = {};
+    for (var p = 0; p < path.length; p++) {
+      pathSet[path[p].row + ',' + path[p].col] = p;
+    }
+
+    for (var p = 0; p < path.length; p++) {
+      var pos = path[p];
+      var neededExits = [];
+      if (p > 0) {
+        // exit toward previous
+        var pr = path[p-1].row - pos.row, pc = path[p-1].col - pos.col;
+        var prevDir = pr === -1 ? 0 : pc === 1 ? 1 : pr === 1 ? 2 : 3;
+        neededExits.push(prevDir);
+      }
+      if (p < path.length - 1) {
+        var nr2 = path[p+1].row - pos.row, nc2 = path[p+1].col - pos.col;
+        var nextDir = nr2 === -1 ? 0 : nc2 === 1 ? 1 : nr2 === 1 ? 2 : 3;
+        neededExits.push(nextDir);
+      }
+      // pick shape that satisfies neededExits
+      var shape, rotIdx;
+      if (neededExits.length === 1) {
+        // cap / source / drain
+        shape = 'elbow'; // use elbow rotated to show the one exit + one decorative
+        // just pick a shape with an exit matching neededExits[0]
+        shape = 'straight';
+        rotIdx = (neededExits[0] === 0 || neededExits[0] === 2) ? 0 : 1;
+      } else if (neededExits.length === 2) {
+        var s = neededExits[0], e = neededExits[1];
+        // straight?
+        if ((s === 0 && e === 2) || (s === 2 && e === 0) || (s === 1 && e === 3) || (s === 3 && e === 1)) {
+          shape = 'straight';
+          rotIdx = (s === 0 || s === 2) ? 0 : 1;
+        } else {
+          // elbow: find which rotation has both exits
+          shape = 'elbow';
+          rotIdx = 0;
+          for (var ri = 0; ri < 4; ri++) {
+            var ex = SHAPES.elbow[ri];
+            if (ex.indexOf(s) !== -1 && ex.indexOf(e) !== -1) { rotIdx = ri; break; }
+          }
+        }
+      } else {
+        shape = 'tee'; rotIdx = 0;
+        for (var ri = 0; ri < 4; ri++) {
+          var ex = SHAPES.tee[ri];
+          if (neededExits.every(function(d){ return ex.indexOf(d) !== -1; })) { rotIdx = ri; break; }
+        }
+      }
+      var solutionRotIdx = rotIdx;
+      // scramble rotation (not for source/drain)
+      var scramble = p > 0 && p < path.length - 1;
+      if (scramble) {
+        var numRots = SHAPES[shape].length;
+        rotIdx = (solutionRotIdx + 1 + Math.floor(r() * (numRots - 1))) % numRots;
+      }
+      grid[pos.row][pos.col] = {
+        shape: shape, rotIdx: rotIdx, solutionRotIdx: solutionRotIdx,
+        exits: computeExits(shape, rotIdx),
+        fixed: false, glow: 0, flowFrac: 0, isPath: true
+      };
+    }
+
+    // Fill non-path cells with random pipes
+    var shapeNames = ['straight', 'elbow', 'tee'];
+    for (i = 0; i < ROWS; i++) {
+      for (j = 0; j < COLS; j++) {
+        if (!grid[i][j]) {
+          var sh = shapeNames[Math.floor(r() * shapeNames.length)];
+          var ri = Math.floor(r() * SHAPES[sh].length);
+          grid[i][j] = {
+            shape: sh, rotIdx: ri, solutionRotIdx: ri,
+            exits: computeExits(sh, ri),
+            fixed: false, glow: 0, flowFrac: 0, isPath: false
+          };
+        }
+      }
+    }
+
+    // Mark source and drain
+    grid[srcR][srcCol].isSource = true;
+    grid[srcR][srcCol].fixed = true;
+    grid[dstR][dstCol].isDrain = true;
+    grid[dstR][dstCol].fixed = true;
+
+    return { grid: grid, srcR: srcR, srcCol: srcCol, dstR: dstR, dstCol: dstCol, path: path, pathSet: pathSet };
+  }
+
+  // BFS to find connected path from source
+  function traceFlow(pz) {
+    var grid = pz.grid;
+    var queue = [{row: pz.srcR, col: pz.srcCol}];
+    var visited = {};
+    visited[pz.srcR + ',' + pz.srcCol] = true;
+    var connected = [];
+    while (queue.length > 0) {
+      var cur = queue.shift();
+      connected.push(cur);
+      var cell = grid[cur.row][cur.col];
+      for (var di = 0; di < cell.exits.length; di++) {
+        var d = cell.exits[di];
+        var nr = cur.row + DY[d], nc = cur.col + DX[d];
+        if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) continue;
+        var key = nr + ',' + nc;
+        if (visited[key]) continue;
+        var neighbor = grid[nr][nc];
+        // neighbor must have exit in opposite direction
+        if (hasExit(neighbor, opp(d))) {
+          visited[key] = true;
+          queue.push({row: nr, col: nc});
+        }
+      }
+    }
+    var drainReached = !!visited[pz.dstR + ',' + pz.dstCol];
+    return { connected: connected, drainReached: drainReached };
+  }
+
+  function countSolved(pz) {
+    var total = 0, solved = 0;
+    for (var i = 0; i < ROWS; i++) {
+      for (var j = 0; j < COLS; j++) {
+        if (pz.grid[i][j].isPath) {
+          total++;
+          if (pz.grid[i][j].rotIdx === pz.grid[i][j].solutionRotIdx) solved++;
+        }
+      }
+    }
+    return { total: total, solved: solved };
+  }
+
+  function rotatePipe(pz, row, col) {
+    var cell = pz.grid[row][col];
+    if (cell.fixed) return false;
+    var numRots = SHAPES[cell.shape].length;
+    cell.rotIdx = (cell.rotIdx + 1) % numRots;
+    cell.exits = computeExits(cell.shape, cell.rotIdx);
+    return true;
+  }
+
+  // ---- Puzzle level management ----
+  var currentLevel = 0;
+  var PUZZLE_SEEDS = [7, 13, 21, 37, 53, 89, 121, 167, 211, 251];
+
+  function newPuzzle(lvl) {
+    var seed = PUZZLE_SEEDS[lvl % PUZZLE_SEEDS.length] + lvl * 31;
+    puzzle = generatePuzzle(seed);
+    flowAnim = 0;
+  }
+
+  // ---- Game state ----
+  function initGame() {
+    currentLevel = 0;
+    score = 0;
+    flashes = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    overlayAlpha = 0;
+    demoStepIdx = 0; demoTimer = 0; demoPhase = 'play';
+    newPuzzle(currentLevel);
+    if (DEMO) {
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    } else if (BOT) {
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    } else {
+      phase = 'title';
+    }
+  }
+
+  function startPlay() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function checkWin() {
+    var flow = traceFlow(puzzle);
+    // update glow on connected cells
+    for (var i = 0; i < ROWS; i++) {
+      for (var j = 0; j < COLS; j++) {
+        puzzle.grid[i][j].connected = false;
+      }
+    }
+    for (var ci = 0; ci < flow.connected.length; ci++) {
+      var pos = flow.connected[ci];
+      puzzle.grid[pos.row][pos.col].connected = true;
+    }
+    return flow.drainReached;
+  }
+
+  function onPuzzleComplete() {
+    score++;
+    if (window.J) J.calm(score);
+    hitStop = 3; zoom = 1.025;
+    flash('PATH CLEAR', TEAL, 38);
+    if (window.LOOP) LOOP.emit('puzzle_solved', { level: currentLevel, score: score });
+    flowAnim = 0;
+    // advance to next puzzle after short delay
+    setTimeout(function() {
+      currentLevel++;
+      newPuzzle(currentLevel);
+    }, 2200);
+  }
+
+  function gameOver() {
+    phase = 'over';
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function() { phase = 'cta'; ctaAt = performance.now(); }, 1200);
+      setTimeout(function() { window.__demoDone = true; }, 5500);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function() {
+          currentLevel = 0; score = 0;
+          newPuzzle(0);
+          phase = 'play';
+          runStartTs = Date.now();
+          if (window.LOOP) LOOP.emit('restart', {});
+        }, 800);
+      }
+    }
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- Input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function cellAt(x, y) {
+    var col = Math.floor((x - GRID_X) / CELL);
+    var row = Math.floor((y - GRID_Y) / CELL);
+    if (row < 0 || row >= ROWS || col < 0 || col >= COLS) return null;
+    return { row: row, col: col };
+  }
+
+  var puzzleComplete = false;
+  var completedAt = 0;
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startPlay(); return; }
+    if (phase === 'play') {
+      var pos = cellAt(x, y);
+      if (pos) {
+        var rotated = rotatePipe(puzzle, pos.row, pos.col);
+        if (rotated) {
+          if (window.J) J.calm(score + 0.5);
+          var won = checkWin();
+          if (won && !puzzleComplete) {
+            puzzleComplete = true;
+            completedAt = performance.now();
+            onPuzzleComplete();
+          }
+        }
+      }
+      return;
+    }
+    if (phase === 'over') {
+      // restart
+      currentLevel = 0; score = 0;
+      newPuzzle(0);
+      puzzleComplete = false;
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('restart', {});
+    }
+  }
+
+  window.addEventListener('pointerdown', function(e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function(e) { if (e.code === 'Space') tap(); });
+
+  // ---- Demo autopilot ----
+  // Calm arc: settle (slowly rotate pipes to correct) → deepen (complete multiple puzzles) → resolve (all glowing) → soft invite
+  // Demo script: a series of [row, col] taps to solve the puzzle one rotation at a time
+  var demoCells = null;
+  var demoTapIdx = 0;
+  var demoTapTimer = 0;
+  var demoPuzzleSolveCount = 0;
+  var DEMO_PUZZLES_TO_SOLVE = 2; // solve 2 puzzles in demo
+  var demoDone = false;
+
+  function buildDemoTapSequence(pz) {
+    // figure out which cells need how many rotations to reach solution
+    var taps = [];
+    for (var i = 0; i < ROWS; i++) {
+      for (var j = 0; j < COLS; j++) {
+        var cell = pz.grid[i][j];
+        if (cell.fixed) continue;
+        var numRots = SHAPES[cell.shape].length;
+        var needed = (cell.solutionRotIdx - cell.rotIdx + numRots) % numRots;
+        for (var k = 0; k < needed; k++) {
+          taps.push({ row: i, col: j });
+        }
+      }
+    }
+    // shuffle with some pauses for human-feel (interleave nearby cells)
+    // Sort by row then col to give a natural scanning pattern
+    taps.sort(function(a, b) { return a.row !== b.row ? a.row - b.row : a.col - b.col; });
+    return taps;
+  }
+
+  function demoAutopilot(dt) {
+    if (demoDone) return;
+    if (phase !== 'play') return;
+    if (!demoCells) {
+      demoCells = buildDemoTapSequence(puzzle);
+      demoTapIdx = 0;
+      demoTapTimer = 60; // wait before starting
+    }
+    demoTapTimer -= dt;
+    if (demoTapTimer > 0) return;
+    if (demoTapIdx >= demoCells.length) {
+      // puzzle should be solved now
+      var won = checkWin();
+      if (won && !puzzleComplete) {
+        puzzleComplete = true;
+        completedAt = performance.now();
+        onPuzzleComplete();
+        demoPuzzleSolveCount++;
+        demoCells = null;
+        demoTapTimer = 100;
+        if (demoPuzzleSolveCount >= DEMO_PUZZLES_TO_SOLVE) {
+          demoDone = true;
+          setTimeout(function() { gameOver(); }, 800);
+        }
+      } else {
+        // Something went wrong, just end
+        demoDone = true;
+        setTimeout(function() { gameOver(); }, 800);
+      }
+      return;
+    }
+    var next = demoCells[demoTapIdx];
+    rotatePipe(puzzle, next.row, next.col);
+    if (window.J) J.calm(demoTapIdx * 0.2);
+    checkWin(); // update glow state without triggering win yet
+    demoTapIdx++;
+    // human-feel: varied wait between taps (25-70 frames)
+    demoTapTimer = 25 + Math.floor(rng() * 45);
+  }
+
+  // ---- Bot autopilot ----
+  var botCells = null;
+  var botTapIdx = 0;
+  var botTapTimer = 0;
+  var botPuzzleCount = 0;
+  var BOT_MAX_PUZZLES = 8; // max puzzles to solve before forcing game_over
+
+  function botAutopilot(dt) {
+    if (phase !== 'play') return;
+    if (!botCells) {
+      botCells = buildDemoTapSequence(puzzle);
+      // intentionally skip some taps (imperfect bot) — only on non-critical cells
+      var imperfect = [];
+      for (var ti = 0; ti < botCells.length; ti++) {
+        // 15% chance to skip a tap (will be off by one rotation, accumulates error)
+        if (rng() > 0.15) imperfect.push(botCells[ti]);
+      }
+      botCells = imperfect;
+      botTapIdx = 0;
+      botTapTimer = 15;
+    }
+    botTapTimer -= dt;
+    if (botTapTimer > 0) return;
+    if (botTapIdx >= botCells.length) {
+      // Try to check win; if we skipped some taps it may not have solved
+      var won = checkWin();
+      botPuzzleCount++;
+      if (botPuzzleCount >= BOT_MAX_PUZZLES || !puzzleComplete) {
+        // force game over
+        puzzleComplete = false;
+        gameOver();
+      } else {
+        // advance puzzle
+        botCells = null;
+        botTapTimer = 20;
+      }
+      return;
+    }
+    var next = botCells[botTapIdx];
+    rotatePipe(puzzle, next.row, next.col);
+    checkWin();
+    botTapIdx++;
+    botTapTimer = 8 + Math.floor(rng() * 12);
+  }
+
+  // When puzzle reset happens (after onPuzzleComplete), reset autopilot state
+  var origNewPuzzle = newPuzzle;
+  // track puzzle resets
+  var lastPuzzleKey = '';
+
+  // ---- Rendering helpers ----
+
+  // Draw a pipe segment in a cell
+  function drawCell(x, y, cell, highlight) {
+    var cx2 = cx;
+    var size = CELL - 4;
+    var cx0 = x + CELL / 2, cy0 = y + CELL / 2;
+    var r = size / 2 - 4;
+    var pipeW = 10;
+
+    // cell bg
+    cx2.fillStyle = cell.isSource ? 'rgba(46,197,182,0.18)' :
+                    cell.isDrain  ? 'rgba(242,177,52,0.18)' :
+                    highlight     ? 'rgba(46,197,182,0.08)' :
+                                    'rgba(255,255,255,0.04)';
+    cx2.beginPath();
+    if (cx2.roundRect) cx2.roundRect(x+2, y+2, size, size, 6);
+    else cx2.rect(x+2, y+2, size, size);
+    cx2.fill();
+
+    // pipe background track
+    cx2.strokeStyle = 'rgba(255,255,255,0.08)';
+    cx2.lineWidth = pipeW + 2;
+    cx2.lineCap = 'round';
+
+    // draw exits
+    var exits = cell.exits;
+    var glowColor = cell.connected ? TEAL : 'rgba(255,255,255,0.2)';
+    var innerColor = cell.connected ? (cell.isDrain ? GOLD : TEAL) : 'rgba(80,90,100,0.9)';
+    if (cell.isSource) { glowColor = TEAL; innerColor = TEAL; }
+
+    // draw pipe segments for each exit pair
+    // For each exit, draw a line from center to edge
+    for (var di = 0; di < exits.length; di++) {
+      var d = exits[di];
+      var ex = cx0 + DX[d] * (CELL / 2 - 4), ey = cy0 + DY[d] * (CELL / 2 - 4);
+
+      // shadow track
+      cx2.strokeStyle = 'rgba(0,0,0,0.4)';
+      cx2.lineWidth = pipeW + 4;
+      cx2.beginPath();
+      cx2.moveTo(cx0, cy0);
+      cx2.lineTo(ex, ey);
+      cx2.stroke();
+
+      // outer pipe
+      cx2.strokeStyle = 'rgba(255,255,255,0.12)';
+      cx2.lineWidth = pipeW;
+      cx2.beginPath();
+      cx2.moveTo(cx0, cy0);
+      cx2.lineTo(ex, ey);
+      cx2.stroke();
+
+      // inner fill (water or dry)
+      cx2.strokeStyle = innerColor;
+      cx2.lineWidth = pipeW - 4;
+      cx2.beginPath();
+      cx2.moveTo(cx0, cy0);
+      cx2.lineTo(ex, ey);
+      cx2.stroke();
+
+      // flow animation on connected pipes
+      if (cell.connected && flowAnim > 0) {
+        var fa = (flowAnim * 0.02) % 1;
+        var fx = cx0 + (ex - cx0) * fa, fy = cy0 + (ey - cy0) * fa;
+        cx2.fillStyle = 'rgba(255,255,255,0.7)';
+        cx2.beginPath();
+        cx2.arc(fx, fy, 2.5, 0, Math.PI * 2);
+        cx2.fill();
+      }
+    }
+
+    // center hub
+    cx2.fillStyle = cell.connected ? (cell.isDrain ? GOLD : TEAL) : 'rgba(60,70,80,0.9)';
+    cx2.beginPath();
+    cx2.arc(cx0, cy0, pipeW / 2, 0, Math.PI * 2);
+    cx2.fill();
+
+    // source/drain markers
+    if (cell.isSource) {
+      cx2.fillStyle = TEAL;
+      cx2.font = 'bold 11px -apple-system, Helvetica, Arial';
+      cx2.textAlign = 'center';
+      cx2.fillText('SRC', cx0, y + 13);
+    }
+    if (cell.isDrain) {
+      cx2.fillStyle = GOLD;
+      cx2.font = 'bold 11px -apple-system, Helvetica, Arial';
+      cx2.textAlign = 'center';
+      cx2.fillText('OUT', cx0, y + CELL - 4);
+    }
+
+    // glow for connected cells
+    if (cell.connected) {
+      cx2.save();
+      cx2.globalAlpha = 0.3 + 0.1 * Math.sin(flowAnim * 0.04);
+      cx2.strokeStyle = TEAL;
+      cx2.lineWidth = 1;
+      if (cx2.roundRect) cx2.roundRect(x+2, y+2, size, size, 6);
+      else cx2.rect(x+2, y+2, size, size);
+      cx2.stroke();
+      cx2.restore();
+    }
+  }
+
+  // ---- Main loop ----
+  var last = performance.now();
+  puzzleComplete = false;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+    requestAnimationFrame(frame);
+
+    // autopilots
+    if (DEMO && phase === 'play') demoAutopilot(dt);
+    if (BOT  && phase === 'play') botAutopilot(dt);
+
+    // flow animation
+    if (phase === 'play') flowAnim += dt;
+
+    // track puzzle resets for autopilots
+    var puzKey = puzzle.srcR + ',' + puzzle.srcCol + ',' + puzzle.dstR + ',' + puzzle.dstCol;
+    if (puzKey !== lastPuzzleKey) {
+      lastPuzzleKey = puzKey;
+      puzzleComplete = false;
+      if (DEMO) { demoCells = null; demoTapTimer = 80; }
+      if (BOT)  { botCells = null; botTapTimer = 15; }
+    }
+
+    // juice decay
+    if (hitStop > 0) hitStop -= dt;
+    shakeAmt *= Math.pow(0.88, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // canvas transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    if (phase === 'title') {
+      drawTitle(now);
+    } else if (phase === 'play' || phase === 'over') {
+      drawGrid(now);
+      drawHUD(now);
+      if (phase === 'over') drawOverlay(now);
+    } else if (phase === 'cta') {
+      drawGrid(now);
+      drawHUD(now);
+      drawCTA(now);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 50);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, H / 2 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    // subtle grid preview behind
+    cx.globalAlpha = 0.15;
+    drawGridCells();
+    cx.globalAlpha = 1;
+
+    cx.fillStyle = '#fff';
+    cx.font = '800 40px -apple-system, Helvetica, Arial';
+    cx.fillText('PIPELINE TRACE', W / 2, 260);
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '500 15px -apple-system, Helvetica, Arial';
+    cx.fillText('rotate pipes. complete the flow.', W / 2, 296);
+
+    var pulse = 0.6 + 0.4 * Math.sin(now / 600);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = TEAL;
+    cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO BEGIN', W / 2, 360);
+    cx.globalAlpha = 1;
+  }
+
+  function drawGridCells() {
+    if (!puzzle) return;
+    for (var i = 0; i < ROWS; i++) {
+      for (var j = 0; j < COLS; j++) {
+        var x = GRID_X + j * CELL, y = GRID_Y + i * CELL;
+        drawCell(x, y, puzzle.grid[i][j], false);
+      }
+    }
+  }
+
+  function drawGrid(now) {
+    if (!puzzle) return;
+    for (var i = 0; i < ROWS; i++) {
+      for (var j = 0; j < COLS; j++) {
+        var x = GRID_X + j * CELL, y = GRID_Y + i * CELL;
+        drawCell(x, y, puzzle.grid[i][j], false);
+      }
+    }
+  }
+
+  function drawHUD(now) {
+    // Level + score
+    cx.textAlign = 'left';
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('LEVEL ' + (currentLevel + 1), GRID_X, 148);
+
+    cx.textAlign = 'right';
+    cx.fillStyle = TEAL;
+    cx.font = '700 13px -apple-system, Helvetica, Arial';
+    cx.fillText('SOLVED ' + score, GRID_X + COLS * CELL, 148);
+
+    // label
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.3)';
+    cx.font = '500 11px -apple-system, Helvetica, Arial';
+    cx.fillText('tap to rotate', W / 2, GRID_Y + ROWS * CELL + 22);
+  }
+
+  function drawOverlay(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.7)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+
+    cx.fillStyle = TEAL;
+    cx.font = '800 36px -apple-system, Helvetica, Arial';
+    cx.fillText('FLOW STOPPED', W / 2, 290);
+
+    cx.fillStyle = '#fff';
+    cx.font = '700 22px -apple-system, Helvetica, Arial';
+    cx.fillText(score + ' paths solved', W / 2, 330);
+
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText('your pipeline ran ' + score + ' deep', W / 2, 360);
+
+    if (!DEMO && !BOT) {
+      var pulse = 0.65 + 0.35 * Math.sin(now / 350);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO TRACE AGAIN', W / 2, 420);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawCTA(now) {
+    if (!ctaAt) return;
+    var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.0);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+
+    cx.fillStyle = '#fff';
+    cx.font = '800 40px -apple-system, Helvetica, Arial';
+    cx.fillText('PIPELINE TRACE', W / 2, 290);
+
+    cx.fillStyle = 'rgba(255,255,255,0.65)';
+    cx.font = '500 16px -apple-system, Helvetica, Arial';
+    cx.fillText('rotate pipes. complete the flow.', W / 2, 325);
+
+    var pulse = 0.7 + 0.3 * Math.sin(now / 320);
+    cx.globalAlpha = ease * pulse;
+    cx.fillStyle = TEAL;
+    cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 390);
+
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 420);
+
+    cx.globalAlpha = 1;
+  }
+
+  initGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

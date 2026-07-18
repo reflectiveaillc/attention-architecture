@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Echo Sequence — Tilt</title>
+<!--
+  LOOP / attention-architecture — Echo Sequence
+  Circuits: 01-rpe, 05-ease, 06-zeigarnik
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone=true
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs → window.__botDone=true
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'echo-sequence';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  // Canvas setup
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var PAD_COLORS = ['#2ec5b6', '#7ecfca', '#a8e6e2', '#f2b134'];
+
+  // ---- Game constants ----
+  var MAX_SEQ = 12;   // target sequence length
+  var PAD_COUNT = 4;
+  // Pad layout: 2x2 grid centred in canvas
+  var PAD_W = 140, PAD_H = 100, PAD_GAP = 14;
+  var PAD_LEFT  = (W - (PAD_W * 2 + PAD_GAP)) / 2;
+  var PAD_TOP   = 340;
+  var PADS = [
+    { x: PAD_LEFT,              y: PAD_TOP,             c: PAD_COLORS[0] },
+    { x: PAD_LEFT + PAD_W + PAD_GAP, y: PAD_TOP,        c: PAD_COLORS[1] },
+    { x: PAD_LEFT,              y: PAD_TOP + PAD_H + PAD_GAP, c: PAD_COLORS[2] },
+    { x: PAD_LEFT + PAD_W + PAD_GAP, y: PAD_TOP + PAD_H + PAD_GAP, c: PAD_COLORS[3] }
+  ];
+
+  // ---- State ----
+  var phase;       // 'title' | 'play' | 'over' | 'cta'
+  var sequence;    // the growing sequence of pad indices
+  var playerSeq;  // what player has echoed so far
+  var playStep;   // which step in the sequence is currently being played back
+  var playTimer;  // countdown to next playback note
+  var awaitPlayer; // true when it's the player's turn
+  var score;       // = sequence.length reached so far (max 12)
+  var hitStop, zoom, shakeAmt;
+  var flashes;
+  var runStartTs;
+  var overAt, ctaAt;
+
+  // Highlight state for pad animations
+  var padLit = [-1, -1, -1, -1]; // alpha per pad 0-1
+  var padPulse = [0,0,0,0];       // extra scale pulse
+
+  // Bot / demo
+  var botRunsDone = 0;
+  var demoStep = 0;           // which step in the demo script
+  var demoTimer = 0;          // frames to wait before acting
+  var demoPaused = false;     // brief pause between playback and response
+
+  function newGame() {
+    phase = 'title';
+    sequence = [];
+    playerSeq = [];
+    playStep = 0;
+    playTimer = 0;
+    awaitPlayer = false;
+    score = 0;
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    flashes = [];
+    overAt = 0; ctaAt = 0;
+    padLit = [0,0,0,0]; padPulse = [0,0,0,0];
+
+    if (DEMO) { startRun(); return; }
+    if (BOT)  { startRun(); return; }
+  }
+
+  function startRun() {
+    phase = 'play';
+    sequence = [];
+    playerSeq = [];
+    awaitPlayer = false;
+    score = 0;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    // Reset demo state
+    demoStep = 0; demoTimer = DEMO ? 40 : 0;
+    demoPaused = false;
+    advanceSequence();
+  }
+
+  // Add one note to the sequence and start playback
+  function advanceSequence() {
+    var next = Math.floor(rng() * PAD_COUNT);
+    sequence.push(next);
+    playerSeq = [];
+    awaitPlayer = false;
+    playStep = 0;
+    playTimer = DEMO ? 50 : 30; // brief pause before playback starts
+  }
+
+  // Light up a pad for visual feedback
+  function litPad(idx, strength) {
+    padLit[idx] = strength || 1;
+    padPulse[idx] = 0.08;
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 32, t: 0 });
+  }
+
+  // ---- Play a note during sequence playback ----
+  function playNote(idx) {
+    litPad(idx, 1);
+    if (window.J) J.calm(sequence.length);
+    if (window.LOOP) LOOP.emit('note_played', { idx: idx, step: playStep, len: sequence.length });
+  }
+
+  // ---- Handle player tapping pad ----
+  function onPadTap(idx) {
+    if (!awaitPlayer || phase !== 'play') return;
+    litPad(idx, 0.9);
+    if (window.J) J.calm(playerSeq.length + 1);
+
+    var expected = sequence[playerSeq.length];
+    playerSeq.push(idx);
+
+    if (idx !== expected) {
+      // Wrong tap → game over
+      shakeAmt = 4;
+      flash('CLOSE', TEAL, 34);
+      if (window.LOOP) LOOP.emit('near_miss', { step: playerSeq.length, seq_len: sequence.length });
+      setTimeout(function () { gameOver(); }, 320);
+      awaitPlayer = false;
+      return;
+    }
+
+    // Correct
+    if (playerSeq.length === sequence.length) {
+      // Completed the full echo
+      score = sequence.length;
+      window.__demoScore = score;
+
+      if (score < MAX_SEQ) {
+        // zoom-pulse on each completion
+        zoom = 1.02;
+        hitStop = 3;
+        flash('+' + score, TEAL, 40);
+        if (window.J) J.calm(score);
+        if (window.LOOP) LOOP.emit('echo_complete', { len: score });
+        // After a beat, extend sequence
+        awaitPlayer = false;
+        var delay = DEMO ? 55 : 38;
+        setTimeout(function () { advanceSequence(); }, delay * 16.667);
+      } else {
+        // Full 12-note sequence reached → win / resolve
+        zoom = 1.03;
+        hitStop = 6;
+        flash('ECHO!', TEAL, 52);
+        if (window.J) J.calm(12);
+        if (window.LOOP) LOOP.emit('echo_complete', { len: 12 });
+        awaitPlayer = false;
+        setTimeout(function () { gameOver(true); }, 900);
+      }
+    }
+    // else: more notes to echo in this round, keep awaitPlayer = true
+  }
+
+  function gameOver(completed) {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.calm(0);
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1), completed: !!completed });
+
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () {
+          newGame();
+          startRun();
+        }, 600);
+      }
+    }
+  }
+
+  // ---- Input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function hitPad(x, y) {
+    for (var i = 0; i < PAD_COUNT; i++) {
+      var p = PADS[i];
+      if (x >= p.x && x <= p.x + PAD_W && y >= p.y && y <= p.y + PAD_H) return i;
+    }
+    return -1;
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale;
+    var y = (e.clientY - r.top) / scale;
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') {
+      var pi = hitPad(x, y);
+      if (pi >= 0) onPadTap(pi);
+      return;
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (window.LOOP) LOOP.emit('restart', {});
+      newGame();
+      startRun();
+    }
+  });
+
+  // ---- Demo autopilot ----
+  // Demo script: plays a calm, settling arc:
+  // sequence grows 1→2→3→4→5→6→7 (settles), then mistakes at 8 → game over
+  // Hesitation varies to look human
+  var demoHesitations = [45, 38, 50, 42, 35, 55, 48, 60, 30, 44, 52, 36];
+  var demoPlayerIdx = 0;   // index into playerSeq being echoed
+  var demoWait = 0;
+
+  function demoPilot(dt) {
+    if (phase !== 'play') return;
+    if (!awaitPlayer) return;
+
+    // Hesitate before each tap
+    demoWait -= dt;
+    if (demoWait > 0) return;
+
+    var hesit = demoHesitations[playerSeq.length % demoHesitations.length] || 40;
+    demoWait = hesit;
+
+    // Demo: correct until length 7, then mis-tap on 8th sequence round
+    var correct = sequence[playerSeq.length];
+    var tapIdx;
+    if (sequence.length <= 7) {
+      tapIdx = correct; // perfect echo
+    } else {
+      // Introduce a mistake ~40% through the 8th echo
+      if (playerSeq.length === Math.floor(sequence.length * 0.4)) {
+        tapIdx = (correct + 1) % PAD_COUNT; // wrong pad
+      } else {
+        tapIdx = correct;
+      }
+    }
+    onPadTap(tapIdx);
+  }
+
+  // ---- Bot autopilot ----
+  var botWait = 0;
+  // Bot makes mistakes more often as sequence grows — ensures game_over
+  function botPilot(dt) {
+    if (phase !== 'play') return;
+    if (!awaitPlayer) return;
+    botWait -= dt;
+    if (botWait > 0) return;
+    botWait = 22 + rng() * 20;
+
+    var correct = sequence[playerSeq.length];
+    var mistakeProb = 0.08 + sequence.length * 0.05; // rises with difficulty
+    var tapIdx = (rng() < mistakeProb) ? Math.floor(rng() * PAD_COUNT) : correct;
+    onPadTap(tapIdx);
+  }
+
+  // ---- Render ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Sequence playback tick
+    if (phase === 'play' && !awaitPlayer && sequence.length > 0) {
+      playTimer -= dt;
+      if (playTimer <= 0) {
+        if (playStep < sequence.length) {
+          playNote(sequence[playStep]);
+          playStep++;
+          playTimer = 26; // ~430ms between notes
+        } else {
+          // Playback done → player's turn
+          awaitPlayer = true;
+          playTimer = 9999;
+        }
+      }
+    }
+
+    // Decay pad highlights
+    for (var i = 0; i < PAD_COUNT; i++) {
+      padLit[i]  = Math.max(0, padLit[i] - 0.04 * dt);
+      padPulse[i] = Math.max(0, padPulse[i] - 0.005 * dt);
+    }
+
+    // Juice decay
+    if (hitStop > 0) { hitStop -= dt; }
+    else {
+      if (DEMO) demoPilot(dt);
+      else if (BOT) botPilot(dt);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // ---- Draw ----
+    cx.save();
+    // Screen shake + zoom-pulse
+    if (shakeAmt > 0.15 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.07)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.02)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- Title ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('ECHO', W / 2, 240);
+      cx.fillStyle = 'rgba(255,255,255,0.85)'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('SEQUENCE', W / 2, 292);
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('listen. repeat. go deeper.', W / 2, 330);
+      var pulse = 0.55 + 0.45 * Math.sin(now / 700);
+      cx.globalAlpha = pulse; cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, 640);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Play phase ----
+    if (phase === 'play' || phase === 'over') {
+      // Score / sequence length
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 62px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('NOTES ECHOED', W / 2, 120);
+
+      // Sequence length indicator dots
+      var dotTot = MAX_SEQ, dotR = 5, dotSpacing = 18;
+      var dotStartX = W / 2 - ((dotTot - 1) * dotSpacing) / 2;
+      for (var d = 0; d < dotTot; d++) {
+        cx.beginPath();
+        cx.arc(dotStartX + d * dotSpacing, 150, dotR, 0, Math.PI * 2);
+        if (d < sequence.length) {
+          cx.fillStyle = d < score ? TEAL : 'rgba(46,197,182,0.35)';
+        } else {
+          cx.fillStyle = 'rgba(255,255,255,0.1)';
+        }
+        cx.fill();
+      }
+
+      // Status label
+      if (phase === 'play') {
+        cx.textAlign = 'center';
+        cx.fillStyle = awaitPlayer ? 'rgba(242,177,52,0.9)' : 'rgba(46,197,182,0.7)';
+        cx.font = '600 13px Menlo, monospace';
+        cx.fillText(awaitPlayer ? 'YOUR TURN' : 'LISTEN…', W / 2, 188);
+      }
+
+      // Pads
+      for (var pi = 0; pi < PAD_COUNT; pi++) {
+        var pd = PADS[pi];
+        var lit = padLit[pi];
+        var pulse2 = padPulse[pi];
+        var pw = PAD_W + pulse2 * PAD_W;
+        var ph = PAD_H + pulse2 * PAD_H;
+        var px = pd.x - pulse2 * PAD_W / 2;
+        var py2 = pd.y - pulse2 * PAD_H / 2;
+
+        // Pad background
+        var baseAlpha = 0.13 + lit * 0.55;
+        cx.fillStyle = pd.c;
+        cx.globalAlpha = baseAlpha;
+        roundRect(cx, px, py2, pw, ph, 18);
+        cx.fill();
+        cx.globalAlpha = 1;
+
+        // Border
+        cx.strokeStyle = pd.c;
+        cx.lineWidth = 1.5 + lit * 2;
+        cx.globalAlpha = 0.3 + lit * 0.7;
+        roundRect(cx, px, py2, pw, ph, 18);
+        cx.stroke();
+        cx.globalAlpha = 1;
+
+        // Pad number / icon
+        cx.textAlign = 'center';
+        cx.fillStyle = lit > 0.3 ? '#fff' : 'rgba(255,255,255,0.35)';
+        cx.font = '700 22px -apple-system, Helvetica, Arial';
+        cx.fillText(pi + 1, pd.x + PAD_W / 2, pd.y + PAD_H / 2 + 8);
+      }
+    }
+
+    // ---- Game over overlay ----
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText(score >= MAX_SEQ ? 'RESOLVED.' : 'ENDED.', W / 2, 270);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' of ' + MAX_SEQ + ' notes', W / 2, 314);
+      cx.fillStyle = GOLD; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText(score >= 9 ? 'DEEP LISTENER' : score >= 5 ? 'FINDING THE PATTERN' : 'KEEP ECHOING', W / 2, 348);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 500);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ECHO AGAIN', W / 2, 640);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // ---- Demo CTA card ----
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t * 2.5);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('ECHO', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.9)'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('SEQUENCE', W / 2, 345);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('how deep can you echo?', W / 2, 388);
+      var p3 = 0.75 + 0.25 * Math.sin(now / 380);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 440);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 470);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Floating reward text ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 265 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // ---- Mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // roundRect helper (older browsers compat)
+  function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    if (ctx.roundRect) {
+      ctx.roundRect(x, y, w, h, r);
+    } else {
+      ctx.moveTo(x + r, y);
+      ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r);
+      ctx.lineTo(x + w, y + h - r); ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+      ctx.lineTo(x + r, y + h); ctx.arcTo(x, y + h, x, y + h - r, r);
+      ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r);
+      ctx.closePath();
+    }
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

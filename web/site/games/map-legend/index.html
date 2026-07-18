@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Map Legend — Tilt</title>
+<!--
+  LOOP / attention-architecture — Map Legend
+  Circuits: 06-zeigarnik, 05-ease, 08-investment
+  Calm engine: J.calm(step) only.
+  Modes:
+    ?demo=1&seed=7        scripted calm arc ~16s -> soft CTA -> __demoDone
+    ?bot=1&runs=N&seed=M  imperfect autopilot, N runs -> __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:none; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'map-legend';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // palette
+  var INK  = '#0b0d12';
+  var TEAL = '#2ec5b6';
+  var GOLD = '#f2b134';
+  var INK2 = '#1a1e28';
+
+  // ---- MAP DATA ----
+  // 5 symbols (fewer = fits on screen comfortably)
+  var SYMBOL_DEFS = [
+    { id: 'mountain', label: 'Highland',   color: '#8aacbf' },
+    { id: 'forest',   label: 'Forest',     color: '#5a9e72' },
+    { id: 'water',    label: 'River',      color: '#2e90c5' },
+    { id: 'city',     label: 'Settlement', color: '#d4a45a' },
+    { id: 'ruins',    label: 'Ruins',      color: '#9a7a9a' }
+  ];
+  var NUM_SYM = SYMBOL_DEFS.length; // 5
+
+  // Map occupies top area: y=95 to y=415 (320px tall, 381px wide)
+  var MAP_X = 12, MAP_Y = 95, MAP_W = 381, MAP_H = 310;
+
+  // 8 regions — 2 per symbol type except water (1)
+  // positions as fractions of MAP_W/MAP_H
+  var REGION_TEMPLATES = [
+    { sx: 0.06, sy: 0.06, sw: 0.22, sh: 0.28, sym: 0 }, // mountain top-left
+    { sx: 0.72, sy: 0.08, sw: 0.22, sh: 0.26, sym: 0 }, // mountain top-right
+    { sx: 0.30, sy: 0.12, sw: 0.24, sh: 0.26, sym: 1 }, // forest center-top
+    { sx: 0.56, sy: 0.40, sw: 0.20, sh: 0.24, sym: 1 }, // forest right
+    { sx: 0.08, sy: 0.42, sw: 0.10, sh: 0.48, sym: 2 }, // river left (tall thin)
+    { sx: 0.28, sy: 0.52, sw: 0.22, sh: 0.14, sym: 2 }, // river center
+    { sx: 0.28, sy: 0.70, sw: 0.20, sh: 0.24, sym: 3 }, // city south
+    { sx: 0.55, sy: 0.70, sw: 0.20, sh: 0.24, sym: 3 }, // city south-east
+    { sx: 0.06, sy: 0.72, sw: 0.18, sh: 0.22, sym: 4 }, // ruins south-west
+    { sx: 0.78, sy: 0.44, sw: 0.17, sh: 0.30, sym: 4 }  // ruins right
+  ];
+
+  // Legend panel: y=415 to bottom, 5 items × 42px = 210px, fits within 720
+  var LEG_X = MAP_X, LEG_W = MAP_W;
+  var LEG_TOP = MAP_Y + MAP_H + 10; // 415
+  var LEG_ITEM_H = 42;
+  var LEG_ITEM_GAP = 6;
+
+  // Juice state
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size || 30, t: 0 }); }
+
+  // ---- GAME STATE ----
+  var phase, score, runStartTs, botRunsDone, regions, legendItems, drag, solved, overAt, ctaStartAt;
+  var AUTO_QUEUE, autoIdx, autoWait, autoPhase2, autoDragItem, autoDragPx, autoDragPy, autoTargetX, autoTargetY;
+
+  function newGame() {
+    rng = mulberry32(SEED + (BOT ? botRunsDone * 17 : 0));
+    phase = 'play';
+    score = 0;
+    runStartTs = Date.now();
+    regions = buildRegions();
+    legendItems = buildLegend();
+    drag = null;
+    solved = 0;
+    flashes = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    AUTO_QUEUE = null; autoIdx = 0; autoWait = 0;
+    autoPhase2 = false; autoDragItem = null;
+    overAt = 0; ctaStartAt = 0;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function buildRegions() {
+    return REGION_TEMPLATES.map(function (t) {
+      return {
+        x: MAP_X + t.sx * MAP_W,
+        y: MAP_Y + t.sy * MAP_H,
+        w: t.sw * MAP_W,
+        h: t.sh * MAP_H,
+        sym: t.sym,
+        matched: false,
+        pulse: 0
+      };
+    });
+  }
+
+  function buildLegend() {
+    var items = SYMBOL_DEFS.map(function (def, i) {
+      return { symIdx: i, label: def.label, color: def.color, matched: false };
+    });
+    // Shuffle with seeded RNG
+    for (var i = items.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = items[i]; items[i] = items[j]; items[j] = tmp;
+    }
+    // Assign Y positions
+    items.forEach(function (it, i) {
+      it.y = LEG_TOP + 20 + i * (LEG_ITEM_H + LEG_ITEM_GAP);
+    });
+    return items;
+  }
+
+  function legendItemRect(item) {
+    return { x: LEG_X + 4, y: item.y, w: LEG_W - 8, h: LEG_ITEM_H };
+  }
+
+  function hitRegion(px, py) {
+    for (var i = 0; i < regions.length; i++) {
+      var r = regions[i];
+      if (!r.matched && px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h) return r;
+    }
+    return null;
+  }
+
+  function tryDrop(item, px, py) {
+    var region = hitRegion(px, py);
+    if (!region) return false;
+    if (region.sym === item.symIdx) {
+      region.matched = true;
+      region.pulse = 1;
+      item.matched = true;
+      solved++;
+      score++;
+      hitStop = 3;
+      zoom = 1.025;
+      shakeAmt = 2;
+      if (window.J) J.calm(solved);
+      flash(item.label + ' ✓', TEAL, 26);
+      if (window.LOOP) LOOP.emit('symbol_matched', { sym: item.symIdx, n: solved });
+      if (solved >= NUM_SYM) {
+        setTimeout(function () { gameOver(); }, 600);
+      }
+      return true;
+    } else {
+      shakeAmt = 3;
+      flash('not quite', 'rgba(255,255,255,0.45)', 20);
+      return false;
+    }
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (DEMO) window.__demoScore = score;
+    if (window.J) J.calm(8);
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaStartAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 1600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { newGame(); }, 500);
+      }
+    }
+  }
+
+  function resetRun() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    newGame();
+  }
+
+  // ---- INPUT ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, px, py) { return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h; }
+
+  function pointerDown(px, py) {
+    if (DEMO || BOT) return;
+    if (window.J && inR(MUTE_R, px, py)) { J.toggleMute(); return; }
+    if (phase === 'over' && performance.now() - overAt > 500) { resetRun(); return; }
+    if (phase !== 'play') return;
+    for (var i = 0; i < legendItems.length; i++) {
+      var it = legendItems[i];
+      if (it.matched) continue;
+      var r = legendItemRect(it);
+      if (inR(r, px, py)) {
+        drag = { item: it, px: px, py: py };
+        return;
+      }
+    }
+  }
+
+  function pointerMove(px, py) {
+    if (!drag) return;
+    drag.px = px; drag.py = py;
+  }
+
+  function pointerUp(px, py) {
+    if (!drag) return;
+    tryDrop(drag.item, px, py);
+    drag = null;
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointermove', function (e) {
+    if (!drag) return;
+    var r = cv.getBoundingClientRect();
+    pointerMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointercancel', function () { drag = null; });
+
+  // ---- AUTOPILOT (demo + bot) ----
+  function buildAutoQueue() {
+    AUTO_QUEUE = [];
+    legendItems.forEach(function (it) {
+      for (var i = 0; i < regions.length; i++) {
+        if (regions[i].sym === it.symIdx) {
+          AUTO_QUEUE.push({ item: it, region: regions[i] });
+          return;
+        }
+      }
+    });
+    autoIdx = 0;
+    autoWait = DEMO ? 30 : 10;
+    autoPhase2 = false;
+    autoDragPx = 0; autoDragPy = 0;
+  }
+
+  function autopilot() {
+    if (phase !== 'play') return;
+    if (!AUTO_QUEUE) buildAutoQueue();
+
+    autoWait -= 1;
+    if (autoWait > 0) return;
+
+    // Skip already-matched items
+    while (autoIdx < AUTO_QUEUE.length && AUTO_QUEUE[autoIdx].item.matched) {
+      autoIdx++;
+    }
+    if (autoIdx >= AUTO_QUEUE.length) return;
+
+    var entry = AUTO_QUEUE[autoIdx];
+    var it = entry.item;
+    var reg = entry.region;
+
+    // Find an unmatched region of the right type
+    var targetReg = null;
+    for (var i = 0; i < regions.length; i++) {
+      if (!regions[i].matched && regions[i].sym === it.symIdx) {
+        targetReg = regions[i]; break;
+      }
+    }
+    if (!targetReg) { autoIdx++; autoWait = 5; return; }
+
+    if (!autoPhase2) {
+      // Start drag from legend item position
+      var r = legendItemRect(it);
+      autoDragPx = r.x + r.w * 0.5;
+      autoDragPy = it.y + LEG_ITEM_H * 0.5;
+      autoTargetX = targetReg.x + targetReg.w * 0.5 + (BOT ? (rng() - 0.5) * targetReg.w * 0.25 : 0);
+      autoTargetY = targetReg.y + targetReg.h * 0.5 + (BOT ? (rng() - 0.5) * targetReg.h * 0.25 : 0);
+      drag = { item: it, px: autoDragPx, py: autoDragPy };
+      autoPhase2 = true;
+      autoWait = DEMO ? 12 : 4;
+    } else {
+      // Move toward target each frame
+      var dx = autoTargetX - autoDragPx;
+      var dy = autoTargetY - autoDragPy;
+      var speed = DEMO ? 9 : 25;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < speed + 1) {
+        // Arrive — drop
+        drag = { item: it, px: autoTargetX, py: autoTargetY };
+        var matched = tryDrop(it, autoTargetX, autoTargetY);
+        drag = null;
+        autoPhase2 = false;
+        if (matched) {
+          autoIdx++;
+          autoWait = DEMO ? 38 : 12;
+        } else {
+          // Bot missed — aim more precisely
+          autoTargetX = targetReg.x + targetReg.w * 0.5;
+          autoTargetY = targetReg.y + targetReg.h * 0.5;
+          autoPhase2 = true;
+          autoWait = DEMO ? 15 : 5;
+        }
+      } else {
+        autoDragPx += (dx / dist) * speed;
+        autoDragPy += (dy / dist) * speed;
+        drag = { item: it, px: autoDragPx, py: autoDragPy };
+      }
+    }
+  }
+
+  // ---- SYMBOL DRAWING ----
+  function drawSymbol(ctx, id, x, y, size, color) {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 1.8;
+    var h = size;
+    switch (id) {
+      case 'mountain':
+        ctx.beginPath();
+        ctx.moveTo(x, y - h * 0.5);
+        ctx.lineTo(x - h * 0.45, y + h * 0.4);
+        ctx.lineTo(x + h * 0.45, y + h * 0.4);
+        ctx.closePath();
+        ctx.stroke();
+        ctx.globalAlpha = 0.35;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        // snow cap
+        ctx.beginPath();
+        ctx.moveTo(x, y - h * 0.5);
+        ctx.lineTo(x - h * 0.13, y - h * 0.2);
+        ctx.lineTo(x + h * 0.13, y - h * 0.2);
+        ctx.closePath();
+        ctx.fill();
+        break;
+      case 'forest':
+        // Double triangle tree
+        ctx.beginPath();
+        ctx.moveTo(x, y - h * 0.5);
+        ctx.lineTo(x - h * 0.32, y + h * 0.05);
+        ctx.lineTo(x + h * 0.32, y + h * 0.05);
+        ctx.closePath();
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(x, y - h * 0.18);
+        ctx.lineTo(x - h * 0.4, y + h * 0.42);
+        ctx.lineTo(x + h * 0.4, y + h * 0.42);
+        ctx.closePath();
+        ctx.fill();
+        break;
+      case 'water':
+        ctx.lineWidth = 1.5;
+        for (var w2 = 0; w2 < 3; w2++) {
+          var wy = y - h * 0.28 + w2 * h * 0.28;
+          ctx.beginPath();
+          ctx.moveTo(x - h * 0.45, wy);
+          ctx.bezierCurveTo(x - h * 0.15, wy - h * 0.12, x + h * 0.15, wy + h * 0.12, x + h * 0.45, wy);
+          ctx.stroke();
+        }
+        break;
+      case 'city':
+        ctx.fillRect(x - h * 0.36, y - h * 0.1, h * 0.18, h * 0.5);
+        ctx.fillRect(x - h * 0.1, y - h * 0.38, h * 0.2, h * 0.78);
+        ctx.fillRect(x + h * 0.17, y - h * 0.22, h * 0.18, h * 0.62);
+        break;
+      case 'ruins':
+        var cols2 = [-h * 0.28, 0, h * 0.28];
+        cols2.forEach(function (cx2) {
+          // Crumbled column (broken top)
+          ctx.fillRect(x + cx2 - h * 0.07, y + h * 0.1, h * 0.14, h * 0.35);
+        });
+        // Base slab
+        ctx.fillRect(x - h * 0.42, y + h * 0.38, h * 0.84, h * 0.1);
+        // Broken top column (middle only)
+        ctx.globalAlpha = 0.7;
+        ctx.fillRect(x - h * 0.07, y - h * 0.32, h * 0.14, h * 0.42);
+        ctx.globalAlpha = 1;
+        break;
+    }
+    ctx.restore();
+  }
+
+  // ---- RENDER ----
+  var last = performance.now();
+
+  function frame(ts) {
+    var dt = Math.min((ts - last) / 16.667, 3); last = ts;
+
+    // autopilot (runs even during hitStop interval for movement but skips sim when frozen)
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else if ((DEMO || BOT) && phase === 'play') {
+      autopilot();
+    }
+
+    cx.save();
+    // juice transforms
+    if (shakeAmt > 0.15 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.15 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // ---- HEADER ----
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('MAP LEGEND', W / 2, 30);
+
+    cx.fillStyle = TEAL;
+    cx.font = '800 30px -apple-system, Helvetica, Arial';
+    cx.fillText(solved + ' / ' + NUM_SYM, W / 2, 68);
+    cx.fillStyle = 'rgba(255,255,255,0.3)';
+    cx.font = '500 11px -apple-system, Helvetica, Arial';
+    cx.fillText('symbols decoded', W / 2, 84);
+
+    // ---- MAP PANEL ----
+    var mapBg = cx.createLinearGradient(MAP_X, MAP_Y, MAP_X + MAP_W, MAP_Y + MAP_H);
+    mapBg.addColorStop(0, '#1c2235');
+    mapBg.addColorStop(1, '#151929');
+    cx.fillStyle = mapBg;
+    cx.beginPath();
+    cx.roundRect ? cx.roundRect(MAP_X, MAP_Y, MAP_W, MAP_H, 10) : cx.rect(MAP_X, MAP_Y, MAP_W, MAP_H);
+    cx.fill();
+    cx.strokeStyle = 'rgba(46,197,182,0.12)';
+    cx.lineWidth = 1;
+    cx.stroke();
+
+    // Subtle grid
+    cx.strokeStyle = 'rgba(255,255,255,0.03)';
+    cx.lineWidth = 0.5;
+    for (var gx = 0; gx <= MAP_W; gx += 38) {
+      cx.beginPath(); cx.moveTo(MAP_X + gx, MAP_Y); cx.lineTo(MAP_X + gx, MAP_Y + MAP_H); cx.stroke();
+    }
+    for (var gy = 0; gy <= MAP_H; gy += 38) {
+      cx.beginPath(); cx.moveTo(MAP_X, MAP_Y + gy); cx.lineTo(MAP_X + MAP_W, MAP_Y + gy); cx.stroke();
+    }
+
+    // Draw map regions
+    regions.forEach(function (reg) {
+      var def = SYMBOL_DEFS[reg.sym];
+
+      cx.globalAlpha = reg.matched ? 0.9 : 0.5;
+      cx.fillStyle = def.color + '28';
+      cx.strokeStyle = reg.matched ? def.color : 'rgba(255,255,255,0.18)';
+      cx.lineWidth = reg.matched ? 1.5 : 0.8;
+      cx.beginPath();
+      cx.roundRect ? cx.roundRect(reg.x, reg.y, reg.w, reg.h, 4) : cx.rect(reg.x, reg.y, reg.w, reg.h);
+      cx.fill(); cx.stroke();
+      cx.globalAlpha = 1;
+
+      var cx2 = reg.x + reg.w / 2;
+      var cy2 = reg.y + reg.h / 2;
+      var symSize = Math.min(reg.w, reg.h) * 0.36;
+      cx.globalAlpha = reg.matched ? 1.0 : 0.55;
+      drawSymbol(cx, def.id, cx2, cy2, symSize, def.color);
+      cx.globalAlpha = 1;
+
+      // Pulse ring
+      if (reg.pulse > 0) {
+        reg.pulse -= 0.025 * dt;
+        if (reg.pulse < 0) reg.pulse = 0;
+        cx.strokeStyle = def.color;
+        cx.lineWidth = 1.5 * reg.pulse;
+        cx.globalAlpha = reg.pulse * 0.7;
+        cx.beginPath();
+        cx.arc(cx2, cy2, symSize * (1.5 + (1 - reg.pulse) * 0.8), 0, Math.PI * 2);
+        cx.stroke();
+        cx.globalAlpha = 1;
+      }
+
+      // Label badge when matched
+      if (reg.matched) {
+        var lw = Math.min(reg.w - 4, 72), lh = 16;
+        var lx = cx2 - lw / 2;
+        var ly = reg.y + reg.h - lh - 2;
+        cx.fillStyle = 'rgba(11,13,18,0.7)';
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(lx, ly, lw, lh, 3) : cx.rect(lx, ly, lw, lh);
+        cx.fill();
+        cx.fillStyle = def.color;
+        cx.font = '600 8px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText(def.label, cx2, reg.y + reg.h - 6);
+      }
+    });
+
+    // Highlight regions for dragged item
+    if (drag) {
+      var dit = drag.item;
+      var ddef = SYMBOL_DEFS[dit.symIdx];
+      regions.forEach(function (reg) {
+        if (reg.matched || reg.sym !== dit.symIdx) return;
+        cx.strokeStyle = ddef.color;
+        cx.lineWidth = 2;
+        cx.globalAlpha = 0.45 + 0.35 * Math.sin(ts / 260);
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(reg.x, reg.y, reg.w, reg.h, 4) : cx.rect(reg.x, reg.y, reg.w, reg.h);
+        cx.stroke();
+        cx.globalAlpha = 1;
+      });
+    }
+
+    // ---- LEGEND PANEL ----
+    cx.fillStyle = 'rgba(255,255,255,0.04)';
+    var legH = 20 + NUM_SYM * (LEG_ITEM_H + LEG_ITEM_GAP);
+    cx.beginPath();
+    cx.roundRect ? cx.roundRect(LEG_X, LEG_TOP, LEG_W, legH, 8) : cx.rect(LEG_X, LEG_TOP, LEG_W, legH);
+    cx.fill();
+
+    cx.textAlign = 'left';
+    cx.fillStyle = 'rgba(255,255,255,0.28)';
+    cx.font = '600 10px -apple-system, Helvetica, Arial';
+    cx.fillText('drag each label to its symbol on the map', LEG_X + 12, LEG_TOP + 14);
+
+    legendItems.forEach(function (it) {
+      if (it.matched) return;
+      var r = legendItemRect(it);
+      var def = SYMBOL_DEFS[it.symIdx];
+      var isDragging = drag && drag.item === it;
+      if (isDragging) return; // drawn separately on top
+
+      cx.fillStyle = 'rgba(255,255,255,0.05)';
+      cx.strokeStyle = def.color + '55';
+      cx.lineWidth = 1;
+      cx.beginPath();
+      cx.roundRect ? cx.roundRect(r.x, r.y, r.w, r.h, 6) : cx.rect(r.x, r.y, r.w, r.h);
+      cx.fill(); cx.stroke();
+
+      drawSymbol(cx, def.id, r.x + 28, r.y + LEG_ITEM_H / 2, 12, def.color);
+
+      cx.fillStyle = 'rgba(255,255,255,0.82)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'left';
+      cx.fillText(it.label, r.x + 50, r.y + LEG_ITEM_H / 2 + 5);
+
+      cx.fillStyle = 'rgba(255,255,255,0.18)';
+      cx.font = '11px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'right';
+      cx.fillText('drag →', r.x + r.w - 8, r.y + LEG_ITEM_H / 2 + 4);
+    });
+
+    // Draw dragged ghost on top of everything
+    if (drag) {
+      var gitem = drag.item;
+      var gdef = SYMBOL_DEFS[gitem.symIdx];
+      var gpx = drag.px, gpy = drag.py;
+      var gw = 120, gh = 38;
+
+      cx.save();
+      cx.shadowColor = gdef.color;
+      cx.shadowBlur = 14;
+      cx.fillStyle = INK2;
+      cx.strokeStyle = gdef.color;
+      cx.lineWidth = 1.5;
+      cx.beginPath();
+      cx.roundRect ? cx.roundRect(gpx - gw / 2, gpy - gh / 2, gw, gh, 8)
+                   : cx.rect(gpx - gw / 2, gpy - gh / 2, gw, gh);
+      cx.fill(); cx.stroke();
+      cx.restore();
+
+      drawSymbol(cx, gdef.id, gpx - gw / 2 + 20, gpy, 11, gdef.color);
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '700 13px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'left';
+      cx.fillText(gitem.label, gpx - gw / 2 + 38, gpy + 5);
+    }
+
+    // ---- FLASHES ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 36);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + fl.size + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, MAP_Y - 12 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 36) flashes.splice(k, 1);
+    }
+
+    // ---- GAME OVER overlay ----
+    if (phase === 'over') {
+      var oa = Math.min(1, (performance.now() - overAt) / 500);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.76 * oa) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = oa;
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '900 34px -apple-system, Helvetica, Arial';
+      cx.fillText('MAP DECODED', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('all ' + NUM_SYM + ' symbols placed', W / 2, 322);
+      cx.fillStyle = GOLD;
+      cx.font = '800 20px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' regions unlocked', W / 2, 358);
+      if (!DEMO && !BOT) {
+        var p = 0.6 + 0.4 * Math.sin(ts / 320);
+        cx.globalAlpha = oa * p;
+        cx.fillStyle = TEAL;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — DECODE AGAIN', W / 2, 410);
+      }
+      cx.globalAlpha = 1;
+    }
+
+    // ---- DEMO CTA card ----
+    if (phase === 'cta') {
+      var ctaElapsed = (performance.now() - ctaStartAt) / 1000;
+      var ease = Math.min(1, ctaElapsed * 2.5);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.88 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('MAP LEGEND', W / 2, 298);
+      cx.fillStyle = 'rgba(255,255,255,0.65)';
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('the map finally makes sense.', W / 2, 332);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('grow yours.', W / 2, 358);
+      var tp = 0.7 + 0.3 * Math.sin(performance.now() / 280);
+      cx.globalAlpha = ease * tp;
+      cx.fillStyle = TEAL;
+      cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 416);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 446);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  botRunsDone = 0;
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Worry Sort — Tilt</title>
+<!--
+  LOOP / attention-architecture — Worry Sort
+  Engine: calm. Circuits: 05-ease, 06-zeigarnik, 08-investment.
+  Mechanic: worry word cards drift up; tap each to place into
+            "in my control" or "not in my control" jar.
+  No wrong answers. All cards sorted → both jars seal → screen rests.
+
+  Modes:
+    ?demo=1&seed=7   calm arc ~16s → soft CTA → window.__demoDone=true
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone=true
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'worry-sort';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = Math.max(1, +qs.get('runs') || 3);
+  var SEED = +qs.get('seed') || 42;
+
+  // Mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // Palette — calm, no vermillion
+  var INK       = '#0b0d12';
+  var TEAL      = '#2ec5b6';
+  var GOLD      = '#f2b134';
+  var SOFT_BLUE = '#5ab4d8';
+
+  // Worry words pool
+  var WORRY_WORDS = [
+    'traffic',      'deadlines',   'health',       'weather',
+    'rent',         'opinions',    'sleep',        'news',
+    'my effort',    'the economy', 'my attitude',  'other people',
+    'my words',     'aging',       'my choices',   'social media',
+    'exercise',     'politics',    'gratitude',    'inflation',
+    'my habits',    'the future',  'my reactions', 'disasters',
+    'hydration',    'algorithms',  'rest',         'job market',
+    'my focus',     'gravity'
+  ];
+
+  // Jar layout — at bottom quarter of canvas
+  var JAR_W = 148, JAR_H = 148, JAR_R = 14;
+  var JAR_LEFT  = { x: 14,         y: 530, label: 'in my\ncontrol',     col: TEAL      };
+  var JAR_RIGHT = { x: W - 14 - JAR_W, y: 530, label: 'not in my\ncontrol', col: SOFT_BLUE };
+
+  // Card dimensions
+  var CARD_W = 200, CARD_H = 56, CARD_R = 14;
+
+  // Card zone — where cards float (between title area and jars)
+  var CARD_ZONE_TOP    = 200;
+  var CARD_ZONE_BOTTOM = 490;
+
+  // Juice vars
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var ctaAt = 0, ctaEase = 0;
+
+  // Bot state
+  var botRunsDone = 0;
+  var botDelay    = 0;
+
+  // Demo state
+  var demoDelay   = 0;
+  var demoMoveIdx = 0;
+  var demoDone    = false;
+  // Demo script: alternating jar sides, hesitation delays (frames at 60fps)
+  var demoWaits = [75, 60, 82, 55, 68, 50, 72, 46, 58, 42];
+
+  // Game state
+  var state, flashes, particles, runStartTs;
+
+  // ---- Particle sparks ----
+  function spawnParticles(x, y, col) {
+    for (var i = 0; i < 7; i++) {
+      var angle = (i / 7) * Math.PI * 2 + rng() * 0.5;
+      var speed = 1.0 + rng() * 1.8;
+      particles.push({
+        x: x, y: y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 0.8,
+        col: col, life: 1.0, r: 2.5 + rng() * 3
+      });
+    }
+  }
+
+  // ---- Build cards ----
+  function buildCards(words) {
+    return words.map(function (word, idx) {
+      // Stagger initial positions in the card zone — first few visible immediately
+      var spawnY;
+      if (idx < 3) {
+        // First 3 cards already in play zone, spread vertically
+        spawnY = CARD_ZONE_TOP + 40 + idx * 80;
+      } else {
+        // Rest enter from the bottom edge
+        spawnY = CARD_ZONE_BOTTOM + 20 + (idx - 3) * 55;
+      }
+      return {
+        word: word,
+        x: 80 + rng() * (W - 180),
+        y: spawnY,
+        vy: -(0.45 + rng() * 0.25),   // drift upward
+        drift: (rng() - 0.5) * 0.22,  // gentle horizontal sway
+        placed: false,
+        jarIdx: -1,
+        alpha: idx < 3 ? 1 : 0,       // first 3 start visible
+        w: CARD_W, h: CARD_H
+      };
+    });
+  }
+
+  // ---- Init ----
+  function newGame() {
+    rng = mulberry32(SEED);
+
+    // Shuffle worry words
+    var pool = WORRY_WORDS.slice();
+    for (var i = pool.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+    }
+    var chosen = pool.slice(0, 10);
+
+    state = {
+      phase: 'play',
+      cards: buildCards(chosen),
+      jarLeft:  { count: 0, sealed: false, sealT: 0 },
+      jarRight: { count: 0, sealed: false, sealT: 0 },
+      score: 0,
+      overAt: 0
+    };
+    flashes   = [];
+    particles = [];
+    hitStop   = 0; zoom = 1; shakeAmt = 0;
+    ctaEase   = 0; ctaAt = 0;
+    demoDelay = 55; demoMoveIdx = 0; demoDone = false;
+    botDelay  = 20;
+
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- Helpers ----
+  function allPlaced() {
+    for (var i = 0; i < state.cards.length; i++) {
+      if (!state.cards[i].placed) return false;
+    }
+    return true;
+  }
+
+  function jarCX(jarDef) { return jarDef.x + JAR_W / 2; }
+  function jarCY(jarDef) { return jarDef.y + JAR_H / 2; }
+
+  // ---- Place a card into a jar ----
+  function placeCard(cardIdx, jarSide) {
+    var card = state.cards[cardIdx];
+    if (!card || card.placed) return;
+    card.placed = true;
+    card.jarIdx = jarSide;
+
+    var jarDef   = jarSide === 0 ? JAR_LEFT  : JAR_RIGHT;
+    var jarState = jarSide === 0 ? state.jarLeft : state.jarRight;
+    jarState.count++;
+    state.score++;
+
+    spawnParticles(jarCX(jarDef), jarDef.y + 20, jarDef.col);
+    if (window.J) J.calm(state.score / 10);
+    zoom = 1.016;
+
+    if (window.LOOP) LOOP.emit('card_placed', {
+      word: card.word,
+      jar: jarSide === 0 ? 'control' : 'not_control',
+      score: state.score
+    });
+
+    if (allPlaced()) {
+      state.jarLeft.sealed  = true; state.jarLeft.sealT  = 0;
+      state.jarRight.sealed = true; state.jarRight.sealT = 0;
+      hitStop = 5; zoom = 1.028;
+      flash('SORTED ✓', TEAL, 38);
+      if (window.J) J.calm(1.0);
+      setTimeout(function () { gameOver(); }, 1600);
+    }
+  }
+
+  // ---- Game over ----
+  function gameOver() {
+    if (state.phase !== 'play') return;
+    state.phase  = 'over';
+    state.overAt = performance.now();
+    var dur      = (Date.now() - runStartTs) / 1000;
+
+    window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt   = performance.now();
+        ctaEase = 0;
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 1600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () {
+          if (window.LOOP) LOOP.emit('restart', {});
+          newGame();
+        }, 350);
+      }
+    }
+  }
+
+  function flash(txt, col, size) {
+    flashes.push({ txt: txt, col: col || TEAL, size: size || 34, t: 0 });
+  }
+
+  // ---- Input ----
+  var MUTE_R  = { x: W - 46, y: 10,  w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 115, y: 438, w: 230, h: 44 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function cardHit(x, y) {
+    for (var i = state.cards.length - 1; i >= 0; i--) {
+      var c = state.cards[i];
+      if (c.placed || c.alpha < 0.15) continue;
+      if (Math.abs(x - c.x) <= c.w / 2 + 4 && Math.abs(y - c.y) <= c.h / 2 + 4) return i;
+    }
+    return -1;
+  }
+
+  function jarHit(x, y) {
+    var jars = [JAR_LEFT, JAR_RIGHT];
+    for (var i = 0; i < 2; i++) {
+      var jd = jars[i];
+      if (x >= jd.x - 8 && x <= jd.x + JAR_W + 8 && y >= jd.y - 8 && y <= jd.y + JAR_H + 32) return i;
+    }
+    return -1;
+  }
+
+  var selected = -1;
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'sorted' }); return;
+      }
+      if (window.LOOP) LOOP.emit('restart', {});
+      newGame(); return;
+    }
+    if (state.phase !== 'play') return;
+
+    if (selected >= 0) {
+      var jIdx = jarHit(x, y);
+      if (jIdx >= 0) { placeCard(selected, jIdx); selected = -1; return; }
+      var cIdx = cardHit(x, y);
+      if (cIdx >= 0) { selected = cIdx; return; }
+      selected = -1; return;
+    }
+    var ci = cardHit(x, y);
+    if (ci >= 0) { selected = ci; }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (state.phase !== 'play' || selected < 0) return;
+    if (e.code === 'ArrowLeft'  || e.code === 'KeyA') { placeCard(selected, 0); selected = -1; }
+    if (e.code === 'ArrowRight' || e.code === 'KeyD') { placeCard(selected, 1); selected = -1; }
+  });
+
+  // ---- Demo autopilot ----
+  // Calm arc: settle (slow, hesitant) → deepen (steady) → resolve (gentle pace)
+  function demoPilot(dt) {
+    if (state.phase !== 'play' || demoDone) return;
+    demoDelay -= dt;
+    if (demoDelay > 0) return;
+
+    // Find the next visible un-placed card (lowest y = highest on screen = most urgent)
+    var best = -1, bestY = H + 1;
+    for (var i = 0; i < state.cards.length; i++) {
+      var c = state.cards[i];
+      if (c.placed || c.alpha < 0.5) continue;
+      if (c.y < bestY) { bestY = c.y; best = i; }
+    }
+    if (best < 0) { demoDelay = 15; return; } // wait for cards to become visible
+
+    // Alternate jars; bias left in first half, right in second half
+    var jarSide = demoMoveIdx % 2 === 0 ? 0 : 1;
+    if (demoMoveIdx > 5 && demoMoveIdx % 3 === 0) jarSide = jarSide === 0 ? 1 : 0; // occasional swap
+
+    placeCard(best, jarSide);
+    demoMoveIdx++;
+    demoDelay = demoWaits[Math.min(demoMoveIdx, demoWaits.length - 1)];
+  }
+
+  // ---- Bot autopilot ----
+  function botPilot(dt) {
+    if (state.phase !== 'play') return;
+    botDelay -= dt;
+    if (botDelay > 0) return;
+
+    // Find any visible un-placed card
+    var available = [];
+    for (var i = 0; i < state.cards.length; i++) {
+      var c = state.cards[i];
+      if (!c.placed && c.alpha > 0.15) available.push(i);
+    }
+
+    if (available.length === 0) {
+      // No visible cards yet — wait
+      botDelay = 10; return;
+    }
+
+    var ci = available[Math.floor(rng() * available.length)];
+    var jarSide = rng() < 0.5 ? 0 : 1;
+    placeCard(ci, jarSide);
+    botDelay = 12 + rng() * 15;
+  }
+
+  // ---- Draw jar ----
+  function drawJar(jarDef, jarState, highlighted) {
+    var x = jarDef.x, y = jarDef.y, col = jarDef.col;
+    var sealed    = jarState.sealed;
+    var fillRatio = Math.min(jarState.count / 5, 1);
+
+    if (highlighted) { cx.shadowBlur = 22; cx.shadowColor = col; }
+    else if (sealed) { cx.shadowBlur = 14; cx.shadowColor = col; }
+    else              { cx.shadowBlur = 0; }
+
+    cx.fillStyle  = 'rgba(255,255,255,0.03)';
+    cx.strokeStyle = highlighted ? col : (sealed ? col : 'rgba(255,255,255,0.15)');
+    cx.lineWidth   = highlighted ? 2.5 : (sealed ? 2 : 1.2);
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(x, y, JAR_W, JAR_H, JAR_R);
+    else cx.rect(x, y, JAR_W, JAR_H);
+    cx.fill(); cx.stroke();
+    cx.shadowBlur = 0;
+
+    // Soft fill wave
+    if (fillRatio > 0) {
+      var fH = (JAR_H - 4) * fillRatio;
+      cx.globalAlpha = 0.20;
+      cx.fillStyle = col;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(x + 2, y + JAR_H - fH - 1, JAR_W - 4, fH, [0, 0, JAR_R - 2, JAR_R - 2]);
+      else cx.rect(x + 2, y + JAR_H - fH - 1, JAR_W - 4, fH);
+      cx.fill();
+      cx.globalAlpha = 1;
+    }
+
+    // Seal sparkle
+    if (sealed && jarState.sealT < 55) {
+      jarState.sealT++;
+      var prog = jarState.sealT / 55;
+      cx.globalAlpha = (1 - prog) * 0.65;
+      cx.strokeStyle = col; cx.lineWidth = 2;
+      cx.beginPath();
+      cx.rect(x - 5 * prog, y - 5 * prog, JAR_W + 10 * prog, JAR_H + 10 * prog);
+      cx.stroke();
+      cx.globalAlpha = 1;
+    }
+
+    // Count badge
+    if (jarState.count > 0) {
+      cx.fillStyle = sealed ? col : 'rgba(255,255,255,0.5)';
+      cx.textAlign = 'center';
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText(String(jarState.count), x + JAR_W / 2, y + JAR_H / 2 + 8);
+    }
+
+    // Label
+    var lines = jarDef.label.split('\n');
+    cx.textAlign  = 'center';
+    cx.fillStyle  = sealed ? col : 'rgba(255,255,255,0.50)';
+    cx.font       = '600 12px -apple-system, Helvetica, Arial';
+    for (var li = 0; li < lines.length; li++) {
+      cx.fillText(lines[li], x + JAR_W / 2, y + JAR_H + 20 + li * 17);
+    }
+  }
+
+  // ---- Draw card ----
+  function drawCard(card, isSel) {
+    if (card.placed) return;
+    var a = Math.min(card.alpha, 1);
+    if (a < 0.01) return;
+
+    cx.save();
+    cx.globalAlpha = a;
+    cx.translate(card.x, card.y);
+    if (isSel) cx.scale(1.05, 1.05);
+
+    var hw = card.w / 2, hh = card.h / 2;
+
+    cx.shadowBlur  = isSel ? 20 : 5;
+    cx.shadowColor = isSel ? TEAL : 'rgba(0,0,0,0.55)';
+
+    cx.fillStyle   = isSel ? 'rgba(46,197,182,0.15)' : 'rgba(255,255,255,0.07)';
+    cx.strokeStyle = isSel ? TEAL : 'rgba(255,255,255,0.20)';
+    cx.lineWidth   = isSel ? 2 : 1;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(-hw, -hh, card.w, card.h, CARD_R);
+    else cx.rect(-hw, -hh, card.w, card.h);
+    cx.fill(); cx.stroke();
+    cx.shadowBlur = 0;
+
+    cx.fillStyle = isSel ? '#fff' : 'rgba(255,255,255,0.88)';
+    cx.font      = (isSel ? '700' : '500') + ' 16px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.fillText(card.word, 0, 6);
+
+    cx.restore();
+    cx.globalAlpha = 1;
+  }
+
+  // ---- Main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Juice decay + autopilots
+    if (hitStop > 0) { hitStop -= dt; }
+    else {
+      if (DEMO) demoPilot(dt);
+      if (BOT)  botPilot(dt);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // Update floating cards
+    for (var i = 0; i < state.cards.length; i++) {
+      var card = state.cards[i];
+      if (card.placed) continue;
+
+      card.y     += card.vy * dt;
+      card.x     += card.drift * dt;
+      // Gentle sway variation (use a fixed computed drift rather than rng() in loop — predictable)
+      card.drift += Math.sin(now * 0.0003 + i * 1.3) * 0.008 * dt;
+      card.drift  = Math.max(-0.5, Math.min(0.5, card.drift));
+
+      // Clamp horizontal
+      if (card.x < card.w / 2 + 12) { card.x = card.w / 2 + 12; card.drift = Math.abs(card.drift); }
+      if (card.x > W - card.w / 2 - 12) { card.x = W - card.w / 2 - 12; card.drift = -Math.abs(card.drift); }
+
+      // Fade in when entering view
+      if (card.y < CARD_ZONE_BOTTOM + 30 && card.y > CARD_ZONE_TOP - 40) {
+        card.alpha = Math.min(1, card.alpha + 0.04 * dt);
+      }
+
+      // Recycle if drifted too high — reset below
+      if (card.y < CARD_ZONE_TOP - card.h) {
+        card.y     = CARD_ZONE_BOTTOM + 30 + rng() * 40;
+        card.alpha = 0;
+        card.x     = 70 + rng() * (W - 160);
+      }
+    }
+
+    // Update particles
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pt = particles[p];
+      pt.x  += pt.vx * dt;
+      pt.y  += pt.vy * dt;
+      pt.vy += 0.07 * dt;
+      pt.life -= 0.030 * dt;
+      if (pt.life <= 0) particles.splice(p, 1);
+    }
+
+    // === RENDER ===
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // BG
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createRadialGradient(W / 2, H * 0.55, 0, W / 2, H * 0.55, H * 0.62);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // Title
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.60)';
+    cx.font      = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('WORRY SORT', W / 2, 38);
+
+    // Score
+    var placed = 0;
+    for (var si = 0; si < state.cards.length; si++) { if (state.cards[si].placed) placed++; }
+    var total  = state.cards.length;
+    cx.fillStyle = 'rgba(255,255,255,0.92)';
+    cx.font      = '800 50px -apple-system, Helvetica, Arial';
+    cx.fillText(placed, W / 2, 96);
+    cx.fillStyle = 'rgba(255,255,255,0.30)';
+    cx.font      = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('of ' + total + ' sorted', W / 2, 116);
+
+    // Progress dots
+    var dotR = 4, dotSp = 17;
+    var dotX = W / 2 - ((total - 1) * dotSp) / 2;
+    for (var d = 0; d < total; d++) {
+      cx.fillStyle = d < placed ? TEAL : 'rgba(255,255,255,0.16)';
+      cx.beginPath(); cx.arc(dotX + d * dotSp, 136, dotR, 0, Math.PI * 2); cx.fill();
+    }
+
+    // Instruction
+    cx.fillStyle = 'rgba(255,255,255,0.20)';
+    cx.font      = '500 11px -apple-system, Helvetica, Arial';
+    cx.fillText(selected >= 0 ? 'now tap a jar →' : 'tap a word · then a jar', W / 2, 162);
+
+    // Cards (below jar level first)
+    for (var ci = 0; ci < state.cards.length; ci++) {
+      if (!state.cards[ci].placed && state.cards[ci].y > JAR_LEFT.y) {
+        drawCard(state.cards[ci], ci === selected);
+      }
+    }
+
+    // Jars
+    var hl = selected >= 0 && state.phase === 'play';
+    drawJar(JAR_LEFT,  state.jarLeft,  hl);
+    drawJar(JAR_RIGHT, state.jarRight, hl);
+
+    // Cards above jar level (on top of jars — card zone)
+    for (var ci2 = 0; ci2 < state.cards.length; ci2++) {
+      if (!state.cards[ci2].placed && state.cards[ci2].y <= JAR_LEFT.y) {
+        drawCard(state.cards[ci2], ci2 === selected);
+      }
+    }
+
+    // Particles
+    for (var pi = 0; pi < particles.length; pi++) {
+      var ppt = particles[pi];
+      cx.globalAlpha = Math.max(0, ppt.life * 0.85);
+      cx.fillStyle   = ppt.col;
+      cx.beginPath();
+      cx.arc(ppt.x, ppt.y, ppt.r * Math.max(0, ppt.life), 0, Math.PI * 2);
+      cx.fill();
+    }
+    cx.globalAlpha = 1;
+
+    // Flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = fa;
+      cx.textAlign   = 'center';
+      cx.fillStyle   = fl.col;
+      cx.font        = '900 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.45);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(k, 1);
+    }
+
+    // Game over overlay (human + bot — not demo CTA)
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('SORTED.', W / 2, 272);
+      cx.fillStyle = 'rgba(255,255,255,0.82)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' worries sorted', W / 2, 310);
+      cx.fillStyle = 'rgba(255,255,255,0.38)'; cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('control is a practice', W / 2, 340);
+
+      if (!DEMO && !BOT) {
+        var pulse = 0.6 + 0.4 * Math.sin(now / 340);
+        cx.globalAlpha = pulse; cx.fillStyle = TEAL;
+        cx.font = '600 15px -apple-system, Helvetica, Arial';
+        cx.fillText('tap to sort again', W / 2, 390);
+        cx.globalAlpha = 1;
+
+        // Share pill
+        cx.fillStyle   = 'rgba(242,177,52,0.10)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 22);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 13px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ SHARE THE CALM', W / 2, SHARE_R.y + 28);
+      }
+    }
+
+    // Demo CTA card
+    if (state.phase === 'cta') {
+      ctaEase = Math.min(ctaEase + dt / 55, 1);
+      var ease = ctaEase;
+      cx.fillStyle = 'rgba(11,13,18,' + (0.88 * ease).toFixed(2) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('WORRY SORT', W / 2, 280);
+      cx.fillStyle = 'rgba(255,255,255,0.62)'; cx.font = '600 17px -apple-system, Helvetica, Arial';
+      cx.fillText('sort what you can control', W / 2, 318);
+      var p2 = 0.7 + 0.3 * Math.sin(now / 290);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p2;
+      cx.font = '900 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 386);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.36)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 420);
+      cx.globalAlpha = 1;
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign   = 'center'; cx.globalAlpha = 0.5;
+      cx.font        = '16px -apple-system, Helvetica, Arial'; cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

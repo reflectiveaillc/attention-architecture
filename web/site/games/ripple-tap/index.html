@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Ripple Tap — Tilt</title>
+<!--
+  LOOP / attention-architecture — Ripple Tap
+  Engine: calm. Circuits: 05-ease, 01-rpe, 07-timing.
+  Mechanic: tap water surface → perfect predictable ripple every time.
+  No variation, no surprise — the nervous system learns: tap, ripple, safe.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'ripple-tap';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- ripple pool ----
+  var ripples = [];
+  // Each ripple: { x, y, r, maxR, born, life }
+  var RIPPLE_SPEED = 60;   // px/s
+  var RIPPLE_LIFE  = 2.2;  // s
+
+  // ---- water surface lines ----
+  // Gentle idle wave lines to give the water a living feel
+  var waveT = 0;
+
+  // ---- game state ----
+  // Score = number of taps. Game ends when BOT has done enough or DEMO arc finishes.
+  var score = 0;
+  var phase = 'idle';   // idle | play | over | cta | demo_settle | demo_deepen | demo_resolve
+  var runStartTs = 0;
+  var overAt = 0, ctaAt = 0;
+
+  // Juice state
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var flashes = [];
+
+  // Bot state
+  var botRunsDone = 0;
+  var botTapTimer = 0;          // countdown frames until next bot tap
+  var BOT_TAPS_PER_RUN = 8;    // bot does K taps then stops → natural lose condition
+  var botTapsDone = 0;
+  var BOT_IDLE_TIME = 3.5;     // seconds idle after bot taps done → game_over fires
+
+  // Demo arc state
+  // arc: settle(0-4s) → deepen(4-10s) → resolve(10-14s) → cta(14-17.5s)
+  var demoStartTs = 0;
+  var demoPhase = 'settle'; // settle | deepen | resolve | done
+  var demoNextTap = 0;      // time until next demo auto-tap (seconds from arc start)
+  // pre-scheduled demo taps (seconds from demo start, x fraction, y fraction)
+  var DEMO_TAPS = [
+    0.8,  1.7,  2.5,         // settle: slow, spaced out
+    4.1,  4.8,  5.5, 6.2, 6.9, 7.6,   // deepen: rhythmic, more frequent
+    10.2, 11.0, 11.7, 12.4, 13.1      // resolve: gentle fade-out pace
+  ];
+  var DEMO_POSITIONS = [
+    [0.50, 0.55], [0.32, 0.48], [0.68, 0.60],
+    [0.45, 0.52], [0.60, 0.45], [0.38, 0.58], [0.55, 0.62], [0.42, 0.50], [0.65, 0.55],
+    [0.50, 0.50], [0.35, 0.52], [0.62, 0.48], [0.48, 0.56], [0.55, 0.52]
+  ];
+  var demoTapIdx = 0;
+
+  // Idle "inviting" pulse — a slow glow ring in the center encouraging a tap
+  var inviteT = 0;
+
+  // MUTE toggle rect (human only)
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- helpers ----
+  function addRipple(x, y) {
+    var maxR = 90 + rng() * 60;
+    ripples.push({ x: x, y: y, r: 0, maxR: maxR, born: 0, life: RIPPLE_LIFE });
+    score++;
+    if (window.J) J.calm(score);
+    // small zoom pulse on every tap
+    zoom = 1.015;
+    if (score % 5 === 0) {
+      // every 5 taps, a slightly bigger glow moment
+      hitStop = 0.6;
+      shakeAmt = 1.2;
+      flash('+' + score, TEAL, 22);
+    }
+    if (window.LOOP) LOOP.emit('ripple', { n: score });
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  function spawnRippleAt(fx, fy) {
+    // fx, fy are 0-1 fractions of W, H
+    addRipple(fx * W, fy * H);
+  }
+
+  // ---- game lifecycle ----
+  function startPlay() {
+    phase = 'play';
+    score = 0;
+    ripples = [];
+    flashes = [];
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 1200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetBot(); }, 800);
+      }
+    }
+  }
+
+  function resetBot() {
+    score = 0;
+    ripples = [];
+    flashes = [];
+    botTapsDone = 0;
+    botTapTimer = 40 + rng() * 30;   // frames (~0.7-1.2s) before first tap
+    if (window.LOOP) LOOP.emit('restart', {});
+    startPlay();
+  }
+
+  // ---- input ----
+  function humanTap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'idle') { startPlay(); }
+    if (phase === 'play') {
+      var rx = (x !== undefined) ? x : W / 2;
+      var ry = (y !== undefined) ? y : H / 2;
+      addRipple(rx, ry);
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      score = 0; ripples = []; flashes = [];
+      if (window.LOOP) LOOP.emit('restart', {});
+      startPlay();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    humanTap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') humanTap();
+  });
+
+  // ---- autopilots ----
+  // BOT: taps K times at human-ish intervals, then goes passive → game_over
+  // Passive means no more taps → score doesn't accumulate → after idle, game ends via timer
+  var botIdleElapsed = 0;
+
+  function botAutopilot(dt) {
+    if (phase !== 'play') return;
+    if (botTapsDone < BOT_TAPS_PER_RUN) {
+      botTapTimer -= dt * 60;
+      if (botTapTimer <= 0) {
+        var fx = 0.2 + rng() * 0.6;
+        var fy = 0.3 + rng() * 0.5;
+        addRipple(fx * W, fy * H);
+        botTapsDone++;
+        // varied interval 0.8s-2.0s in frames
+        botTapTimer = 48 + rng() * 72;
+      }
+    } else {
+      // passive: wait for BOT_IDLE_TIME then trigger game_over
+      botIdleElapsed += dt;
+      if (botIdleElapsed >= BOT_IDLE_TIME) {
+        botIdleElapsed = 0;
+        gameOver();
+      }
+    }
+  }
+
+  // DEMO: follows pre-scheduled tap times
+  function demoAutopilot(elapsed) {
+    if (demoPhase === 'done') return;
+    // fire scheduled taps
+    while (demoTapIdx < DEMO_TAPS.length && elapsed >= DEMO_TAPS[demoTapIdx]) {
+      var pos = DEMO_POSITIONS[demoTapIdx % DEMO_POSITIONS.length];
+      spawnRippleAt(pos[0], pos[1]);
+      demoTapIdx++;
+    }
+    // advance arc phase
+    if (elapsed < 4) {
+      demoPhase = 'settle';
+    } else if (elapsed < 10) {
+      demoPhase = 'deepen';
+    } else if (elapsed < 14) {
+      demoPhase = 'resolve';
+    } else {
+      // arc complete → trigger game over → cta
+      demoPhase = 'done';
+      gameOver();
+    }
+  }
+
+  // ---- render helpers ----
+  function drawWater(now) {
+    // Subtle horizontal wave lines giving the surface life
+    cx.save();
+    cx.globalAlpha = 0.07;
+    var lineCount = 18;
+    for (var i = 0; i < lineCount; i++) {
+      var yBase = 200 + i * 30;
+      cx.beginPath();
+      cx.moveTo(0, yBase);
+      for (var x = 0; x <= W; x += 8) {
+        var wave = Math.sin((x / W) * Math.PI * 4 + waveT * 0.8 + i * 0.4) * 2.5;
+        cx.lineTo(x, yBase + wave);
+      }
+      cx.strokeStyle = TEAL;
+      cx.lineWidth = 0.8;
+      cx.stroke();
+    }
+    cx.restore();
+  }
+
+  function drawRipples(dt) {
+    for (var i = ripples.length - 1; i >= 0; i--) {
+      var rp = ripples[i];
+      rp.born += dt;
+      rp.r = (rp.born / rp.life) * rp.maxR;
+      var age = rp.born / rp.life;   // 0 → 1
+      if (age >= 1) { ripples.splice(i, 1); continue; }
+
+      // 3 concentric rings per ripple for richness
+      for (var ring = 0; ring < 3; ring++) {
+        var ringAge = Math.max(0, age - ring * 0.12);
+        var ringR   = ringAge * rp.maxR;
+        var alpha   = Math.max(0, (1 - ringAge) * 0.55 * (1 - ring * 0.25));
+        if (ringR <= 0) continue;
+        cx.beginPath();
+        cx.arc(rp.x, rp.y, ringR, 0, Math.PI * 2);
+        cx.strokeStyle = TEAL;
+        cx.lineWidth = 1.5 - ring * 0.3;
+        cx.globalAlpha = alpha;
+        cx.stroke();
+        cx.globalAlpha = 1;
+      }
+
+      // center splash dot — fades fast
+      if (rp.born < 0.15) {
+        var splashA = (1 - rp.born / 0.15) * 0.7;
+        cx.beginPath();
+        cx.arc(rp.x, rp.y, 4 * (1 - rp.born / 0.15), 0, Math.PI * 2);
+        cx.fillStyle = TEAL;
+        cx.globalAlpha = splashA;
+        cx.fill();
+        cx.globalAlpha = 1;
+      }
+    }
+  }
+
+  function drawInvite(now) {
+    // A soft pulsing ring in center inviting the first tap
+    inviteT += 0.016;
+    var pulse = 0.4 + 0.3 * Math.sin(inviteT * 2.2);
+    cx.beginPath();
+    cx.arc(W / 2, H / 2, 40 + 10 * Math.sin(inviteT * 1.8), 0, Math.PI * 2);
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 1.5;
+    cx.globalAlpha = pulse;
+    cx.stroke();
+    cx.globalAlpha = 1;
+
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(46,197,182,0.7)';
+    cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.globalAlpha = pulse;
+    cx.fillText('TAP THE WATER', W / 2, H / 2 + 75);
+    cx.globalAlpha = 1;
+  }
+
+  function drawScore() {
+    if (score === 0) return;
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(46,197,182,0.55)';
+    cx.font = '600 13px Menlo, monospace';
+    cx.fillText(score + ' ripples', W / 2, 48);
+  }
+
+  function drawTitle() {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.font = '800 38px -apple-system, Helvetica, Arial';
+    cx.fillText('RIPPLE TAP', W / 2, H / 2 - 60);
+    cx.fillStyle = 'rgba(255,255,255,0.38)';
+    cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText('feel the calm', W / 2, H / 2 - 30);
+  }
+
+  function drawFlashes(dt) {
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2 + (rng() - 0.5) * 40, H / 2 - 80 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+  }
+
+  function drawOverlay() {
+    // gentle darkening
+    cx.fillStyle = 'rgba(11,13,18,0.45)';
+    cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL;
+    cx.font = '800 34px -apple-system, Helvetica, Arial';
+    cx.fillText(score + ' ripples', W / 2, H / 2 - 30);
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText('a moment of calm', W / 2, H / 2 + 5);
+    if (!DEMO && !BOT) {
+      var pulse = 0.5 + 0.4 * Math.sin(performance.now() / 500);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — RIPPLE AGAIN', W / 2, H / 2 + 50);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawCTA(now) {
+    var t   = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2.0);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '800 40px -apple-system, Helvetica, Arial';
+    cx.fillText('RIPPLE TAP', W / 2, H / 2 - 80);
+    cx.fillStyle = 'rgba(255,255,255,0.65)';
+    cx.font = '500 17px -apple-system, Helvetica, Arial';
+    cx.fillText('your stillness is here', W / 2, H / 2 - 42);
+    var p2 = 0.65 + 0.35 * Math.sin(now / 380);
+    cx.globalAlpha = ease * p2;
+    cx.fillStyle = TEAL;
+    cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, H / 2 + 24);
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(255,255,255,0.38)';
+    cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, H / 2 + 60);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+    waveT += dt * 0.016;
+
+    // hit-stop decay — MUST decay before calling autopilot
+    if (hitStop > 0) { hitStop -= dt; }
+
+    // bot / demo autopilots (only when hitStop fully done)
+    if (hitStop <= 0) {
+      if (BOT && phase === 'play') {
+        botAutopilot(dt);
+      }
+      if (DEMO && phase === 'play') {
+        var elapsed = (Date.now() - runStartTs) / 1000;
+        demoAutopilot(elapsed);
+      }
+    }
+
+    // juice decay
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // canvas transforms
+    cx.save();
+    if (shakeAmt > 0.15 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    // subtle deep-water gradient
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.10)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // water surface
+    drawWater(now);
+
+    // ripples
+    drawRipples(dt);
+
+    // score (subtle)
+    drawScore();
+
+    // flash text
+    drawFlashes(dt);
+
+    // phase-specific overlays
+    if (phase === 'idle') {
+      drawTitle();
+      drawInvite(now);
+    }
+    if (phase === 'over') {
+      drawOverlay();
+    }
+    if (phase === 'cta') {
+      drawCTA(now);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- init ----
+  if (DEMO) {
+    // demo starts in play immediately
+    startPlay();
+  } else if (BOT) {
+    botTapTimer = 30 + rng() * 30;
+    botIdleElapsed = 0;
+    botTapsDone = 0;
+    startPlay();
+  } else {
+    phase = 'idle';
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

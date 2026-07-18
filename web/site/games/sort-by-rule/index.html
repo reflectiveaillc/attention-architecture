@@ -6,12 +6,12 @@
 <title>Sort by Rule — Tilt</title>
 <!--
   LOOP / attention-architecture — Sort by Rule
-  Circuits: 06-zeigarnik (the rule is almost figured out), 05-ease (the gesture is already known),
+  Circuits: 06-zeigarnik (rule is almost figured out), 05-ease (thumb already knows this move),
             08-investment (each correct sort deepens commitment).
-  Engine: CALM — soft bells only, no percussion/tension/death.
+  Engine: CALM — J.calm(step) only.
   Modes:
     ?demo=1&seed=7        scripted calm arc ~16s → soft CTA → window.__demoDone
-    ?bot=1&runs=N&seed=5  imperfect autoplay, N runs (bot eventually LOSES), window.__botDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, N runs (bot LOSES), window.__botDone
 -->
 <style>
   html,body{margin:0;padding:0;height:100%;background:#0b0d12;overflow:hidden;
@@ -29,7 +29,6 @@
 <script>
 (function(){
 'use strict';
-
 var W=405,H=720;
 var qs=new URLSearchParams(location.search);
 var DEMO=qs.get('demo')==='1';
@@ -37,7 +36,6 @@ var BOT=qs.get('bot')==='1';
 var BOT_RUNS=+qs.get('runs')||3;
 var SEED=+qs.get('seed')||42;
 
-// mulberry32 seeded RNG
 function mulberry32(a){
   return function(){
     a|=0;a=a+0x6D2B79F5|0;
@@ -59,21 +57,13 @@ function fit(){
 }
 window.addEventListener('resize',fit);fit();
 
-var TEAL='#2ec5b6',GOLD='#f2b134',INK='#0b0d12';
-var SOFT='#a0c4c2'; // softer teal for calm aesthetic
+var TEAL='#2ec5b6',GOLD='#f2b134',INK='#0b0d12',SOFT='#a0c4c2';
 
-// ──────────────────────────────────────────────
-// RULE DEFINITIONS
-// Each rule has: items (array of {label, group}), bins (2 labels), revealText
-// The player must infer the rule from watching first few correct placements.
-// ──────────────────────────────────────────────
+// ── RULES ──
 var RULES=[
   {
-    id:'even-odd',
-    hint:'Something about numbers…',
-    reveal:'EVEN vs ODD',
-    bins:['LEFT','RIGHT'],
-    binLabels:['EVEN','ODD'],
+    id:'even-odd',hint:'Something about numbers…',
+    reveal:'EVEN vs ODD',binLabels:['EVEN','ODD'],
     items:[
       {label:'2',g:0},{label:'7',g:1},{label:'4',g:0},{label:'9',g:1},
       {label:'6',g:0},{label:'3',g:1},{label:'8',g:0},{label:'1',g:1},
@@ -83,11 +73,8 @@ var RULES=[
     ]
   },
   {
-    id:'long-short',
-    hint:'Something about length…',
-    reveal:'SHORT vs LONG words',
-    bins:['LEFT','RIGHT'],
-    binLabels:['SHORT','LONG'],
+    id:'long-short',hint:'Something about length…',
+    reveal:'SHORT ≤4 vs LONG >4 letters',binLabels:['SHORT','LONG'],
     items:[
       {label:'cat',g:0},{label:'elephant',g:1},{label:'sun',g:0},{label:'umbrella',g:1},
       {label:'map',g:0},{label:'computer',g:1},{label:'sky',g:0},{label:'butterfly',g:1},
@@ -97,11 +84,8 @@ var RULES=[
     ]
   },
   {
-    id:'vowel-consonant',
-    hint:'Look at how they start…',
-    reveal:'STARTS VOWEL vs CONSONANT',
-    bins:['LEFT','RIGHT'],
-    binLabels:['VOWEL','CONS.'],
+    id:'vowel-consonant',hint:'Look at how they start…',
+    reveal:'STARTS WITH VOWEL vs CONSONANT',binLabels:['VOWEL','CONS.'],
     items:[
       {label:'apple',g:0},{label:'bird',g:1},{label:'ocean',g:0},{label:'cloud',g:1},
       {label:'ice',g:0},{label:'flame',g:1},{label:'earth',g:0},{label:'tree',g:1},
@@ -111,11 +95,8 @@ var RULES=[
     ]
   },
   {
-    id:'nature-made',
-    hint:'Where did it come from?',
-    reveal:'NATURE-MADE vs MAN-MADE',
-    bins:['LEFT','RIGHT'],
-    binLabels:['NATURE','MADE'],
+    id:'nature-made',hint:'Where did it come from?',
+    reveal:'NATURE-MADE vs MAN-MADE',binLabels:['NATURE','MADE'],
     items:[
       {label:'rock',g:0},{label:'chair',g:1},{label:'leaf',g:0},{label:'lamp',g:1},
       {label:'river',g:0},{label:'phone',g:1},{label:'shell',g:0},{label:'knife',g:1},
@@ -126,516 +107,391 @@ var RULES=[
   }
 ];
 
-// ──────────────────────────────────────────────
-// GAME STATE
-// ──────────────────────────────────────────────
-var state,flashes,runStartTs;
-var hitStop=0,zoom=1,shakeAmt=0;
-var botRunsDone=0;
-var ctaAt=0,last=performance.now();
+var CARD_W=160,CARD_H=52;
+var BIN_Y=556,BIN_H=80;
+var BIN_L_X=52,BIN_R_X=W-52-CARD_W;
+var SETTLE_Y=BIN_Y-CARD_H-28;
+
+// ── STATE ──
+var phase,rule,queue,active,sorted,errors,score,overAt,sealAt,revealShown;
+var flashes=[];
+var hitStop=0,zoom=1,shakeAmt=0,revealPulse=0;
+var runStartTs=0;
 var best=0;
 try{best=+localStorage.getItem('sbr_best')||0;}catch(_){}
 
-// visual juice vars
-var revealPulse=0; // pulse on rule reveal
+// autopilot
+var apTimer=0;
+var apWaits=[40,35,45,50,40,35,45,55,40,35,45,50,35,40,50,40,45,50,35,40];
+var apIdx=0;
+var botRunsDone=0;
+var botActionCount=0;
+var BOT_ACTIONS_THEN_FAIL=7; // after 7 total actions, force wrong every time → 3 errors → game over
 
-// ──────────────────────────────────────────────
-// Item visual: a drifting card
-// Each item: {label,g,x,y,vy,t,state:'drift'|'correct'|'wrong'|'done',
-//             swipeDir,animT,alpha}
-// ──────────────────────────────────────────────
-var CARD_W=160,CARD_H=52;
-var BIN_Y=560; // y top of bins
-var BIN_H=80;
-var BIN_L_X=60,BIN_R_X=W-60-CARD_W; // bin left/right x
+var ctaAt=0,last=performance.now();
 
 function pickRule(){
-  var idx=Math.floor(rng()*RULES.length);
-  return RULES[idx];
+  return RULES[Math.floor(rng()*RULES.length)];
 }
 
-function newGame(){
-  var rule=pickRule();
-  // shuffle items with seeded rng
-  var items=rule.items.slice().map(function(it,i){return{label:it.label,g:it.g,idx:i};});
-  for(var i=items.length-1;i>0;i--){
+function shuffleItems(arr){
+  var a=arr.slice();
+  for(var i=a.length-1;i>0;i--){
     var j=Math.floor(rng()*(i+1));
-    var tmp=items[i];items[i]=items[j];items[j]=tmp;
+    var t=a[i];a[i]=a[j];a[j]=t;
   }
+  return a;
+}
 
-  state={
-    phase:'title', // title|play|sealed|over|cta
-    rule:rule,
-    items:items,
-    queue:items.slice(), // items yet to drop
-    active:null,  // current drifting item
-    sorted:[], // correctly sorted so far
-    errors:0,  // wrong sorts
-    maxErrors:3, // 3 strikes → game over
-    score:0,
-    overAt:0,
-    sealAt:0,
-    revealShown:false
-  };
+function initRun(){
+  rule=pickRule();
+  var rawItems=shuffleItems(rule.items);
+  queue=rawItems.slice();
+  // DEMO must seal well under the 90s clip window: 6 cards ≈ a ~15s calm arc.
+  if(DEMO) queue=queue.slice(0,6);
+  active=null;
+  sorted=[];
+  errors=0;
+  score=0;
+  overAt=0;
+  sealAt=0;
+  revealShown=false;
   flashes=[];
   hitStop=0;zoom=1;shakeAmt=0;revealPulse=0;
-
-  if(DEMO){
-    setTimeout(startRun,400);
-    return;
-  }
-  if(BOT) startRun();
+  apIdx=0;
+  botActionCount=0;
 }
 
 function startRun(){
-  state.phase='play';
+  phase='play';
   runStartTs=Date.now();
-  if(window.LOOP) LOOP.emit('play_start',{seed:SEED,rule:state.rule.id});
+  apTimer=apWaits[0]||60;
+  apIdx=0;
+  if(window.LOOP) LOOP.emit('play_start',{seed:SEED,rule:rule.id});
   spawnNext();
 }
 
 function spawnNext(){
-  if(state.phase!=='play') return;
-  if(state.queue.length===0){
-    // all items sorted! seal the tray
-    sealGame();
-    return;
-  }
-  var it=state.queue.shift();
-  // drift in from top center with slight x variance
-  var startX=W/2-CARD_W/2+(rng()-0.5)*40;
-  state.active={
-    label:it.label,
-    g:it.g,
-    x:startX,
-    y:-CARD_H-10,
-    vy:1.6+(rng()*0.6),
-    state:'drift',
-    animT:0,
-    alpha:1,
-    targetX:startX, // settles here while waiting for input
-    settled:false
+  if(phase!=='play') return;
+  if(queue.length===0){ sealGame(); return; }
+  var it=queue.shift();
+  var sx=W/2-CARD_W/2+(rng()-0.5)*30;
+  active={
+    label:it.label,g:it.g,
+    x:sx,y:-CARD_H-10,
+    vy:1.8+(rng()*0.5),
+    state:'drift',   // drift | arriving | settled | correct | wrong
+    animT:0,alpha:1
   };
 }
 
+function emitGameOver(result){
+  var dur=(Date.now()-runStartTs)/1000;
+  if(window.LOOP) LOOP.emit('game_over',{score:score,dur_s:+dur.toFixed(1),result:result,errors:errors});
+}
+
 function sealGame(){
-  state.phase='sealed';
-  state.sealAt=performance.now();
-  state.revealShown=true;
+  phase='sealed';
+  sealAt=performance.now();
+  revealShown=true;
+  revealPulse=1;
+  if(score>best){best=score;try{localStorage.setItem('sbr_best',String(best));}catch(_){}}
   if(window.J) J.calm(8);
   zoom=1.02;
-  var dur=(Date.now()-runStartTs)/1000;
-  var sc=state.score;
-  if(sc>best){best=sc;try{localStorage.setItem('sbr_best',String(best));}catch(_){}}
-  if(window.LOOP) LOOP.emit('game_over',{score:sc,dur_s:+dur.toFixed(1),result:'sealed'});
-  if(window.LOOP) LOOP.emit('rule_revealed',{rule:state.rule.id,errors:state.errors});
+  emitGameOver('sealed');
+  if(window.LOOP) LOOP.emit('rule_revealed',{rule:rule.id,errors:errors});
+  window.__demoScore=score;
   if(DEMO){
-    window.__demoScore=sc;
-    setTimeout(function(){state.phase='cta';ctaAt=performance.now();
-      setTimeout(function(){window.__demoDone=true;},3600);},2800);
+    setTimeout(function(){
+      phase='cta';ctaAt=performance.now();
+      setTimeout(function(){window.__demoDone=true;},3600);
+    },2800);
   }
   if(BOT){
     botRunsDone++;
     if(botRunsDone>=BOT_RUNS){window.__botDone=true;}
-    else setTimeout(function(){newGame();startRun();},600);
+    else setTimeout(function(){initRun();startRun();},500);
   }
 }
 
 function gameOver(){
-  state.phase='over';
-  state.overAt=performance.now();
-  shakeAmt=6;
-  var dur=(Date.now()-runStartTs)/1000;
-  var sc=state.score;
-  if(sc>best){best=sc;try{localStorage.setItem('sbr_best',String(best));}catch(_){}}
-  if(window.J) J.calm(0); // soft ending
-  if(window.LOOP) LOOP.emit('game_over',{score:sc,dur_s:+dur.toFixed(1),result:'failed',errors:state.errors});
+  phase='over';
+  overAt=performance.now();
+  shakeAmt=5;
+  revealShown=true;
+  if(score>best){best=score;try{localStorage.setItem('sbr_best',String(best));}catch(_){}}
+  if(window.J) J.calm(0);
+  emitGameOver('failed');
+  window.__demoScore=score;
   if(DEMO){
-    window.__demoScore=sc;
-    setTimeout(function(){state.phase='cta';ctaAt=performance.now();
-      setTimeout(function(){window.__demoDone=true;},3600);},2200);
+    setTimeout(function(){
+      phase='cta';ctaAt=performance.now();
+      setTimeout(function(){window.__demoDone=true;},3600);
+    },2200);
   }
   if(BOT){
     botRunsDone++;
     if(botRunsDone>=BOT_RUNS){window.__botDone=true;}
-    else setTimeout(function(){newGame();startRun();},600);
+    else setTimeout(function(){initRun();startRun();},500);
   }
 }
 
-function flash(txt,color,size){flashes.push({txt:txt,color:color,size:size||30,t:0});}
+function flash(txt,color,size){flashes.push({txt:txt,color:color,size:size||28,t:0});}
 
-// ──────────────────────────────────────────────
-// SORT LOGIC
-// group 0 = left bin, group 1 = right bin
-// ──────────────────────────────────────────────
-function trySort(direction){
-  // direction: 0=left, 1=right
-  if(!state.active||state.active.state!=='drift'||!state.active.settled) return;
-  var it=state.active;
-  if(direction===it.g){
-    // CORRECT
-    state.score++;
-    state.sorted.push({label:it.label,g:it.g});
-    if(window.J) J.calm(Math.floor(state.score/3));
-    if(state.score===1) zoom=1.02;
-    flash('+1',TEAL,28);
-    if(window.LOOP) LOOP.emit('item_sorted',{label:it.label,correct:true,n:state.score});
-    it.state='correct';
-    it.animT=0;
-    // after animation, spawn next
-    setTimeout(spawnNext,300);
+function trySort(dir){
+  if(!active||active.state!=='settled') return;
+  if(phase!=='play') return;
+  var it=active;
+  if(dir===it.g){
+    score++;
+    sorted.push({label:it.label,g:it.g});
+    if(window.J) J.calm(Math.floor(score/4));
+    flash('+1',TEAL,26);
+    if(score===1) zoom=1.02;
+    if(window.LOOP) LOOP.emit('item_sorted',{label:it.label,correct:true,n:score});
+    it.state='correct';it.animT=0;
+    setTimeout(spawnNext,280);
   } else {
-    // WRONG — gentle return, no harsh sound
-    state.errors++;
+    errors++;
     shakeAmt=2;
-    flash('not that one',SOFT,22);
-    if(window.LOOP) LOOP.emit('item_sorted',{label:it.label,correct:false,errors:state.errors});
-    it.state='wrong';
-    it.animT=0;
-    // float back to center after 600ms
-    setTimeout(function(){
-      if(state.active&&state.active.state==='wrong'){
-        state.active.state='drift';
-        state.active.x=W/2-CARD_W/2+(rng()-0.5)*20;
-        state.active.targetX=state.active.x;
-        state.active.y=BIN_Y-CARD_H-80;
-        state.active.settled=false;
-      }
-    },600);
-    if(state.errors>=state.maxErrors){
-      setTimeout(gameOver,700);
+    flash('not that one',SOFT,20);
+    if(window.LOOP) LOOP.emit('item_sorted',{label:it.label,correct:false,errors:errors});
+    it.state='wrong';it.animT=0;
+    if(errors>=3){
+      setTimeout(gameOver,600);
+    } else {
+      // return item gently
+      setTimeout(function(){
+        if(active&&active.state==='wrong'){
+          active.state='drift';
+          active.x=W/2-CARD_W/2+(rng()-0.5)*20;
+          active.y=SETTLE_Y-60;
+          active.vy=0.8;
+        }
+      },550);
     }
   }
 }
 
-// ──────────────────────────────────────────────
-// INPUT
-// ──────────────────────────────────────────────
+// ── INPUT ──
 var MUTE_R={x:W-46,y:10,w:38,h:38};
 function inR(r,x,y){return x>=r.x&&x<=r.x+r.w&&y>=r.y&&y<=r.y+r.h;}
+var dragStart=null;
 
-// Drag state
-var dragStart=null,dragItem=null;
-var swipeThresh=50;
-
-function pointerDown(px,py){
+function pdDown(px,py){
   if(DEMO||BOT) return;
   if(inR(MUTE_R,px,py)&&window.J){J.toggleMute();return;}
-  if(state.phase==='title'){startRun();return;}
-  if(state.phase==='over'&&performance.now()-state.overAt>350){
-    newGame();return;
-  }
-  if(state.phase==='play'&&state.active&&state.active.settled&&state.active.state==='drift'){
-    dragStart={x:px,y:py};
-    dragItem=state.active;
-  }
+  if(phase==='title'){startRun();return;}
+  if(phase==='over'&&performance.now()-overAt>350){initRun();startRun();return;}
+  if(phase==='play'&&active&&active.state==='settled') dragStart={x:px,y:py};
 }
-
-function pointerUp(px,py){
-  if(DEMO||BOT) return;
-  if(!dragStart||!dragItem) return;
-  var dx=px-dragStart.x;
-  dragStart=null;dragItem=null;
-  if(Math.abs(dx)>swipeThresh){
-    trySort(dx<0?0:1);
-  }
+function pdUp(px,py){
+  if(DEMO||BOT||!dragStart) return;
+  var dx=px-dragStart.x;dragStart=null;
+  if(Math.abs(dx)>45) trySort(dx<0?0:1);
 }
 
 window.addEventListener('pointerdown',function(e){
   var r=cv.getBoundingClientRect();
-  pointerDown((e.clientX-r.left)/scale,(e.clientY-r.top)/scale);
+  pdDown((e.clientX-r.left)/scale,(e.clientY-r.top)/scale);
 });
 window.addEventListener('pointerup',function(e){
   var r=cv.getBoundingClientRect();
-  pointerUp((e.clientX-r.left)/scale,(e.clientY-r.top)/scale);
+  pdUp((e.clientX-r.left)/scale,(e.clientY-r.top)/scale);
 });
-// keyboard: left/right arrow
 window.addEventListener('keydown',function(e){
   if(e.code==='ArrowLeft') trySort(0);
   if(e.code==='ArrowRight') trySort(1);
 });
 
-// ──────────────────────────────────────────────
-// AUTOPILOTS
-// ──────────────────────────────────────────────
-var demoStep=0;
-var demoTimer=0;
-// demo script: correct placements that gradually reveal the rule,
-// then resolve with a full sealed tray
-// Arc: settle(~3 items correct) → deepen(items 4-14 correct, slow) → resolve(15-20 sealed)
-var demoWaits=[60,55,70,80,65,55,70,85,60,55,65,70,55,60,75,60,65,70,55,60];
-var demoWaitIdx=0;
-
-var botActionCount=0;
-var BOT_MAX_CORRECT=14; // after 14 correct, bot starts making errors to lose
-
+// ── AUTOPILOT ──
 function autopilot(){
-  if(!state.active||!state.active.settled||state.active.state!=='drift') return;
-  if(state.phase!=='play') return;
+  if(!active||active.state!=='settled'||phase!=='play') return;
+  if(hitStop>0) return;
+  apTimer--;
+  if(apTimer>0) return;
+
+  // reset timer
+  apTimer=apWaits[Math.min(apIdx,apWaits.length-1)];
+  apIdx++;
 
   if(DEMO){
-    demoTimer--;
-    if(demoTimer>0) return;
-    // always correct in demo
-    trySort(state.active.g);
-    demoTimer=demoWaits[Math.min(demoWaitIdx,demoWaits.length-1)];
-    demoWaitIdx++;
+    // always correct in demo for smooth settle→deepen→resolve arc
+    trySort(active.g);
   } else if(BOT){
-    demoTimer--;
-    if(demoTimer>0) return;
-    var correct;
-    if(botActionCount<BOT_MAX_CORRECT){
-      // mostly correct early on, occasionally wrong
-      correct=rng()<0.85;
-    } else {
-      // after BOT_MAX_CORRECT, start making errors to trigger game over
-      correct=rng()<0.2;
-    }
     botActionCount++;
-    trySort(correct?state.active.g:1-state.active.g);
-    demoTimer=Math.floor(30+rng()*40);
+    var correct;
+    if(botActionCount<=BOT_ACTIONS_THEN_FAIL){
+      // mostly correct early — looks human
+      correct=(rng()<0.85);
+    } else {
+      // always wrong now → 3 errors → game over
+      correct=false;
+    }
+    trySort(correct?active.g:1-active.g);
   }
 }
 
-// init demo/bot timer
-function initAutopilot(){
-  demoTimer=demoWaits[0];
-  demoWaitIdx=0;
-  demoStep=0;
-  botActionCount=0;
+// ── RENDER HELPERS ──
+function rr(x,y,w,h,r){
+  if(cx.roundRect){cx.roundRect(x,y,w,h,r);return;}
+  cx.moveTo(x+r,y);cx.lineTo(x+w-r,y);cx.arcTo(x+w,y,x+w,y+r,r);
+  cx.lineTo(x+w,y+h-r);cx.arcTo(x+w,y+h,x+w-r,y+h,r);
+  cx.lineTo(x+r,y+h);cx.arcTo(x,y+h,x,y+h-r,r);
+  cx.lineTo(x,y+r);cx.arcTo(x,y,x+r,y,r);cx.closePath();
 }
 
-// ──────────────────────────────────────────────
-// RENDER HELPERS
-// ──────────────────────────────────────────────
-function roundRect(x,y,w,h,r){
-  if(cx.roundRect){cx.roundRect(x,y,w,h,r);}
-  else{
-    cx.moveTo(x+r,y);cx.lineTo(x+w-r,y);cx.arcTo(x+w,y,x+w,y+r,r);
-    cx.lineTo(x+w,y+h-r);cx.arcTo(x+w,y+h,x+w-r,y+h,r);
-    cx.lineTo(x+r,y+h);cx.arcTo(x,y+h,x,y+h-r,r);
-    cx.lineTo(x,y+r);cx.arcTo(x,y,x+r,y,r);cx.closePath();
-  }
-}
-
-function drawCard(it,alpha){
-  alpha=alpha==null?1:alpha;
-  cx.save();
-  cx.globalAlpha=alpha;
-  // card bg
-  cx.fillStyle='rgba(46,197,182,0.12)';
-  cx.strokeStyle=TEAL;
-  cx.lineWidth=1.5;
-  cx.beginPath();roundRect(it.x,it.y,CARD_W,CARD_H,10);cx.fill();cx.stroke();
-  // label
-  cx.fillStyle='#fff';
-  cx.font='700 22px -apple-system,Helvetica,Arial';
-  cx.textAlign='center';
-  cx.textBaseline='middle';
+function drawCard(it,al){
+  cx.save();cx.globalAlpha=al==null?1:al;
+  cx.fillStyle='rgba(46,197,182,0.13)';cx.strokeStyle=TEAL;cx.lineWidth=1.5;
+  cx.beginPath();rr(it.x,it.y,CARD_W,CARD_H,10);cx.fill();cx.stroke();
+  cx.fillStyle='#fff';cx.font='700 22px -apple-system,Helvetica,Arial';
+  cx.textAlign='center';cx.textBaseline='middle';
   cx.fillText(it.label,it.x+CARD_W/2,it.y+CARD_H/2);
-  cx.textBaseline='alphabetic';
-  cx.restore();
+  cx.textBaseline='alphabetic';cx.restore();
 }
 
-function drawBin(x,label,highlighted,count){
-  var alpha=highlighted?1:0.5;
+function drawBin(x,lbl,count,revealed){
   cx.save();
-  cx.globalAlpha=alpha;
-  // bin outline
   cx.fillStyle='rgba(46,197,182,0.07)';
-  cx.strokeStyle=highlighted?TEAL:'rgba(46,197,182,0.3)';
-  cx.lineWidth=highlighted?2:1;
-  cx.beginPath();roundRect(x,BIN_Y,CARD_W,BIN_H,12);cx.fill();cx.stroke();
-  // label
-  cx.fillStyle=highlighted?TEAL:SOFT;
-  cx.font='700 13px Menlo,monospace';
-  cx.textAlign='center';
-  cx.fillText('?',x+CARD_W/2,BIN_Y+30);
-  // count badge
+  cx.strokeStyle=revealed?TEAL:'rgba(46,197,182,0.25)';cx.lineWidth=revealed?2:1;
+  cx.beginPath();rr(x,BIN_Y,CARD_W,BIN_H,12);cx.fill();cx.stroke();
+  cx.fillStyle=revealed?TEAL:SOFT;cx.textAlign='center';
+  cx.font=revealed?'800 13px -apple-system,Helvetica,Arial':'700 18px Menlo,monospace';
+  cx.fillText(revealed?lbl:'?',x+CARD_W/2,BIN_Y+(revealed?30:32));
   if(count>0){
-    cx.fillStyle=GOLD;
-    cx.font='600 11px -apple-system,Helvetica,Arial';
-    cx.fillText(count+'',x+CARD_W/2,BIN_Y+52);
+    cx.fillStyle=GOLD;cx.font='600 11px -apple-system,Helvetica,Arial';
+    cx.fillText(''+count,x+CARD_W/2,BIN_Y+52);
   }
   cx.restore();
 }
 
-function drawBinRevealed(x,label,count){
-  cx.save();
-  cx.fillStyle='rgba(46,197,182,0.12)';
-  cx.strokeStyle=TEAL;
-  cx.lineWidth=1.5;
-  cx.beginPath();roundRect(x,BIN_Y,CARD_W,BIN_H,12);cx.fill();cx.stroke();
-  cx.fillStyle=TEAL;
-  cx.font='800 15px -apple-system,Helvetica,Arial';
-  cx.textAlign='center';
-  cx.fillText(label,x+CARD_W/2,BIN_Y+34);
-  cx.fillStyle=GOLD;
-  cx.font='600 11px -apple-system,Helvetica,Arial';
-  cx.fillText(count+'',x+CARD_W/2,BIN_Y+54);
-  cx.restore();
-}
-
-// ──────────────────────────────────────────────
-// MAIN FRAME
-// ──────────────────────────────────────────────
+// ── FRAME ──
 function frame(now){
   var dt=Math.min((now-last)/16.667,3);last=now;
 
-  // update active item physics
-  if(state.active){
-    var it=state.active;
-    if(it.state==='drift'){
-      if(!it.settled){
-        // drift down
-        it.y+=it.vy*dt;
-        var settleY=BIN_Y-CARD_H-30;
-        if(it.y>=settleY){
-          it.y=settleY;
-          it.settled=true;
-          if(window.J) J.calm(0); // soft arrival chime
-        }
+  // update active item
+  if(active){
+    if(active.state==='drift'||active.state==='arriving'){
+      active.y+=active.vy*dt;
+      if(active.y>=SETTLE_Y){
+        active.y=SETTLE_Y;
+        active.state='settled';
+        if(window.J) J.calm(0);
       }
-      // gentle float when settled
-      if(it.settled){
-        it.y+= Math.sin(now/900)*0.3*dt;
-        // clamp to settle zone
-        var sy=BIN_Y-CARD_H-30;
-        if(it.y<sy-8) it.y=sy-8;
-        if(it.y>sy+8) it.y=sy+8;
-        autopilot();
-      }
-    } else if(it.state==='correct'){
-      it.animT+=dt;
-      it.alpha=Math.max(0,1-it.animT/18);
-      if(it.animT>20) state.active=null;
-    } else if(it.state==='wrong'){
-      it.animT+=dt;
-      // wobble effect
+    } else if(active.state==='settled'){
+      // gentle float
+      active.y=SETTLE_Y+Math.sin(now/900)*4;
+      autopilot();
+    } else if(active.state==='correct'){
+      active.animT+=dt;
+      active.alpha=Math.max(0,1-active.animT/16);
+      if(active.animT>20){active=null;}
+    } else if(active.state==='wrong'){
+      active.animT+=dt;
+      // wobble left-right
+      var wob=Math.sin(active.animT*1.2)*5*Math.max(0,1-active.animT/18);
+      active.x=(W/2-CARD_W/2)+wob;
     }
   }
 
-  // decay juice
-  if(hitStop>0) hitStop-=dt; else { /* autopilot called inside settled check */ }
-  shakeAmt*=Math.pow(0.85,dt);
+  // juice decay
+  if(hitStop>0) hitStop-=dt;
+  shakeAmt*=Math.pow(0.84,dt);
   zoom+=(1-zoom)*0.12*dt;
   revealPulse*=Math.pow(0.92,dt);
 
   // ── DRAW ──
   cx.save();
-  // screen shake + zoom juice
   if(shakeAmt>0.2||zoom>1.001){
     var sx=(Math.random()-0.5)*shakeAmt,sy=(Math.random()-0.5)*shakeAmt;
     cx.translate(W/2+sx,H/2+sy);cx.scale(zoom,zoom);cx.translate(-W/2,-H/2);
   }
 
-  // BG
   cx.fillStyle=INK;cx.fillRect(-20,-20,W+40,H+40);
   var bg=cx.createLinearGradient(0,0,0,H);
-  bg.addColorStop(0,'rgba(46,197,182,0.04)');
-  bg.addColorStop(1,'rgba(46,197,182,0.01)');
+  bg.addColorStop(0,'rgba(46,197,182,0.04)');bg.addColorStop(1,'rgba(46,197,182,0.01)');
   cx.fillStyle=bg;cx.fillRect(0,0,W,H);
 
-  // ── TITLE ──
-  if(state.phase==='title'){
+  // TITLE
+  if(phase==='title'){
     cx.textAlign='center';
     cx.fillStyle='#fff';cx.font='900 38px -apple-system,Helvetica,Arial';
     cx.fillText('SORT BY RULE',W/2,280);
     cx.fillStyle=SOFT;cx.font='600 16px -apple-system,Helvetica,Arial';
     cx.fillText('swipe to sort. infer the rule.',W/2,318);
     var p=0.6+0.4*Math.sin(now/500);
-    cx.globalAlpha=p;cx.fillStyle=TEAL;
-    cx.font='700 15px -apple-system,Helvetica,Arial';
+    cx.globalAlpha=p;cx.fillStyle=TEAL;cx.font='700 15px -apple-system,Helvetica,Arial';
     cx.fillText('TAP TO BEGIN',W/2,370);cx.globalAlpha=1;
   }
 
-  // ── PLAY / OVER ──
-  if(state.phase==='play'||state.phase==='over'||state.phase==='sealed'){
-    // hint text (fades as rule becomes clear)
-    var hintAlpha=Math.max(0,1-(state.score/6));
-    if(hintAlpha>0.01&&!state.revealShown){
-      cx.globalAlpha=hintAlpha*0.6;
-      cx.fillStyle=SOFT;cx.font='500 13px Menlo,monospace';
-      cx.textAlign='center';
-      cx.fillText(state.rule.hint,W/2,55);
+  // PLAY / OVER / SEALED common elements
+  if(phase==='play'||phase==='over'||phase==='sealed'){
+    // hint fades as rule becomes clear
+    var hintA=revealShown?0:Math.max(0,1-score/5);
+    if(hintA>0.01){
+      cx.globalAlpha=hintA*0.55;cx.fillStyle=SOFT;
+      cx.font='500 13px Menlo,monospace';cx.textAlign='center';
+      cx.fillText(rule.hint,W/2,55);cx.globalAlpha=1;
+    }
+
+    // score
+    cx.textAlign='center';
+    cx.fillStyle='rgba(255,255,255,0.9)';cx.font='800 52px -apple-system,Helvetica,Arial';
+    cx.fillText(''+score,W/2,110);
+    cx.fillStyle='rgba(255,255,255,0.3)';cx.font='600 12px -apple-system,Helvetica,Arial';
+    cx.fillText('sorted',W/2,130);
+
+    // error dots (3 lives)
+    var edx=W/2-22;
+    for(var i=0;i<3;i++){
+      cx.fillStyle=i<(3-errors)?'rgba(46,197,182,0.55)':'rgba(255,255,255,0.1)';
+      cx.beginPath();cx.arc(edx+i*22,152,5,0,Math.PI*2);cx.fill();
+    }
+
+    // progress bar
+    var total=rule.items.length;
+    var barW=W-80,barX=40,barY=168;
+    cx.fillStyle='rgba(255,255,255,0.08)';cx.fillRect(barX,barY,barW,3);
+    cx.fillStyle=TEAL;cx.fillRect(barX,barY,barW*(score/total),3);
+
+    // rule reveal label
+    if(revealShown){
+      var rpulse=1+revealPulse*0.06;
+      cx.save();cx.translate(W/2,198);cx.scale(rpulse,rpulse);cx.translate(-W/2,-198);
+      cx.fillStyle=TEAL;cx.font='700 13px Menlo,monospace';cx.textAlign='center';
+      cx.fillText('THE RULE: '+rule.reveal,W/2,198);
+      cx.restore();
+    } else {
+      cx.globalAlpha=0.2;cx.strokeStyle=TEAL;cx.lineWidth=0.5;
+      cx.beginPath();cx.moveTo(40,185);cx.lineTo(W-40,185);cx.stroke();
       cx.globalAlpha=1;
     }
 
-    // score + errors display
-    cx.textAlign='center';
-    cx.fillStyle='rgba(255,255,255,0.9)';
-    cx.font='800 52px -apple-system,Helvetica,Arial';
-    cx.fillText(state.score,W/2,110);
-    cx.fillStyle='rgba(255,255,255,0.35)';
-    cx.font='600 12px -apple-system,Helvetica,Arial';
-    cx.fillText('sorted',W/2,130);
-
-    // error hearts
-    var ex=W/2-((state.maxErrors-1)*20)/2;
-    for(var i=0;i<state.maxErrors;i++){
-      cx.fillStyle=i<(state.maxErrors-state.errors)?'rgba(46,197,182,0.6)':'rgba(255,255,255,0.12)';
-      cx.beginPath();cx.arc(ex+i*22,155,6,0,Math.PI*2);cx.fill();
-    }
-
-    // progress dots (remaining queue)
-    var total=state.items.length;
-    var done=state.score;
-    var dotStartX=W/2-Math.min(total,20)*8/2;
-    cx.globalAlpha=0.4;
-    for(var d=0;d<Math.min(total,20);d++){
-      cx.fillStyle=d<done?TEAL:'rgba(255,255,255,0.2)';
-      cx.beginPath();cx.arc(dotStartX+d*8,175,3,0,Math.PI*2);cx.fill();
-    }
-    cx.globalAlpha=1;
-
-    // divider line with rule label (hidden until revealed)
-    var ruleAlpha=state.revealShown?1:0;
-    if(state.revealShown&&revealPulse<0.01) ruleAlpha=1;
-    cx.globalAlpha=ruleAlpha;
-    cx.strokeStyle=TEAL;cx.lineWidth=0.5;
-    cx.beginPath();cx.moveTo(40,200);cx.lineTo(W-40,200);cx.stroke();
-    cx.fillStyle=TEAL;cx.font='800 15px Menlo,monospace';
-    cx.textAlign='center';
-    if(state.revealShown){
-      var rpulse=1+revealPulse*0.08;
-      cx.save();cx.translate(W/2,215);cx.scale(rpulse,rpulse);cx.translate(-W/2,-215);
-      cx.fillText('THE RULE: '+state.rule.reveal,W/2,215);
-      cx.restore();
-    }
-    cx.globalAlpha=1;
-
     // bins
-    var leftCount=state.sorted.filter(function(s){return s.g===0;}).length;
-    var rightCount=state.sorted.filter(function(s){return s.g===1;}).length;
-    if(state.revealShown){
-      drawBinRevealed(BIN_L_X,state.rule.binLabels[0],leftCount);
-      drawBinRevealed(W-BIN_L_X-CARD_W,state.rule.binLabels[1],rightCount);
-    } else {
-      drawBin(BIN_L_X,'?',false,leftCount);
-      drawBin(W-BIN_L_X-CARD_W,'?',false,rightCount);
-    }
+    var lc=sorted.filter(function(s){return s.g===0;}).length;
+    var rc=sorted.filter(function(s){return s.g===1;}).length;
+    drawBin(BIN_L_X,rule.binLabels[0],lc,revealShown);
+    drawBin(BIN_R_X,rule.binLabels[1],rc,revealShown);
 
-    // bin arrows (guide) when item is settled, not yet revealed
-    if(state.active&&state.active.settled&&state.active.state==='drift'&&!state.revealShown){
-      var arrowA=0.3+0.3*Math.sin(now/400);
-      cx.globalAlpha=arrowA;
-      cx.fillStyle=SOFT;cx.font='24px -apple-system';
+    // swipe arrows when item settled (before reveal)
+    if(active&&active.state==='settled'&&!revealShown){
+      var aa=0.25+0.25*Math.sin(now/450);
+      cx.globalAlpha=aa;cx.fillStyle=SOFT;cx.font='22px -apple-system,Helvetica,Arial';
       cx.textAlign='center';
-      cx.fillText('←',BIN_L_X+CARD_W/2,BIN_Y+BIN_H+28);
-      cx.fillText('→',W-BIN_L_X-CARD_W/2,BIN_Y+BIN_H+28);
+      cx.fillText('←',BIN_L_X+CARD_W/2,BIN_Y+BIN_H+26);
+      cx.fillText('→',BIN_R_X+CARD_W/2,BIN_Y+BIN_H+26);
       cx.globalAlpha=1;
     }
 
     // active card
-    if(state.active&&state.active.state!=='done'){
-      var a=state.active.state==='correct'?state.active.alpha:1;
-      drawCard(state.active,a);
-      // swipe hint label when first item settling
-      if(state.score===0&&state.active.settled&&state.active.state==='drift'){
-        cx.globalAlpha=0.45;
-        cx.fillStyle=SOFT;cx.font='600 11px -apple-system,Helvetica,Arial';
-        cx.textAlign='center';
-        cx.fillText('swipe left or right',W/2,state.active.y+CARD_H+18);
+    if(active&&active.state!=='done'){
+      var ca=(active.state==='correct')?active.alpha:1;
+      drawCard(active,ca);
+      if(score===0&&active.state==='settled'){
+        cx.globalAlpha=0.4;cx.fillStyle=SOFT;
+        cx.font='600 11px -apple-system,Helvetica,Arial';cx.textAlign='center';
+        cx.fillText('swipe left or right',W/2,active.y+CARD_H+16);
         cx.globalAlpha=1;
       }
     }
@@ -643,71 +499,68 @@ function frame(now){
     // flashes
     for(var k=flashes.length-1;k>=0;k--){
       var fl=flashes[k];fl.t+=dt;
-      var fa=Math.max(0,1-fl.t/35);
-      cx.globalAlpha=fa;cx.textAlign='center';
-      cx.fillStyle=fl.color;
-      cx.font='700 '+(fl.size+fl.t*0.3)+'px -apple-system,Helvetica,Arial';
-      cx.fillText(fl.txt,W/2,330-fl.t*1.2);
+      var fa=Math.max(0,1-fl.t/32);
+      cx.globalAlpha=fa;cx.textAlign='center';cx.fillStyle=fl.color;
+      cx.font='700 '+(fl.size+fl.t*0.25)+'px -apple-system,Helvetica,Arial';
+      cx.fillText(fl.txt,W/2,320-fl.t*1.0);
       cx.globalAlpha=1;
-      if(fl.t>36) flashes.splice(k,1);
+      if(fl.t>34) flashes.splice(k,1);
     }
   }
 
-  // ── SEALED ──
-  if(state.phase==='sealed'){
+  // SEALED overlay
+  if(phase==='sealed'){
     cx.fillStyle='rgba(11,13,18,0.5)';cx.fillRect(0,0,W,H);
     cx.textAlign='center';
     cx.fillStyle=TEAL;cx.font='900 28px -apple-system,Helvetica,Arial';
-    cx.fillText('SORTED.',W/2,300);
-    cx.fillStyle='rgba(255,255,255,0.8)';cx.font='700 17px -apple-system,Helvetica,Arial';
-    cx.fillText('20 of 20 — the rule was:',W/2,336);
-    cx.fillStyle=GOLD;cx.font='900 22px -apple-system,Helvetica,Arial';
-    cx.fillText(state.rule.reveal,W/2,366);
-    cx.fillStyle='rgba(255,255,255,0.4)';cx.font='600 12px -apple-system,Helvetica,Arial';
-    cx.fillText('hiding in plain sight the whole time',W/2,390);
+    cx.fillText('SORTED.',W/2,294);
+    cx.fillStyle='rgba(255,255,255,0.8)';cx.font='600 16px -apple-system,Helvetica,Arial';
+    cx.fillText('all 20 sorted — the rule:',W/2,326);
+    cx.fillStyle=GOLD;cx.font='900 20px -apple-system,Helvetica,Arial';
+    cx.fillText(rule.reveal,W/2,356);
+    cx.fillStyle='rgba(255,255,255,0.35)';cx.font='500 13px -apple-system,Helvetica,Arial';
+    cx.fillText('hiding in plain sight the whole time',W/2,382);
   }
 
-  // ── GAME OVER ──
-  if(state.phase==='over'){
+  // OVER overlay
+  if(phase==='over'){
     cx.fillStyle='rgba(11,13,18,0.6)';cx.fillRect(0,0,W,H);
     cx.textAlign='center';
-    cx.fillStyle=SOFT;cx.font='900 32px -apple-system,Helvetica,Arial';
-    cx.fillText('LOST THE THREAD',W/2,295);
-    cx.fillStyle='rgba(255,255,255,0.75)';cx.font='700 18px -apple-system,Helvetica,Arial';
-    cx.fillText(state.score+' sorted before the slip',W/2,335);
-    cx.fillStyle=GOLD;cx.font='700 15px -apple-system,Helvetica,Arial';
-    cx.fillText('the rule was: '+state.rule.reveal,W/2,365);
+    cx.fillStyle=SOFT;cx.font='900 28px -apple-system,Helvetica,Arial';
+    cx.fillText('LOST THE THREAD',W/2,288);
+    cx.fillStyle='rgba(255,255,255,0.7)';cx.font='600 17px -apple-system,Helvetica,Arial';
+    cx.fillText(score+' sorted before the slip',W/2,320);
+    cx.fillStyle=GOLD;cx.font='700 14px -apple-system,Helvetica,Arial';
+    cx.fillText('rule: '+rule.reveal,W/2,350);
     if(!DEMO&&!BOT){
       var p2=0.6+0.4*Math.sin(now/400);
-      cx.globalAlpha=p2;cx.fillStyle=TEAL;
-      cx.font='700 15px -apple-system,Helvetica,Arial';
-      cx.fillText('TAP TO TRY AGAIN',W/2,415);
-      cx.globalAlpha=1;
+      cx.globalAlpha=p2;cx.fillStyle=TEAL;cx.font='700 15px -apple-system,Helvetica,Arial';
+      cx.fillText('TAP TO TRY AGAIN',W/2,400);cx.globalAlpha=1;
     }
   }
 
-  // ── DEMO CTA ──
-  if(state.phase==='cta'){
-    var t=(now-ctaAt)/1000,ease=Math.min(1,t*2.0);
-    cx.fillStyle='rgba(11,13,18,'+(0.8*ease)+')';cx.fillRect(0,0,W,H);
+  // CTA (demo)
+  if(phase==='cta'){
+    var ct=(now-ctaAt)/1000,ease=Math.min(1,ct*2.0);
+    cx.fillStyle='rgba(11,13,18,'+(0.82*ease)+')';cx.fillRect(0,0,W,H);
     cx.globalAlpha=ease;cx.textAlign='center';
     cx.fillStyle='#fff';cx.font='900 36px -apple-system,Helvetica,Arial';
-    cx.fillText('SORT BY RULE',W/2,290);
-    cx.fillStyle='rgba(255,255,255,0.7)';cx.font='600 16px -apple-system,Helvetica,Arial';
-    cx.fillText('the pattern was right there.',W/2,324);
+    cx.fillText('SORT BY RULE',W/2,284);
+    cx.fillStyle='rgba(255,255,255,0.65)';cx.font='600 15px -apple-system,Helvetica,Arial';
+    cx.fillText('the pattern was right there.',W/2,316);
     var p3=0.75+0.25*Math.sin(now/320);
     cx.fillStyle=TEAL;cx.globalAlpha=ease*p3;
     cx.font='800 22px -apple-system,Helvetica,Arial';
-    cx.fillText('▶ GROW YOURS',W/2,388);
+    cx.fillText('▶ GROW YOURS',W/2,380);
     cx.globalAlpha=ease;
-    cx.fillStyle='rgba(255,255,255,0.4)';cx.font='600 14px -apple-system,Helvetica,Arial';
-    cx.fillText('link in bio',W/2,418);
+    cx.fillStyle='rgba(255,255,255,0.38)';cx.font='600 13px -apple-system,Helvetica,Arial';
+    cx.fillText('link in bio',W/2,410);
     cx.globalAlpha=1;
   }
 
   // mute toggle (human only)
   if(!DEMO&&!BOT&&window.J){
-    cx.textAlign='center';cx.globalAlpha=0.5;
+    cx.textAlign='center';cx.globalAlpha=0.45;
     cx.font='16px -apple-system,Helvetica,Arial';cx.fillStyle='#fff';
     cx.fillText(J.muted?'🔇':'🔊',MUTE_R.x+MUTE_R.w/2,MUTE_R.y+26);
     cx.globalAlpha=1;
@@ -717,11 +570,17 @@ function frame(now){
   requestAnimationFrame(frame);
 }
 
-newGame();
-// init autopilot timers after newGame
-initAutopilot();
+// ── BOOT ──
+phase='title';
+initRun();
+if(DEMO){
+  phase='play';
+  startRun();
+} else if(BOT){
+  phase='play';
+  startRun();
+}
 requestAnimationFrame(frame);
-
 })();
 </script>
 </body>

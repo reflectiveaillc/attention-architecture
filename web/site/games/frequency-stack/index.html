@@ -1,0 +1,818 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Frequency Stack — Tilt</title>
+<!--
+  LOOP / attention-architecture — Frequency Stack
+  Circuits: 06-zeigarnik, 01-rpe, 08-investment
+  Engine: calm
+  Mechanic: tokens fall, drag to correct histogram column, discover hidden distribution
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'frequency-stack';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL2 = '#25a89b', SOFT = 'rgba(46,197,182,0.18)';
+
+  // Distribution shapes
+  var SHAPES = ['bell', 'skew-right', 'bimodal', 'skew-left', 'uniform'];
+  var SHAPE_LABELS = {
+    'bell':       'NORMAL DISTRIBUTION',
+    'skew-right': 'RIGHT-SKEWED',
+    'bimodal':    'BIMODAL',
+    'skew-left':  'LEFT-SKEWED',
+    'uniform':    'UNIFORM'
+  };
+
+  var NUM_COLS = 7;
+  var TOTAL_TOKENS = 21;
+  var COL_PAD = 14;
+  var HIST_LEFT, HIST_RIGHT, COL_W, COL_CENTERS;
+  var HIST_BASE_Y = 610;
+  var HIST_TOP_Y  = 330;
+  var HIST_H = HIST_BASE_Y - HIST_TOP_Y;
+
+  function initLayout() {
+    HIST_LEFT  = COL_PAD;
+    HIST_RIGHT = W - COL_PAD;
+    COL_W = (HIST_RIGHT - HIST_LEFT) / NUM_COLS;
+    COL_CENTERS = [];
+    for (var i = 0; i < NUM_COLS; i++) {
+      COL_CENTERS.push(HIST_LEFT + COL_W * i + COL_W / 2);
+    }
+  }
+  initLayout();
+
+  // Generate target distribution weights for a shape
+  function genWeights(shape) {
+    var w = [];
+    for (var i = 0; i < NUM_COLS; i++) {
+      var x = i / (NUM_COLS - 1); // 0..1
+      var v;
+      if (shape === 'bell') {
+        v = Math.exp(-Math.pow((x - 0.5) * 4, 2) / 2);
+      } else if (shape === 'skew-right') {
+        v = Math.exp(-Math.pow((x - 0.2) * 3.5, 2) / 2) * (1 - x * 0.3);
+      } else if (shape === 'bimodal') {
+        v = Math.exp(-Math.pow((x - 0.25) * 5, 2) / 2) + Math.exp(-Math.pow((x - 0.75) * 5, 2) / 2);
+      } else if (shape === 'skew-left') {
+        v = Math.exp(-Math.pow((x - 0.8) * 3.5, 2) / 2) * (1 - (1 - x) * 0.3);
+      } else { // uniform
+        v = 1;
+      }
+      w.push(Math.max(0.05, v));
+    }
+    return w;
+  }
+
+  // Turn weights into discrete token counts summing to TOTAL_TOKENS
+  function weightsToTokens(weights, total) {
+    var sum = weights.reduce(function (a, b) { return a + b; }, 0);
+    var raw = weights.map(function (w) { return w / sum * total; });
+    var floored = raw.map(Math.floor);
+    var remainder = total - floored.reduce(function (a, b) { return a + b; }, 0);
+    // distribute remainder to highest fractional parts
+    var fracs = raw.map(function (v, i) { return { i: i, f: v - Math.floor(v) }; });
+    fracs.sort(function (a, b) { return b.f - a.f; });
+    for (var j = 0; j < remainder; j++) floored[fracs[j].i]++;
+    return floored;
+  }
+
+  // --- Game state ---
+  var phase, shape, targetCounts, placed, colCounts;
+  var fallingToken, dragToken;
+  var flashes, hitStop, shakeAmt, zoom;
+  var score, runStartTs, botRunsDone;
+  var revealAnim, ctaAt, demoIdx, demoPhase;
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+
+  // token visual properties
+  var TOKEN_R = 16; // radius
+  var SPAWN_Y = 80;
+  var FALL_SPEED = 2.2;
+
+  // queue of tokens to place (column index for each token in order)
+  var tokenQueue;
+  var queuePos;
+
+  function buildTokenQueue(counts) {
+    // shuffle all tokens
+    var q = [];
+    for (var col = 0; col < NUM_COLS; col++) {
+      for (var k = 0; k < counts[col]; k++) q.push(col);
+    }
+    // Fisher-Yates with our seeded rng
+    for (var i = q.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = q[i]; q[i] = q[j]; q[j] = tmp;
+    }
+    return q;
+  }
+
+  function tokenColor(col) {
+    // teal gradient across columns
+    var t = col / (NUM_COLS - 1);
+    var r = Math.round(46  + t * (242 - 46));
+    var g = Math.round(197 + t * (177 - 197));
+    var b = Math.round(182 + t * (52  - 182));
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  function newGame() {
+    rng = mulberry32(SEED);
+    phase = DEMO ? 'intro' : (BOT ? 'play' : 'title');
+    // pick shape
+    if (DEMO) {
+      shape = 'bimodal'; // hook: the shape was bimodal the whole time
+    } else if (BOT) {
+      shape = SHAPES[Math.floor(rng() * SHAPES.length)];
+    } else {
+      shape = SHAPES[Math.floor(rng() * SHAPES.length)];
+    }
+    var weights = genWeights(shape);
+    targetCounts = weightsToTokens(weights, TOTAL_TOKENS);
+    colCounts = new Array(NUM_COLS).fill(0);
+    placed = 0;
+    score = 0;
+    flashes = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    fallingToken = null; dragToken = null;
+    revealAnim = 0;
+    ctaAt = 0;
+    botRunsDone = 0;
+    demoIdx = 0;
+    demoPhase = 'settle';
+
+    tokenQueue = buildTokenQueue(targetCounts);
+    queuePos = 0;
+
+    if (phase === 'play') {
+      startRun();
+    } else if (phase === 'title') {
+      // wait for tap
+    } else if (phase === 'intro') {
+      // demo: short pause then start
+      runStartTs = Date.now();
+      setTimeout(function () {
+        phase = 'play';
+        if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+        spawnToken();
+      }, 1200);
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    spawnToken();
+  }
+
+  function spawnToken() {
+    if (queuePos >= tokenQueue.length) return; // all placed, should trigger reveal
+    var col = tokenQueue[queuePos];
+    fallingToken = {
+      col: col,
+      x: COL_CENTERS[Math.floor(rng() * NUM_COLS)], // spawn at random col
+      y: SPAWN_Y - TOKEN_R * 2,
+      vy: 0,
+      color: tokenColor(col),
+      pulse: 0
+    };
+  }
+
+  function placeToken(col) {
+    if (!fallingToken && !dragToken) return;
+    var tok = dragToken || fallingToken;
+    var targetCol = tok.col;
+
+    colCounts[col]++;
+    placed++;
+    queuePos++;
+
+    var correct = (col === targetCol);
+    var score_delta = correct ? 10 : 0;
+    score += score_delta;
+
+    // juice
+    if (correct) {
+      hitStop = 5;
+      zoom = 1.025;
+      flash('+10', TEAL, 28, COL_CENTERS[col], HIST_BASE_Y - colCounts[col] * barH(col) - 20);
+      if (window.J) J.calm(placed);
+      if (placed % 5 === 0) {
+        // milestone glow flash
+        flash('FILLING IN...', GOLD, 22, W / 2, 260);
+      }
+    } else {
+      shakeAmt = 2;
+      if (window.J) J.calm(0);
+    }
+
+    if (window.LOOP) LOOP.emit('token_placed', { col: col, correct: correct, placed: placed });
+
+    fallingToken = null;
+    dragToken = null;
+
+    if (queuePos >= tokenQueue.length) {
+      // all tokens placed, reveal
+      setTimeout(triggerReveal, 300);
+    } else {
+      spawnToken();
+    }
+  }
+
+  function barH(col) {
+    var maxCount = Math.max.apply(null, colCounts);
+    if (maxCount === 0) return 0;
+    return Math.round((colCounts[col] / maxCount) * HIST_H * 0.9);
+  }
+
+  function triggerReveal() {
+    phase = 'reveal';
+    revealAnim = 0;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (window.J) J.calm(21); // final calm bell
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 4000);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 1200);
+      }
+    }
+  }
+
+  function resetRun() {
+    rng = mulberry32(SEED + botRunsDone);
+    shape = SHAPES[Math.floor(rng() * SHAPES.length)];
+    var weights = genWeights(shape);
+    targetCounts = weightsToTokens(weights, TOTAL_TOKENS);
+    colCounts = new Array(NUM_COLS).fill(0);
+    placed = 0; score = 0;
+    flashes = []; hitStop = 0; shakeAmt = 0; zoom = 1;
+    fallingToken = null; dragToken = null;
+    revealAnim = 0;
+    tokenQueue = buildTokenQueue(targetCounts);
+    queuePos = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size, x, y) {
+    flashes.push({ txt: txt, color: color, size: size, x: x || W / 2, y: y || 250, t: 0 });
+  }
+
+  // --- Input ---
+  var dragStartX, dragStartY, isDragging = false;
+
+  function ptrDown(px, py) {
+    if (DEMO || BOT) return;
+    // mute toggle
+    if (px >= MUTE_R.x && px <= MUTE_R.x + MUTE_R.w && py >= MUTE_R.y && py <= MUTE_R.y + MUTE_R.h) {
+      if (window.J) J.toggleMute();
+      return;
+    }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'reveal' || phase === 'cta') { resetRun(); return; }
+    if (phase !== 'play') return;
+
+    // pick up falling token if near it
+    if (fallingToken) {
+      var dx = px - fallingToken.x, dy = py - fallingToken.y;
+      if (Math.sqrt(dx * dx + dy * dy) < TOKEN_R * 2.5) {
+        dragToken = fallingToken;
+        dragToken.x = px; dragToken.y = py;
+        fallingToken = null;
+        isDragging = true;
+        dragStartX = px; dragStartY = py;
+      }
+    }
+  }
+
+  function ptrMove(px, py) {
+    if (DEMO || BOT || !isDragging || !dragToken) return;
+    dragToken.x = px;
+    dragToken.y = py;
+  }
+
+  function ptrUp(px, py) {
+    if (DEMO || BOT) return;
+    if (phase !== 'play') return;
+    isDragging = false;
+    if (dragToken) {
+      // find nearest column
+      var col = colForX(px);
+      placeToken(col);
+    }
+  }
+
+  function colForX(x) {
+    var col = Math.floor((x - HIST_LEFT) / COL_W);
+    return Math.max(0, Math.min(NUM_COLS - 1, col));
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    ptrDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointermove', function (e) {
+    var r = cv.getBoundingClientRect();
+    ptrMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    ptrUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' && phase === 'play' && fallingToken) {
+      // drop to column nearest to token
+      var col = colForX(fallingToken.x);
+      placeToken(col);
+    }
+  });
+
+  // --- Bot / Demo autopilot ---
+  var botDropDelay = 0;
+  // demo script: carefully timed — settle 4, deepen 8, resolve 9, total 21
+  // bimodal: first 4 go to cols 1-2 (left peak), middle 8 spread, last 9 fill right peak
+  var demoScript = [
+    // settle phase: left peak forms
+    1, 2, 1, 2,
+    // deepen: spread tokens, right side starts
+    5, 6, 4, 5, 6, 5, 4, 3,
+    // resolve: right peak completes, shape revealed
+    5, 6, 5, 6, 5, 6, 5, 6, 6
+  ];
+  var demoWaits = [
+    80, 70, 90, 100,
+    60, 55, 70, 65, 80, 60, 70, 90,
+    50, 45, 55, 50, 60, 45, 55, 50, 80
+  ];
+  var demoTimer = 0, demoStep = 0;
+
+  function autopilot(dt) {
+    if (!fallingToken || phase !== 'play') return;
+
+    if (DEMO) {
+      demoTimer -= dt;
+      if (demoTimer > 0) return;
+      var targetCol = demoScript[Math.min(demoStep, demoScript.length - 1)];
+      // move token toward target column center x
+      var targetX = COL_CENTERS[targetCol];
+      var dx = targetX - fallingToken.x;
+      fallingToken.x += dx * 0.25;
+      if (Math.abs(dx) < 4) {
+        placeToken(targetCol);
+        demoWait_val = demoWaits[Math.min(demoStep, demoWaits.length - 1)] || 60;
+        demoTimer = demoWait_val;
+        demoStep++;
+      }
+    } else if (BOT) {
+      botDropDelay -= dt;
+      if (botDropDelay > 0) return;
+      // imperfect bot: 70% correct, 30% off by 1
+      var targetCol = fallingToken.col;
+      if (rng() < 0.3) {
+        var delta = rng() < 0.5 ? -1 : 1;
+        targetCol = Math.max(0, Math.min(NUM_COLS - 1, targetCol + delta));
+      }
+      var tx = COL_CENTERS[targetCol];
+      var ddx = tx - fallingToken.x;
+      fallingToken.x += ddx * 0.3;
+      if (Math.abs(ddx) < 5) {
+        placeToken(targetCol);
+        botDropDelay = 30 + rng() * 40;
+      }
+    }
+  }
+  var demoWait_val = 80;
+
+  // --- Render ---
+  function drawHistogram(alpha) {
+    alpha = (alpha === undefined) ? 1 : alpha;
+    // column backgrounds
+    for (var i = 0; i < NUM_COLS; i++) {
+      var cx2 = COL_CENTERS[i];
+      var left = cx2 - COL_W / 2 + 2;
+      var w    = COL_W - 4;
+      // slot bg
+      cx.globalAlpha = 0.08 * alpha;
+      cx.fillStyle = TEAL;
+      cx.fillRect(left, HIST_TOP_Y, w, HIST_H);
+      cx.globalAlpha = alpha;
+
+      // filled bar (proportional to colCounts)
+      if (colCounts[i] > 0) {
+        var maxCount = Math.max.apply(null, colCounts);
+        var bh = Math.round((colCounts[i] / Math.max(maxCount, 1)) * HIST_H * 0.9);
+        var by = HIST_BASE_Y - bh;
+        var g = cx.createLinearGradient(0, by, 0, HIST_BASE_Y);
+        g.addColorStop(0, TEAL);
+        g.addColorStop(1, TEAL2);
+        cx.fillStyle = g;
+        cx.globalAlpha = 0.75 * alpha;
+        cx.fillRect(left, by, w, bh);
+        cx.globalAlpha = alpha;
+      }
+
+      // column label (0-6)
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 10px Menlo, monospace';
+      cx.textAlign = 'center';
+      cx.fillText(i, cx2, HIST_BASE_Y + 14);
+    }
+
+    // baseline
+    cx.strokeStyle = 'rgba(46,197,182,0.25)';
+    cx.lineWidth = 1;
+    cx.beginPath();
+    cx.moveTo(HIST_LEFT, HIST_BASE_Y);
+    cx.lineTo(HIST_RIGHT, HIST_BASE_Y);
+    cx.stroke();
+  }
+
+  function drawRevealCurve(progress) {
+    // draw target shape outline
+    var maxTarget = Math.max.apply(null, targetCounts);
+    cx.beginPath();
+    cx.strokeStyle = GOLD;
+    cx.lineWidth = 2.5;
+    cx.globalAlpha = Math.min(1, progress * 2);
+    for (var i = 0; i < NUM_COLS; i++) {
+      var cx2 = COL_CENTERS[i];
+      var bh = Math.round((targetCounts[i] / maxTarget) * HIST_H * 0.9);
+      var by = HIST_BASE_Y - bh;
+      if (i === 0) cx.moveTo(cx2, by);
+      else cx.lineTo(cx2, by);
+    }
+    cx.stroke();
+    cx.globalAlpha = 1;
+  }
+
+  function drawToken(tok, alpha) {
+    if (!tok) return;
+    cx.globalAlpha = alpha !== undefined ? alpha : 1;
+    var g = cx.createRadialGradient(tok.x - TOKEN_R * 0.3, tok.y - TOKEN_R * 0.3, 1, tok.x, tok.y, TOKEN_R);
+    g.addColorStop(0, tok.color);
+    g.addColorStop(1, TEAL2);
+    cx.fillStyle = g;
+    cx.beginPath();
+    cx.arc(tok.x, tok.y, TOKEN_R, 0, Math.PI * 2);
+    cx.fill();
+
+    // inner highlight
+    cx.fillStyle = 'rgba(255,255,255,0.15)';
+    cx.beginPath();
+    cx.arc(tok.x - TOKEN_R * 0.3, tok.y - TOKEN_R * 0.3, TOKEN_R * 0.45, 0, Math.PI * 2);
+    cx.fill();
+    cx.globalAlpha = 1;
+  }
+
+  function drawHUD() {
+    // tokens remaining
+    var remaining = TOTAL_TOKENS - placed;
+    cx.textAlign = 'left';
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '600 12px Menlo, monospace';
+    cx.fillText('TOKENS: ' + remaining, 16, 40);
+
+    // score
+    cx.textAlign = 'right';
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.font = '800 18px -apple-system, Helvetica, Arial';
+    cx.fillText(score, W - 16, 40);
+
+    // progress bar
+    var pct = placed / TOTAL_TOKENS;
+    cx.fillStyle = 'rgba(46,197,182,0.15)';
+    cx.fillRect(16, 52, W - 32, 4);
+    cx.fillStyle = TEAL;
+    cx.fillRect(16, 52, (W - 32) * pct, 4);
+
+    // hint: "find the shape"
+    if (placed < 4) {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.25)';
+      cx.font = '500 11px -apple-system, Helvetica, Arial';
+      cx.fillText('drag tokens into the columns', W / 2, 68);
+    }
+  }
+
+  function drawTitle() {
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '900 36px -apple-system, Helvetica, Arial';
+    cx.fillText('FREQUENCY', W / 2, 270);
+    cx.fillStyle = TEAL;
+    cx.font = '900 36px -apple-system, Helvetica, Arial';
+    cx.fillText('STACK', W / 2, 310);
+
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText('drag tokens into the histogram', W / 2, 350);
+    cx.fillText('discover the hidden shape', W / 2, 370);
+
+    var pulse = 0.55 + 0.45 * Math.sin(performance.now() / 500);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = TEAL;
+    cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO BEGIN', W / 2, 430);
+    cx.globalAlpha = 1;
+  }
+
+  function drawReveal(progress) {
+    // completed histogram
+    drawHistogram(1);
+    drawRevealCurve(progress);
+
+    // shape label
+    if (progress > 0.5) {
+      var a = Math.min(1, (progress - 0.5) * 3);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = GOLD;
+      cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText(SHAPE_LABELS[shape], W / 2, HIST_TOP_Y - 28);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('the shape was hidden in the data', W / 2, HIST_TOP_Y - 8);
+      cx.globalAlpha = 1;
+    }
+
+    // score summary
+    if (progress > 0.7) {
+      var a2 = Math.min(1, (progress - 0.7) * 4);
+      cx.globalAlpha = a2;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 48px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 250);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('accuracy points', W / 2, 272);
+      cx.globalAlpha = 1;
+    }
+
+    // play again (human only)
+    if (!DEMO && !BOT && progress > 0.8) {
+      var a3 = Math.min(1, (progress - 0.8) * 6);
+      var pulse2 = 0.6 + 0.4 * Math.sin(performance.now() / 400);
+      cx.globalAlpha = a3 * pulse2;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('TAP TO PLAY AGAIN', W / 2, 292);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawCTA(elapsed) {
+    var ease = Math.min(1, elapsed * 2.5);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+
+    cx.fillStyle = '#fff';
+    cx.font = '900 38px -apple-system, Helvetica, Arial';
+    cx.fillText('FREQUENCY', W / 2, 270);
+    cx.fillStyle = TEAL;
+    cx.font = '900 38px -apple-system, Helvetica, Arial';
+    cx.fillText('STACK', W / 2, 312);
+
+    cx.fillStyle = 'rgba(255,255,255,0.6)';
+    cx.font = '500 15px -apple-system, Helvetica, Arial';
+    cx.fillText('it was bimodal the whole time.', W / 2, 352);
+    cx.fillText('grow your own pattern.', W / 2, 372);
+
+    var pulse3 = 0.7 + 0.3 * Math.sin(performance.now() / 320);
+    cx.fillStyle = TEAL;
+    cx.globalAlpha = ease * pulse3;
+    cx.font = '800 22px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ GROW YOURS', W / 2, 430);
+
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 458);
+    cx.globalAlpha = 1;
+  }
+
+  // Target distribution ghost (faint, helps guide but doesn't reveal shape name)
+  function drawGhost() {
+    // very faint hint of target shape — only show after 8 tokens
+    if (placed < 8) return;
+    var maxTarget = Math.max.apply(null, targetCounts);
+    var hintAlpha = Math.min(0.12, (placed - 8) * 0.01);
+    cx.globalAlpha = hintAlpha;
+    for (var i = 0; i < NUM_COLS; i++) {
+      var cx2 = COL_CENTERS[i];
+      var left = cx2 - COL_W / 2 + 2;
+      var w2   = COL_W - 4;
+      var bh = Math.round((targetCounts[i] / maxTarget) * HIST_H * 0.9);
+      var by = HIST_BASE_Y - bh;
+      cx.fillStyle = GOLD;
+      cx.fillRect(left, by, w2, 2);
+    }
+    cx.globalAlpha = 1;
+  }
+
+  // Column highlight when dragging
+  function drawDropZoneHighlight(tok) {
+    if (!tok) return;
+    var col = colForX(tok.x);
+    var cx2 = COL_CENTERS[col];
+    var left = cx2 - COL_W / 2 + 2;
+    var w = COL_W - 4;
+    cx.fillStyle = 'rgba(46,197,182,0.22)';
+    cx.fillRect(left, HIST_TOP_Y, w, HIST_H);
+    // small arrow indicator
+    cx.fillStyle = TEAL;
+    cx.beginPath();
+    cx.moveTo(cx2 - 7, HIST_TOP_Y - 14);
+    cx.lineTo(cx2 + 7, HIST_TOP_Y - 14);
+    cx.lineTo(cx2,     HIST_TOP_Y - 4);
+    cx.closePath();
+    cx.fill();
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // juice decay
+    if (hitStop > 0) hitStop -= dt;
+    else if (hitStop < 0) hitStop = 0;
+    shakeAmt *= Math.pow(0.83, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // falling token physics (only when not in hitStop)
+    if (hitStop <= 0 && fallingToken && phase === 'play') {
+      fallingToken.vy += 0.12 * dt;
+      fallingToken.y  += fallingToken.vy * dt;
+      // pulse glow
+      fallingToken.pulse = (fallingToken.pulse || 0) + dt * 0.08;
+      // if it reaches histogram area, auto-place at nearest column
+      if (fallingToken.y >= HIST_BASE_Y - TOKEN_R - 2) {
+        var col = colForX(fallingToken.x);
+        placeToken(col);
+      }
+    }
+
+    // autopilots
+    if (hitStop <= 0) autopilot(dt);
+
+    // reveal progress
+    if (phase === 'reveal') {
+      revealAnim += dt * 0.025;
+      if (revealAnim > 1) revealAnim = 1;
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.15 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(242,177,52,0.03)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    if (phase === 'title') {
+      drawTitle();
+      // draw a hint histogram in bg
+      cx.globalAlpha = 0.35;
+      drawHistogram(0.35);
+      cx.globalAlpha = 1;
+    } else if (phase === 'intro') {
+      // brief pause before demo play starts
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('finding the pattern…', W / 2, H / 2);
+    } else if (phase === 'play') {
+      drawHistogram(1);
+      drawGhost();
+      if (dragToken) drawDropZoneHighlight(dragToken);
+      else if (fallingToken) drawDropZoneHighlight(fallingToken);
+
+      // falling token
+      if (fallingToken) drawToken(fallingToken);
+      // dragged token
+      if (dragToken) drawToken(dragToken);
+
+      drawHUD();
+    } else if (phase === 'reveal') {
+      drawReveal(revealAnim);
+    } else if (phase === 'cta') {
+      // still show histogram under CTA
+      drawHistogram(1);
+      drawRevealCurve(1);
+      var elapsed = (now - ctaAt) / 1000;
+      drawCTA(elapsed);
+    }
+
+    // floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 35);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.globalAlpha = 0.5;
+      cx.textAlign = 'center';
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1019 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>System Close — Tilt</title>
+<!--
+  LOOP / attention-architecture — System Close
+  Circuits: 06-zeigarnik (hidden conditions pull you to complete), 01-rpe (variable
+            discovery reward), 08-investment (each stage builds commitment).
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip: challenge card → discovery run → near-fail → complete → CTA
+    ?bot=1&runs=N&seed=M  imperfect autopilot, N full cycles, sets __botDone
+    ?dare=N          incoming challenge: beat N completed runs
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'system-close';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ── GAME STATE ───────────────────────────────────────────────────────────
+  // 5 stages, each with a hidden trigger condition
+  // Stage triggers: hold, double-tap, swipe-up, long-press, tap-sequence (3 taps)
+  // Player must DISCOVER each trigger by experimenting
+
+  var STAGE_DEFS = [
+    { name: 'INIT',    hint: 'HOLD',        color: TEAL,  gearSpeed: 0.4 },
+    { name: 'PARSE',   hint: 'DOUBLE TAP',  color: GOLD,  gearSpeed: 0.8 },
+    { name: 'COMPILE', hint: 'SWIPE UP',    color: VERM,  gearSpeed: 1.3 },
+    { name: 'LINK',    hint: 'LONG PRESS',  color: '#9b7fff', gearSpeed: 1.8 },
+    { name: 'RUN',     hint: '3× TAP',      color: '#2ec5b6', gearSpeed: 2.4 }
+  ];
+
+  // Phase: title | challenge | play | complete | cta | over
+  var phase, runStartTs, runs = 0, best = 0;
+  var dareBeaten = false;
+  try { best = +localStorage.getItem('sc_best') || 0; } catch(_) {}
+
+  // Juice vars
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+
+  // Stage progress
+  var currentStage, stageProgress; // 0-4 stage index, progress 0-1 within stage
+  var discovered; // which stages player has figured out
+
+  // Input tracking
+  var holdStart = 0, isHolding = false;
+  var lastTapTime = 0, tapCount = 0, tapCountTimer = 0;
+  var touchStartY = 0, swipeArmed = false;
+  var longPressTimer = null;
+
+  // Demo/bot state
+  var demoPhase = 'challenge', demoTimer = 0, challengeAt = 0, ctaAt = 0;
+  var demoStageStep = 0, demoWait = 0;
+  var botRunsDone = 0, botStage = 0, botStageWait = 0;
+
+  // Gear animation
+  var gearAngle = [0, 0, 0, 0, 0];
+  var gearSpin  = [0, 0, 0, 0, 0]; // current spin speed per gear (lerp toward target)
+
+  // Particle system for completion
+  var particles = [];
+
+  // ── INIT ─────────────────────────────────────────────────────────────────
+  function newGame() {
+    currentStage = 0;
+    stageProgress = 0;
+    discovered = [false, false, false, false, false];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    flashes = []; particles = [];
+    isHolding = false; holdStart = 0;
+    lastTapTime = 0; tapCount = 0; tapCountTimer = 0;
+    swipeArmed = false;
+    dareBeaten = false;
+    gearAngle = [0, 0, 0, 0, 0];
+    gearSpin  = [0, 0, 0, 0, 0];
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      demoStageStep = 0;
+      demoWait = 75; // frames before demo starts playing after challenge
+      setTimeout(startPlay, 1300);
+      return;
+    }
+    if (BOT) {
+      phase = 'play';
+      startPlay();
+      return;
+    }
+    phase = 'title';
+  }
+
+  function startPlay() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ── STAGE LOGIC ──────────────────────────────────────────────────────────
+  function triggerStage() {
+    if (phase !== 'play') return;
+    if (currentStage >= STAGE_DEFS.length) return;
+
+    var wasDiscovered = discovered[currentStage];
+    discovered[currentStage] = true;
+
+    // Juice
+    hitStop = 5;
+    shakeAmt = currentStage === 4 ? 8 : 3;
+    zoom = 1.04;
+    flash(STAGE_DEFS[currentStage].name + ' ✓', STAGE_DEFS[currentStage].color, 38);
+    if (window.J) {
+      if (currentStage === 4) { J.perfect(5); }
+      else { J.hit(currentStage + 1); J.tension((currentStage + 1) / 5); }
+    }
+    if (!wasDiscovered && window.LOOP) {
+      LOOP.emit('stage_triggered', { stage: currentStage, name: STAGE_DEFS[currentStage].name });
+    }
+    if (window.LOOP) LOOP.emit('near_miss', { n: currentStage }); // reuse for stage events
+
+    currentStage++;
+    stageProgress = 0;
+
+    if (currentStage >= STAGE_DEFS.length) {
+      // ALL 5 STAGES COMPLETE — run the full cycle
+      setTimeout(completeCycle, 400);
+    }
+  }
+
+  function completeCycle() {
+    phase = 'complete';
+    runs++;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (runs > best) {
+      best = runs;
+      try { localStorage.setItem('sc_best', String(best)); } catch(_) {}
+      if (window.J) setTimeout(function() { J.fanfare(); }, 300);
+    }
+    if (window.J) J.gold();
+    shakeAmt = 4;
+    zoom = 1.06;
+    spawnCompletionParticles();
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && runs > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(runs);
+    }
+
+    if (window.LOOP) LOOP.emit('game_over', { score: runs, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      window.__demoScore = runs;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2500);
+      return;
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(resetForNextRun, 800);
+      }
+      return;
+    }
+    // human — show score card, allow restart
+    setTimeout(function () { phase = 'over'; }, 2000);
+  }
+
+  function resetForNextRun() {
+    currentStage = 0;
+    stageProgress = 0;
+    discovered = [false, false, false, false, false];
+    particles = [];
+    flashes = [];
+    gearSpin = [0, 0, 0, 0, 0];
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('restart', {});
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function spawnCompletionParticles() {
+    for (var i = 0; i < 32; i++) {
+      var angle = rng() * Math.PI * 2;
+      var speed = 2 + rng() * 5;
+      particles.push({
+        x: W / 2, y: H / 2,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 2,
+        color: [TEAL, GOLD, VERM, '#9b7fff'][Math.floor(rng() * 4)],
+        life: 1, size: 4 + rng() * 5
+      });
+    }
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 3))));
+  }
+
+  // ── INPUT ────────────────────────────────────────────────────────────────
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 560, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // Stage 0 (INIT): HOLD — hold for 60 frames (~1s)
+  // Stage 1 (PARSE): DOUBLE TAP — two taps within 400ms
+  // Stage 2 (COMPILE): SWIPE UP — upward drag > 80px
+  // Stage 3 (LINK): LONG PRESS — hold for 100 frames (~1.7s)
+  // Stage 4 (RUN): 3× TAP — three quick taps within 600ms
+
+  var holdFrames = 0;
+  var HOLD_THRESHOLD = 60;
+  var LONG_PRESS_THRESHOLD = 100;
+
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale;
+    var y = (e.clientY - r.top) / scale;
+
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+
+    if (phase === 'title') { startPlay(); return; }
+
+    if (phase === 'over' && performance.now() - (window._overAt || 0) > 350) {
+      if (inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: runs, unit: 'runs' }); return;
+      }
+      resetForNextRun(); return;
+    }
+
+    if (phase !== 'play') return;
+
+    isHolding = true;
+    holdStart = performance.now();
+    holdFrames = 0;
+    swipeArmed = true;
+    touchStartY = y;
+
+    // Count taps for double-tap and 3× tap
+    var now = performance.now();
+    if (now - lastTapTime < 600) {
+      tapCount++;
+    } else {
+      tapCount = 1;
+    }
+    lastTapTime = now;
+
+    // Check double-tap (stage 1)
+    if (currentStage === 1 && tapCount >= 2 && now - lastTapTime < 600) {
+      setTimeout(function() {
+        if (currentStage === 1) triggerStage();
+      }, 0);
+    }
+    // Check 3x tap (stage 4)
+    if (currentStage === 4 && tapCount >= 3) {
+      triggerStage();
+      tapCount = 0;
+    }
+    // Immediate double-tap check
+    if (currentStage === 1 && tapCount === 2) {
+      triggerStage();
+      tapCount = 0;
+    }
+  });
+
+  window.addEventListener('pointerup', function (e) {
+    if (DEMO || BOT) return;
+    isHolding = false;
+    holdFrames = 0;
+    swipeArmed = false;
+  });
+
+  window.addEventListener('pointermove', function (e) {
+    if (DEMO || BOT) return;
+    if (!swipeArmed || !isHolding) return;
+    if (phase !== 'play') return;
+    var r = cv.getBoundingClientRect();
+    var y = (e.clientY - r.top) / scale;
+    var dy = touchStartY - y; // positive = swipe up
+    if (currentStage === 2 && dy > 80) {
+      swipeArmed = false;
+      triggerStage();
+    }
+  });
+
+  window.addEventListener('keydown', function (e) {
+    if (DEMO || BOT) return;
+    if (e.code === 'Space') {
+      if (phase === 'title') { startPlay(); return; }
+      if (phase === 'play') {
+        tapCount = (performance.now() - lastTapTime < 600) ? tapCount + 1 : 1;
+        lastTapTime = performance.now();
+        if (currentStage === 1 && tapCount >= 2) { triggerStage(); tapCount = 0; }
+        if (currentStage === 4 && tapCount >= 3) { triggerStage(); tapCount = 0; }
+      }
+    }
+  });
+
+  // ── DEMO AUTOPILOT ────────────────────────────────────────────────────────
+  // Mirror-neuron arc:
+  // challenge card → play starts → slowly discovers each stage with hesitation
+  // near-fail at stage 3 (hovers but doesn't trigger for a beat — tension)
+  // saves it → completes all 5 → score card → CTA
+  var demoScript = [
+    { stage: 0, method: 'hold',        wait: 55  }, // INIT — hold
+    { stage: 1, method: 'doubletap',   wait: 70  }, // PARSE — double tap (hesitates)
+    { stage: 2, method: 'swipe',       wait: 60  }, // COMPILE — swipe
+    { stage: 3, method: 'longpress',   wait: 110 }, // LINK — long press (near-fail: holds too long, almost gives up)
+    { stage: 4, method: 'tripletap',   wait: 80  }, // RUN — 3x tap
+  ];
+  var demoScriptIdx = 0;
+  var demoActionTimer = 0;
+  var demoActionPhase = 'waiting'; // waiting | acting
+  var demoHoldCounter = 0;
+  var demoNearFail = false; // stage 3: simulate hesitation / near give-up
+
+  function demoPulse(dt) {
+    if (phase !== 'play') return;
+
+    demoActionTimer += dt;
+    if (demoScriptIdx >= demoScript.length) return;
+    var step = demoScript[demoScriptIdx];
+
+    if (currentStage !== step.stage) {
+      // Already triggered this stage (shouldn't happen) — advance
+      demoScriptIdx++;
+      demoActionTimer = 0;
+      demoActionPhase = 'waiting';
+      demoHoldCounter = 0;
+      return;
+    }
+
+    if (demoActionPhase === 'waiting') {
+      if (demoActionTimer > step.wait) {
+        demoActionTimer = 0;
+        demoActionPhase = 'acting';
+        demoHoldCounter = 0;
+      }
+      return;
+    }
+
+    // Acting phase
+    if (step.method === 'hold') {
+      // Simulate hold — increment holdFrames until threshold
+      holdFrames += dt;
+      if (holdFrames >= HOLD_THRESHOLD) {
+        holdFrames = 0;
+        triggerStage();
+        demoScriptIdx++;
+        demoActionPhase = 'waiting';
+        demoActionTimer = 0;
+      }
+    } else if (step.method === 'doubletap') {
+      // Two taps separated by ~200ms sim time
+      demoHoldCounter += dt;
+      if (demoHoldCounter > 10 && demoHoldCounter <= 11) {
+        // First tap — mark time
+        lastTapTime = performance.now();
+        tapCount = 1;
+      }
+      if (demoHoldCounter > 22) {
+        // Second tap
+        tapCount = 2;
+        triggerStage();
+        tapCount = 0;
+        demoScriptIdx++;
+        demoActionPhase = 'waiting';
+        demoActionTimer = 0;
+        demoHoldCounter = 0;
+      }
+    } else if (step.method === 'swipe') {
+      // Instant trigger
+      triggerStage();
+      demoScriptIdx++;
+      demoActionPhase = 'waiting';
+      demoActionTimer = 0;
+    } else if (step.method === 'longpress') {
+      // Simulate near-fail: start hold, pause at ~80% then continue
+      demoHoldCounter += dt;
+      if (!demoNearFail && demoHoldCounter > LONG_PRESS_THRESHOLD * 0.75) {
+        // Freeze for a beat — visible tension
+        demoNearFail = true;
+        flash('...', GOLD, 28);
+        if (window.J) J.tension(0.9);
+      }
+      if (demoNearFail && demoHoldCounter < LONG_PRESS_THRESHOLD * 0.75 + 35) {
+        // Holding the tension beat — don't advance
+      } else if (demoHoldCounter >= LONG_PRESS_THRESHOLD + 35) {
+        // Finally trigger
+        demoNearFail = false;
+        if (window.LOOP) LOOP.emit('near_miss', { n: 3, ratio: 0.05 });
+        triggerStage();
+        demoScriptIdx++;
+        demoActionPhase = 'waiting';
+        demoActionTimer = 0;
+        demoHoldCounter = 0;
+      }
+    } else if (step.method === 'tripletap') {
+      demoHoldCounter += dt;
+      if (demoHoldCounter > 8 && demoHoldCounter <= 9) { tapCount = 1; }
+      if (demoHoldCounter > 16 && demoHoldCounter <= 17) { tapCount = 2; }
+      if (demoHoldCounter > 24) {
+        tapCount = 3;
+        triggerStage();
+        tapCount = 0;
+        demoScriptIdx++;
+        demoActionPhase = 'waiting';
+        demoActionTimer = 0;
+        demoHoldCounter = 0;
+      }
+    }
+  }
+
+  // ── BOT AUTOPILOT ─────────────────────────────────────────────────────────
+  var botHoldFrames = 0;
+  var botTapCount = 0;
+  var botTapTimer = 0;
+  var BOT_STAGE_DELAYS = [40, 55, 35, 90, 45]; // frames before each stage trigger
+
+  function botPulse(dt) {
+    if (phase !== 'play') return;
+    if (currentStage >= STAGE_DEFS.length) return;
+
+    botStageWait += dt;
+    var delay = BOT_STAGE_DELAYS[currentStage] || 50;
+    // add slight randomness per bot run
+    var jitter = (rng() - 0.5) * 20;
+    if (botStageWait < delay + jitter) return;
+
+    // Trigger based on current stage method
+    var method = demoScript[currentStage] ? demoScript[currentStage].method : 'hold';
+    if (method === 'hold') {
+      holdFrames += dt;
+      if (holdFrames >= HOLD_THRESHOLD) { holdFrames = 0; triggerStage(); botStageWait = 0; }
+    } else if (method === 'doubletap') {
+      botTapTimer += dt;
+      if (botTapTimer > 8) { tapCount = 2; triggerStage(); tapCount = 0; botTapTimer = 0; botStageWait = 0; }
+    } else if (method === 'swipe') {
+      triggerStage(); botStageWait = 0;
+    } else if (method === 'longpress') {
+      holdFrames += dt;
+      if (holdFrames >= LONG_PRESS_THRESHOLD) { holdFrames = 0; triggerStage(); botStageWait = 0; }
+    } else if (method === 'tripletap') {
+      botTapTimer += dt;
+      if (botTapTimer > 12) { tapCount = 3; triggerStage(); tapCount = 0; botTapTimer = 0; botStageWait = 0; }
+    } else {
+      triggerStage(); botStageWait = 0;
+    }
+  }
+
+  // ── HUMAN HOLD TRACKING ─────────────────────────────────────────────────
+  function updateHoldTriggers(dt) {
+    if (DEMO || BOT || phase !== 'play') return;
+
+    if (isHolding) {
+      holdFrames += dt;
+      // Stage 0: HOLD ~1s
+      if (currentStage === 0 && holdFrames >= HOLD_THRESHOLD) {
+        holdFrames = 0;
+        triggerStage();
+      }
+      // Stage 3: LONG PRESS ~1.7s
+      if (currentStage === 3 && holdFrames >= LONG_PRESS_THRESHOLD) {
+        holdFrames = 0;
+        triggerStage();
+      }
+    } else {
+      holdFrames = 0;
+    }
+
+    // Tap timer decay for multi-tap detection
+    if (tapCountTimer > 0) {
+      tapCountTimer -= dt;
+      if (tapCountTimer <= 0) { tapCount = 0; }
+    }
+  }
+
+  // ── FLASH ────────────────────────────────────────────────────────────────
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 36, t: 0 });
+  }
+
+  // ── RENDER ───────────────────────────────────────────────────────────────
+
+  // Draw a gear (simplified hexagonal gear)
+  function drawGear(cx, gx, gy, radius, teeth, angle, color, active) {
+    cx.save();
+    cx.translate(gx, gy);
+    cx.rotate(angle);
+
+    var toothH = radius * 0.22;
+    var innerR = radius - toothH;
+
+    // Gear body
+    cx.beginPath();
+    cx.arc(0, 0, innerR, 0, Math.PI * 2);
+    cx.fillStyle = active ? color : 'rgba(255,255,255,0.08)';
+    cx.fill();
+
+    // Teeth
+    cx.beginPath();
+    for (var t = 0; t < teeth; t++) {
+      var a = (t / teeth) * Math.PI * 2;
+      var a2 = ((t + 0.3) / teeth) * Math.PI * 2;
+      var a3 = ((t + 0.7) / teeth) * Math.PI * 2;
+      var a4 = ((t + 1) / teeth) * Math.PI * 2;
+      cx.moveTo(Math.cos(a) * innerR, Math.sin(a) * innerR);
+      cx.lineTo(Math.cos(a2) * (innerR + toothH), Math.sin(a2) * (innerR + toothH));
+      cx.lineTo(Math.cos(a3) * (innerR + toothH), Math.sin(a3) * (innerR + toothH));
+      cx.lineTo(Math.cos(a4) * innerR, Math.sin(a4) * innerR);
+    }
+    cx.fillStyle = active ? color : 'rgba(255,255,255,0.06)';
+    cx.fill();
+
+    // Inner hole
+    cx.beginPath();
+    cx.arc(0, 0, innerR * 0.32, 0, Math.PI * 2);
+    cx.fillStyle = INK;
+    cx.fill();
+
+    // Rim
+    cx.beginPath();
+    cx.arc(0, 0, innerR, 0, Math.PI * 2);
+    cx.strokeStyle = active ? color : 'rgba(255,255,255,0.15)';
+    cx.lineWidth = 1.5;
+    cx.stroke();
+
+    cx.restore();
+  }
+
+  // Draw connector line between gears when stage active
+  function drawConnector(cx, x1, y1, x2, y2, active, color) {
+    cx.save();
+    cx.beginPath();
+    cx.moveTo(x1, y1);
+    cx.lineTo(x2, y2);
+    cx.strokeStyle = active ? color : 'rgba(255,255,255,0.08)';
+    cx.lineWidth = active ? 2 : 1;
+    if (active) {
+      cx.shadowColor = color;
+      cx.shadowBlur = 8;
+    }
+    cx.stroke();
+    cx.restore();
+  }
+
+  // Gear layout: 5 gears in a path — center machine visual
+  // Two rows: row1 at y=290, row2 at y=390, middle at y=340
+  var GEAR_POS = [
+    { x: 100, y: 310, r: 34, teeth: 8  },  // stage 0
+    { x: 195, y: 270, r: 28, teeth: 7  },  // stage 1
+    { x: 290, y: 310, r: 34, teeth: 8  },  // stage 2
+    { x: 195, y: 360, r: 22, teeth: 6  },  // stage 3 (center flywheel)
+    { x: 195, y: 440, r: 30, teeth: 8  },  // stage 4 (output)
+  ];
+
+  function drawMachine(now) {
+    // Background panel
+    var panX = 52, panY = 230, panW = W - 104, panH = 250;
+    cx.fillStyle = 'rgba(255,255,255,0.03)';
+    cx.strokeStyle = 'rgba(255,255,255,0.1)';
+    cx.lineWidth = 1;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(panX, panY, panW, panH, 12);
+    else cx.rect(panX, panY, panW, panH);
+    cx.fill(); cx.stroke();
+
+    // Connectors
+    var lines = [
+      [0,1], [1,2], [2,3], [1,3], [3,4]
+    ];
+    for (var li = 0; li < lines.length; li++) {
+      var a = lines[li][0], b = lines[li][1];
+      var active = currentStage > Math.max(a, b);
+      var col = active ? STAGE_DEFS[b].color : 'rgba(255,255,255,0.08)';
+      drawConnector(cx,
+        GEAR_POS[a].x, GEAR_POS[a].y,
+        GEAR_POS[b].x, GEAR_POS[b].y,
+        active, col
+      );
+    }
+
+    // Gears
+    for (var gi = 0; gi < 5; gi++) {
+      var gp = GEAR_POS[gi];
+      var active2 = gi < currentStage;
+      var col2 = STAGE_DEFS[gi].color;
+      // Spin active gears
+      var targetSpin = active2 ? STAGE_DEFS[gi].gearSpeed * 0.04 : 0;
+      // Current gear is pulsing
+      if (gi === currentStage) {
+        targetSpin = 0.008 + 0.006 * Math.sin(now / 400);
+      }
+      gearSpin[gi] += (targetSpin - gearSpin[gi]) * 0.08;
+      gearAngle[gi] += gearSpin[gi];
+
+      // Alternate direction for meshing effect
+      var dir = (gi % 2 === 0) ? 1 : -1;
+      drawGear(cx, gp.x, gp.y, gp.r, gp.teeth, gearAngle[gi] * dir, col2, active2);
+
+      // Stage label
+      cx.textAlign = 'center';
+      cx.font = '500 9px Menlo, monospace';
+      cx.fillStyle = active2 ? col2 : 'rgba(255,255,255,0.25)';
+      cx.fillText(STAGE_DEFS[gi].name, gp.x, gp.y + gp.r + 14);
+    }
+
+    // Current stage hint (if not discovered yet)
+    if (phase === 'play' && currentStage < STAGE_DEFS.length) {
+      var gpc = GEAR_POS[currentStage];
+      // Pulsing ring on active gear
+      var pulse = 0.4 + 0.4 * Math.sin(now / 350);
+      cx.save();
+      cx.globalAlpha = pulse;
+      cx.beginPath();
+      cx.arc(gpc.x, gpc.y, gpc.r + 6, 0, Math.PI * 2);
+      cx.strokeStyle = STAGE_DEFS[currentStage].color;
+      cx.lineWidth = 2;
+      cx.stroke();
+      cx.restore();
+    }
+
+    // Output display at bottom of machine
+    var outY = panY + panH - 18;
+    cx.textAlign = 'center';
+    cx.font = '700 11px Menlo, monospace';
+    if (currentStage >= 5) {
+      cx.fillStyle = GOLD;
+      cx.fillText('SYSTEM COMPLETE', W / 2, outY);
+    } else {
+      cx.fillStyle = 'rgba(255,255,255,0.2)';
+      cx.fillText('STAGE ' + currentStage + ' / 5', W / 2, outY);
+    }
+  }
+
+  // Stage instruction panel (teaches the player what to try)
+  function drawStagePanel(now) {
+    if (phase !== 'play' || currentStage >= STAGE_DEFS.length) return;
+    var def = STAGE_DEFS[currentStage];
+
+    var panY = 510;
+    cx.textAlign = 'center';
+
+    // Stage name
+    cx.font = '700 12px Menlo, monospace';
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.fillText('UNLOCK NEXT STAGE', W / 2, panY);
+
+    // Hint — pulsing
+    var pulse = 0.7 + 0.3 * Math.sin(now / 450);
+    cx.globalAlpha = pulse;
+    cx.font = '900 22px -apple-system, Helvetica, Arial';
+    cx.fillStyle = def.color;
+    cx.fillText(def.hint, W / 2, panY + 34);
+    cx.globalAlpha = 1;
+
+    // Hold progress bar for hold/long-press stages
+    if ((currentStage === 0 || currentStage === 3) && !DEMO && !BOT) {
+      var threshold = currentStage === 0 ? HOLD_THRESHOLD : LONG_PRESS_THRESHOLD;
+      var progress = Math.min(holdFrames / threshold, 1);
+      if (progress > 0) {
+        var bx = W / 2 - 80, by2 = panY + 50, bw = 160, bh = 6;
+        cx.fillStyle = 'rgba(255,255,255,0.1)';
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(bx, by2, bw, bh, 3);
+        else cx.rect(bx, by2, bw, bh);
+        cx.fill();
+        cx.fillStyle = def.color;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(bx, by2, bw * progress, bh, 3);
+        else cx.rect(bx, by2, bw * progress, bh);
+        cx.fill();
+      }
+    }
+
+    // Tap counter for multi-tap stages
+    if ((currentStage === 1 || currentStage === 4) && !DEMO && !BOT) {
+      var needed = currentStage === 1 ? 2 : 3;
+      var dots = '';
+      for (var d = 0; d < needed; d++) {
+        dots += d < tapCount ? '●' : '○';
+        if (d < needed - 1) dots += ' ';
+      }
+      cx.font = '700 20px Menlo, monospace';
+      cx.fillStyle = def.color;
+      cx.fillText(dots, W / 2, panY + 58);
+    }
+  }
+
+  var overAt = 0;
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Autopilots
+    if (DEMO) demoPulse(dt);
+    if (BOT)  botPulse(dt);
+    if (!DEMO && !BOT) updateHoldTriggers(dt);
+
+    // Juice decay
+    if (hitStop > 0) hitStop -= dt;
+    shakeAmt *= Math.pow(0.88, dt);
+    zoom += (1 - zoom) * 0.13 * dt;
+
+    // Particles
+    for (var pi = particles.length - 1; pi >= 0; pi--) {
+      var p = particles[pi];
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vy += 0.18 * dt;
+      p.life -= 0.015 * dt;
+      if (p.life <= 0) particles.splice(pi, 1);
+    }
+
+    // ── DRAW ──
+    cx.save();
+
+    // Shake/zoom juice
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // BG
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.05)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // Grid lines (machine aesthetic)
+    cx.strokeStyle = 'rgba(255,255,255,0.03)';
+    cx.lineWidth = 1;
+    for (var gx = 0; gx < W; gx += 40) {
+      cx.beginPath(); cx.moveTo(gx, 0); cx.lineTo(gx, H); cx.stroke();
+    }
+    for (var gy2 = 0; gy2 < H; gy2 += 40) {
+      cx.beginPath(); cx.moveTo(0, gy2); cx.lineTo(W, gy2); cx.stroke();
+    }
+
+    // ── TITLE ──
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('SYSTEM', W / 2, 240);
+      cx.fillStyle = TEAL;
+      cx.fillText('CLOSE', W / 2, 295);
+
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('5 hidden triggers.', W / 2, 345);
+      cx.fillText('discover them all.', W / 2, 368);
+
+      var pulse2 = 0.6 + 0.4 * Math.sin(now / 350);
+      cx.globalAlpha = pulse2;
+      cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 430);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.2)';
+      cx.font = '500 11px Menlo, monospace';
+      cx.fillText('LOOP — attention-architecture', W / 2, 680);
+    }
+
+    // ── CHALLENGE CARD (demo beat 1) ──
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 15px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('3', W / 2, 410);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("completed runs", W / 2, 440);
+    }
+
+    // ── PLAY ──
+    if (phase === 'play') {
+      // Runs counter top
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '800 60px -apple-system, Helvetica, Arial';
+      cx.fillText(runs, W / 2, 100);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px Menlo, monospace';
+      cx.fillText('RUNS   BEST ' + best, W / 2, 122);
+
+      // Dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 148);
+      }
+
+      drawMachine(now);
+      drawStagePanel(now);
+    }
+
+    // ── COMPLETE CYCLE animation ──
+    if (phase === 'complete') {
+      // Particles
+      for (var pk = 0; pk < particles.length; pk++) {
+        var p2 = particles[pk];
+        cx.save();
+        cx.globalAlpha = p2.life;
+        cx.fillStyle = p2.color;
+        cx.beginPath();
+        cx.arc(p2.x, p2.y, p2.size, 0, Math.PI * 2);
+        cx.fill();
+        cx.restore();
+      }
+
+      // Machine in full spin mode
+      drawMachine(now);
+
+      cx.textAlign = 'center';
+
+      // Big SYSTEM COMPLETE text
+      var pulse3 = 0.85 + 0.15 * Math.sin(now / 200);
+      cx.save();
+      cx.globalAlpha = pulse3;
+      cx.fillStyle = GOLD;
+      cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('SYSTEM COMPLETE', W / 2, 170);
+      cx.restore();
+
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('run ' + runs + ' complete', W / 2, 210);
+    }
+
+    // ── OVER ──
+    if (phase === 'over') {
+      window._overAt = window._overAt || performance.now();
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+
+      // Particles still flying
+      for (var pj = 0; pj < particles.length; pj++) {
+        var p3 = particles[pj];
+        cx.save();
+        cx.globalAlpha = p3.life * 0.6;
+        cx.fillStyle = p3.color;
+        cx.beginPath();
+        cx.arc(p3.x, p3.y, p3.size, 0, Math.PI * 2);
+        cx.fill();
+        cx.restore();
+      }
+
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('SYSTEM COMPLETE', W / 2, 280);
+      cx.fillStyle = '#fff';
+      cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText(runs + ' run' + (runs !== 1 ? 's' : ''), W / 2, 325);
+      var pt = pctTop(runs);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 368);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 392);
+
+      // Restart pulse
+      if (!DEMO && !BOT) {
+        var p4 = 0.6 + 0.4 * Math.sin(now / 300);
+        cx.globalAlpha = p4;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — RUN IT AGAIN', W / 2, 440);
+        cx.globalAlpha = 1;
+
+        // Share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ── CTA ──
+    if (phase === 'cta') {
+      var elapsed = (now - ctaAt) / 1000;
+      var ease = Math.min(1, elapsed * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+
+      // Particles
+      for (var pm = 0; pm < particles.length; pm++) {
+        var p5 = particles[pm];
+        cx.save();
+        cx.globalAlpha = p5.life * ease * 0.5;
+        cx.fillStyle = p5.color;
+        cx.beginPath();
+        cx.arc(p5.x, p5.y, p5.size, 0, Math.PI * 2);
+        cx.fill();
+        cx.restore();
+      }
+
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('SYSTEM', W / 2, 270);
+      cx.fillStyle = TEAL;
+      cx.fillText('CLOSE', W / 2, 325);
+
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText(runs + ' run' + (runs !== 1 ? 's' : '') + '. beat it.', W / 2, 368);
+
+      var p6 = 0.7 + 0.3 * Math.sin(now / 260);
+      cx.globalAlpha = ease * p6;
+      cx.fillStyle = VERM;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || runs), W / 2, 430);
+
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 462);
+      cx.globalAlpha = 1;
+    }
+
+    // ── FLASHES ──
+    for (var fk = flashes.length - 1; fk >= 0; fk--) {
+      var fl = flashes[fk]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 175 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(fk, 1);
+    }
+
+    // ── MUTE TOGGLE (human only) ──
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

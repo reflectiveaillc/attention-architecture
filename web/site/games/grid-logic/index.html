@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Grid Logic — Tilt</title>
+<!--
+  LOOP / attention-architecture — Grid Logic
+  Circuits: 06-zeigarnik, 01-rpe, 05-ease
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7    scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'grid-logic';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // --- mulberry32 seeded RNG ---
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  // --- canvas / fit ---
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var GRID_N = 5;
+  var CELL = 60, GAP = 4;
+  var CLUE_SZ = 28; // space for clue numbers
+  var GRID_W = GRID_N * (CELL + GAP) - GAP;
+  var GRID_OX = (W - GRID_W - CLUE_SZ) / 2 + CLUE_SZ; // left edge of cells
+  var GRID_OY = 280; // top edge of cells
+
+  // --- puzzle generation ---
+  function makePuzzle(rngFn) {
+    // generate a solvable 5x5 pattern with ~40-60% fill
+    var grid = [];
+    for (var r = 0; r < GRID_N; r++) {
+      grid[r] = [];
+      for (var c = 0; c < GRID_N; c++) {
+        grid[r][c] = rngFn() < 0.52 ? 1 : 0;
+      }
+    }
+    // compute clues
+    var rowClues = [], colClues = [];
+    for (var r = 0; r < GRID_N; r++) {
+      var cnt = 0;
+      for (var c = 0; c < GRID_N; c++) cnt += grid[r][c];
+      rowClues[r] = cnt;
+    }
+    for (var c = 0; c < GRID_N; c++) {
+      var cnt = 0;
+      for (var r = 0; r < GRID_N; r++) cnt += grid[r][c];
+      colClues[c] = cnt;
+    }
+    return { solution: grid, rowClues: rowClues, colClues: colClues };
+  }
+
+  // --- state ---
+  var puzzle, playerGrid, phase, score, flashes, hitStop, zoom, shakeAmt;
+  var runStartTs, botRunsDone, ctaAt, demoAt, demoStep, demoQueue;
+  var solvedRows, solvedCols;
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+
+  function initGame() {
+    rng = mulberry32(SEED);
+    puzzle = makePuzzle(rng);
+    playerGrid = [];
+    solvedRows = [];
+    solvedCols = [];
+    for (var r = 0; r < GRID_N; r++) {
+      playerGrid[r] = [];
+      solvedRows[r] = false;
+      for (var c = 0; c < GRID_N; c++) playerGrid[r][c] = 0;
+    }
+    for (var c = 0; c < GRID_N; c++) solvedCols[c] = false;
+    phase = DEMO ? 'demo' : (BOT ? 'play' : 'title');
+    score = 0;
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    botRunsDone = 0;
+    runStartTs = Date.now();
+    demoStep = 0;
+    ctaAt = 0;
+    demoAt = performance.now();
+
+    if (DEMO) {
+      buildDemoQueue();
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    } else if (BOT) {
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+  }
+
+  // demo: pre-planned cell sequence that fills most of the puzzle
+  // leaving one cell for the "near-perfection itch", then completes it
+  function buildDemoQueue() {
+    // We'll pick cells in an order that solves the puzzle nearly completely,
+    // then pause, then fill the last correct cell for the bloom
+    var sol = puzzle.solution;
+    var moves = [];
+    // First pass: fill correct cells in reading order, skipping wrong ones
+    // We'll fill ~24 out of 25 possible, leaving the final cell
+    var correct = [];
+    for (var r = 0; r < GRID_N; r++) {
+      for (var c = 0; c < GRID_N; c++) {
+        if (sol[r][c] === 1) correct.push([r, c]);
+      }
+    }
+    // shuffle slightly for human feel using rng
+    for (var i = correct.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = correct[i]; correct[i] = correct[j]; correct[j] = tmp;
+    }
+    // Save last correct cell for the dramatic finish
+    var lastMove = correct.pop();
+    demoQueue = { moves: correct, lastMove: lastMove, idx: 0, timer: 0, state: 'filling', pauseAt: -1 };
+    // Pause before the last cell to create the "one cell left" itch
+    demoQueue.pauseAt = correct.length; // pause just after all but last
+  }
+
+  // --- check constraints ---
+  function checkSolved() {
+    var allDone = true;
+    for (var r = 0; r < GRID_N; r++) {
+      var cnt = 0;
+      for (var c = 0; c < GRID_N; c++) cnt += playerGrid[r][c];
+      solvedRows[r] = (cnt === puzzle.rowClues[r]);
+      if (!solvedRows[r]) allDone = false;
+    }
+    for (var c = 0; c < GRID_N; c++) {
+      var cnt = 0;
+      for (var r = 0; r < GRID_N; r++) cnt += playerGrid[r][c];
+      solvedCols[c] = (cnt === puzzle.colClues[c]);
+      if (!solvedCols[c]) allDone = false;
+    }
+    return allDone;
+  }
+
+  function countCorrectCells() {
+    var n = 0;
+    for (var r = 0; r < GRID_N; r++)
+      for (var c = 0; c < GRID_N; c++)
+        if (playerGrid[r][c] === puzzle.solution[r][c]) n++;
+    return n;
+  }
+
+  function toggleCell(r, c) {
+    if (phase !== 'play') return;
+    playerGrid[r][c] = playerGrid[r][c] ? 0 : 1;
+    var step = countCorrectCells();
+    score = step;
+    if (window.J) J.calm(step / 25);
+    zoom = 1.015;
+
+    if (checkSolved()) {
+      onPuzzleSolved();
+    } else {
+      // floating feedback
+      if (solvedRows[r] || solvedCols[c]) {
+        flash('GOOD', TEAL, 28);
+        if (window.J) J.calm(0.7);
+      }
+      if (window.LOOP) LOOP.emit('cell_tap', { r: r, c: c, correct: playerGrid[r][c] === puzzle.solution[r][c] ? 1 : 0 });
+    }
+  }
+
+  function onPuzzleSolved() {
+    phase = 'solved';
+    score = 25;
+    hitStop = 6;
+    zoom = 1.04;
+    shakeAmt = 0; // calm: no shake on success
+    flash('PERFECT', TEAL, 44);
+    if (window.J) { J.calm(1.0); }
+    var dur = (Date.now() - runStartTs) / 1000;
+    window.__demoScore = score;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () { phase = 'cta'; ctaAt = performance.now(); }, 1800);
+      setTimeout(function () { window.__demoDone = true; }, 5400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else { setTimeout(resetBot, 800); }
+    }
+  }
+
+  function onBotFail() {
+    // Bot "gives up" by triggering game_over with partial score
+    phase = 'over';
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    botRunsDone++;
+    if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+    else { setTimeout(resetBot, 600); }
+  }
+
+  function resetBot() {
+    rng = mulberry32(SEED + botRunsDone * 13);
+    puzzle = makePuzzle(rng);
+    playerGrid = [];
+    solvedRows = []; solvedCols = [];
+    for (var r = 0; r < GRID_N; r++) {
+      playerGrid[r] = []; solvedRows[r] = false;
+      for (var c = 0; c < GRID_N; c++) playerGrid[r][c] = 0;
+    }
+    for (var c = 0; c < GRID_N; c++) solvedCols[c] = false;
+    score = 0; flashes = [];
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) { LOOP.emit('restart', {}); LOOP.emit('play_start', { seed: SEED }); }
+    botTimer = 0; botDone = false;
+  }
+
+  // --- bot autopilot state ---
+  var botTimer = 0, botDone = false;
+  var botActionsLeft = 0;
+  var botMistakes = 0;
+
+  function botInit() {
+    // bot will make N correct taps, then N wrong taps, then fail
+    botActionsLeft = 7 + Math.floor(rng() * 6); // 7-12 correct actions
+    botMistakes = 0;
+  }
+  botInit();
+
+  function botTick(dt) {
+    if (phase !== 'play' || DEMO) return;
+    botTimer += dt;
+    if (botTimer < 28) return; // ~0.5s between moves at 60fps
+    botTimer = 0;
+
+    if (botActionsLeft > 0) {
+      // pick a correct cell to fill
+      var sol = puzzle.solution;
+      var candidates = [];
+      for (var r = 0; r < GRID_N; r++)
+        for (var c = 0; c < GRID_N; c++)
+          if (sol[r][c] === 1 && playerGrid[r][c] === 0) candidates.push([r, c]);
+      if (candidates.length === 0) {
+        // all correct cells filled — puzzle should be solved (or we overdid it)
+        // check if solved
+        if (checkSolved()) { onPuzzleSolved(); return; }
+        // otherwise fall through to fail
+      } else {
+        var pick = candidates[Math.floor(rng() * candidates.length)];
+        playerGrid[pick[0]][pick[1]] = 1;
+        score = countCorrectCells();
+        if (window.J) J.calm(score / 25);
+        zoom = 1.01;
+        checkSolved();
+        if (phase === 'solved') return; // solved!
+        botActionsLeft--;
+        if (window.LOOP) LOOP.emit('cell_tap', { r: pick[0], c: pick[1], correct: 1 });
+        return;
+      }
+    }
+
+    // After correct moves, make a wrong move then fail
+    botMistakes++;
+    // pick a wrong cell (fill a 0-cell)
+    var sol = puzzle.solution;
+    var wrong = [];
+    for (var r = 0; r < GRID_N; r++)
+      for (var c = 0; c < GRID_N; c++)
+        if (sol[r][c] === 0 && playerGrid[r][c] === 0) wrong.push([r, c]);
+
+    if (wrong.length > 0 && botMistakes <= 3) {
+      var pick = wrong[Math.floor(rng() * wrong.length)];
+      playerGrid[pick[0]][pick[1]] = 1;
+      score = countCorrectCells();
+      zoom = 1.01;
+      if (window.LOOP) LOOP.emit('cell_tap', { r: pick[0], c: pick[1], correct: 0 });
+    } else {
+      // give up → game_over
+      onBotFail();
+    }
+  }
+
+  // --- demo autopilot ---
+  var demoTimer = 0, demoPaused = false, demoPauseTimer = 0;
+
+  function demoTick(dt) {
+    if (phase !== 'play' || !demoQueue) return;
+    var q = demoQueue;
+
+    if (q.state === 'filling') {
+      demoTimer += dt;
+      if (demoTimer < 38) return; // ~0.63s between moves
+      demoTimer = 0;
+
+      if (q.idx < q.moves.length) {
+        var move = q.moves[q.idx];
+        playerGrid[move[0]][move[1]] = 1;
+        score = countCorrectCells();
+        if (window.J) J.calm(score / 25);
+        zoom = 1.012;
+        checkSolved();
+        if (window.LOOP) LOOP.emit('cell_tap', { r: move[0], c: move[1], correct: 1 });
+
+        // Check if a row/col just got satisfied for a soft highlight
+        var r = move[0], c = move[1];
+        if (solvedRows[r] || solvedCols[c]) {
+          flash('', TEAL, 0); // silent visual cue via zoom
+        }
+        q.idx++;
+
+        // pause dramatically before the last cell
+        if (q.idx === q.moves.length) {
+          q.state = 'pause';
+          demoPauseTimer = 0;
+        }
+      }
+    } else if (q.state === 'pause') {
+      // The "near-perfection itch" — one cell left, linger
+      demoPauseTimer += dt;
+      if (demoPauseTimer > 90) { // ~1.5s pause
+        q.state = 'final';
+        demoTimer = 0;
+      }
+    } else if (q.state === 'final') {
+      demoTimer += dt;
+      if (demoTimer < 30) return;
+      // Place the last cell — grid blooms
+      var lm = q.lastMove;
+      playerGrid[lm[0]][lm[1]] = 1;
+      score = 25;
+      if (window.J) J.calm(1.0);
+      hitStop = 5; zoom = 1.04;
+      if (checkSolved()) {
+        onPuzzleSolved();
+      }
+      q.state = 'done';
+    }
+  }
+
+  // --- flash system ---
+  function flash(txt, color, size) {
+    if (txt) flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // --- input ---
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') {
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      return;
+    }
+    if (phase === 'over') {
+      restartHuman();
+      return;
+    }
+    if (phase !== 'play') return;
+
+    // hit-test grid cells
+    for (var r = 0; r < GRID_N; r++) {
+      for (var c = 0; c < GRID_N; c++) {
+        var cx2 = GRID_OX + c * (CELL + GAP);
+        var cy2 = GRID_OY + r * (CELL + GAP);
+        if (px >= cx2 && px <= cx2 + CELL && py >= cy2 && py <= cy2 + CELL) {
+          toggleCell(r, c);
+          return;
+        }
+      }
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.code === 'Enter') tap();
+  });
+
+  function restartHuman() {
+    rng = mulberry32(SEED + Math.floor(Date.now() % 10000));
+    puzzle = makePuzzle(rng);
+    playerGrid = [];
+    solvedRows = []; solvedCols = [];
+    for (var r = 0; r < GRID_N; r++) {
+      playerGrid[r] = []; solvedRows[r] = false;
+      for (var c = 0; c < GRID_N; c++) playerGrid[r][c] = 0;
+    }
+    for (var c = 0; c < GRID_N; c++) solvedCols[c] = false;
+    score = 0; flashes = [];
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) { LOOP.emit('restart', {}); LOOP.emit('play_start', { seed: SEED }); }
+  }
+
+  // --- render ---
+  var last = performance.now();
+  var bloomT = 0; // bloom animation on solve
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // juice decay
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      // autopilots run only when not hit-stopped
+      if (DEMO) demoTick(dt);
+      if (BOT) botTick(dt);
+    }
+
+    zoom += (1 - zoom) * 0.10 * dt;
+    shakeAmt *= Math.pow(0.80, dt);
+
+    if (phase === 'solved') bloomT += dt;
+
+    cx.save();
+    if (zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // title screen
+    if (phase === 'title') {
+      drawTitle(now);
+      cx.restore();
+      requestAnimationFrame(frame);
+      return;
+    }
+
+    // draw grid (all phases except title)
+    if (phase !== 'cta') {
+      drawGrid(now);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 50);
+      if (a <= 0) { flashes.splice(k, 1); continue; }
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, GRID_OY - 40 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+    }
+
+    // solved overlay
+    if (phase === 'solved') {
+      drawSolvedOverlay(now);
+    }
+
+    // over screen (human time-out or forced fail)
+    if (phase === 'over') {
+      drawOverScreen();
+    }
+
+    // demo CTA
+    if (phase === 'cta') {
+      drawCTA(now);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL;
+    cx.font = '900 46px -apple-system, Helvetica, Arial';
+    cx.fillText('GRID LOGIC', W / 2, 270);
+    cx.fillStyle = 'rgba(255,255,255,0.65)';
+    cx.font = '500 15px -apple-system, Helvetica, Arial';
+    cx.fillText('fill cells to match every clue', W / 2, 310);
+
+    // mini example grid hint
+    drawMiniPreview();
+
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('row & column counts tell you what to fill', W / 2, 600);
+
+    var pulse = 0.6 + 0.4 * Math.sin(now / 380);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = TEAL;
+    cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO BEGIN', W / 2, 640);
+    cx.globalAlpha = 1;
+  }
+
+  function drawMiniPreview() {
+    // draw a tiny 3x3 example grid
+    var s = 38, g = 3, ox = W / 2 - (3 * (s + g) - g) / 2, oy = 340;
+    var ex = [[1,0,1],[1,1,0],[0,1,1]];
+    var rcl = [2,2,2], ccl = [2,2,2];
+    for (var r = 0; r < 3; r++) {
+      cx.fillStyle = 'rgba(255,255,255,0.18)';
+      cx.font = '700 12px Menlo, monospace';
+      cx.textAlign = 'right';
+      cx.fillText(rcl[r], ox - 6, oy + r * (s + g) + s / 2 + 5);
+      for (var c = 0; c < 3; c++) {
+        var x = ox + c * (s + g), y = oy + r * (s + g);
+        cx.fillStyle = ex[r][c] ? 'rgba(46,197,182,0.55)' : 'rgba(255,255,255,0.06)';
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(x, y, s, s, 5) : cx.rect(x, y, s, s);
+        cx.fill();
+      }
+    }
+    for (var c = 0; c < 3; c++) {
+      cx.fillStyle = 'rgba(255,255,255,0.18)';
+      cx.font = '700 12px Menlo, monospace';
+      cx.textAlign = 'center';
+      cx.fillText(ccl[c], ox + c * (s + g) + s / 2, oy + 3 * (s + g) + 16);
+    }
+  }
+
+  function drawGrid(now) {
+    // header label
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.38)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('fill every row & column', W / 2, GRID_OY - 72);
+
+    // score / progress
+    cx.fillStyle = TEAL;
+    cx.font = '900 48px -apple-system, Helvetica, Arial';
+    cx.fillText(score, W / 2, GRID_OY - 28);
+    cx.fillStyle = 'rgba(255,255,255,0.28)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('cells correct', W / 2, GRID_OY - 10);
+
+    // row clues (left of grid)
+    for (var r = 0; r < GRID_N; r++) {
+      var cy2 = GRID_OY + r * (CELL + GAP) + CELL / 2;
+      cx.textAlign = 'right';
+      var rowDone = solvedRows[r];
+      cx.fillStyle = rowDone ? TEAL : 'rgba(255,255,255,0.55)';
+      cx.font = (rowDone ? '900' : '700') + ' 18px Menlo, monospace';
+      cx.fillText(puzzle.rowClues[r], GRID_OX - 10, cy2 + 6);
+    }
+
+    // col clues (above grid)
+    for (var c = 0; c < GRID_N; c++) {
+      var cx2 = GRID_OX + c * (CELL + GAP) + CELL / 2;
+      var colDone = solvedCols[c];
+      cx.textAlign = 'center';
+      cx.fillStyle = colDone ? TEAL : 'rgba(255,255,255,0.55)';
+      cx.font = (colDone ? '900' : '700') + ' 18px Menlo, monospace';
+      cx.fillText(puzzle.colClues[c], cx2, GRID_OY - 14);
+    }
+
+    // cells
+    for (var r = 0; r < GRID_N; r++) {
+      for (var c = 0; c < GRID_N; c++) {
+        var cx2 = GRID_OX + c * (CELL + GAP);
+        var cy2 = GRID_OY + r * (CELL + GAP);
+        var filled = playerGrid[r][c] === 1;
+        var rowDone = solvedRows[r], colDone = solvedCols[c];
+
+        // cell bg
+        if (filled) {
+          var g = cx.createLinearGradient(cx2, cy2, cx2, cy2 + CELL);
+          if (rowDone || colDone) {
+            g.addColorStop(0, 'rgba(46,197,182,0.90)');
+            g.addColorStop(1, 'rgba(46,197,182,0.70)');
+          } else {
+            g.addColorStop(0, 'rgba(46,197,182,0.62)');
+            g.addColorStop(1, 'rgba(46,197,182,0.44)');
+          }
+          cx.fillStyle = g;
+        } else {
+          cx.fillStyle = 'rgba(255,255,255,0.06)';
+        }
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(cx2, cy2, CELL, CELL, 8);
+        else cx.rect(cx2, cy2, CELL, CELL);
+        cx.fill();
+
+        // border
+        cx.strokeStyle = filled
+          ? (rowDone || colDone ? 'rgba(46,197,182,0.5)' : 'rgba(46,197,182,0.28)')
+          : 'rgba(255,255,255,0.09)';
+        cx.lineWidth = 1.2;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(cx2 + 0.6, cy2 + 0.6, CELL - 1.2, CELL - 1.2, 8);
+        else cx.rect(cx2 + 0.6, cy2 + 0.6, CELL - 1.2, CELL - 1.2);
+        cx.stroke();
+
+        // "one cell left" pulse (demo near-perfection itch)
+        if (DEMO && demoQueue && demoQueue.state === 'pause') {
+          var lm = demoQueue.lastMove;
+          if (r === lm[0] && c === lm[1]) {
+            var p = 0.4 + 0.5 * Math.sin(now / 180);
+            cx.strokeStyle = 'rgba(242,177,52,' + p + ')';
+            cx.lineWidth = 2.5;
+            cx.beginPath();
+            if (cx.roundRect) cx.roundRect(cx2 - 1, cy2 - 1, CELL + 2, CELL + 2, 9);
+            else cx.rect(cx2 - 1, cy2 - 1, CELL + 2, CELL + 2);
+            cx.stroke();
+          }
+        }
+      }
+    }
+
+    // bloom effect on solve
+    if (phase === 'solved' && bloomT < 60) {
+      var bAlpha = Math.max(0, 0.35 - bloomT / 60 * 0.35);
+      var bR = bloomT * 6;
+      cx.beginPath();
+      cx.arc(W / 2, GRID_OY + GRID_W / 2, bR, 0, Math.PI * 2);
+      cx.strokeStyle = 'rgba(46,197,182,' + bAlpha + ')';
+      cx.lineWidth = 4;
+      cx.stroke();
+    }
+  }
+
+  function drawSolvedOverlay(now) {
+    if (DEMO) return; // demo handles its own flow
+    // soft glow overlay
+    cx.fillStyle = 'rgba(11,13,18,0.45)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    var p = 0.8 + 0.2 * Math.sin(now / 400);
+    cx.globalAlpha = p;
+    cx.fillStyle = TEAL;
+    cx.font = '900 46px -apple-system, Helvetica, Arial';
+    cx.fillText('SOLVED', W / 2, 610);
+    cx.globalAlpha = 1;
+    cx.fillStyle = 'rgba(255,255,255,0.50)';
+    cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('tap to try another', W / 2, 646);
+    if (!BOT) {
+      // share zone
+      var SR = { x: W / 2 - 120, y: 660, w: 240, h: 42 };
+      cx.fillStyle = 'rgba(46,197,182,0.12)';
+      cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(SR.x, SR.y, SR.w, SR.h, 21); else cx.rect(SR.x, SR.y, SR.w, SR.h);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = TEAL;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText('⚡ DARE A FRIEND', W / 2, SR.y + 28);
+    }
+  }
+
+  function drawOverScreen() {
+    cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.70)';
+    cx.font = '700 24px -apple-system, Helvetica, Arial';
+    cx.fillText('not quite', W / 2, 380);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText('tap to retry', W / 2, 415);
+  }
+
+  function drawCTA(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2.0);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')'; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease; cx.textAlign = 'center';
+
+    cx.fillStyle = TEAL;
+    cx.font = '900 44px -apple-system, Helvetica, Arial';
+    cx.fillText('GRID LOGIC', W / 2, 290);
+
+    cx.fillStyle = 'rgba(255,255,255,0.70)';
+    cx.font = '500 17px -apple-system, Helvetica, Arial';
+    cx.fillText('the answer is always there.', W / 2, 334);
+    cx.fillText('can you find it?', W / 2, 358);
+
+    var p = 0.65 + 0.35 * Math.sin(now / 320);
+    cx.fillStyle = TEAL;
+    cx.globalAlpha = ease * p;
+    cx.font = '900 28px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 430);
+    cx.globalAlpha = ease;
+
+    cx.fillStyle = 'rgba(255,255,255,0.40)';
+    cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 468);
+    cx.globalAlpha = 1;
+  }
+
+  initGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

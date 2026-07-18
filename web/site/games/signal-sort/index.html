@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Signal Sort — Tilt</title>
+<!--
+  LOOP / attention-architecture — Signal Sort
+  Circuits: 01-rpe (variable reward per tap), 05-ease (pattern gets clearer),
+            06-zeigarnik (so close to 20, one more).
+  Modes (query params):
+    ?demo=1&seed=7        scripted calm arc ~16s → soft CTA, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, N runs, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'signal-sort';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var SOFT_GREEN = '#4ecdc4', SOFT_AMBER = '#ffbe76', DIM = 'rgba(255,255,255,0.18)';
+
+  // ─── Signal pattern definition ────────────────────────────────────────────
+  // Each icon is defined by a "shape code": a shape + rotation + dot-count + gap
+  // Signal has ONE canonical combination; noise varies one of those attributes.
+  // We use simple geometric primitives drawn on canvas (no images/SVG).
+
+  // Shapes: 0=triangle, 1=diamond, 2=pentagon, 3=hexagon, 4=circle, 5=square
+  var SHAPE_NAMES = ['triangle','diamond','pentagon','hexagon','circle','square'];
+  var SIGNAL_SHAPE   = 1;   // diamond
+  var SIGNAL_DOTS    = 3;   // 3 interior dots
+  var SIGNAL_ROT     = 0;   // 0 = canonical rotation
+
+  // Each round: 1 signal + (GRID_COLS*GRID_ROWS - 1) noise icons
+  var GRID_COLS = 4, GRID_ROWS = 4;
+  var ICON_W = 72, ICON_H = 72, ICON_PAD = 14;
+  var GRID_X0 = (W - GRID_COLS * (ICON_W + ICON_PAD) + ICON_PAD) / 2;
+  var GRID_Y0 = 260;
+
+  var TARGET = 20;  // correct picks to win
+
+  // ─── State ────────────────────────────────────────────────────────────────
+  var state, flashes, hitStop, zoom, shakeAmt;
+  var runStartTs, best = 0;
+  try { best = +localStorage.getItem('ss_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',   // title | play | over | cta
+      score: 0,
+      round: 0,
+      grid: [],         // array of {shape,dots,rot,isSignal,tapped,wrongTap,x,y}
+      signalPos: -1,
+      overAt: 0,
+      ctaAt: 0,
+      roundAnim: 0,     // ms since round started (for settle-in animation)
+      streak: 0,
+      misses: 0,
+    };
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0;
+    if (DEMO) { buildDemoRound(0); state.phase = 'play'; startRun(); return; }
+    if (BOT)  { buildRound(); state.phase = 'play'; startRun(); return; }
+  }
+
+  function startRun() {
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ─── Round builder ────────────────────────────────────────────────────────
+  function buildRound() {
+    var total = GRID_COLS * GRID_ROWS;
+    var signalSlot = Math.floor(rng() * total);
+    var cells = [];
+    for (var i = 0; i < total; i++) {
+      var isSignal = (i === signalSlot);
+      var item;
+      if (isSignal) {
+        item = { shape: SIGNAL_SHAPE, dots: SIGNAL_DOTS, rot: SIGNAL_ROT, isSignal: true };
+      } else {
+        // noise: change exactly one property so it's subtly wrong
+        var noiseType = Math.floor(rng() * 3); // 0=shape, 1=dots, 2=rot
+        var nShape = SIGNAL_SHAPE, nDots = SIGNAL_DOTS, nRot = SIGNAL_ROT;
+        if (noiseType === 0) {
+          // different shape (not diamond)
+          var shapes = [0,2,3,4,5];
+          nShape = shapes[Math.floor(rng() * shapes.length)];
+        } else if (noiseType === 1) {
+          // different dot count (1, 2, or 4)
+          var dotChoices = [1,2,4];
+          nDots = dotChoices[Math.floor(rng() * dotChoices.length)];
+        } else {
+          // rotated (30, 45, 60, or 90 deg off)
+          var rotChoices = [Math.PI/6, Math.PI/4, Math.PI/3, Math.PI/2];
+          nRot = rotChoices[Math.floor(rng() * rotChoices.length)];
+        }
+        item = { shape: nShape, dots: nDots, rot: nRot, isSignal: false };
+      }
+      item.tapped = false;
+      item.wrongTap = false;
+      item.col = i % GRID_COLS;
+      item.row = Math.floor(i / GRID_COLS);
+      item.x = GRID_X0 + item.col * (ICON_W + ICON_PAD);
+      item.y = GRID_Y0 + item.row * (ICON_H + ICON_PAD);
+      item.entryDelay = i * 0.03; // stagger
+      cells.push(item);
+    }
+    state.grid = cells;
+    state.signalPos = signalSlot;
+    state.roundAnim = 0;
+  }
+
+  // Demo uses the same buildRound but with controlled seed
+  function buildDemoRound(roundNum) {
+    // reset rng to give repeatable demo rounds
+    buildRound();
+  }
+
+  // ─── Game logic ──────────────────────────────────────────────────────────
+  function tapCell(col, row) {
+    if (state.phase !== 'play') return;
+    var idx = row * GRID_COLS + col;
+    var cell = state.grid[idx];
+    if (!cell || cell.tapped) return;
+    cell.tapped = true;
+    if (cell.isSignal) {
+      // CORRECT
+      state.score++;
+      state.streak++;
+      hitStop = 50;
+      zoom = 1.025;
+      if (window.J) J.calm(state.score);
+      flash('+1', TEAL, 38);
+      if (window.LOOP) LOOP.emit('signal_found', { round: state.round, score: state.score });
+      if (state.score >= TARGET) {
+        endGame(true);
+        return;
+      }
+      // next round
+      state.round++;
+      buildRound();
+      state.roundAnim = 0;
+    } else {
+      // WRONG
+      cell.wrongTap = true;
+      state.misses++;
+      state.streak = 0;
+      shakeAmt = 3;
+      if (window.J) J.calm(0);
+      flash('noise', 'rgba(255,255,255,0.45)', 26);
+      if (window.LOOP) LOOP.emit('near_miss', { round: state.round, score: state.score });
+      // wrong tap ends run
+      endGame(false);
+    }
+  }
+
+  function endGame(won) {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (state.score > best) {
+      best = state.score;
+      try { localStorage.setItem('ss_best', String(best)); } catch (_) {}
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), won: won });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () {
+          resetRun();
+        }, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.score = 0;
+    state.round = 0;
+    state.streak = 0;
+    state.misses = 0;
+    flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    buildRound();
+    state.phase = 'play';
+    resetBotPerRun();
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0, x: W / 2, y: H / 2 - 60 });
+  }
+
+  // ─── Bot / Demo autopilots ────────────────────────────────────────────────
+  // All waits are in ms, counted down with real dt*16.667
+  var botRunsDone = 0;
+  var apWait = 0;          // ms remaining before next autopilot action
+  var apRoundScore = -1;   // track which score we last acted on (prevent double-tap)
+  var demoTapsDone = 0;    // how many demo taps done (DEMO only)
+  var demoWaitsMs = [900, 700, 1100, 600, 1200, 750, 1000, 580, 1300, 820, 740, 620, 1080, 700, 900];
+
+  function autopilot(dtMs) {
+    if (state.phase !== 'play') return;
+    if (apWait > 0) { apWait -= dtMs; return; }
+
+    if (DEMO) {
+      // Guard: only act once per score value
+      if (apRoundScore === state.score) return;
+      apRoundScore = state.score;
+
+      if (demoTapsDone < 14) {
+        // tap the signal
+        var sc = state.grid[state.signalPos];
+        if (sc && !sc.tapped) {
+          tapCell(sc.col, sc.row);
+          demoTapsDone++;
+          apWait = demoWaitsMs[Math.min(demoTapsDone, demoWaitsMs.length - 1)];
+        }
+      } else {
+        // miss on purpose to end demo run
+        for (var i = 0; i < state.grid.length; i++) {
+          if (!state.grid[i].isSignal && !state.grid[i].tapped) {
+            tapCell(state.grid[i].col, state.grid[i].row);
+            break;
+          }
+        }
+      }
+      return;
+    }
+
+    if (BOT) {
+      // Guard: only act once per score value
+      if (apRoundScore === state.score) return;
+      apRoundScore = state.score;
+
+      // After 8 correct picks, make a wrong tap to fire game_over
+      if (state.score >= 8) {
+        for (var j = 0; j < state.grid.length; j++) {
+          if (!state.grid[j].isSignal && !state.grid[j].tapped) {
+            tapCell(state.grid[j].col, state.grid[j].row);
+            return;
+          }
+        }
+      }
+
+      // Normal: tap signal with hesitation
+      var sig = state.grid[state.signalPos];
+      if (sig && !sig.tapped) {
+        tapCell(sig.col, sig.row);
+        apWait = 400 + rng() * 500; // 400-900ms
+      }
+    }
+  }
+
+  function resetBotPerRun() {
+    apWait = 400 + rng() * 400;
+    apRoundScore = -1;
+    demoTapsDone = 0;
+  }
+
+  // ─── Input ────────────────────────────────────────────────────────────────
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 480, w: 250, h: 46 };
+  function inR(r, px, py) { return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { buildRound(); state.phase = 'play'; startRun(); return; }
+    if (state.phase === 'play') {
+      // hit test grid
+      for (var i = 0; i < state.grid.length; i++) {
+        var cell = state.grid[i];
+        if (px >= cell.x && px <= cell.x + ICON_W && py >= cell.y && py <= cell.y + ICON_H) {
+          tapCell(cell.col, cell.row);
+          return;
+        }
+      }
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'signals found' }); return;
+      }
+      resetRun(); resetBotPerRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ─── Drawing helpers ──────────────────────────────────────────────────────
+  function drawShape(shape, x, y, size, rot) {
+    cx.save();
+    cx.translate(x, y);
+    cx.rotate(rot);
+    var r = size * 0.42;
+    cx.beginPath();
+    if (shape === 0) {
+      // triangle
+      for (var i = 0; i < 3; i++) {
+        var a = -Math.PI / 2 + (i / 3) * Math.PI * 2;
+        if (i === 0) cx.moveTo(Math.cos(a) * r, Math.sin(a) * r);
+        else cx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+      }
+    } else if (shape === 1) {
+      // diamond
+      cx.moveTo(0, -r);
+      cx.lineTo(r * 0.65, 0);
+      cx.lineTo(0, r);
+      cx.lineTo(-r * 0.65, 0);
+    } else if (shape === 2) {
+      // pentagon
+      for (var i = 0; i < 5; i++) {
+        var a = -Math.PI / 2 + (i / 5) * Math.PI * 2;
+        if (i === 0) cx.moveTo(Math.cos(a) * r, Math.sin(a) * r);
+        else cx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+      }
+    } else if (shape === 3) {
+      // hexagon
+      for (var i = 0; i < 6; i++) {
+        var a = (i / 6) * Math.PI * 2;
+        if (i === 0) cx.moveTo(Math.cos(a) * r, Math.sin(a) * r);
+        else cx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+      }
+    } else if (shape === 4) {
+      // circle
+      cx.arc(0, 0, r, 0, Math.PI * 2);
+    } else {
+      // square
+      cx.rect(-r * 0.78, -r * 0.78, r * 1.56, r * 1.56);
+    }
+    cx.closePath();
+    cx.restore();
+  }
+
+  function drawDots(count, x, y, size) {
+    cx.save();
+    cx.translate(x, y);
+    var r2 = size * 0.1;
+    if (count === 1) {
+      cx.beginPath(); cx.arc(0, 0, r2, 0, Math.PI * 2); cx.fill();
+    } else if (count === 2) {
+      cx.beginPath(); cx.arc(-size * 0.14, 0, r2, 0, Math.PI * 2); cx.fill();
+      cx.beginPath(); cx.arc( size * 0.14, 0, r2, 0, Math.PI * 2); cx.fill();
+    } else if (count === 3) {
+      cx.beginPath(); cx.arc(0,            -size * 0.12, r2, 0, Math.PI * 2); cx.fill();
+      cx.beginPath(); cx.arc(-size * 0.14,  size * 0.08, r2, 0, Math.PI * 2); cx.fill();
+      cx.beginPath(); cx.arc( size * 0.14,  size * 0.08, r2, 0, Math.PI * 2); cx.fill();
+    } else {
+      cx.beginPath(); cx.arc(-size * 0.13, -size * 0.10, r2, 0, Math.PI * 2); cx.fill();
+      cx.beginPath(); cx.arc( size * 0.13, -size * 0.10, r2, 0, Math.PI * 2); cx.fill();
+      cx.beginPath(); cx.arc(-size * 0.13,  size * 0.10, r2, 0, Math.PI * 2); cx.fill();
+      cx.beginPath(); cx.arc( size * 0.13,  size * 0.10, r2, 0, Math.PI * 2); cx.fill();
+    }
+    cx.restore();
+  }
+
+  function drawIcon(cell, age) {
+    var cx2 = cx;
+    var cx_ = cell.x + ICON_W / 2;
+    var cy_ = cell.y + ICON_H / 2;
+    var entryT = Math.min(1, Math.max(0, (age - cell.entryDelay) / 0.25));
+    if (entryT <= 0) return; // not yet visible
+
+    var alpha = cell.wrongTap ? 0.25 : (cell.tapped ? 0.22 : 1.0);
+    var scl = cell.tapped ? 1.12 : (0.75 + 0.25 * easeOut(entryT));
+
+    cx2.save();
+    cx2.globalAlpha = alpha;
+    cx2.translate(cx_, cy_);
+    cx2.scale(scl, scl);
+    cx2.translate(-cx_, -cy_);
+
+    // background tile
+    var tileFill;
+    if (cell.tapped && cell.isSignal) {
+      tileFill = 'rgba(46,197,182,0.20)';
+    } else if (cell.wrongTap) {
+      tileFill = 'rgba(255,255,255,0.04)';
+    } else {
+      tileFill = 'rgba(255,255,255,0.07)';
+    }
+    cx2.fillStyle = tileFill;
+    cx2.beginPath();
+    if (cx2.roundRect) cx2.roundRect(cell.x + 4, cell.y + 4, ICON_W - 8, ICON_H - 8, 10);
+    else cx2.rect(cell.x + 4, cell.y + 4, ICON_W - 8, ICON_H - 8);
+    cx2.fill();
+
+    // border for correctly tapped
+    if (cell.tapped && cell.isSignal) {
+      cx2.strokeStyle = TEAL;
+      cx2.lineWidth = 2;
+      cx2.stroke();
+    }
+
+    // shape stroke
+    var strokeColor = cell.isSignal ? TEAL : 'rgba(255,255,255,0.55)';
+    if (cell.wrongTap) strokeColor = 'rgba(255,255,255,0.15)';
+    if (cell.tapped && cell.isSignal) strokeColor = TEAL;
+
+    drawShape(cell.shape, cx_, cy_, ICON_W, cell.rot);
+    cx2.strokeStyle = strokeColor;
+    cx2.lineWidth = cell.isSignal ? 2.0 : 1.5;
+    cx2.stroke();
+
+    // dots inside shape
+    cx2.fillStyle = cell.isSignal ? TEAL : 'rgba(255,255,255,0.55)';
+    if (cell.wrongTap) cx2.fillStyle = 'rgba(255,255,255,0.15)';
+    drawDots(cell.dots, cx_, cy_, ICON_W);
+
+    cx2.restore();
+  }
+
+  function easeOut(t) { return 1 - Math.pow(1 - t, 3); }
+
+  // ─── Signal legend (what to find) ─────────────────────────────────────────
+  function drawLegend() {
+    var lx = W / 2, ly = 120;
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '500 12px Menlo, monospace';
+    cx.fillText('FIND THE SIGNAL', lx, ly - 38);
+
+    // draw the signal icon in legend
+    cx.save();
+    cx.globalAlpha = 1;
+    // tile
+    var tw = 54, th = 54;
+    cx.fillStyle = 'rgba(46,197,182,0.14)';
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 1.5;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(lx - tw/2, ly - th/2, tw, th, 8);
+    else cx.rect(lx - tw/2, ly - th/2, tw, th);
+    cx.fill(); cx.stroke();
+    // shape
+    drawShape(SIGNAL_SHAPE, lx, ly, 54, SIGNAL_ROT);
+    cx.strokeStyle = TEAL; cx.lineWidth = 2; cx.stroke();
+    // dots
+    cx.fillStyle = TEAL;
+    drawDots(SIGNAL_DOTS, lx, ly, 54);
+    cx.restore();
+
+    // label
+    cx.fillStyle = TEAL;
+    cx.font = '700 11px Menlo, monospace';
+    cx.fillText('diamond · 3 dots · upright', lx, ly + 38);
+  }
+
+  // ─── Progress bar ─────────────────────────────────────────────────────────
+  function drawProgress() {
+    var px0 = 32, py0 = 218, pw = W - 64, ph = 6;
+    var filled = state.score / TARGET;
+    // bg
+    cx.fillStyle = 'rgba(255,255,255,0.08)';
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(px0, py0, pw, ph, 3);
+    else cx.rect(px0, py0, pw, ph);
+    cx.fill();
+    // fill
+    cx.fillStyle = TEAL;
+    cx.globalAlpha = 0.85;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(px0, py0, pw * filled, ph, 3);
+    else cx.rect(px0, py0, pw * filled, ph);
+    cx.fill();
+    cx.globalAlpha = 1;
+    // label
+    cx.textAlign = 'right';
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '500 11px Menlo, monospace';
+    cx.fillText(state.score + ' / ' + TARGET, px0 + pw, py0 - 6);
+    cx.textAlign = 'center';
+  }
+
+  // ─── Render loop ──────────────────────────────────────────────────────────
+  var last = performance.now();
+  function frame(now) {
+    requestAnimationFrame(frame);
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // advance grid entry animation
+    if (state.phase === 'play') {
+      state.roundAnim += dt * 16.667 / 1000; // in seconds
+    }
+
+    // autopilot tick
+    if (hitStop > 0) {
+      hitStop -= dt;
+      // don't run autopilot during hit-stop
+    } else {
+      if ((DEMO || BOT) && state.phase === 'play') {
+        autopilot(dt * 16.667);
+      }
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.80, dt);
+    zoom += (1 - zoom) * 0.15 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ── TITLE ──────────────────────────────────────────────────────────────
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 44px -apple-system, Helvetica, Arial';
+      cx.fillText('SIGNAL SORT', W / 2, 270);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('find the signal in the noise', W / 2, 310);
+      // legend preview
+      drawLegend();
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = 0.7 + 0.3 * Math.sin(now / 600);
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // ── PLAY ───────────────────────────────────────────────────────────────
+    if (state.phase === 'play') {
+      drawLegend();
+      drawProgress();
+
+      for (var i = 0; i < state.grid.length; i++) {
+        drawIcon(state.grid[i], state.roundAnim);
+      }
+
+      // round label
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.22)';
+      cx.font = '500 11px Menlo, monospace';
+      cx.fillText('round ' + (state.round + 1), W / 2, 640);
+    }
+
+    // ── OVER ───────────────────────────────────────────────────────────────
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.65)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+
+      var won = state.score >= TARGET;
+      if (won) {
+        cx.fillStyle = TEAL;
+        cx.font = '900 38px -apple-system, Helvetica, Arial';
+        cx.fillText('SIGNAL CLEAR', W / 2, 290);
+      } else {
+        cx.fillStyle = 'rgba(255,255,255,0.9)';
+        cx.font = '900 38px -apple-system, Helvetica, Arial';
+        cx.fillText('NOISE GOT YOU', W / 2, 290);
+      }
+
+      cx.fillStyle = '#fff';
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' signals found', W / 2, 336);
+
+      cx.fillStyle = GOLD;
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('best: ' + best, W / 2, 370);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 400);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — FIND IT AGAIN', W / 2, 418);
+        cx.globalAlpha = 1;
+
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ── DEMO CTA ───────────────────────────────────────────────────────────
+    if (state.phase === 'cta') {
+      var t = (now - state.ctaAt) / 1000;
+      var ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.80 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+
+      cx.fillStyle = TEAL;
+      cx.font = '800 14px Menlo, monospace';
+      cx.fillText('SIGNAL SORT', W / 2, 268);
+
+      cx.fillStyle = '#fff';
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText('can you spot the signal', W / 2, 308);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '500 18px -apple-system, Helvetica, Arial';
+      cx.fillText('by round 5?', W / 2, 336);
+
+      var p3 = 0.75 + 0.25 * Math.sin(now / 300);
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 406);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // ── FLASHES ────────────────────────────────────────────────────────────
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 36);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 1.2);
+      cx.globalAlpha = 1;
+      if (fl.t > 36) flashes.splice(k, 1);
+    }
+
+    // ── MUTE TOGGLE ────────────────────────────────────────────────────────
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+  }
+
+  // Init
+  resetBotPerRun();
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

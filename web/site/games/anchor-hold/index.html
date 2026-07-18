@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Anchor Hold — Tilt</title>
+<!--
+  LOOP / attention-architecture — Anchor Hold
+  Engine: calm. Circuits: 05-ease, 07-timing, 06-zeigarnik.
+  Conditioned path: compulsive thumb-check — opening the app to feel grounded.
+  Mechanic: Hold the glowing anchor; water calms, progress arc fills.
+  Release early → water stirs. Hold all 8 s → screen stills, soft chime.
+  Modes:
+    ?demo=1&seed=7       scripted calm arc ~16 s → CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5 imperfect bot attempts N runs, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'anchor-hold';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs  = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = Math.max(1, +qs.get('runs') || 3);
+  var SEED = +qs.get('seed') || 42;
+
+  // ---- mulberry32 seeded RNG ----
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  // ---- canvas setup ----
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  var HOLD_NEEDED = 8000;  // ms of total hold time to resolve
+  var AX = W / 2, AY = 440; // anchor centre
+  var AR = 44;               // tap-hit radius
+
+  // ---- state ----
+  var phase    = 'idle';   // idle | holding | resolved | over | cta
+  var arcFill  = 0;        // 0..1
+  var calmness = 0;        // 0..1
+  var holding  = false;
+  var holdStart = 0;       // performance.now() when current hold began
+  var holdTotal = 0;       // accumulated hold ms from previous holds this run
+  var runStart  = 0;
+  var overAt = 0, ctaAt = 0, resolveAt = 0;
+  var botRunsDone = 0;
+  var flashes = [], ripples = [];
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var calmStep = 0;
+
+  // ---- wave layers ----
+  var waves = [];
+  function initWaves() {
+    waves = [];
+    for (var i = 0; i < 6; i++) {
+      waves.push({
+        amp:   18 + rng() * 14,
+        freq:  0.008 + rng() * 0.006,
+        speed: (rng() - 0.5) * 0.04,
+        ph:    rng() * Math.PI * 2,
+        yBase: 465 + i * 36 + rng() * 10,
+        alpha: 0.13 + rng() * 0.08
+      });
+    }
+  }
+  initWaves();
+
+  // ---- helpers ----
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+  function ripple(x, y) { ripples.push({ x: x, y: y, r: 0, maxR: 50 + rng() * 30, a: 0.65 }); }
+
+  // ---- run lifecycle ----
+  function startRun() {
+    phase = 'idle'; arcFill = 0; calmness = 0;
+    holding = false; holdTotal = 0; holdStart = 0;
+    flashes = []; ripples = []; calmStep = 0;
+    runStart = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    if (DEMO) scheduleDemo();
+    if (BOT)  scheduleBot();
+  }
+
+  function beginHold() {
+    if (holding) return;
+    holding = true;
+    holdStart = performance.now();
+    if (window.J) J.calm(calmStep++);
+  }
+
+  function endHold() {
+    if (!holding) return;
+    holding = false;
+    holdTotal += performance.now() - holdStart;
+    holdStart = 0;
+    // stir ripples
+    ripple(AX + (rng() - 0.5) * 36, AY + (rng() - 0.5) * 20);
+    ripple(AX + (rng() - 0.5) * 44, AY + 18 + rng() * 18);
+  }
+
+  function liveHeldMs() {
+    return holding ? (performance.now() - holdStart) : 0;
+  }
+
+  function resolveRun() {
+    endHold();
+    phase = 'resolved'; resolveAt = performance.now();
+    hitStop = 6; zoom = 1.025;
+    if (window.J) { J.calm(calmStep++); J.calm(calmStep++); }
+    flash('STILL', TEAL, 52);
+    var score = 100;
+    var dur = (Date.now() - runStart) / 1000;
+    window.__demoScore = score;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) setTimeout(function () { phase = 'cta'; ctaAt = performance.now(); setTimeout(function () { window.__demoDone = true; }, 3600); }, 3200);
+    if (BOT)  onBotRunDone();
+  }
+
+  function failRun() {
+    endHold();
+    phase = 'over'; overAt = performance.now();
+    shakeAmt = 3;
+    var score = Math.round(arcFill * 100);
+    var dur = (Date.now() - runStart) / 1000;
+    window.__demoScore = score;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (BOT) onBotRunDone();
+  }
+
+  function onBotRunDone() {
+    botRunsDone++;
+    if (botRunsDone >= BOT_RUNS) {
+      window.__botDone = true;
+    } else {
+      setTimeout(function () {
+        if (window.LOOP) LOOP.emit('restart', {});
+        startRun();
+      }, 600);
+    }
+  }
+
+  // ---- demo scripting ----
+  // Calm arc: wait 0.6 s → hold 8 s straight (fills arc fully) → resolve → CTA
+  function scheduleDemo() {
+    setTimeout(function () {
+      beginHold();
+    }, 600);
+  }
+
+  // ---- bot scripting ----
+  // Each run: hold for a random short portion (< HOLD_NEEDED), then fail.
+  // This guarantees game_over fires on every bot run.
+  function scheduleBot() {
+    // Delay 400–800 ms, then hold for a random sub-threshold duration, then fail.
+    var delay   = 400 + rng() * 400;          // ms before first hold
+    var holdFor = (2000 + rng() * 2500);      // ms of hold (2–4.5 s, never ≥ 8 s)
+    setTimeout(function () {
+      beginHold();
+      setTimeout(function () {
+        endHold();
+        // deliberate fail — bot never completes the arc
+        failRun();
+      }, holdFor);
+    }, delay);
+  }
+
+  // ---- human input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function inAnchor(x, y) { var dx = x - AX, dy = y - AY; return dx * dx + dy * dy <= AR * AR * 1.4; }
+
+  cv.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale, py = (e.clientY - r.top) / scale;
+    if (inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (window.LOOP) LOOP.emit('restart', {});
+      startRun(); return;
+    }
+    if (phase === 'resolved' && performance.now() - resolveAt > 800) {
+      if (window.LOOP) LOOP.emit('restart', {});
+      startRun(); return;
+    }
+    if ((phase === 'idle' || phase === 'holding') && inAnchor(px, py)) {
+      phase = 'holding'; beginHold();
+    }
+  });
+  window.addEventListener('pointerup',     function () { if (!DEMO && !BOT && phase === 'holding') { endHold(); if (arcFill < 1) phase = 'idle'; } });
+  window.addEventListener('pointercancel', function () { if (!DEMO && !BOT && phase === 'holding') { endHold(); if (arcFill < 1) phase = 'idle'; } });
+
+  // ---- render loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dtRaw = now - last; last = now;
+    var dt = Math.min(dtRaw / 16.667, 3);
+
+    // --- juice decay ---
+    if (hitStop > 0) { hitStop -= dt; }
+    shakeAmt *= Math.pow(0.87, dt);
+    zoom += (1 - zoom) * 0.11 * dt;
+
+    // --- arc fill ---
+    var totalHeld = holdTotal + liveHeldMs();
+    arcFill = Math.min(1, totalHeld / HOLD_NEEDED);
+
+    // calmness lags arc, collapses when not holding
+    var targetCalm = holding ? arcFill : arcFill * 0.55;
+    calmness += (targetCalm - calmness) * 0.014 * dt;
+    calmness = Math.max(0, Math.min(1, calmness));
+
+    // resolve check (human or demo)
+    if (arcFill >= 1 && (phase === 'holding' || phase === 'idle')) {
+      resolveRun();
+    }
+
+    // --- waves ---
+    for (var wi = 0; wi < waves.length; wi++) {
+      waves[wi].ph += waves[wi].speed * dt * (1 + (1 - calmness) * 2);
+    }
+
+    // --- ripples ---
+    for (var ri = ripples.length - 1; ri >= 0; ri--) {
+      var rp = ripples[ri];
+      rp.r += 2.2 * dt * (1 - calmness * 0.5);
+      rp.a -= 0.017 * dt;
+      if (rp.a <= 0 || rp.r >= rp.maxR) ripples.splice(ri, 1);
+    }
+
+    // --- flashes ---
+    for (var fi = flashes.length - 1; fi >= 0; fi--) {
+      flashes[fi].t += dt;
+      if (flashes[fi].t > 55) flashes.splice(fi, 1);
+    }
+
+    // === DRAW ===
+    cx.save();
+    if (shakeAmt > 0.25 || zoom > 1.001) {
+      var sx = (rng() - 0.5) * shakeAmt * 2, sy = (rng() - 0.5) * shakeAmt * 2;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bgG = cx.createLinearGradient(0, 0, 0, H);
+    bgG.addColorStop(0, 'rgba(8,18,36,' + (0.6 + calmness * 0.35) + ')');
+    bgG.addColorStop(1, 'rgba(4,14,28,0.9)');
+    cx.fillStyle = bgG; cx.fillRect(0, 0, W, H);
+
+    // stars
+    if (calmness > 0.15) {
+      var starRng = mulberry32(SEED + 77);
+      var sa = Math.min(1, (calmness - 0.15) * 1.3);
+      for (var si = 0; si < 32; si++) {
+        var sx2 = starRng() * W, sy2 = starRng() * (AY - 130);
+        var sr = 0.5 + starRng() * 1.1;
+        var tw = 0.35 + 0.65 * Math.sin(now / (440 + starRng() * 600) + si * 1.3);
+        cx.globalAlpha = tw * sa * 0.65;
+        cx.fillStyle = '#c8e4ff';
+        cx.beginPath(); cx.arc(sx2, sy2, sr, 0, Math.PI * 2); cx.fill();
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // water
+    drawWater();
+
+    // ripple rings
+    for (var rri = 0; rri < ripples.length; rri++) {
+      var rp2 = ripples[rri];
+      cx.strokeStyle = 'rgba(80,190,210,' + rp2.a + ')';
+      cx.lineWidth = 1.2;
+      cx.beginPath();
+      cx.ellipse(rp2.x, rp2.y, rp2.r, rp2.r * 0.36, 0, 0, Math.PI * 2);
+      cx.stroke();
+    }
+
+    // anchor
+    drawAnchor(now);
+
+    // progress arc
+    if (arcFill > 0 || phase === 'holding' || phase === 'idle') {
+      drawProgressArc();
+    }
+
+    // resolved glow overlay
+    if (phase === 'resolved') {
+      var rAge = (now - resolveAt) / 1000;
+      var rAlpha = Math.max(0, 1 - rAge / 3.8);
+      var rGlow = cx.createRadialGradient(AX, AY, 0, AX, AY, 170);
+      rGlow.addColorStop(0, 'rgba(46,197,182,' + rAlpha * 0.38 + ')');
+      rGlow.addColorStop(1, 'rgba(46,197,182,0)');
+      cx.fillStyle = rGlow; cx.fillRect(0, 0, W, H);
+    }
+
+    // flash text
+    for (var fli = 0; fli < flashes.length; fli++) {
+      var fl = flashes[fli];
+      var fA = Math.max(0, 1 - fl.t / 55);
+      cx.globalAlpha = fA; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.25) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, H / 2 - 90 - fl.t * 0.45);
+      cx.globalAlpha = 1;
+    }
+
+    drawUI(now);
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- draw helpers ----
+  function drawWater() {
+    var chaos = 1 - calmness;
+    for (var wi = 0; wi < waves.length; wi++) {
+      var wv = waves[wi];
+      var eff = wv.amp * (0.06 + chaos * 0.94) * (1 - wi * 0.07);
+      cx.beginPath(); cx.moveTo(0, wv.yBase);
+      for (var x = 0; x <= W; x += 5) {
+        var y = wv.yBase
+              + Math.sin(x * wv.freq + wv.ph) * eff
+              + Math.sin(x * wv.freq * 1.8 + wv.ph * 1.4) * eff * 0.28;
+        cx.lineTo(x, y);
+      }
+      cx.lineTo(W, H + 20); cx.lineTo(0, H + 20); cx.closePath();
+      var wT = Math.round(40 + calmness * 24);
+      var wB = Math.round(120 + calmness * 55);
+      cx.fillStyle = 'rgba(14,' + wT + ',' + wB + ',' + (wv.alpha * (0.45 + calmness * 0.65)) + ')';
+      cx.fill();
+    }
+    // still-water overlay
+    if (calmness > 0.42) {
+      var stA = (calmness - 0.42) * 0.65;
+      var sg = cx.createLinearGradient(0, AY - 60, 0, H);
+      sg.addColorStop(0, 'rgba(20,56,90,' + stA * 0.75 + ')');
+      sg.addColorStop(1, 'rgba(6,22,44,' + stA + ')');
+      cx.fillStyle = sg; cx.fillRect(0, AY - 60, W, H - AY + 60);
+      // moonpath
+      if (calmness > 0.6) {
+        var mpA = (calmness - 0.6) * 0.55;
+        cx.globalAlpha = mpA;
+        var mpg = cx.createLinearGradient(W / 2 - 24, AY - 40, W / 2 + 24, H);
+        mpg.addColorStop(0, 'rgba(195,235,255,0.08)');
+        mpg.addColorStop(0.5, 'rgba(175,225,255,0.18)');
+        mpg.addColorStop(1, 'rgba(150,210,240,0.06)');
+        cx.fillStyle = mpg; cx.fillRect(W / 2 - 20, AY - 40, 40, H - AY + 40);
+        cx.globalAlpha = 1;
+      }
+    }
+  }
+
+  function drawAnchor(now) {
+    cx.save();
+    var hGlow = holding ? (0.72 + 0.28 * Math.sin(now / 175)) : (0.28 + 0.14 * Math.sin(now / 580));
+    var gR = 58 + hGlow * 28;
+    // ambient glow
+    var ag = cx.createRadialGradient(AX, AY, 0, AX, AY, gR);
+    ag.addColorStop(0, 'rgba(46,197,182,' + hGlow * 0.5 + ')');
+    ag.addColorStop(0.55, 'rgba(46,197,182,' + hGlow * 0.12 + ')');
+    ag.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = ag; cx.beginPath(); cx.arc(AX, AY, gR, 0, Math.PI * 2); cx.fill();
+
+    // anchor symbol
+    var aCol = holding ? TEAL : 'rgba(95,195,205,0.82)';
+    cx.strokeStyle = aCol;
+    cx.lineWidth = holding ? 3.5 : 2.6;
+    cx.lineCap = 'round'; cx.lineJoin = 'round';
+    var S = 22;
+    // ring
+    cx.beginPath(); cx.arc(AX, AY - S * 0.9, S * 0.28, 0, Math.PI * 2); cx.stroke();
+    // shaft
+    cx.beginPath(); cx.moveTo(AX, AY - S * 0.62); cx.lineTo(AX, AY + S * 0.85); cx.stroke();
+    // crossbar
+    cx.beginPath(); cx.moveTo(AX - S * 0.65, AY - S * 0.25); cx.lineTo(AX + S * 0.65, AY - S * 0.25); cx.stroke();
+    // left fluke
+    cx.beginPath();
+    cx.moveTo(AX - S * 0.65, AY + S * 0.85);
+    cx.quadraticCurveTo(AX - S * 0.98, AY + S * 0.68, AX - S * 0.65, AY + S * 0.48);
+    cx.stroke();
+    // right fluke
+    cx.beginPath();
+    cx.moveTo(AX + S * 0.65, AY + S * 0.85);
+    cx.quadraticCurveTo(AX + S * 0.98, AY + S * 0.68, AX + S * 0.65, AY + S * 0.48);
+    cx.stroke();
+    // base bar
+    cx.beginPath();
+    cx.moveTo(AX - S * 0.65, AY + S * 0.85);
+    cx.lineTo(AX, AY + S * 1.1);
+    cx.lineTo(AX + S * 0.65, AY + S * 0.85);
+    cx.stroke();
+
+    // pulse ring while holding
+    if (holding) {
+      var pR = AR + 11 + Math.sin(performance.now() / 115) * 7;
+      cx.beginPath(); cx.arc(AX, AY, pR, 0, Math.PI * 2);
+      cx.strokeStyle = 'rgba(46,197,182,' + (0.22 + 0.14 * Math.sin(performance.now() / 115)) + ')';
+      cx.lineWidth = 1.6; cx.stroke();
+    }
+    cx.restore();
+  }
+
+  function drawProgressArc() {
+    var arcR = AR + 22;
+    cx.save();
+    // track ring
+    cx.beginPath(); cx.arc(AX, AY, arcR, 0, Math.PI * 2);
+    cx.strokeStyle = 'rgba(46,197,182,0.1)'; cx.lineWidth = 3; cx.stroke();
+    // filled arc
+    if (arcFill > 0) {
+      var startA = -Math.PI / 2, endA = startA + arcFill * Math.PI * 2;
+      var pct = arcFill;
+      var arcCol = pct < 0.5 ? TEAL : (pct < 0.88 ? '#4ab8cc' : GOLD);
+      cx.beginPath(); cx.arc(AX, AY, arcR, startA, endA);
+      cx.strokeStyle = arcCol; cx.lineWidth = 3.5; cx.lineCap = 'round'; cx.stroke();
+      // tip dot
+      var tx = AX + Math.cos(endA) * arcR, ty = AY + Math.sin(endA) * arcR;
+      cx.beginPath(); cx.arc(tx, ty, 4.2, 0, Math.PI * 2);
+      cx.fillStyle = arcCol; cx.fill();
+    }
+    cx.restore();
+  }
+
+  function drawUI(now) {
+    cx.textAlign = 'center';
+
+    // idle / holding prompt
+    if (phase === 'idle' || phase === 'holding') {
+      if (phase === 'idle') {
+        var pa = 0.48 + 0.32 * Math.sin(now / 680);
+        cx.fillStyle = 'rgba(80,190,205,' + pa + ')';
+        cx.font = '600 16px -apple-system, Helvetica, Arial';
+        cx.fillText('hold the anchor', W / 2, AY + 108);
+      } else if (arcFill < 0.28) {
+        cx.fillStyle = 'rgba(80,190,205,0.5)';
+        cx.font = '500 14px -apple-system, Helvetica, Arial';
+        cx.fillText('keep holding...', W / 2, AY + 108);
+      }
+    }
+
+    // % readout while holding
+    if ((phase === 'holding' || phase === 'idle') && arcFill > 0.04) {
+      cx.fillStyle = 'rgba(160,235,240,' + Math.min(1, arcFill * 2.2) + ')';
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText(Math.round(arcFill * 100) + '%', W / 2, AY - 96);
+    }
+
+    // resolved
+    if (phase === 'resolved') {
+      var rAge = (now - resolveAt) / 1000, rEase = Math.min(1, rAge * 1.5);
+      cx.globalAlpha = rEase;
+      cx.fillStyle = 'rgba(8,16,32,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.fillStyle = TEAL; cx.font = '800 50px -apple-system, Helvetica, Arial';
+      cx.fillText('STILL', W / 2, 304);
+      cx.fillStyle = 'rgba(165,235,242,0.82)'; cx.font = '500 20px -apple-system, Helvetica, Arial';
+      cx.fillText('you held it', W / 2, 342);
+      if (!DEMO && !BOT) {
+        var p3 = 0.65 + 0.35 * Math.sin(now / 330);
+        cx.fillStyle = 'rgba(46,197,182,' + p3 + ')'; cx.font = '600 15px -apple-system, Helvetica, Arial';
+        cx.fillText('tap to go again', W / 2, 408);
+      }
+      cx.globalAlpha = 1;
+    }
+
+    // over
+    if (phase === 'over') {
+      var oAge = (now - overAt) / 1000, oEase = Math.min(1, oAge * 1.8);
+      cx.globalAlpha = oEase;
+      cx.fillStyle = 'rgba(8,16,32,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.fillStyle = 'rgba(155,218,228,0.9)'; cx.font = '700 32px -apple-system, Helvetica, Arial';
+      cx.fillText('drifted away', W / 2, 300);
+      cx.fillStyle = 'rgba(165,235,242,0.58)'; cx.font = '500 17px -apple-system, Helvetica, Arial';
+      cx.fillText(Math.round(arcFill * 100) + '% reached', W / 2, 338);
+      if (!DEMO && !BOT) {
+        var p4 = 0.6 + 0.4 * Math.sin(now / 350);
+        cx.fillStyle = 'rgba(46,197,182,' + p4 + ')'; cx.font = '600 16px -apple-system, Helvetica, Arial';
+        cx.fillText('tap — try again', W / 2, 400);
+      }
+      cx.globalAlpha = 1;
+    }
+
+    // demo CTA card
+    if (phase === 'cta') {
+      var cAge = (now - ctaAt) / 1000, cEase = Math.min(1, cAge * 2.0);
+      cx.globalAlpha = cEase;
+      cx.fillStyle = 'rgba(8,16,32,0.82)'; cx.fillRect(0, 0, W, H);
+      cx.fillStyle = 'rgba(210,240,255,0.92)'; cx.font = '800 44px -apple-system, Helvetica, Arial';
+      cx.fillText('ANCHOR HOLD', W / 2, 300);
+      cx.fillStyle = 'rgba(150,225,235,0.78)'; cx.font = '500 19px -apple-system, Helvetica, Arial';
+      cx.fillText('hold until the sea goes still', W / 2, 340);
+      var p5 = 0.75 + 0.25 * Math.sin(now / 275);
+      cx.fillStyle = TEAL; cx.globalAlpha = cEase * p5;
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 408);
+      cx.globalAlpha = cEase;
+      cx.fillStyle = 'rgba(46,197,182,0.68)'; cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 444);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.globalAlpha = 0.44; cx.textAlign = 'center';
+      cx.font = '16px -apple-system, Helvetica, Arial'; cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  // ---- go ----
+  startRun();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

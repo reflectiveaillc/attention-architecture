@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Odd One Deep — Tilt</title>
+<!--
+  LOOP / attention-architecture — Odd One Deep
+  Circuits: 06-zeigarnik, 01-rpe, 05-ease
+  Engine: calm
+  Mechanic: 4x4 matrix of items, one outlier violates the hidden rule.
+  Watch a full display cycle, then tap the outlier. Rule grows each round.
+  10 rounds, outlier chain resolves.
+  Modes:
+    ?demo=1&seed=7       scripted calm arc ~16s → CTA card ~3.5s → __demoDone
+    ?bot=1&runs=N&seed=5 imperfect autopilot, N runs, __botDone on completion
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'odd-one-deep';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = Math.max(1, +qs.get('runs') || 2);
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  // canvas setup
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var SOFT_BLUE = '#7eb8e8', SOFT_PURPLE = '#b48adb', SOFT_PINK = '#e89ab2';
+  var SOFT_GREEN = '#8dd9b0';
+
+  // ---- Shape / colour / count / rotation libraries ----
+  var SHAPES = ['circle', 'square', 'triangle', 'diamond', 'hexagon', 'star'];
+  var COLORS = [TEAL, GOLD, SOFT_BLUE, SOFT_PURPLE, SOFT_PINK, SOFT_GREEN];
+  var COUNTS = [1, 2, 3];
+  var ROTATIONS = [0, 30, 60, 90];
+
+  // ---- Game state ----
+  var phase; // 'title' | 'watch' | 'pick' | 'feedback' | 'over' | 'cta'
+  var round, score, totalRounds, runStartTs;
+  var grid;          // array of 16 cell objects {shape, color, count, rotation, isOdd}
+  var oddIdx;        // index (0-15) of the outlier
+  var playerTapped;  // index tapped (-1 = none yet)
+  var feedbackCorrect;
+  var streak;
+  var watchProgress; // 0..1 cycle for the watch phase
+  var watchDuration; // ms to watch
+  var phaseStart;    // performance.now() when phase began
+  var flashes;
+  var hitStop, shakeAmt, zoom;
+  var ctaAt, overAt;
+  var botRunsDone;
+  var dareBeaten;
+
+  // juice state
+  hitStop = 0; shakeAmt = 0; zoom = 1;
+
+  // Dimensions — which dimensions are active for the current rule
+  // Level 1: shape only
+  // Level 2: shape + colour
+  // Level 3: shape + colour + count
+  // Level 4+: shape + colour + count + rotation
+  function activeDims(r) {
+    if (r <= 2)  return ['shape'];
+    if (r <= 4)  return ['shape', 'color'];
+    if (r <= 6)  return ['shape', 'color', 'count'];
+    return               ['shape', 'color', 'count', 'rotation'];
+  }
+
+  function pickRng(arr) { return arr[Math.floor(rng() * arr.length)]; }
+
+  function buildGrid(r) {
+    var dims = activeDims(r);
+    // Choose a "majority" value for each active dimension
+    var maj = {};
+    dims.forEach(function (d) {
+      if (d === 'shape')    maj.shape    = pickRng(SHAPES);
+      if (d === 'color')    maj.color    = pickRng(COLORS);
+      if (d === 'count')    maj.count    = pickRng(COUNTS);
+      if (d === 'rotation') maj.rotation = pickRng(ROTATIONS);
+    });
+    // Fill defaults for inactive dims (varied → not a rule axis)
+    // Inactive dims are random per cell → don't create false outliers
+    // To avoid confusing multiple outliers on inactive dims, keep them
+    // consistent across non-outlier cells too.
+    var defShape    = maj.shape    || pickRng(SHAPES);
+    var defColor    = maj.color    || pickRng(COLORS);
+    var defCount    = maj.count    || 1;
+    var defRotation = maj.rotation || 0;
+
+    // Pick ONE dimension for the outlier to deviate on
+    var outlierDim = dims[Math.floor(rng() * dims.length)];
+
+    // Pick an outlier value different from majority
+    function differentFrom(arr, val) {
+      var opts = arr.filter(function (v) { return v !== val; });
+      return opts[Math.floor(rng() * opts.length)];
+    }
+
+    var cells = [];
+    for (var i = 0; i < 16; i++) {
+      cells.push({
+        shape:    defShape,
+        color:    defColor,
+        count:    defCount,
+        rotation: defRotation,
+        isOdd:    false
+      });
+    }
+
+    // Place the outlier
+    oddIdx = Math.floor(rng() * 16);
+    var oc = cells[oddIdx];
+    oc.isOdd = true;
+    if (outlierDim === 'shape')    oc.shape    = differentFrom(SHAPES,    defShape);
+    if (outlierDim === 'color')    oc.color    = differentFrom(COLORS,    defColor);
+    if (outlierDim === 'count')    oc.count    = differentFrom(COUNTS,    defCount);
+    if (outlierDim === 'rotation') oc.rotation = differentFrom(ROTATIONS, defRotation);
+
+    return cells;
+  }
+
+  function startRound() {
+    grid = buildGrid(round);
+    playerTapped = -1;
+    feedbackCorrect = null;
+    // Watch duration: starts at 3.2s, shrinks slightly each round (min 2s)
+    watchDuration = Math.max(2000, 3200 - round * 90);
+    watchProgress = 0;
+    phase = 'watch';
+    phaseStart = performance.now();
+    if (window.J) J.calm(round);
+  }
+
+  function startGame() {
+    round = 1;
+    score = 0;
+    totalRounds = 10;
+    streak = 0;
+    flashes = [];
+    dareBeaten = false;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    startRound();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 32, t: 0 });
+  }
+
+  function onTap(gx, gy) {
+    if (DEMO || BOT) return;
+    if (phase === 'title') { startGame(); return; }
+    if (phase === 'watch') {
+      // early tap: shortcut to pick
+      phase = 'pick';
+      phaseStart = performance.now();
+      return;
+    }
+    if (phase === 'pick') {
+      handlePick(gx, gy);
+      return;
+    }
+    if (phase === 'feedback') {
+      if (performance.now() - phaseStart > 500) advanceRound();
+      return;
+    }
+    if (phase === 'over' && performance.now() - overAt > 400) {
+      resetGame();
+      return;
+    }
+  }
+
+  // Map canvas coords to grid index
+  var GRID_TOP = 200, CELL_SIZE = 84, COLS = 4;
+  function coordToCell(gx, gy) {
+    var col = Math.floor((gx - (W - CELL_SIZE * COLS) / 2) / CELL_SIZE);
+    var row = Math.floor((gy - GRID_TOP) / CELL_SIZE);
+    if (col < 0 || col >= 4 || row < 0 || row >= 4) return -1;
+    return row * 4 + col;
+  }
+
+  function handlePick(gx, gy) {
+    var idx = coordToCell(gx, gy);
+    if (idx < 0) return;
+    playerTapped = idx;
+    var correct = (idx === oddIdx);
+    feedbackCorrect = correct;
+    phase = 'feedback';
+    phaseStart = performance.now();
+
+    if (correct) {
+      streak++;
+      score += 10 + streak * 2;
+      hitStop = 50;
+      zoom = 1.025;
+      if (window.J) J.calm(round);
+      flash('FOUND IT', TEAL, 36);
+      if (window.LOOP) LOOP.emit('round_correct', { round: round, streak: streak });
+    } else {
+      streak = 0;
+      shakeAmt = 4;
+      flash('NOT QUITE', GOLD, 32);
+      if (window.LOOP) LOOP.emit('round_wrong', { round: round, tapped: idx, correct: oddIdx });
+    }
+
+    // dare beaten?
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+      dareBeaten = true;
+      if (window.J) J.calm(10);
+      SHARE.beaten(score);
+    }
+  }
+
+  function advanceRound() {
+    if (window.LOOP) LOOP.emit('round_done', { round: round, score: score });
+    round++;
+    if (round > totalRounds) {
+      endGame();
+    } else {
+      startRound();
+    }
+  }
+
+  function endGame() {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetGame(); }, 600);
+      }
+    }
+  }
+
+  function resetGame() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    startGame();
+  }
+
+  // ---- Mute / Share button regions ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // input
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var gx = (e.clientX - r.left) / scale;
+    var gy = (e.clientY - r.top)  / scale;
+    if (inR(MUTE_R, gx, gy) && window.J) { J.toggleMute(); return; }
+    if (phase === 'over' && inR(SHARE_R, gx, gy) && window.SHARE) {
+      SHARE.send({ score: score, unit: 'rounds' }); return;
+    }
+    onTap(gx, gy);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') onTap(W / 2, GRID_TOP + 2 * CELL_SIZE);
+  });
+
+  // ---- Bot / Demo autopilots ----
+  var botRunsDone = 0;
+  var demoStep = 0;
+  // Demo script: round 1-7 correct (building beautifully), round 8 wrong (mistake), 9-10 correct
+  var demoScript = [true, true, true, true, true, true, true, false, true, true];
+  var demoPickDelay = [900, 700, 800, 850, 750, 900, 700, 1100, 800, 750];
+
+  var autoPending = false;
+  function scheduleAutoPick(delayMs, fn) {
+    autoPending = true;
+    setTimeout(function () { autoPending = false; fn(); }, delayMs);
+  }
+
+  function autopilot(now) {
+    if (phase === 'watch') {
+      // auto-advance after watch completes
+      var elapsed = now - phaseStart;
+      if (elapsed >= watchDuration && !autoPending) {
+        phase = 'pick';
+        phaseStart = now;
+      }
+      return;
+    }
+    if (phase === 'pick' && !autoPending) {
+      var pickDelay;
+      var pickCorrect;
+      if (DEMO) {
+        pickCorrect = demoScript[Math.min(round - 1, demoScript.length - 1)];
+        pickDelay   = demoPickDelay[Math.min(round - 1, demoPickDelay.length - 1)];
+      } else {
+        // BOT: ~85% accuracy, with some error
+        pickCorrect = rng() < 0.80;
+        pickDelay   = 500 + Math.floor(rng() * 600);
+      }
+      scheduleAutoPick(pickDelay, function () {
+        var targetIdx;
+        if (pickCorrect) {
+          targetIdx = oddIdx;
+        } else {
+          // pick a random wrong cell
+          do { targetIdx = Math.floor(rng() * 16); } while (targetIdx === oddIdx);
+        }
+        var col = targetIdx % 4, row = Math.floor(targetIdx / 4);
+        var gx = (W - CELL_SIZE * 4) / 2 + col * CELL_SIZE + CELL_SIZE / 2;
+        var gy = GRID_TOP + row * CELL_SIZE + CELL_SIZE / 2;
+        var cx_idx = coordToCell(gx, gy);
+        playerTapped = cx_idx;
+        var correct = (cx_idx === oddIdx);
+        feedbackCorrect = correct;
+        phase = 'feedback';
+        phaseStart = performance.now();
+        if (correct) { streak++; score += 10 + streak * 2; hitStop = 40; zoom = 1.02; if (window.J) J.calm(round); }
+        else { streak = 0; shakeAmt = 3; }
+        if (window.LOOP) LOOP.emit(correct ? 'round_correct' : 'round_wrong', { round: round });
+      });
+    }
+    if (phase === 'feedback' && !autoPending) {
+      var elapsed2 = now - phaseStart;
+      if (elapsed2 > 900) {
+        advanceRound();
+      }
+    }
+  }
+
+  // ---- Drawing helpers ----
+  function drawShape(type, cx2, cy2, size, color, rotation, count) {
+    cx.save();
+    cx.translate(cx2, cy2);
+    cx.rotate(rotation * Math.PI / 180);
+    cx.fillStyle = color;
+    cx.strokeStyle = color;
+    cx.lineWidth = 1.5;
+
+    var sz = size;
+    if (count === 1) {
+      drawSingleShape(type, 0, 0, sz);
+    } else if (count === 2) {
+      var off = sz * 0.38;
+      drawSingleShape(type, -off, 0, sz * 0.7);
+      drawSingleShape(type,  off, 0, sz * 0.7);
+    } else {
+      drawSingleShape(type,  0,     -sz * 0.38, sz * 0.6);
+      drawSingleShape(type, -sz * 0.33, sz * 0.28, sz * 0.6);
+      drawSingleShape(type,  sz * 0.33, sz * 0.28, sz * 0.6);
+    }
+    cx.restore();
+  }
+
+  function drawSingleShape(type, x, y, r) {
+    cx.beginPath();
+    if (type === 'circle') {
+      cx.arc(x, y, r, 0, Math.PI * 2);
+      cx.fill();
+    } else if (type === 'square') {
+      cx.fillRect(x - r, y - r, r * 2, r * 2);
+    } else if (type === 'triangle') {
+      cx.moveTo(x, y - r);
+      cx.lineTo(x + r * 0.866, y + r * 0.5);
+      cx.lineTo(x - r * 0.866, y + r * 0.5);
+      cx.closePath();
+      cx.fill();
+    } else if (type === 'diamond') {
+      cx.moveTo(x, y - r);
+      cx.lineTo(x + r * 0.7, y);
+      cx.lineTo(x, y + r);
+      cx.lineTo(x - r * 0.7, y);
+      cx.closePath();
+      cx.fill();
+    } else if (type === 'hexagon') {
+      for (var i = 0; i < 6; i++) {
+        var a = (i * Math.PI / 3) - Math.PI / 6;
+        if (i === 0) cx.moveTo(x + r * Math.cos(a), y + r * Math.sin(a));
+        else cx.lineTo(x + r * Math.cos(a), y + r * Math.sin(a));
+      }
+      cx.closePath(); cx.fill();
+    } else if (type === 'star') {
+      for (var j = 0; j < 10; j++) {
+        var a2 = (j * Math.PI / 5) - Math.PI / 2;
+        var rv = j % 2 === 0 ? r : r * 0.45;
+        var px = x + rv * Math.cos(a2), py2 = y + rv * Math.sin(a2);
+        if (j === 0) cx.moveTo(px, py2); else cx.lineTo(px, py2);
+      }
+      cx.closePath(); cx.fill();
+    }
+  }
+
+  // Draw a single grid cell
+  function drawCell(cell, col, row, state, now) {
+    var gx = (W - CELL_SIZE * 4) / 2 + col * CELL_SIZE;
+    var gy = GRID_TOP + row * CELL_SIZE;
+    var cx2 = gx + CELL_SIZE / 2, cy2 = gy + CELL_SIZE / 2;
+    var idx = row * 4 + col;
+
+    // cell bg
+    var bgAlpha = 0.06;
+    if (phase === 'feedback' && idx === oddIdx) bgAlpha = 0.18;
+    if (phase === 'pick' && idx === playerTapped && playerTapped >= 0) bgAlpha = 0.14;
+
+    cx.save();
+    cx.globalAlpha = bgAlpha;
+    cx.fillStyle = cell.color;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(gx + 4, gy + 4, CELL_SIZE - 8, CELL_SIZE - 8, 8);
+    else cx.rect(gx + 4, gy + 4, CELL_SIZE - 8, CELL_SIZE - 8);
+    cx.fill();
+    cx.globalAlpha = 1;
+
+    // highlight tapped wrong cell
+    if (phase === 'feedback' && idx === playerTapped && !feedbackCorrect) {
+      cx.strokeStyle = GOLD;
+      cx.lineWidth = 1.5;
+      cx.globalAlpha = 0.7;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(gx + 4, gy + 4, CELL_SIZE - 8, CELL_SIZE - 8, 8);
+      else cx.rect(gx + 4, gy + 4, CELL_SIZE - 8, CELL_SIZE - 8);
+      cx.stroke();
+      cx.globalAlpha = 1;
+    }
+
+    // highlight correct cell in feedback
+    if (phase === 'feedback' && idx === oddIdx) {
+      var pulse = feedbackCorrect ? 0.8 + 0.2 * Math.sin(now / 100) : 0.6;
+      cx.strokeStyle = feedbackCorrect ? TEAL : 'rgba(200,200,200,0.5)';
+      cx.lineWidth = 2;
+      cx.globalAlpha = pulse;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(gx + 4, gy + 4, CELL_SIZE - 8, CELL_SIZE - 8, 8);
+      else cx.rect(gx + 4, gy + 4, CELL_SIZE - 8, CELL_SIZE - 8);
+      cx.stroke();
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+
+    // shape
+    var shapeSize = 14;
+    cx.globalAlpha = 0.92;
+    drawShape(cell.shape, cx2, cy2, shapeSize, cell.color, cell.rotation, cell.count);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- Dim label for current rule ----
+  function dimLabel(r) {
+    if (r <= 2)  return 'find the shape that doesn\'t belong';
+    if (r <= 4)  return 'shape + colour';
+    if (r <= 6)  return 'shape · colour · count';
+    return               'shape · colour · count · angle';
+  }
+
+  // Progress ring for watch phase
+  function drawWatchRing(cx2, cy2, progress) {
+    cx.save();
+    cx.strokeStyle = 'rgba(46,197,182,0.18)';
+    cx.lineWidth = 3;
+    cx.beginPath(); cx.arc(cx2, cy2, 22, 0, Math.PI * 2); cx.stroke();
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 3;
+    cx.beginPath();
+    cx.arc(cx2, cy2, 22, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * progress);
+    cx.stroke();
+    cx.restore();
+  }
+
+  // ---- Main render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Autopilot (BOT or DEMO) drives progress
+    if (BOT || DEMO) {
+      if (phase === 'watch' || phase === 'pick' || phase === 'feedback') autopilot(now);
+    }
+
+    // Watch progress
+    if (phase === 'watch') {
+      watchProgress = Math.min(1, (now - phaseStart) / watchDuration);
+      if (!BOT && !DEMO && watchProgress >= 1) {
+        phase = 'pick';
+        phaseStart = now;
+      }
+    }
+
+    // Juice decay
+    if (hitStop > 0) hitStop -= dt; else {
+      // only update game logic outside hitstop — autopilot called above
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // Begin frame with save/transform/restore for juice
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(180,138,219,0.05)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ======= TITLE =======
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '800 38px -apple-system, Helvetica, Arial';
+      cx.fillText('ODD ONE DEEP', W / 2, 290);
+      cx.fillStyle = TEAL; cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('watch the grid. spot what breaks the rule.', W / 2, 330);
+      var pulse = 0.55 + 0.45 * Math.sin(now / 500);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = 'rgba(46,197,182,0.9)'; cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, 390);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.25)'; cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('10 rounds — the rule deepens each time', W / 2, 430);
+    }
+
+    // ======= WATCH / PICK / FEEDBACK =======
+    if (phase === 'watch' || phase === 'pick' || phase === 'feedback') {
+      // Round counter
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.28)'; cx.font = '600 12px Menlo, monospace';
+      cx.fillText('ROUND ' + round + ' / ' + totalRounds, W / 2, 58);
+
+      // Score
+      cx.fillStyle = 'rgba(255,255,255,0.82)'; cx.font = '800 44px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 108);
+
+      // Rule hint
+      cx.fillStyle = 'rgba(255,255,255,0.38)'; cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText(dimLabel(round), W / 2, 136);
+
+      // Phase label
+      if (phase === 'watch') {
+        cx.fillStyle = TEAL; cx.font = '600 13px -apple-system, Helvetica, Arial';
+        cx.fillText('STUDY THE PATTERN', W / 2, 172);
+      } else if (phase === 'pick') {
+        cx.fillStyle = GOLD; cx.font = '700 14px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP THE ODD ONE', W / 2, 172);
+      } else if (phase === 'feedback') {
+        cx.fillStyle = feedbackCorrect ? TEAL : GOLD;
+        cx.font = '700 14px -apple-system, Helvetica, Arial';
+        cx.fillText(feedbackCorrect ? '✓ CORRECT' : 'NOT QUITE', W / 2, 172);
+      }
+
+      // Grid
+      if (grid) {
+        for (var i = 0; i < 16; i++) {
+          var col = i % 4, row = Math.floor(i / 4);
+          drawCell(grid[i], col, row, phase, now);
+        }
+      }
+
+      // Watch ring (bottom center of grid)
+      if (phase === 'watch') {
+        var ringX = W / 2, ringY = GRID_TOP + CELL_SIZE * 4 + 34;
+        drawWatchRing(ringX, ringY, watchProgress);
+        cx.textAlign = 'center';
+        cx.fillStyle = 'rgba(46,197,182,0.6)';
+        cx.font = '500 10px Menlo, monospace';
+        cx.fillText('LOCK IN', W / 2, ringY + 6);
+      }
+
+      // Streak display
+      if (streak > 1) {
+        cx.textAlign = 'center';
+        cx.fillStyle = TEAL;
+        cx.font = '600 12px -apple-system, Helvetica, Arial';
+        cx.fillText('STREAK ×' + streak, W / 2, GRID_TOP + CELL_SIZE * 4 + 70);
+      }
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '700 12px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare, W / 2, GRID_TOP + CELL_SIZE * 4 + 90);
+      }
+    }
+
+    // ======= OVER =======
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '800 36px -apple-system, Helvetica, Arial';
+      cx.fillText('ALL 10 FOUND', W / 2, 296);
+      cx.fillStyle = TEAL; cx.font = '700 48px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 358);
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('pattern depth score', W / 2, 382);
+      if (!DEMO && !BOT) {
+        var p2 = 0.55 + 0.45 * Math.sin(now / 420);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — PLAY AGAIN', W / 2, 440);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 29);
+      }
+    }
+
+    // ======= CTA (demo only) =======
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.4);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.72 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '800 40px -apple-system, Helvetica, Arial';
+      cx.fillText('ODD ONE DEEP', W / 2, 298);
+      cx.fillStyle = 'rgba(255,255,255,0.65)'; cx.font = '500 17px -apple-system, Helvetica, Arial';
+      cx.fillText('can you find the outlier every time?', W / 2, 338);
+      var p3 = 0.65 + 0.35 * Math.sin(now / 340);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 402);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(46,197,182,0.55)'; cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 434);
+      cx.globalAlpha = 1;
+    }
+
+    // Floating flash texts
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 35);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 164 - fl.t * 1.1);
+      cx.globalAlpha = 1;
+      if (fl.t > 35) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- Init ----
+  phase = DEMO || BOT ? 'init' : 'title';
+  flashes = [];
+  botRunsDone = 0;
+
+  if (DEMO) {
+    // Demo starts directly with the game — no title
+    setTimeout(function () { startGame(); }, 200);
+  } else if (BOT) {
+    startGame();
+  }
+  // human: stays on title until tap
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

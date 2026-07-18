@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Breath Dial — Tilt</title>
+<!--
+  LOOP / attention-architecture — Breath Dial
+  Engine: calm. Circuits: 05-ease, 07-timing, 01-rpe.
+  Conditioned path: doomscrolling as nervous-system coping loop — chasing
+  the next card. The player's thumb knows this move already. The game IS that move.
+
+  Modes:
+    ?demo=1&seed=7        scripted ~16s calm arc → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'breath-dial';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // Seeded RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL2 = 'rgba(46,197,182,0.18)', TEAL3 = 'rgba(46,197,182,0.06)';
+
+  // --- Game constants ---
+  var CX = W / 2, CY = H / 2 - 20;  // center of dial
+  var DIAL_R = 110;         // outer handle radius
+  var CIRCLE_MIN = 48;      // minimum inner circle radius
+  var CIRCLE_MAX = 130;     // maximum inner circle radius
+  var TOTAL_CYCLES = 5;     // cycles to complete
+
+  // --- State ---
+  var phase;               // 'title' | 'play' | 'over' | 'cta'
+  var cycles;              // completed cycles
+  var breathPhase;         // 'inhale' | 'exhale'
+  var dialAngle;           // current handle angle (radians), 0 = top (12 o'clock)
+  var circleR;             // current inner circle radius
+  var prevAngle;           // previous frame angle (for drag delta)
+  var totalProgress;       // 0..1 within current half-cycle
+  var halfsDone;           // count of half-cycles done (2 per full cycle)
+  var runStartTs;
+  var overAt;
+  var ctaAt;
+
+  // Juice
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+
+  // Floating texts
+  var flashes = [];
+
+  // Bot / Demo state
+  var botRunsDone = 0;
+  var demoPhaseT = 0;  // elapsed time in demo
+
+  // Input state
+  var dragging = false;
+  var dragStartAngle = 0;
+  var lastInputAngle = 0;
+  var lastInputT = 0;   // timestamp of last drag event
+  var sessionDone = false;  // true once all 5 cycles are done (prevents double-fire)
+
+  // Mute region
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function newGame() {
+    phase = DEMO || BOT ? 'play' : 'title';
+    cycles = 0;
+    breathPhase = 'inhale';
+    dialAngle = -Math.PI / 2;  // start at 12 o'clock
+    prevAngle = dialAngle;
+    circleR = CIRCLE_MIN;
+    totalProgress = 0;
+    halfsDone = 0;
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    dragging = false;
+    sessionDone = false;
+
+    if (DEMO) {
+      demoPhaseT = 0;
+      // auto-start play
+      startRun();
+      return;
+    }
+    if (BOT) {
+      startRun();
+      return;
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function completeCycle() {
+    if (sessionDone) return;  // prevent double-fire
+    cycles++;
+    // Juice on each completion
+    if (window.J) J.calm(cycles);
+    hitStop = 30;  // brief pause to mark the moment
+    zoom = 1.025;
+    flash('BREATH ' + cycles, TEAL, 34);
+    if (window.LOOP) LOOP.emit('cycle_complete', { n: cycles });
+
+    if (cycles >= TOTAL_CYCLES) {
+      // Session ends
+      sessionDone = true;
+      setTimeout(function () { gameOver(); }, 500);
+    }
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 0;  // calm game — no death shake
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.calm(cycles);
+    if (DEMO) window.__demoScore = cycles;
+    if (window.LOOP) LOOP.emit('game_over', { score: cycles, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 1800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    cycles = 0;
+    breathPhase = 'inhale';
+    dialAngle = -Math.PI / 2;
+    prevAngle = dialAngle;
+    circleR = CIRCLE_MIN;
+    totalProgress = 0;
+    halfsDone = 0;
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    dragging = false;
+    demoPhaseT = 0;
+    demoScriptIdx = 0;
+    demoPrevT = 0;
+    sessionDone = false;
+    botResetState();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // --- Input: drag to rotate dial ---
+  function getAngleFromCenter(x, y) {
+    return Math.atan2(y - CY, x - CX);
+  }
+
+  function onPointerDown(ex, ey) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, ex, ey) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      resetRun();
+      return;
+    }
+    if (phase !== 'play') return;
+    // Check if within dial hit zone
+    var dx = ex - CX, dy = ey - CY;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > DIAL_R * 1.5) return;
+    dragging = true;
+    lastInputAngle = getAngleFromCenter(ex, ey);
+    lastInputT = performance.now();
+  }
+
+  function onPointerMove(ex, ey) {
+    if (DEMO || BOT || !dragging || phase !== 'play') return;
+    var a = getAngleFromCenter(ex, ey);
+    var da = angleDelta(lastInputAngle, a);
+    lastInputAngle = a;
+    lastInputT = performance.now();
+    applyDialDelta(da);
+  }
+
+  function onPointerUp() {
+    dragging = false;
+  }
+
+  // Normalized angle delta (handles wrap-around)
+  function angleDelta(from, to) {
+    var d = to - from;
+    while (d > Math.PI) d -= 2 * Math.PI;
+    while (d < -Math.PI) d += 2 * Math.PI;
+    return d;
+  }
+
+  function applyDialDelta(da) {
+    // Clockwise (positive da) = inhale, counter-clockwise (negative da) = exhale
+    // But we enforce breath direction: you can only rotate in the correct direction
+    var isClockwise = da > 0;
+    var isCounterClock = da < 0;
+
+    if (breathPhase === 'inhale' && isClockwise) {
+      dialAngle += da;
+      // Advance circle radius: full inhale = CW half-turn (PI radians)
+      totalProgress = Math.min(1, totalProgress + Math.abs(da) / Math.PI);
+      circleR = CIRCLE_MIN + (CIRCLE_MAX - CIRCLE_MIN) * totalProgress;
+      if (totalProgress >= 1) {
+        // Completed inhale — switch to exhale
+        halfsDone++;
+        breathPhase = 'exhale';
+        totalProgress = 0;
+        if (window.J) J.calm(halfsDone);
+      }
+    } else if (breathPhase === 'exhale' && isCounterClock) {
+      dialAngle += da;
+      totalProgress = Math.min(1, totalProgress + Math.abs(da) / Math.PI);
+      circleR = CIRCLE_MAX - (CIRCLE_MAX - CIRCLE_MIN) * totalProgress;
+      if (totalProgress >= 1) {
+        halfsDone++;
+        breathPhase = 'inhale';
+        totalProgress = 0;
+        circleR = CIRCLE_MIN;
+        // Full cycle complete
+        if (halfsDone % 2 === 0) {
+          completeCycle();
+        }
+      }
+    }
+    // Gentle resistance feedback (small zoom pulse)
+    zoom = Math.max(zoom, 1.005);
+  }
+
+  // Register pointer events
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    onPointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var r = cv.getBoundingClientRect();
+    onPointerMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', onPointerUp);
+  cv.addEventListener('pointercancel', onPointerUp);
+
+  // --- Demo autopilot ---
+  // Scripted calm arc: settle (slow start) → deepen (fuller cycles) → resolve → soft invitation
+  // We drive via demoPhaseT (elapsed seconds) with a pre-scripted sequence of
+  // dial increments: gentle CW half-turn (inhale) then CCW half-turn (exhale)
+  // repeated 5 times with humanizing hesitations.
+
+  // Demo timing (seconds): each element = [startT, endT, phase]
+  // 5 cycles @ ~2.8s each + pauses between = ~16s total
+  var DEMO_SCRIPT = [
+    // cycle 1: slow settle (long hesitation at start)
+    { startT: 1.0, endT: 2.8, dir: 'inhale' },
+    { startT: 3.2, endT: 4.6, dir: 'exhale' },
+    // cycle 2: deepen
+    { startT: 5.0, endT: 6.3, dir: 'inhale' },
+    { startT: 6.6, endT: 7.8, dir: 'exhale' },
+    // cycle 3
+    { startT: 8.1, endT: 9.3, dir: 'inhale' },
+    { startT: 9.6, endT: 10.7, dir: 'exhale' },
+    // cycle 4
+    { startT: 10.9, endT: 11.9, dir: 'inhale' },
+    { startT: 12.1, endT: 13.0, dir: 'exhale' },
+    // cycle 5: resolve
+    { startT: 13.2, endT: 14.1, dir: 'inhale' },
+    { startT: 14.3, endT: 15.2, dir: 'exhale' }
+  ];
+  var demoScriptIdx = 0;
+  var demoPrevT = 0;
+
+  function demoAutopilot(dt) {
+    if (phase !== 'play') return;
+    demoPhaseT += dt / 60;  // dt is frames at 60fps, convert to seconds
+
+    var seg = DEMO_SCRIPT[demoScriptIdx];
+    if (!seg) return;
+
+    var t = demoPhaseT;
+    if (t < seg.startT) return;  // waiting / hesitating
+    if (t > seg.endT) {
+      // Segment done — ensure progress fully completes
+      if (seg.dir === 'inhale' && breathPhase === 'inhale') {
+        var remaining = 1 - totalProgress;
+        if (remaining > 0) applyDialDelta(remaining * Math.PI);
+      } else if (seg.dir === 'exhale' && breathPhase === 'exhale') {
+        var remaining = 1 - totalProgress;
+        if (remaining > 0) applyDialDelta(-(remaining * Math.PI));
+      }
+      demoScriptIdx++;
+      return;
+    }
+
+    // Within segment: drive progress proportionally
+    var segFrac = (t - seg.startT) / (seg.endT - seg.startT);
+    var prevFrac = (demoPrevT - seg.startT) / (seg.endT - seg.startT);
+    if (prevFrac < 0) prevFrac = 0;
+    var delta = (segFrac - prevFrac) * Math.PI;
+    if (delta <= 0) { demoPrevT = t; return; }
+
+    if (seg.dir === 'inhale') {
+      applyDialDelta(delta);
+    } else {
+      applyDialDelta(-delta);
+    }
+    demoPrevT = t;
+  }
+
+  // --- Bot autopilot ---
+  // Imperfect: random variance in speed, drives 5 full cycles then stops
+  var BOT_CW_SPEED = 0.18;   // radians per frame (nominal) — fast enough for validation
+  var botCurrentDir = 1;     // 1 = CW (inhale), -1 = CCW (exhale)
+  var botCyclesDone = 0;
+
+  function botResetState() {
+    botCurrentDir = 1;
+    botCyclesDone = 0;
+  }
+
+  function botAutopilot(dt) {
+    if (phase !== 'play') return;
+    // Once 5 cycles done, let gameOver fire (it was triggered by completeCycle)
+    if (botCyclesDone >= TOTAL_CYCLES) return;
+
+    // Add imperfection via RNG
+    var speed = BOT_CW_SPEED * (0.75 + rng() * 0.5) * dt;
+    var da = botCurrentDir * speed;
+
+    applyDialDelta(da);
+
+    // Track when breathPhase flips to switch botCurrentDir
+    if (breathPhase === 'inhale' && botCurrentDir === -1) {
+      botCurrentDir = 1;  // flip to CW for inhale
+    } else if (breathPhase === 'exhale' && botCurrentDir === 1) {
+      botCurrentDir = -1; // flip to CCW for exhale
+    }
+
+    // Track bot's own cycle count for safety
+    if (cycles > botCyclesDone) {
+      botCyclesDone = cycles;
+    }
+  }
+
+  // --- Render ---
+  var last = performance.now();
+  var ctaAt = 0;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Autopilots
+    if (DEMO && phase === 'play') demoAutopilot(dt);
+    if (BOT && phase === 'play') botAutopilot(dt);
+
+    // HitStop + juice decay
+    if (hitStop > 0) {
+      hitStop -= dt;
+    }
+    zoom += (1 - zoom) * 0.10 * dt;
+    shakeAmt *= Math.pow(0.88, dt);
+
+    // --- Draw ---
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (rng() - 0.5) * shakeAmt * 2;
+      var sy = (rng() - 0.5) * shakeAmt * 2;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    // Subtle warm ambient glow that breathes with circleR
+    var glowAlpha = 0.03 + 0.05 * ((circleR - CIRCLE_MIN) / (CIRCLE_MAX - CIRCLE_MIN));
+    var bg = cx.createRadialGradient(CX, CY, 0, CX, CY, 280);
+    bg.addColorStop(0, 'rgba(46,197,182,' + glowAlpha.toFixed(3) + ')');
+    bg.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    if (phase === 'title') {
+      drawTitle(now);
+    } else if (phase === 'play' || phase === 'over') {
+      drawPlay(now);
+      drawUI(now);
+      if (phase === 'over') drawOver(now);
+    } else if (phase === 'cta') {
+      drawPlay(now);   // keep dial visible behind CTA
+      drawCtaCard(now);
+    }
+
+    // Floating texts
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 55);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, CY - 160 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 55) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL; cx.font = '300 13px -apple-system, Helvetica, Arial';
+    cx.fillText('BREATH DIAL', W / 2, 120);
+
+    // Draw idle dial
+    drawDial(now, true);
+
+    cx.fillStyle = '#fff'; cx.font = '800 36px -apple-system, Helvetica, Arial';
+    cx.fillText('slow down', W / 2, CY + 170);
+    cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '500 16px -apple-system, Helvetica, Arial';
+    cx.fillText('five slow breaths', W / 2, CY + 200);
+
+    var pulse = 0.5 + 0.5 * Math.sin(now / 700);
+    cx.globalAlpha = 0.55 + 0.25 * pulse;
+    cx.fillStyle = TEAL; cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('drag to breathe', W / 2, CY + 240);
+    cx.globalAlpha = 1;
+  }
+
+  function drawPlay(now) {
+    drawDial(now, false);
+  }
+
+  function drawDial(now, idle) {
+    var r = circleR;
+    if (idle) {
+      // Idle: gently pulse the circle
+      r = CIRCLE_MIN + 10 * (0.5 + 0.5 * Math.sin(now / 1200));
+    }
+
+    // Outer track ring
+    cx.beginPath();
+    cx.arc(CX, CY, DIAL_R, 0, 2 * Math.PI);
+    cx.strokeStyle = 'rgba(46,197,182,0.12)';
+    cx.lineWidth = 2;
+    cx.stroke();
+
+    // Progress arc (shows how far into current half-cycle)
+    if (!idle && phase === 'play') {
+      var startA = -Math.PI / 2;
+      var arcSpan = totalProgress * Math.PI;
+      var isInhale = breathPhase === 'inhale';
+      cx.beginPath();
+      if (isInhale) {
+        cx.arc(CX, CY, DIAL_R, startA + (halfsDone % 2 === 0 ? 0 : Math.PI),
+               startA + (halfsDone % 2 === 0 ? 0 : Math.PI) + arcSpan);
+      } else {
+        var exhaleStart = startA + Math.PI;
+        cx.arc(CX, CY, DIAL_R, exhaleStart, exhaleStart + arcSpan);
+      }
+      cx.strokeStyle = TEAL;
+      cx.lineWidth = 3;
+      cx.stroke();
+    }
+
+    // Cycle dots around outer ring
+    if (!idle) {
+      for (var i = 0; i < TOTAL_CYCLES; i++) {
+        var dotAngle = -Math.PI / 2 + (i / TOTAL_CYCLES) * 2 * Math.PI;
+        var dx = CX + Math.cos(dotAngle) * (DIAL_R + 14);
+        var dy = CY + Math.sin(dotAngle) * (DIAL_R + 14);
+        cx.beginPath();
+        cx.arc(dx, dy, 4, 0, 2 * Math.PI);
+        cx.fillStyle = i < cycles ? TEAL : 'rgba(46,197,182,0.25)';
+        cx.fill();
+      }
+    }
+
+    // Inner expanding/contracting circle (the breath circle)
+    // Outer glow layers
+    var glowLayers = [
+      { r: r + 22, a: 0.04 },
+      { r: r + 12, a: 0.08 },
+      { r: r + 5,  a: 0.15 }
+    ];
+    for (var gi = 0; gi < glowLayers.length; gi++) {
+      var gl = glowLayers[gi];
+      cx.beginPath();
+      cx.arc(CX, CY, gl.r, 0, 2 * Math.PI);
+      cx.strokeStyle = 'rgba(46,197,182,' + gl.a + ')';
+      cx.lineWidth = 2;
+      cx.stroke();
+    }
+
+    // Fill circle with radial gradient
+    var grad = cx.createRadialGradient(CX, CY, r * 0.1, CX, CY, r);
+    var breathT = (r - CIRCLE_MIN) / (CIRCLE_MAX - CIRCLE_MIN);
+    // Color shifts from soft teal (contracted) to deeper teal (expanded)
+    var inner = 'rgba(46,197,182,' + (0.22 + breathT * 0.14) + ')';
+    var outer = 'rgba(30,140,130,' + (0.08 + breathT * 0.06) + ')';
+    grad.addColorStop(0, inner);
+    grad.addColorStop(1, outer);
+    cx.beginPath();
+    cx.arc(CX, CY, r, 0, 2 * Math.PI);
+    cx.fillStyle = grad;
+    cx.fill();
+
+    // Circle border
+    cx.beginPath();
+    cx.arc(CX, CY, r, 0, 2 * Math.PI);
+    cx.strokeStyle = 'rgba(46,197,182,' + (0.45 + breathT * 0.35) + ')';
+    cx.lineWidth = 2;
+    cx.stroke();
+
+    // Dial handle (dot on the outer ring at dialAngle)
+    if (!idle) {
+      var hx = CX + Math.cos(dialAngle) * DIAL_R;
+      var hy = CY + Math.sin(dialAngle) * DIAL_R;
+      // Handle glow
+      cx.beginPath();
+      cx.arc(hx, hy, 14, 0, 2 * Math.PI);
+      cx.fillStyle = 'rgba(46,197,182,0.18)';
+      cx.fill();
+      // Handle dot
+      cx.beginPath();
+      cx.arc(hx, hy, 8, 0, 2 * Math.PI);
+      cx.fillStyle = TEAL;
+      cx.fill();
+      cx.beginPath();
+      cx.arc(hx, hy, 8, 0, 2 * Math.PI);
+      cx.strokeStyle = 'rgba(255,255,255,0.35)';
+      cx.lineWidth = 1.5;
+      cx.stroke();
+    }
+
+    // Center text: breath cue
+    if (phase === 'play' && !idle) {
+      var cueText = breathPhase === 'inhale' ? 'inhale' : 'exhale';
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(46,197,182,' + (0.55 + breathT * 0.35) + ')';
+      cx.font = '300 16px -apple-system, Helvetica, Arial';
+      cx.fillText(cueText, CX, CY + 6);
+    } else if (idle) {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(46,197,182,0.4)';
+      cx.font = '300 14px -apple-system, Helvetica, Arial';
+      cx.fillText('breathe', CX, CY + 6);
+    }
+  }
+
+  function drawUI(now) {
+    // Cycle count top
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.65)';
+    cx.font = '700 56px -apple-system, Helvetica, Arial';
+    cx.fillText(cycles, W / 2, 100);
+    cx.fillStyle = 'rgba(255,255,255,0.28)';
+    cx.font = '500 12px -apple-system, Helvetica, Arial';
+    cx.fillText('of ' + TOTAL_CYCLES + ' breaths', W / 2, 122);
+
+    // Direction hint below dial
+    if (phase === 'play') {
+      var arrowText = breathPhase === 'inhale' ? '↻ clockwise' : '↺ counter-clockwise';
+      var alphaPulse = 0.28 + 0.18 * Math.sin(now / 900);
+      cx.fillStyle = 'rgba(46,197,182,' + alphaPulse.toFixed(3) + ')';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText(arrowText, W / 2, CY + 155);
+    }
+  }
+
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL; cx.font = '700 38px -apple-system, Helvetica, Arial';
+    cx.fillText('still.', W / 2, 300);
+    cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '600 18px -apple-system, Helvetica, Arial';
+    cx.fillText('five breaths complete', W / 2, 340);
+    cx.fillStyle = 'rgba(46,197,182,0.5)'; cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText('notice the quiet', W / 2, 370);
+    if (!DEMO && !BOT) {
+      var p = 0.55 + 0.3 * Math.sin(now / 600);
+      cx.globalAlpha = p;
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to go again', W / 2, 430);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawCtaCard(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2.0);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease).toFixed(3) + ')'; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease; cx.textAlign = 'center';
+    cx.fillStyle = TEAL; cx.font = '300 13px -apple-system, Helvetica, Arial';
+    cx.fillText('BREATH DIAL', W / 2, 280);
+    cx.fillStyle = '#fff'; cx.font = '700 32px -apple-system, Helvetica, Arial';
+    cx.fillText('five slow breaths.', W / 2, 330);
+    cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '400 17px -apple-system, Helvetica, Arial';
+    cx.fillText('your nervous system will thank you.', W / 2, 368);
+    var p2 = 0.75 + 0.25 * Math.sin(now / 500);
+    cx.fillStyle = TEAL; cx.globalAlpha = ease * p2;
+    cx.font = '700 20px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 430);
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '500 13px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 460);
+    cx.globalAlpha = 1;
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

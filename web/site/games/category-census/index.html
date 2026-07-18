@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Category Census — Tilt</title>
+<!--
+  LOOP / attention-architecture — Category Census
+  Circuits: 06-zeigarnik, 05-ease, 01-rpe
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s -> soft CTA card -> window.__demoDone=true
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone=true
+-->
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#0b0d12;overflow:hidden;
+            -webkit-user-select:none;user-select:none;touch-action:manipulation;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{display:block;background:#0b0d12;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'category-census';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function(){
+'use strict';
+var W=405, H=720;
+var qs=new URLSearchParams(location.search);
+var DEMO=qs.get('demo')==='1';
+var BOT =qs.get('bot')==='1';
+var BOT_RUNS=+qs.get('runs')||3;
+var SEED=+qs.get('seed')||42;
+
+// mulberry32
+function mulberry32(a){
+  return function(){
+    a|=0; a=a+0x6D2B79F5|0;
+    var t=Math.imul(a^a>>>15,1|a);
+    t=t+Math.imul(t^t>>>7,61|t)^t;
+    return((t^t>>>14)>>>0)/4294967296;
+  };
+}
+var rng=mulberry32(SEED);
+function rInt(n){return Math.floor(rng()*n);}
+
+var cv=document.getElementById('c'), cx=cv.getContext('2d');
+var dpr=Math.min(window.devicePixelRatio||1,2), scale=1;
+function fit(){
+  var vw=window.innerWidth, vh=window.innerHeight;
+  scale=Math.min(vw/W,vh/H);
+  cv.style.width=(W*scale)+'px'; cv.style.height=(H*scale)+'px';
+  cv.width=W*dpr; cv.height=H*dpr;
+  cx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener('resize',fit); fit();
+
+var TEAL='#2ec5b6', GOLD='#f2b134', INK='#0b0d12';
+
+// 4 bins
+var BINS=[
+  {label:'FICTION',   color:'#2ec5b6'},
+  {label:'NON-FICTION',color:'#f2b134'},
+  {label:'REFERENCE', color:'#8b7cf8'},
+  {label:'HYBRID',    color:'#e88c2e'}
+];
+
+// 30 items — correctBin index; edge=true = surprise edge case
+var ITEM_LIST=[
+  {text:'A Novel',            correctBin:0},           // 0
+  {text:'Encyclopedia',       correctBin:2},           // 1
+  {text:'Auto-biography',     correctBin:1},           // 2
+  {text:'Graphic Novel',      correctBin:0},           // 3
+  {text:'Atlas',              correctBin:2},           // 4
+  {text:'Essay Collection',   correctBin:1},           // 5
+  {text:'Memoir',             correctBin:1},           // 6
+  {text:'Almanac',            correctBin:2},           // 7
+  {text:'Fable',              correctBin:0},           // 8
+  {text:'True Crime',         correctBin:1},           // 9
+  {text:'Docufiction',        correctBin:3,edge:true}, // 10
+  {text:'Thesaurus',          correctBin:2},           // 11
+  {text:'Short Stories',      correctBin:0},           // 12
+  {text:'Biography',          correctBin:1},           // 13
+  {text:'Manual',             correctBin:2},           // 14
+  {text:'Creative Nonfic.',   correctBin:3,edge:true}, // 15
+  {text:'Poetry',             correctBin:0},           // 16
+  {text:'Self-Help',          correctBin:1},           // 17
+  {text:'Dictionary',         correctBin:2},           // 18
+  {text:'Faction',            correctBin:3,edge:true}, // 19
+  {text:'Fantasy',            correctBin:0},           // 20
+  {text:'Travel Guide',       correctBin:2},           // 21
+  {text:'Historical Novel',   correctBin:0},           // 22
+  {text:'Narrative Science',  correctBin:3,edge:true}, // 23
+  {text:'Play (Drama)',       correctBin:0},           // 24
+  {text:'Textbook',           correctBin:2},           // 25
+  {text:'Literary Journalism',correctBin:3,edge:true}, // 26
+  {text:'Satire',             correctBin:0},           // 27
+  {text:'Cookbook',           correctBin:1},           // 28
+  {text:'Auto-fiction',       correctBin:3,edge:true}  // 29
+];
+
+// demo: each step = {itemIdx, bin}
+// shock-honesty arc: wrong-bin on edge cases, then correct reveal
+var DEMO_SCRIPT=[
+  {i:0,  bin:0},   // correct — A Novel
+  {i:1,  bin:2},   // correct — Encyclopedia
+  {i:2,  bin:1},   // correct — Auto-biography
+  {i:3,  bin:0},   // correct — Graphic Novel
+  {i:10, bin:0},   // WRONG  — Docufiction tapped Fiction (instinct)
+  {i:10, bin:3},   // correct — oh, it's Hybrid (shock reveal)
+  {i:15, bin:1},   // WRONG  — Creative Nonfic. tapped Non-Fiction
+  {i:15, bin:3},   // correct — actually Hybrid
+  {i:4,  bin:2},   // correct
+  {i:11, bin:2},   // correct
+  {i:6,  bin:1},   // correct
+  {i:19, bin:0},   // WRONG  — Faction looks like Fiction
+  {i:19, bin:3},   // correct — Hybrid
+  {i:8,  bin:0},   // correct
+  {i:5,  bin:1},   // correct
+  {i:12, bin:0}    // correct — last item before CTA
+];
+var DEMO_WAITS=[55,48,42,40,65,52,62,50,38,36,40,58,46,36,40,44];
+
+// bin layout
+var BIN_Y=560, BIN_H=110, BIN_W=88;
+var BIN_XS=[14,111,208,305];
+var ITEM_W=186, ITEM_H=46;
+var ITEM_REST_Y=340, ITEM_START_Y=60;
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+var phase, itemQueue, current, score, errors;
+var runStartTs, flashes, shakeAmt, hitStop, zoom;
+var itemY=ITEM_START_Y;
+var binCounts=[0,0,0,0];
+
+// drop animation
+var drop={active:false,item:null,fromX:0,fromY:0,toX:0,toY:0,bin:-1,ok:false,t:0,dur:22};
+// bounce-back animation
+var bnc={active:false,item:null,fromX:0,fromY:0,toX:0,toY:0,t:0,dur:20};
+
+// demo
+var demoIdx=0, demoWait=55;
+// bot
+var botRunsDone=0, botActed=0, BOT_K=22;
+
+// ─── INIT ─────────────────────────────────────────────────────────────────────
+function newGame(){
+  phase='title';
+  score=0; errors=0;
+  flashes=[]; shakeAmt=0; hitStop=0; zoom=1;
+  drop.active=false; bnc.active=false;
+  binCounts=[0,0,0,0];
+  current=null; itemY=ITEM_START_Y;
+  runStartTs=Date.now();
+
+  // build shuffled queue
+  itemQueue=ITEM_LIST.slice();
+  for(var i=itemQueue.length-1;i>0;i--){
+    var j=rInt(i+1); var t=itemQueue[i]; itemQueue[i]=itemQueue[j]; itemQueue[j]=t;
+  }
+
+  if(DEMO){
+    demoIdx=0; demoWait=DEMO_WAITS[0];
+    phase='play';
+    loadDemoItem();
+    if(window.LOOP) LOOP.emit('play_start',{seed:SEED});
+    return;
+  }
+  if(BOT){
+    botActed=0;
+    phase='play';
+    loadNextItem();
+    if(window.LOOP) LOOP.emit('play_start',{seed:SEED});
+    return;
+  }
+}
+
+function loadNextItem(){
+  if(score+errors>=30){ doGameOver(); return; }
+  if(!itemQueue.length){ doGameOver(); return; }
+  current=itemQueue.shift();
+  itemY=ITEM_START_Y;
+}
+
+// demo: pull item by index from ITEM_LIST, bypass queue
+function loadDemoItem(){
+  if(demoIdx>=DEMO_SCRIPT.length){
+    // all demo steps done -> CTA after short pause
+    setTimeout(startCTA, 600);
+    return;
+  }
+  current=ITEM_LIST[DEMO_SCRIPT[demoIdx].i];
+  itemY=ITEM_START_Y;
+}
+
+function startCTA(){
+  window.__demoScore=score;
+  if(window.LOOP) LOOP.emit('game_over',{score:score,dur_s:+((Date.now()-runStartTs)/1000).toFixed(1)});
+  phase='cta';
+  ctaAt=performance.now();
+  setTimeout(function(){window.__demoDone=true;},3500);
+}
+
+function doGameOver(){
+  phase='over';
+  var dur=(Date.now()-runStartTs)/1000;
+  if(window.LOOP) LOOP.emit('game_over',{score:score,dur_s:+dur.toFixed(1)});
+  if(BOT){
+    botRunsDone++;
+    if(botRunsDone>=BOT_RUNS){ window.__botDone=true; }
+    else setTimeout(newGame,600);
+  }
+}
+
+// ─── PLACE ────────────────────────────────────────────────────────────────────
+function placeToBin(binIdx){
+  if(!current||drop.active||bnc.active) return;
+  var ok=(binIdx===current.correctBin);
+  drop.active=true;
+  drop.item=current; current=null;
+  drop.fromX=W/2; drop.fromY=ITEM_REST_Y;
+  drop.toX=BIN_XS[binIdx]+BIN_W/2;
+  drop.toY=BIN_Y+BIN_H/2-8;
+  drop.bin=binIdx; drop.ok=ok; drop.t=0;
+}
+
+function onDropLand(){
+  drop.active=false;
+  var item=drop.item;
+  var binIdx=drop.bin;
+
+  if(drop.ok){
+    binCounts[binIdx]++;
+    score++;
+    if(window.J) J.calm(score);
+    hitStop=3; zoom=1.015;
+    flash(item.edge?'EDGE CASE ✓':'SORTED', item.edge?'#e88c2e':TEAL, item.edge?38:30);
+    if(item.edge) shakeAmt=2;
+    if(window.LOOP) LOOP.emit('item_sorted',{item:item.text,bin:BINS[binIdx].label,correct:true,edge:!!item.edge});
+    afterPlace(true, item);
+  } else {
+    errors++;
+    shakeAmt=3;
+    flash('WRONG BIN','#e06040',28);
+    if(window.LOOP) LOOP.emit('item_sorted',{item:item.text,bin:BINS[binIdx].label,correct:false,edge:!!item.edge});
+    // bounce back to centre
+    bnc.active=true; bnc.item=item;
+    bnc.fromX=drop.toX; bnc.fromY=drop.toY;
+    bnc.toX=W/2; bnc.toY=ITEM_REST_Y;
+    bnc.t=0;
+    // in demo mode: advance demoIdx NOW so next step corrects it
+    if(DEMO){
+      demoIdx++;
+      demoWait=DEMO_WAITS[Math.min(demoIdx,DEMO_WAITS.length-1)];
+    }
+  }
+}
+
+// called after a correct placement (or after bounce end in non-demo)
+function afterPlace(correct, item){
+  if(DEMO){
+    demoIdx++;
+    demoWait=DEMO_WAITS[Math.min(demoIdx,DEMO_WAITS.length-1)];
+    loadDemoItem();
+  } else {
+    if(score+errors>=30){ setTimeout(doGameOver,400); return; }
+    loadNextItem();
+  }
+}
+
+function onBounceEnd(){
+  bnc.active=false;
+  var item=bnc.item;
+  if(DEMO){
+    // demo: restore the bounced item as current so next demoIdx step can re-place it
+    current=item; itemY=ITEM_REST_Y;
+    // demoIdx was already incremented in onDropLand (wrong branch)
+    // demoWait was also set there
+  } else {
+    // push back, reload from queue
+    itemQueue.unshift(item);
+    loadNextItem();
+  }
+}
+
+// ─── INPUT ────────────────────────────────────────────────────────────────────
+var MUTE_R={x:W-46,y:10,w:38,h:38};
+function inR(r,x,y){return x>=r.x&&x<=r.x+r.w&&y>=r.y&&y<=r.y+r.h;}
+
+function tap(px,py){
+  if(DEMO||BOT) return;
+  if(px!==undefined&&inR(MUTE_R,px,py)&&window.J){J.toggleMute();return;}
+  if(phase==='title'){
+    phase='play';
+    loadNextItem();
+    if(window.LOOP) LOOP.emit('play_start',{seed:SEED});
+    return;
+  }
+  if(phase==='play'&&current&&!drop.active&&!bnc.active){
+    // hit on bin areas (generously expanded hit zone)
+    for(var b=0;b<4;b++){
+      if(px>=BIN_XS[b]-4&&px<=BIN_XS[b]+BIN_W+4&&py>=BIN_Y-40&&py<=BIN_Y+BIN_H){
+        placeToBin(b); return;
+      }
+    }
+  }
+  if(phase==='over'){
+    if(window.LOOP) LOOP.emit('restart',{});
+    newGame();
+  }
+}
+
+window.addEventListener('pointerdown',function(e){
+  var r=cv.getBoundingClientRect();
+  tap((e.clientX-r.left)/scale,(e.clientY-r.top)/scale);
+});
+
+// ─── AUTOPILOTS ───────────────────────────────────────────────────────────────
+function autopilotDemo(){
+  if(!current||drop.active||bnc.active) return;
+  if(demoWait>0){demoWait--;return;}
+  if(demoIdx>=DEMO_SCRIPT.length) return;
+  var s=DEMO_SCRIPT[demoIdx];
+  placeToBin(s.bin);
+}
+
+function autopilotBot(){
+  if(!current||drop.active||bnc.active) return;
+  if(botActed>=BOT_K){
+    // passive: place wrong to drain faster and hit game_over
+    var wrong=(current.correctBin+1)%4;
+    placeToBin(wrong);
+    return;
+  }
+  // 80% correct, 20% wrong
+  var ok=rng()<0.80;
+  var bin=ok?current.correctBin:((current.correctBin+1+rInt(3))%4);
+  placeToBin(bin);
+  if(ok) botActed++;
+}
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+function flash(txt,color,size){flashes.push({txt:txt,color:color,size:size,t:0});}
+
+function roundRect(x,y,w,h,r){
+  if(cx.roundRect){cx.roundRect(x,y,w,h,r);return;}
+  cx.moveTo(x+r,y);
+  cx.lineTo(x+w-r,y);cx.quadraticCurveTo(x+w,y,x+w,y+r);
+  cx.lineTo(x+w,y+h-r);cx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+  cx.lineTo(x+r,y+h);cx.quadraticCurveTo(x,y+h,x,y+h-r);
+  cx.lineTo(x,y+r);cx.quadraticCurveTo(x,y,x+r,y);
+  cx.closePath();
+}
+
+function drawBin(idx, lit){
+  var x=BIN_XS[idx], y=BIN_Y, w=BIN_W, h=BIN_H;
+  var col=BINS[idx].color;
+  cx.beginPath(); roundRect(x,y,w,h,10);
+  cx.fillStyle=lit?col+'44':'rgba(255,255,255,0.05)';
+  cx.fill();
+  cx.strokeStyle=lit?col:col+'88';
+  cx.lineWidth=lit?2:1.5;
+  cx.stroke();
+
+  cx.textAlign='center';
+  var lbl=BINS[idx].label;
+  cx.fillStyle=lit?col:col+'cc';
+  if(lbl==='NON-FICTION'){
+    cx.font='700 8px -apple-system,Helvetica,Arial';
+    cx.fillText('NON-',x+w/2,y+30);
+    cx.fillText('FICTION',x+w/2,y+42);
+  } else {
+    cx.font='700 9px -apple-system,Helvetica,Arial';
+    cx.fillText(lbl,x+w/2,y+36);
+  }
+  cx.fillStyle='rgba(255,255,255,0.28)';
+  cx.font='600 10px Menlo,monospace';
+  cx.fillText(binCounts[idx],x+w/2,y+h-14);
+}
+
+function drawItemCard(cx2,x,y,w,h,text,alpha,col,glow){
+  cx2.save();
+  cx2.globalAlpha=alpha!==undefined?alpha:1;
+  cx2.beginPath(); roundRect(x-w/2,y-h/2,w,h,10);
+  if(glow){cx2.shadowColor=col;cx2.shadowBlur=20;}
+  cx2.fillStyle=col?col+'28':'rgba(46,197,182,0.14)';
+  cx2.fill();
+  cx2.shadowBlur=0;
+  cx2.strokeStyle=col?col:'#2ec5b6';
+  cx2.lineWidth=1.8; cx2.stroke();
+  cx2.fillStyle='#fff';
+  cx2.font='700 14px -apple-system,Helvetica,Arial';
+  cx2.textAlign='center';
+  cx2.fillText(text,x,y+5);
+  cx2.restore();
+}
+
+// ─── RENDER ───────────────────────────────────────────────────────────────────
+var ctaAt=0, last=performance.now();
+
+function frame(now){
+  requestAnimationFrame(frame);
+  var dt=Math.min((now-last)/16.667,3); last=now;
+
+  // hit-stop gate then advance sim
+  if(hitStop>0){
+    hitStop-=dt;
+  } else {
+    // drop animation
+    if(drop.active){
+      drop.t+=dt;
+      if(drop.t>=drop.dur) onDropLand();
+    }
+    // bounce animation
+    if(bnc.active){
+      bnc.t+=dt;
+      if(bnc.t>=bnc.dur) onBounceEnd();
+    }
+    // item entrance
+    if(phase==='play'&&current&&!drop.active&&!bnc.active){
+      if(itemY<ITEM_REST_Y){
+        itemY+=(ITEM_REST_Y-itemY)*0.18*dt+2*dt;
+        if(itemY>ITEM_REST_Y) itemY=ITEM_REST_Y;
+      }
+      if(DEMO) autopilotDemo();
+      else if(BOT) autopilotBot();
+    }
+  }
+
+  // ── draw ──
+  cx.save();
+  if(shakeAmt>0.2||zoom>1.001){
+    var sx=(Math.random()-0.5)*shakeAmt, sy=(Math.random()-0.5)*shakeAmt;
+    cx.translate(W/2+sx,H/2+sy); cx.scale(zoom,zoom); cx.translate(-W/2,-H/2);
+  }
+  shakeAmt*=Math.pow(0.82,dt); zoom+=(1-zoom)*0.10*dt;
+
+  cx.fillStyle=INK; cx.fillRect(-20,-20,W+40,H+40);
+  var bg=cx.createLinearGradient(0,0,0,H);
+  bg.addColorStop(0,'rgba(46,197,182,0.04)');
+  bg.addColorStop(1,'rgba(139,124,248,0.05)');
+  cx.fillStyle=bg; cx.fillRect(0,0,W,H);
+
+  // TITLE
+  if(phase==='title'){
+    cx.textAlign='center';
+    cx.fillStyle='#fff'; cx.font='900 34px -apple-system,Helvetica,Arial';
+    cx.fillText('CATEGORY CENSUS',W/2,270);
+    cx.fillStyle=TEAL; cx.font='600 14px -apple-system,Helvetica,Arial';
+    cx.fillText('Sort 30 items into the right bin.',W/2,306);
+    cx.fillStyle='rgba(255,255,255,0.35)'; cx.font='600 12px -apple-system,Helvetica,Arial';
+    cx.fillText('the edge cases will surprise you',W/2,328);
+    var p=0.5+0.5*Math.sin(now/400);
+    cx.globalAlpha=p; cx.fillStyle=TEAL; cx.font='700 16px -apple-system,Helvetica,Arial';
+    cx.fillText('TAP A BIN TO BEGIN',W/2,376); cx.globalAlpha=1;
+    for(var bi=0;bi<4;bi++) drawBin(bi,false);
+  }
+
+  // PLAY
+  if(phase==='play'){
+    // progress bar
+    cx.fillStyle='rgba(255,255,255,0.07)'; cx.fillRect(20,50,W-40,3);
+    var done=score+errors;
+    cx.fillStyle=TEAL; cx.fillRect(20,50,(W-40)*(done/30),3);
+
+    // score display
+    cx.textAlign='center';
+    cx.fillStyle='rgba(255,255,255,0.88)'; cx.font='800 48px -apple-system,Helvetica,Arial';
+    cx.fillText(score,W/2,36);
+    cx.fillStyle='rgba(255,255,255,0.28)'; cx.font='600 10px -apple-system,Helvetica,Arial';
+    cx.fillText(done+' / 30    '+errors+' missed',W/2,22);
+
+    // bins
+    for(var b=0;b<4;b++) drawBin(b, drop.active&&drop.bin===b&&drop.ok);
+
+    // falling drop animation
+    if(drop.active){
+      var p2=Math.min(drop.t/drop.dur,1);
+      var ep=1-Math.pow(1-p2,2);
+      var dx=drop.fromX+(drop.toX-drop.fromX)*ep;
+      var dy=drop.fromY+(drop.toY-drop.fromY)*ep;
+      var dcol=drop.ok?TEAL:'#e06040';
+      drawItemCard(cx,dx,dy,ITEM_W,ITEM_H,drop.item.text,0.88,dcol,true);
+    }
+
+    // bounce-back animation
+    if(bnc.active){
+      var p3=Math.min(bnc.t/bnc.dur,1);
+      var ep2=p3;
+      var arc=Math.sin(p3*Math.PI)*50;
+      var bx=bnc.fromX+(bnc.toX-bnc.fromX)*ep2;
+      var by=bnc.fromY+(bnc.toY-bnc.fromY)*ep2-arc;
+      drawItemCard(cx,bx,by,ITEM_W,ITEM_H,bnc.item.text,0.75,'#e06040',false);
+    }
+
+    // current item at rest
+    if(current&&!drop.active&&!bnc.active){
+      var gp=0.82+0.18*Math.sin(now/520);
+      drawItemCard(cx,W/2,itemY,ITEM_W,ITEM_H,current.text,gp,TEAL,false);
+      if(itemY>=ITEM_REST_Y-4){
+        cx.textAlign='center'; cx.fillStyle='rgba(255,255,255,0.2)';
+        cx.font='600 11px -apple-system,Helvetica,Arial';
+        cx.fillText('v  tap a bin  v',W/2,itemY+ITEM_H/2+22);
+      }
+    }
+  }
+
+  // GAME OVER (human/bot)
+  if(phase==='over'){
+    cx.fillStyle='rgba(11,13,18,0.65)'; cx.fillRect(0,0,W,H);
+    cx.textAlign='center';
+    cx.fillStyle='#fff'; cx.font='900 32px -apple-system,Helvetica,Arial';
+    cx.fillText('CENSUS COMPLETE',W/2,268);
+    cx.fillStyle=TEAL; cx.font='800 56px -apple-system,Helvetica,Arial';
+    cx.fillText(score+' / 30',W/2,342);
+    cx.fillStyle=GOLD; cx.font='700 16px -apple-system,Helvetica,Arial';
+    cx.fillText(errors+' edge case'+(errors!==1?'s':'')+' missed',W/2,378);
+    cx.fillStyle='rgba(255,255,255,0.38)'; cx.font='600 11px -apple-system,Helvetica,Arial';
+    cx.fillText('every label hides an edge',W/2,402);
+    if(!DEMO&&!BOT){
+      var p4=0.5+0.5*Math.sin(now/380);
+      cx.globalAlpha=p4; cx.fillStyle=TEAL; cx.font='700 16px -apple-system,Helvetica,Arial';
+      cx.fillText('TAP — SORT AGAIN',W/2,460); cx.globalAlpha=1;
+    }
+  }
+
+  // DEMO CTA
+  if(phase==='cta'){
+    var t2=(now-ctaAt)/1000, ease=Math.min(1,t2*2.5);
+    cx.fillStyle='rgba(11,13,18,'+(0.82*ease)+')'; cx.fillRect(0,0,W,H);
+    cx.globalAlpha=ease; cx.textAlign='center';
+    cx.fillStyle='#fff'; cx.font='900 32px -apple-system,Helvetica,Arial';
+    cx.fillText('CATEGORY CENSUS',W/2,282);
+    cx.fillStyle='rgba(255,255,255,0.6)'; cx.font='600 14px -apple-system,Helvetica,Arial';
+    cx.fillText('how many edge cases can you sort?',W/2,312);
+    var p5=0.65+0.35*Math.sin(now/300);
+    cx.globalAlpha=ease*p5;
+    cx.fillStyle=TEAL; cx.font='900 30px -apple-system,Helvetica,Arial';
+    cx.fillText('► REACH IT',W/2,388);
+    cx.globalAlpha=ease;
+    cx.fillStyle='rgba(255,255,255,0.38)'; cx.font='600 13px -apple-system,Helvetica,Arial';
+    cx.fillText('link in bio',W/2,420);
+    cx.globalAlpha=1;
+  }
+
+  // flashes
+  for(var k=flashes.length-1;k>=0;k--){
+    var fl=flashes[k]; fl.t+=dt;
+    var fa=Math.max(0,1-fl.t/36);
+    cx.globalAlpha=fa; cx.textAlign='center';
+    cx.fillStyle=fl.color;
+    cx.font='900'+(fl.size+fl.t*0.35)+'px -apple-system,Helvetica,Arial';
+    cx.fillText(fl.txt,W/2,230-fl.t*0.65);
+    cx.globalAlpha=1;
+    if(fl.t>36) flashes.splice(k,1);
+  }
+
+  // mute toggle (human only)
+  if(!DEMO&&!BOT&&window.J){
+    cx.textAlign='center'; cx.globalAlpha=0.42;
+    cx.font='16px -apple-system,Helvetica,Arial'; cx.fillStyle='#fff';
+    cx.fillText(J.muted?'🔇':'🔊',MUTE_R.x+MUTE_R.w/2,MUTE_R.y+26);
+    cx.globalAlpha=1;
+  }
+
+  cx.restore();
+}
+
+newGame();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

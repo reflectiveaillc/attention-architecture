@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Order Restore — Tilt</title>
+<!--
+  LOOP / attention-architecture — Order Restore
+  Circuits: 05-ease, 06-zeigarnik, 08-investment.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'order-restore';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // Grid layout: 3x3
+  var N = 3;
+  var CELL = 98, GAP = 10;
+  var GRID_W = N * CELL + (N - 1) * GAP;
+  var GRID_X = (W - GRID_W) / 2;
+  var GRID_Y = 195;
+
+  // Data model:
+  // grid[cellIdx] = tileVal (0..8), where correct state is grid[i] === i
+  // Each tile has visual position {x, y} that lerps toward its cell's pixel position
+  var grid;           // grid[cellIdx] = tileVal
+  var tilePos;        // tilePos[tileVal] = {x, y}  (current visual position)
+  var dragging;       // { tileVal, offX, offY, x, y } or null
+  var phase;          // 'title' | 'play' | 'ready' | 'over' | 'cta'
+  var runStartTs, moveCount, botRunsDone;
+  var shimmerT = 0, shimmerActive = false;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  var overAt = 0, ctaAt = 0;
+  var demoScore = 0;
+
+  // Bot state
+  var botMoves, botMoveIdx, botWaitFrames;
+  // Demo state
+  var demoMoves, demoMoveIdx, demoNextAt;
+
+  function cellXY(idx) {
+    var col = idx % N, row = Math.floor(idx / N);
+    return { x: GRID_X + col * (CELL + GAP), y: GRID_Y + row * (CELL + GAP) };
+  }
+
+  function tileVal2Cell(val) {
+    for (var i = 0; i < grid.length; i++) { if (grid[i] === val) return i; }
+    return -1;
+  }
+
+  function isOrdered() {
+    for (var i = 0; i < grid.length; i++) { if (grid[i] !== i) return false; }
+    return true;
+  }
+
+  // Build a sorted move sequence using selection sort (returns array of [fromCell, toCell])
+  function buildSolveMoves(initGrid) {
+    var g = initGrid.slice();
+    var moves = [];
+    for (var target = 0; target < g.length; target++) {
+      if (g[target] === target) continue;
+      var found = -1;
+      for (var j = target + 1; j < g.length; j++) {
+        if (g[j] === target) { found = j; break; }
+      }
+      if (found >= 0) {
+        moves.push([found, target]);
+        var tmp = g[found]; g[found] = g[target]; g[target] = tmp;
+      }
+    }
+    return moves;
+  }
+
+  function shuffleGrid() {
+    var arr = [];
+    for (var i = 0; i < N * N; i++) arr.push(i);
+    for (var j = arr.length - 1; j > 0; j--) {
+      var k = Math.floor(rng() * (j + 1));
+      var tmp = arr[j]; arr[j] = arr[k]; arr[k] = tmp;
+    }
+    // ensure not already sorted
+    var sorted = true;
+    for (var m = 0; m < arr.length; m++) { if (arr[m] !== m) { sorted = false; break; } }
+    if (sorted) { var t = arr[0]; arr[0] = arr[1]; arr[1] = t; }
+    return arr;
+  }
+
+  function makeTilePos() {
+    var tp = {};
+    for (var i = 0; i < grid.length; i++) {
+      var val = grid[i];
+      var p = cellXY(i);
+      tp[val] = { x: p.x, y: p.y };
+    }
+    return tp;
+  }
+
+  function doSwap(fromCell, toCell) {
+    var tmp = grid[fromCell]; grid[fromCell] = grid[toCell]; grid[toCell] = tmp;
+    moveCount++;
+    if (window.J) J.calm(moveCount);
+    zoom = 1.015;
+    if (window.LOOP) LOOP.emit('tile_placed', { from: fromCell, to: toCell, moves: moveCount });
+  }
+
+  function checkWin() {
+    if (!isOrdered()) return false;
+    shimmerActive = true; shimmerT = 0;
+    zoom = 1.035;
+    if (window.J) J.calm(9);
+    flash('RESTORED', TEAL, 42);
+    return true;
+  }
+
+  function flash(txt, col, sz) { flashes.push({ txt: txt, color: col, size: sz, t: 0 }); }
+
+  function fireGameOver() {
+    if (phase === 'over' || phase === 'cta') return;
+    phase = 'over'; overAt = performance.now();
+    demoScore = moveCount;
+    window.__demoScore = demoScore;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: moveCount, dur_s: +dur.toFixed(1) });
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else { setTimeout(function () { startRun(); }, 700); }
+    }
+  }
+
+  function startRun() {
+    grid = shuffleGrid();
+    tilePos = makeTilePos();
+    dragging = null;
+    flashes = [];
+    shimmerActive = false; shimmerT = 0;
+    moveCount = 0;
+    runStartTs = Date.now();
+    phase = 'play';
+
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+
+    if (BOT) {
+      botMoves = buildSolveMoves(grid.slice());
+      // add hesitation: insert one undo-redo pair at beginning if enough moves
+      if (botMoves.length >= 2) {
+        var m0 = botMoves[0];
+        botMoves.splice(1, 0, [m0[1], m0[0]]); // undo
+        botMoves.splice(2, 0, [m0[0], m0[1]]); // redo
+      }
+      botMoveIdx = 0;
+      botWaitFrames = 50; // ~0.8s at 60fps before first move
+    }
+    if (DEMO) {
+      demoMoves = buildSolveMoves(grid.slice());
+      demoMoveIdx = 0;
+      demoNextAt = performance.now() + 1600; // first settle pause
+    }
+  }
+
+  function newGame() {
+    botRunsDone = 0;
+    if (DEMO || BOT) { startRun(); }
+    else { phase = 'title'; grid = null; tilePos = null; }
+  }
+
+  // ---- Hit regions ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var DONE_R  = { x: W / 2 - 100, y: GRID_Y + GRID_W + 32, w: 200, h: 46 };
+  var SHARE_R = { x: W / 2 - 125, y: 502, w: 250, h: 46 };
+  function inR(r, px, py) { return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h; }
+
+  function hitCell(px, py) {
+    for (var i = 0; i < N * N; i++) {
+      var p = cellXY(i);
+      if (px >= p.x && px <= p.x + CELL && py >= p.y && py <= p.y + CELL) return i;
+    }
+    return -1;
+  }
+
+  function hitTile(px, py) {
+    // Returns tileVal of tile under pointer (uses visual tilePos, excluding dragging tile)
+    for (var val = 0; val < N * N; val++) {
+      if (dragging && dragging.tileVal === val) continue;
+      var tp = tilePos[val];
+      if (tp && px >= tp.x && px <= tp.x + CELL && py >= tp.y && py <= tp.y + CELL) return val;
+    }
+    return -1;
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale, py = (e.clientY - r.top) / scale;
+    if (inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (inR(SHARE_R, px, py) && window.SHARE) { SHARE.send({ score: moveCount, unit: 'moves' }); return; }
+      startRun(); return;
+    }
+    if (phase === 'ready') {
+      if (inR(DONE_R, px, py)) { fireGameOver(); return; }
+    }
+    if (phase === 'play' || phase === 'ready') {
+      var tv = hitTile(px, py);
+      if (tv >= 0) {
+        var tp = tilePos[tv];
+        dragging = { tileVal: tv, offX: px - tp.x, offY: py - tp.y, x: tp.x, y: tp.y };
+      }
+    }
+  });
+
+  window.addEventListener('pointermove', function (e) {
+    if (DEMO || BOT || !dragging) return;
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale, py = (e.clientY - r.top) / scale;
+    dragging.x = px - dragging.offX;
+    dragging.y = py - dragging.offY;
+  });
+
+  window.addEventListener('pointerup', function (e) {
+    if (DEMO || BOT || !dragging) return;
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale, py = (e.clientY - r.top) / scale;
+    var targetCell = hitCell(px - dragging.offX + CELL / 2, py - dragging.offY + CELL / 2);
+    var fromCell = tileVal2Cell(dragging.tileVal);
+
+    if (targetCell >= 0 && targetCell !== fromCell) {
+      doSwap(fromCell, targetCell);
+    }
+    // snap dragging tile to its (potentially new) cell
+    dragging = null;
+    if (checkWin()) {
+      if (!DEMO) phase = 'ready';
+    }
+  });
+
+  // ---- Bot autopilot ----
+  function botStep(dt) {
+    if (phase !== 'play') return;
+    botWaitFrames -= dt;
+    if (botWaitFrames > 0) return;
+    if (botMoveIdx >= botMoves.length) {
+      // All moves done; grid should be ordered
+      if (isOrdered()) {
+        checkWin();
+        setTimeout(function () { fireGameOver(); }, 500);
+      } else {
+        // Emergency: solve remaining
+        var remaining = buildSolveMoves(grid.slice());
+        if (remaining.length > 0) {
+          botMoves = remaining;
+          botMoveIdx = 0;
+          botWaitFrames = 30;
+        } else {
+          fireGameOver();
+        }
+      }
+      return;
+    }
+    var move = botMoves[botMoveIdx++];
+    doSwap(move[0], move[1]);
+    botWaitFrames = 35 + rng() * 25;
+    if (isOrdered()) {
+      checkWin();
+      setTimeout(function () { fireGameOver(); }, 500);
+      botMoveIdx = botMoves.length; // stop
+    }
+  }
+
+  // ---- Demo autopilot ----
+  function demoStep(now) {
+    if (phase !== 'play') return;
+    if (now < demoNextAt) return;
+    if (demoMoveIdx >= demoMoves.length) {
+      // Should be ordered by now — if not, emergency finish
+      if (!isOrdered()) {
+        var rem = buildSolveMoves(grid.slice());
+        if (rem.length > 0) {
+          demoMoves = rem; demoMoveIdx = 0;
+          demoNextAt = now + 800;
+        } else {
+          triggerDemoCTA(now);
+        }
+      }
+      return;
+    }
+    var move = demoMoves[demoMoveIdx++];
+    doSwap(move[0], move[1]);
+
+    // Vary inter-move pause for calm human feel (1.4–3.0s)
+    var gap;
+    if (demoMoveIdx === 1) gap = 2600;          // settle beat after first move
+    else if (demoMoveIdx === demoMoves.length) gap = 1200; // final snap
+    else gap = 1800 + rng() * 900;
+    demoNextAt = now + gap;
+
+    if (isOrdered()) {
+      checkWin();
+      triggerDemoCTA(now);
+      demoMoveIdx = demoMoves.length;
+    }
+  }
+
+  function triggerDemoCTA(now) {
+    window.__demoScore = moveCount;
+    setTimeout(function () {
+      phase = 'cta';
+      ctaAt = performance.now();
+      setTimeout(function () { window.__demoDone = true; }, 3600);
+    }, 1800);
+  }
+
+  // ---- Render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Decay juice
+    if (hitStop > 0) { hitStop -= dt; }
+    else {
+      // Lerp tile visual positions toward their grid cell
+      if (grid && tilePos) {
+        for (var val = 0; val < N * N; val++) {
+          if (dragging && dragging.tileVal === val) continue;
+          var cell = tileVal2Cell(val);
+          if (cell < 0) continue;
+          var cp = cellXY(cell);
+          var tp = tilePos[val];
+          tp.x += (cp.x - tp.x) * 0.2 * dt;
+          tp.y += (cp.y - tp.y) * 0.2 * dt;
+        }
+      }
+      if (BOT) botStep(dt);
+      if (DEMO) demoStep(now);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+    if (shimmerActive) shimmerT += dt;
+
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // BG
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // Title
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('ORDER RESTORE', W / 2, 268);
+      cx.fillStyle = 'rgba(46,197,182,0.8)'; cx.font = '600 16px -apple-system, Helvetica, Arial';
+      var pulse = 0.55 + 0.45 * Math.sin(now / 600);
+      cx.globalAlpha = pulse;
+      cx.fillText('tap to begin', W / 2, 312);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.28)'; cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('drag tiles back into order', W / 2, 346);
+    }
+
+    // Grid + tiles
+    if (grid && tilePos) {
+      var tileColors = [
+        '#1a8a7f','#2ec5b6','#3dd9c9',
+        '#26a69a','#4db6ac','#5fc9bf',
+        '#1d7a72','#38c5b6','#45d4c4'
+      ];
+
+      // Shimmer intensity
+      var shimAlpha = 0;
+      if (shimmerActive) {
+        shimAlpha = Math.min(1, shimmerT / 40) * 0.28 * (0.65 + 0.35 * Math.sin(shimmerT * 0.12));
+      }
+
+      // Shadow cells
+      for (var ci = 0; ci < N * N; ci++) {
+        var cp2 = cellXY(ci);
+        cx.fillStyle = 'rgba(255,255,255,0.04)';
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(cp2.x, cp2.y, CELL, CELL, 10); else cx.rect(cp2.x, cp2.y, CELL, CELL);
+        cx.fill();
+      }
+
+      // Draw tiles: non-dragging first, then dragging on top
+      for (var pass = 0; pass < 2; pass++) {
+        for (var v = 0; v < N * N; v++) {
+          var isDrag = dragging && dragging.tileVal === v;
+          if (pass === 0 && isDrag) continue;
+          if (pass === 1 && !isDrag) continue;
+
+          var tx2 = isDrag ? dragging.x : tilePos[v].x;
+          var ty2 = isDrag ? dragging.y : tilePos[v].y;
+          var col = tileColors[v % tileColors.length];
+
+          cx.save();
+          if (isDrag) { cx.shadowColor = 'rgba(46,197,182,0.5)'; cx.shadowBlur = 20; cx.globalAlpha = 0.88; }
+
+          // Tile body
+          cx.fillStyle = col;
+          cx.beginPath();
+          if (cx.roundRect) cx.roundRect(tx2, ty2, CELL, CELL, 10); else cx.rect(tx2, ty2, CELL, CELL);
+          cx.fill();
+
+          // Shimmer overlay (non-dragging, win state)
+          if (!isDrag && shimmerActive) {
+            cx.fillStyle = 'rgba(61,217,201,' + shimAlpha + ')';
+            cx.beginPath();
+            if (cx.roundRect) cx.roundRect(tx2, ty2, CELL, CELL, 10); else cx.rect(tx2, ty2, CELL, CELL);
+            cx.fill();
+          }
+
+          // Tile label
+          cx.fillStyle = 'rgba(255,255,255,0.92)';
+          cx.font = '700 26px -apple-system, Helvetica, Arial';
+          cx.textAlign = 'center';
+          cx.fillText(v + 1, tx2 + CELL / 2, ty2 + CELL / 2 + 9);
+
+          cx.restore();
+        }
+      }
+
+      // Instruction / move count during play
+      if (phase === 'play') {
+        cx.textAlign = 'center';
+        cx.fillStyle = 'rgba(255,255,255,0.3)';
+        cx.font = '500 13px -apple-system, Helvetica, Arial';
+        cx.fillText('drag tiles to restore order', W / 2, GRID_Y - 18);
+        cx.fillStyle = 'rgba(46,197,182,0.65)';
+        cx.font = '600 13px Menlo, monospace';
+        cx.fillText(moveCount + ' moves', W / 2, GRID_Y + GRID_W + 24);
+      }
+
+      // DONE button
+      if (phase === 'ready') {
+        cx.fillStyle = 'rgba(255,255,255,0.28)';
+        cx.font = '500 13px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText(moveCount + ' moves', W / 2, DONE_R.y - 12);
+        cx.fillStyle = 'rgba(46,197,182,0.18)';
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(DONE_R.x, DONE_R.y, DONE_R.w, DONE_R.h, 23);
+        else cx.rect(DONE_R.x, DONE_R.y, DONE_R.w, DONE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = TEAL; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText('▶  DONE', W / 2, DONE_R.y + 30);
+      }
+    }
+
+    // Game over card
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.58)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('ORDER RESTORED', W / 2, 298);
+      cx.fillStyle = '#fff'; cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText(moveCount + ' moves', W / 2, 338);
+      cx.fillStyle = GOLD; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('find your calm', W / 2, 368);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 400);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('tap — try again', W / 2, 416);
+        cx.globalAlpha = 1;
+        cx.fillStyle = 'rgba(46,197,182,0.12)';
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = TEAL; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 29);
+      }
+    }
+
+    // Demo CTA card
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('ORDER RESTORE', W / 2, 288);
+      cx.fillStyle = 'rgba(255,255,255,0.68)'; cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('restore yours', W / 2, 326);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 340);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 392);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.42)'; cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 424);
+      cx.globalAlpha = 1;
+    }
+
+    // Floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 50);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.25) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, GRID_Y - 44 - fl.t * 0.4);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
