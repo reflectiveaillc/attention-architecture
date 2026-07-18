@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Grid Complete — Tilt</title>
+<!--
+  LOOP / attention-architecture — Grid Complete
+  Circuits: 06-zeigarnik, 05-ease, 02-novelty
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA card → window.__demoDone=true
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone=true
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'grid-complete';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  // canvas fit
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- Grid layout ----
+  var GRID = 5;
+  var CELL = 58, GAP = 6;
+  var GRID_W = GRID * CELL + (GRID - 1) * GAP;  // 5*58 + 4*6 = 314
+  var GRID_X = (W - GRID_W) / 2;                  // left edge
+  var GRID_Y = 200;                                // top edge
+
+  // Soft palette for lit cells (calm tones — teal family + muted warm)
+  var CELL_COLORS = [
+    '#2ec5b6', // teal
+    '#3dd9c9',
+    '#52c8bd',
+    '#6ec4ba',
+    '#5ab5a8',
+    '#4eb09c',
+    '#87d4cc',
+    '#a8e0d8',
+    '#63c9c0',
+    '#79bfbb',
+    '#2ba99a',
+    '#4acfc6',
+    '#68d6ce',
+    '#33b8ac',
+    '#57cac0',
+    '#44b5a8',
+    '#95ddd7',
+    '#3dcfbf',
+    '#61c7bd',
+    '#7de0d6',
+    '#5ecbc3',
+    '#49bcb4',
+    '#86cbc7',
+    '#2fbfb0',
+    '#73d8d1'
+  ];
+
+  // Generate a random unlock order for the 25 cells
+  function makeUnlockOrder(rngFn) {
+    var arr = [];
+    for (var i = 0; i < 25; i++) arr.push(i);
+    // Fisher-Yates shuffle
+    for (var j = arr.length - 1; j > 0; j--) {
+      var k = Math.floor(rngFn() * (j + 1));
+      var tmp = arr[j]; arr[j] = arr[k]; arr[k] = tmp;
+    }
+    return arr;
+  }
+
+  // State
+  var phase;         // 'intro' | 'play' | 'ripple' | 'cta'
+  var cells;         // array of 25 {lit, color, pulse, glowT}
+  var unlockOrder;   // sequence index -> cell index
+  var nextHint;      // which position in unlockOrder is the next to tap (hidden)
+  var score;         // cells lit so far
+  var flashes;
+  var runStartTs;
+  var rippleT;
+  var ctaAt;
+  var hitStop, shakeAmt, zoom;
+  var botRunsDone;
+  var introT;
+
+  // demo state
+  var demoStep, demoWait, demoWaits;
+
+  function cellXY(idx) {
+    var col = idx % GRID, row = Math.floor(idx / GRID);
+    return {
+      x: GRID_X + col * (CELL + GAP),
+      y: GRID_Y + row * (CELL + GAP)
+    };
+  }
+
+  function newGame() {
+    rng = mulberry32(SEED);
+    unlockOrder = makeUnlockOrder(rng);
+    cells = [];
+    for (var i = 0; i < 25; i++) {
+      cells.push({ lit: false, color: CELL_COLORS[i], pulse: 0, glowT: 0 });
+    }
+    score = 0;
+    nextHint = 0;
+    flashes = [];
+    hitStop = 0;
+    shakeAmt = 0;
+    zoom = 1;
+    rippleT = 0;
+    ctaAt = 0;
+    demoStep = 0;
+    demoWait = 0;
+    introT = 0;
+    phase = 'intro';
+    botRunsDone = 0;
+
+    // demo: paced waits between taps (simulates human hesitation)
+    // settle(slow start) → deepen(middle) → resolve(fast finish)
+    demoWaits = [
+      90, 75, 60, 80, 55,  // settle: slow, thoughtful taps
+      50, 45, 55, 40, 48,  // deepen: picking up rhythm
+      42, 38, 45, 35, 40,  // deepen continued
+      35, 30, 32, 28, 30,  // resolve: faster, confident
+      25, 22, 20, 18, 15   // finish: rapid last cells
+    ];
+
+    if (BOT) {
+      // Bot starts immediately
+      setTimeout(startRun, 100);
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    // reveal first hint immediately
+    nextHint = 0;
+  }
+
+  function lightCell(idx) {
+    if (cells[idx].lit) return; // already lit
+    cells[idx].lit = true;
+    cells[idx].glowT = 1.0;
+    score++;
+
+    // Sound: J.calm(step) only — soft bells
+    if (window.J) J.calm(score);
+
+    // juice
+    if (score % 5 === 0) {
+      // every 5th cell: mild hit-stop + zoom pulse
+      hitStop = 0.08; // 80ms freeze
+      zoom = 1.02;
+    }
+    if (score === 25) {
+      // completion! big moment
+      hitStop = 0.15;
+      zoom = 1.04;
+      shakeAmt = 2; // very gentle — calm game
+      if (window.J) J.calm(25);
+    }
+
+    flash(score === 25 ? 'COMPLETE ✓' : (score % 5 === 0 ? score + ' lit' : ''), TEAL, 32);
+    if (window.LOOP) LOOP.emit('cell_lit', { n: score, idx: idx });
+
+    nextHint++;
+    if (score === 25) {
+      // all done — trigger ripple then end
+      setTimeout(function () {
+        phase = 'ripple';
+        rippleT = 0;
+        var dur = (Date.now() - runStartTs) / 1000;
+        if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+
+        if (DEMO) {
+          window.__demoScore = score;
+          setTimeout(function () { phase = 'cta'; ctaAt = performance.now(); }, 1800);
+          setTimeout(function () { window.__demoDone = true; }, 1800 + 3500);
+        }
+        if (BOT) {
+          botRunsDone++;
+          if (botRunsDone >= BOT_RUNS) {
+            window.__botDone = true;
+          } else {
+            setTimeout(function () { resetRun(); }, 1200);
+          }
+        }
+      }, 300);
+    }
+  }
+
+  function resetRun() {
+    unlockOrder = makeUnlockOrder(rng);
+    cells = [];
+    for (var i = 0; i < 25; i++) {
+      cells.push({ lit: false, color: CELL_COLORS[i], pulse: 0, glowT: 0 });
+    }
+    score = 0;
+    nextHint = 0;
+    flashes = [];
+    hitStop = 0;
+    shakeAmt = 0;
+    zoom = 1;
+    rippleT = 0;
+    phase = 'play';
+    if (window.LOOP) LOOP.emit('restart', {});
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED + botRunsDone });
+  }
+
+  function flash(txt, color, size) {
+    if (!txt) return;
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- Input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tapAt(px, py) {
+    if (DEMO || BOT) return;
+    if (window.J && px !== undefined && inR(MUTE_R, px, py)) { J.toggleMute(); return; }
+    if (phase !== 'play') {
+      if (phase === 'intro') { startRun(); return; }
+      if (phase === 'ripple') { resetAndStart(); return; }
+      return;
+    }
+    // Find which cell was tapped
+    for (var i = 0; i < 25; i++) {
+      var pos = cellXY(i);
+      if (px >= pos.x && px <= pos.x + CELL && py >= pos.y && py <= pos.y + CELL) {
+        // Is this the next cell in unlock order?
+        if (i === unlockOrder[nextHint]) {
+          lightCell(i);
+        } else {
+          // wrong cell — gentle shake hint
+          shakeAmt = 1.5;
+          if (window.J) J.calm(0);
+        }
+        return;
+      }
+    }
+  }
+
+  function resetAndStart() {
+    resetRun();
+    unlockOrder = makeUnlockOrder(rng);
+    startRun();
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tapAt((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tapAt(); });
+
+  // ---- Demo & Bot autopilot ----
+  var botActionsLeft = 25; // bot plays all 25 cells then game_over fires
+
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      // Paced demo: wait demoWait frames, then tap the correct cell
+      if (demoStep >= 25) return;
+      demoWait -= dt;
+      if (demoWait > 0) return;
+      var cellIdx = unlockOrder[demoStep];
+      lightCell(cellIdx);
+      demoWait = demoWaits[demoStep] || 30;
+      demoStep++;
+    } else if (BOT) {
+      // Bot: place one cell every ~40 frames; slightly imperfect timing
+      if (nextHint >= 25) return;
+      demoWait -= dt;
+      if (demoWait > 0) return;
+      var botIdx = unlockOrder[nextHint];
+      lightCell(botIdx);
+      // random wait 20-60 frames between cells
+      demoWait = 20 + rng() * 40;
+    }
+  }
+
+  // ---- Render ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Advance intro
+    if (phase === 'intro') {
+      introT += dt;
+      if (introT > 120 && DEMO) {
+        // demo auto-starts after brief pause
+        startRun();
+      }
+    }
+
+    // Hit-stop: freeze sim, then release
+    if (hitStop > 0) {
+      hitStop -= dt * 0.016; // decay in seconds
+    } else {
+      autopilot(dt);
+    }
+
+    // Update ripple
+    if (phase === 'ripple') {
+      rippleT += dt;
+    }
+
+    // juice decay
+    shakeAmt *= Math.pow(0.88, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // cell glow decay
+    for (var i = 0; i < 25; i++) {
+      if (cells[i].glowT > 0) cells[i].glowT *= Math.pow(0.96, dt);
+    }
+
+    // ---- Draw ----
+    cx.save();
+
+    // juice transforms
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.02)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // Title
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.font = '700 22px -apple-system, Helvetica, Arial';
+    cx.fillText('GRID COMPLETE', W / 2, 68);
+
+    // Progress indicator
+    if (phase === 'play' || phase === 'ripple') {
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' / 25', W / 2, 96);
+
+      // Progress bar
+      var barW = 200, barH = 4;
+      var barX = (W - barW) / 2, barY = 108;
+      cx.fillStyle = 'rgba(255,255,255,0.10)';
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(barX, barY, barW, barH, 2);
+      else cx.rect(barX, barY, barW, barH);
+      cx.fill();
+      if (score > 0) {
+        var fillW = (score / 25) * barW;
+        cx.fillStyle = TEAL;
+        cx.globalAlpha = 0.8;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(barX, barY, fillW, barH, 2);
+        else cx.rect(barX, barY, fillW, barH);
+        cx.fill();
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // Draw grid cells
+    drawGrid(now);
+
+    // Hint arrow: point toward next unlockable cell (calm guidance)
+    if (phase === 'play' && nextHint < 25 && !DEMO && !BOT) {
+      var hintIdx = unlockOrder[nextHint];
+      var hPos = cellXY(hintIdx);
+      var hCx = hPos.x + CELL / 2, hCy = hPos.y + CELL / 2;
+      var pulse = 0.4 + 0.4 * Math.sin(now / 500);
+      cx.globalAlpha = pulse * 0.5;
+      cx.fillStyle = TEAL;
+      cx.beginPath();
+      cx.arc(hCx, hCy, CELL / 2 + 6, 0, Math.PI * 2);
+      cx.fill();
+      cx.globalAlpha = 1;
+    }
+
+    // Floating text flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, GRID_Y - 30 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) flashes.splice(k, 1);
+    }
+
+    // Intro screen
+    if (phase === 'intro') {
+      var iFade = Math.min(1, introT / 30);
+      cx.globalAlpha = iFade;
+      cx.fillStyle = 'rgba(11,13,18,0.7)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 38px -apple-system, Helvetica, Arial';
+      cx.fillText('GRID COMPLETE', W / 2, 280);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('light every tile', W / 2, 315);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('follow the glow', W / 2, 338);
+      var ip = 0.6 + 0.4 * Math.sin(now / 380);
+      cx.globalAlpha = iFade * ip;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, 385);
+      cx.globalAlpha = 1;
+    }
+
+    // Ripple / completion glow
+    if (phase === 'ripple') {
+      var rt = rippleT / 60;
+      if (rt <= 2.5) {
+        // draw ripple rings emanating from center
+        var rcx = W / 2, rcy = GRID_Y + (GRID_W) / 2;
+        for (var ring = 0; ring < 3; ring++) {
+          var rAnim = ((rt - ring * 0.3) % 1.2) / 1.2;
+          if (rAnim < 0) continue;
+          var rRadius = rAnim * 220;
+          var rAlpha = (1 - rAnim) * 0.35;
+          cx.strokeStyle = TEAL;
+          cx.globalAlpha = rAlpha;
+          cx.lineWidth = 2;
+          cx.beginPath();
+          cx.arc(rcx, rcy, rRadius, 0, Math.PI * 2);
+          cx.stroke();
+        }
+        cx.globalAlpha = 1;
+      }
+      // completion message
+      var compFade = Math.min(1, rippleT / 30);
+      cx.globalAlpha = compFade;
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '800 32px -apple-system, Helvetica, Arial';
+      cx.fillText('ALL 25 LIT', W / 2, GRID_Y + GRID_W + 50);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('the grid is yours', W / 2, GRID_Y + GRID_W + 75);
+      if (!DEMO && !BOT) {
+        var restartP = 0.6 + 0.4 * Math.sin(now / 350);
+        cx.globalAlpha = compFade * restartP;
+        cx.fillStyle = 'rgba(255,255,255,0.4)';
+        cx.font = '500 13px -apple-system, Helvetica, Arial';
+        cx.fillText('tap for another grid', W / 2, GRID_Y + GRID_W + 100);
+      }
+      cx.globalAlpha = 1;
+    }
+
+    // Demo CTA card
+    if (phase === 'cta') {
+      var ct = (now - ctaAt) / 1000;
+      var cEase = Math.min(1, ct * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * cEase) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = cEase;
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '800 36px -apple-system, Helvetica, Arial';
+      cx.fillText('GRID COMPLETE', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '500 18px -apple-system, Helvetica, Arial';
+      cx.fillText('every square. finally lit.', W / 2, 332);
+      var ctaPulse = 0.75 + 0.25 * Math.sin(now / 280);
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = cEase * ctaPulse;
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ GROW YOURS', W / 2, 400);
+      cx.globalAlpha = cEase;
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawGrid(now) {
+    for (var i = 0; i < 25; i++) {
+      var cell = cells[i];
+      var pos = cellXY(i);
+      var cx_ = pos.x, cy_ = pos.y;
+
+      if (cell.lit) {
+        // Lit: colored fill with glow
+        var glow = cell.glowT;
+        if (glow > 0.05) {
+          cx.shadowColor = cell.color;
+          cx.shadowBlur = 18 * glow;
+        }
+        cx.fillStyle = cell.color;
+        cx.globalAlpha = 0.85 + 0.15 * glow;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(cx_, cy_, CELL, CELL, 8);
+        else cx.rect(cx_, cy_, CELL, CELL);
+        cx.fill();
+        cx.shadowBlur = 0;
+        cx.globalAlpha = 1;
+
+        // subtle inner highlight
+        cx.fillStyle = 'rgba(255,255,255,0.12)';
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(cx_ + 2, cy_ + 2, CELL - 4, 12, 4);
+        else cx.rect(cx_ + 2, cy_ + 2, CELL - 4, 12);
+        cx.fill();
+
+        // ripple effect on completion
+        if (phase === 'ripple') {
+          var ri = rippleT - i * 1.2;
+          if (ri > 0) {
+            var riFade = Math.max(0, 1 - ri / 40);
+            cx.fillStyle = 'rgba(255,255,255,' + (riFade * 0.25) + ')';
+            cx.beginPath();
+            if (cx.roundRect) cx.roundRect(cx_, cy_, CELL, CELL, 8);
+            else cx.rect(cx_, cy_, CELL, CELL);
+            cx.fill();
+          }
+        }
+      } else {
+        // Unlit: dim, soft
+        // Next unlock hint: slightly brighter
+        var isNext = (i === unlockOrder[nextHint]) && phase === 'play';
+        var dimAlpha = isNext ? 0.22 : 0.10;
+        var dimColor = isNext ? TEAL : '#4a5568';
+
+        cx.fillStyle = dimColor;
+        cx.globalAlpha = dimAlpha;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(cx_, cy_, CELL, CELL, 8);
+        else cx.rect(cx_, cy_, CELL, CELL);
+        cx.fill();
+        cx.globalAlpha = 1;
+
+        // subtle border
+        cx.strokeStyle = isNext ? 'rgba(46,197,182,0.3)' : 'rgba(255,255,255,0.06)';
+        cx.lineWidth = 1;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(cx_ + 0.5, cy_ + 0.5, CELL - 1, CELL - 1, 8);
+        else cx.rect(cx_ + 0.5, cy_ + 0.5, CELL - 1, CELL - 1);
+        cx.stroke();
+      }
+    }
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

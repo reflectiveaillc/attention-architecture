@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Soft Check — Tilt</title>
+<!--
+  LOOP / attention-architecture — Soft Check
+  Circuits: 06-zeigarnik (open loop closed), 05-ease (reliably rewarding), 01-rpe (calm variable reward)
+  Engine: calm — J.calm(step) only
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA card → window.__demoDone=true
+    ?bot=1&runs=N    imperfect autopilot, N runs, window.__botDone=true
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'soft-check';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL_MID = '#25a89b', TEAL_PALE = 'rgba(46,197,182,0.18)';
+
+  // ---- state ----
+  var phase;        // 'idle' | 'checking' | 'resolved' | 'over' | 'cta'
+  var checksTotal;  // score = total checks completed this run
+  var CHECKS_TO_WIN = 5;   // 5 checks = one calm session → "all clear"
+  var checkAnim;    // null | { t, dur, cx, cy, r }  — checkmark draw anim
+  var flashes;      // floating reward texts
+  var runStartTs;
+  var overAt, ctaAt;
+  var hitStop, zoom, shakeAmt;
+  var idleTimer;    // frames of idle before game_over (if player doesn't tap)
+  var IDLE_MAX;     // set per run
+  var sessionBest = 0;
+  try { sessionBest = +localStorage.getItem('sc_best') || 0; } catch (_) {}
+
+  // pulse / breathe
+  var breathPhase = 0;  // 0..2π continuous
+  var ringPulse = 0;    // extra ring scale on tap
+  var ringAlpha = 0;    // ring alpha (decays)
+
+  // ---- bot ----
+  var botRunsDone = 0;
+  var botChecksToDo;    // bot does this many then goes passive
+  var botWait = 0;      // countdown to next bot tap
+
+  // ---- demo ----
+  // arc: settle (breathe) → 3 slow checks → 2 quick checks → resolve → CTA
+  var demoChecksTarget = 5;
+  var demoStep = 0;       // which demo beat we're on
+  var demoWait = 0;       // frames until next demo action
+  // demo wait times (frames at ~60fps) between checks: settle, then pace
+  var demoWaits = [110, 90, 75, 60, 50, 40];
+
+  function newGame() {
+    phase       = 'idle';
+    checksTotal = 0;
+    checkAnim   = null;
+    flashes     = [];
+    hitStop     = 0; zoom = 1; shakeAmt = 0;
+    idleTimer   = 0;
+    IDLE_MAX    = 480 + Math.floor(rng() * 120); // ~8-10s idle → game_over
+    breathPhase = 0;
+    ringPulse   = 0; ringAlpha = 0;
+
+    if (BOT) {
+      botChecksToMake = Math.max(1, Math.floor(rng() * (CHECKS_TO_WIN - 1)));
+      botWait = 60 + Math.floor(rng() * 60);
+      startRun();
+    } else if (DEMO) {
+      demoStep = 0;
+      demoWait = 80; // settle for a bit first
+      startRun();
+    }
+    // human: game starts on first tap
+  }
+
+  var botChecksToMake = 2;
+
+  function startRun() {
+    phase = 'idle';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function doCheck() {
+    if (phase !== 'idle') return;
+    checksTotal++;
+    phase = 'checking';
+    idleTimer = 0;
+
+    // juice
+    hitStop  = 30;
+    zoom     = 1.025;
+    ringPulse = 1.5;
+    ringAlpha = 1;
+    shakeAmt  = 0; // calm — no shake on check
+
+    // sound — J.calm uses step for pitch variety
+    if (window.J) J.calm(checksTotal);
+
+    // start checkmark draw animation (dur ~50 frames)
+    checkAnim = { t: 0, dur: 50 };
+
+    // floating reward
+    var msgs = ['✓', 'all good', 'clear', 'checked', '✓'];
+    flash(msgs[(checksTotal - 1) % msgs.length], TEAL, 32);
+
+    if (window.LOOP) LOOP.emit('check_done', { n: checksTotal });
+
+    // after anim settles, either go again or end session
+    var delay = (checksTotal >= CHECKS_TO_WIN) ? 900 : 600;
+    setTimeout(function () {
+      if (checksTotal >= CHECKS_TO_WIN) {
+        endSession();
+      } else {
+        phase = 'idle';
+        idleTimer = 0;
+      }
+    }, delay);
+  }
+
+  function endSession() {
+    phase = 'resolved';
+    if (window.J) J.calm(checksTotal + 1);
+    // emit game_over with score = checksTotal
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (sessionBest < checksTotal) {
+      sessionBest = checksTotal;
+      try { localStorage.setItem('sc_best', String(sessionBest)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: checksTotal, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = checksTotal;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2000);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { restartRun(); }, 800);
+      }
+    }
+    overAt = performance.now();
+  }
+
+  function idleTimeout() {
+    // player didn't tap — session ends with current score (can be 0)
+    phase = 'over';
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (sessionBest < checksTotal) {
+      sessionBest = checksTotal;
+      try { localStorage.setItem('sc_best', String(sessionBest)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: checksTotal, dur_s: +dur.toFixed(1) });
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { restartRun(); }, 800);
+      }
+    }
+    overAt = performance.now();
+  }
+
+  function restartRun() {
+    checksTotal = 0;
+    checkAnim   = null;
+    flashes     = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    idleTimer = 0;
+    IDLE_MAX = 480 + Math.floor(rng() * 120);
+    ringPulse = 0; ringAlpha = 0;
+    breathPhase = 0;
+    botChecksToMake = Math.max(1, Math.floor(rng() * (CHECKS_TO_WIN - 1)));
+    botWait = 60 + Math.floor(rng() * 60);
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 110, y: 500, w: 220, h: 44 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  var CX = W / 2, CY = H / 2 + 20;  // circle center
+  var CR = 82;                         // circle radius
+
+  function dist(x, y) { return Math.sqrt((x - CX) * (x - CX) + (y - CY) * (y - CY)); }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+
+    if (phase === 'over' && performance.now() - overAt > 400) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: checksTotal, unit: 'checks' }); return;
+      }
+      restartRun(); return;
+    }
+
+    if (phase === 'idle') {
+      // tap anywhere (or inside circle) to check
+      doCheck(); return;
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.code === 'Enter') tap();
+  });
+
+  // ---- autopilots ----
+  function autopilot(dt) {
+    if (DEMO) {
+      demoAuto(dt);
+    } else if (BOT) {
+      botAuto(dt);
+    }
+  }
+
+  function demoAuto(dt) {
+    if (phase !== 'idle') return;
+    if (demoWait > 0) { demoWait -= dt; return; }
+    if (checksTotal >= demoChecksTarget) return;
+    // do a check
+    doCheckAuto();
+    demoWait = demoWaits[Math.min(demoStep, demoWaits.length - 1)] || 50;
+    demoStep++;
+  }
+
+  function botAuto(dt) {
+    if (phase !== 'idle') return;
+    botWait -= dt;
+    if (botWait > 0) return;
+    if (checksTotal < botChecksToMake) {
+      doCheckAuto();
+      botWait = 50 + Math.floor(rng() * 80);
+    }
+    // else: go passive — idleTimer fires game_over naturally
+  }
+
+  function doCheckAuto() {
+    checksTotal++;
+    phase = 'checking';
+    idleTimer = 0;
+    hitStop  = 30;
+    zoom     = 1.025;
+    ringPulse = 1.5; ringAlpha = 1;
+    if (window.J) J.calm(checksTotal);
+    checkAnim = { t: 0, dur: 50 };
+    var msgs = ['✓', 'all good', 'clear', 'checked', '✓'];
+    flash(msgs[(checksTotal - 1) % msgs.length], TEAL, 32);
+    if (window.LOOP) LOOP.emit('check_done', { n: checksTotal });
+    var delay = (checksTotal >= CHECKS_TO_WIN) ? 900 : 600;
+    setTimeout(function () {
+      if (checksTotal >= CHECKS_TO_WIN) {
+        endSession();
+      } else {
+        phase = 'idle';
+        idleTimer = 0;
+      }
+    }, delay);
+  }
+
+  // ---- draw helpers ----
+  function drawCheckmark(cx2, x, y, r, progress, color, lineW) {
+    // draw a ✓ inside circle of radius r centered at (x,y)
+    // progress 0..1
+    cx2.save();
+    cx2.strokeStyle = color || '#fff';
+    cx2.lineWidth   = lineW || 5;
+    cx2.lineCap     = 'round';
+    cx2.lineJoin    = 'round';
+    cx2.globalAlpha = Math.min(1, progress * 1.5);
+
+    // checkmark points (relative to center)
+    var pts = [
+      [-r * 0.42, 0],
+      [-r * 0.08, r * 0.35],
+      [r * 0.46, -r * 0.32]
+    ];
+    // total arc length ~2 segments
+    var segLen = [1, 1.3];
+    var total = segLen[0] + segLen[1];
+    var drawn = progress * total;
+
+    cx2.beginPath();
+    cx2.translate(x, y);
+    var px = pts[0][0], py = pts[0][1];
+    cx2.moveTo(px, py);
+
+    for (var s = 0; s < 2; s++) {
+      var tx = pts[s + 1][0], ty = pts[s + 1][1];
+      var frac = Math.min(1, Math.max(0, (drawn - (s > 0 ? segLen[0] : 0)) / segLen[s]));
+      var lx = px + (tx - px) * frac;
+      var ly = py + (ty - py) * frac;
+      cx2.lineTo(lx, ly);
+      if (frac < 1) break;
+      px = tx; py = ty;
+    }
+    cx2.stroke();
+    cx2.restore();
+  }
+
+  // ---- render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // breathe
+    breathPhase += 0.018 * dt;
+
+    // idle timeout (only in idle phase)
+    if (phase === 'idle' && (DEMO || BOT || runStartTs)) {
+      idleTimer += dt;
+      if (idleTimer > IDLE_MAX) {
+        idleTimer = 0;
+        idleTimeout();
+      }
+    }
+
+    // checkmark anim
+    if (checkAnim) {
+      checkAnim.t += dt;
+      if (checkAnim.t > checkAnim.dur) checkAnim = null;
+    }
+
+    // ring decay
+    ringPulse += (0 - ringPulse) * 0.07 * dt;
+    ringAlpha += (0 - ringAlpha) * 0.045 * dt;
+
+    // hit-stop: decay, then call autopilot
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      autopilot(dt);
+    }
+
+    // juice transforms
+    cx.save();
+    zoom += (1 - zoom) * 0.09 * dt;
+    shakeAmt *= Math.pow(0.88, dt);
+    if (zoom > 1.001 || shakeAmt > 0.2) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    // subtle radial glow behind circle
+    var breath = 0.5 + 0.5 * Math.sin(breathPhase);
+    var grd = cx.createRadialGradient(CX, CY, 0, CX, CY, 160);
+    grd.addColorStop(0, 'rgba(46,197,182,' + (0.06 + breath * 0.04) + ')');
+    grd.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = grd; cx.fillRect(0, 0, W, H);
+
+    // ---- main circle ----
+    var circleR = CR * (1 + breath * 0.025);  // gentle breathing size
+    var isIdle  = phase === 'idle' || (!BOT && !DEMO && !runStartTs);
+
+    // outer ring (breathing)
+    cx.beginPath();
+    cx.arc(CX, CY, circleR + 14, 0, Math.PI * 2);
+    cx.strokeStyle = 'rgba(46,197,182,' + (0.12 + breath * 0.10) + ')';
+    cx.lineWidth = 1.5;
+    cx.stroke();
+
+    // tap-ring ripple
+    if (ringAlpha > 0.02) {
+      var rippleR = circleR + 14 + (1 - ringAlpha) * 40;
+      cx.beginPath();
+      cx.arc(CX, CY, rippleR, 0, Math.PI * 2);
+      cx.strokeStyle = 'rgba(46,197,182,' + (ringAlpha * 0.6) + ')';
+      cx.lineWidth = 2;
+      cx.stroke();
+    }
+
+    // circle fill
+    var cGrd = cx.createRadialGradient(CX - 18, CY - 22, 0, CX, CY, circleR);
+    var phase_checking = (phase === 'checking');
+    if (phase_checking) {
+      cGrd.addColorStop(0, '#3dd8c8');
+      cGrd.addColorStop(1, '#1e9b8e');
+    } else {
+      cGrd.addColorStop(0, '#26b8aa');
+      cGrd.addColorStop(1, '#178a7e');
+    }
+    cx.beginPath();
+    cx.arc(CX, CY, circleR, 0, Math.PI * 2);
+    cx.fillStyle = cGrd;
+    cx.fill();
+
+    // shine
+    var shine = cx.createRadialGradient(CX - 24, CY - 28, 0, CX - 24, CY - 28, circleR * 0.7);
+    shine.addColorStop(0, 'rgba(255,255,255,0.18)');
+    shine.addColorStop(1, 'rgba(255,255,255,0)');
+    cx.beginPath();
+    cx.arc(CX, CY, circleR, 0, Math.PI * 2);
+    cx.fillStyle = shine;
+    cx.fill();
+
+    // label or checkmark
+    if (checkAnim) {
+      var prog = Math.min(1, checkAnim.t / checkAnim.dur);
+      drawCheckmark(cx, CX, CY, circleR * 0.54, prog, '#fff', 6);
+    } else {
+      cx.textAlign = 'center';
+      cx.textBaseline = 'middle';
+      cx.fillStyle = phase === 'resolved' ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.92)';
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText(phase === 'resolved' ? 'ALL CLEAR' : 'CHECK', CX, CY);
+    }
+    cx.textBaseline = 'alphabetic';
+
+    // ---- score / status text ----
+    cx.textAlign = 'center';
+
+    if (phase !== 'cta' && phase !== 'over') {
+      // dot indicators for checks completed
+      var dotY = CY + circleR + 38;
+      var dotSpacing = 24;
+      var totalDots = CHECKS_TO_WIN;
+      var startX = CX - ((totalDots - 1) * dotSpacing) / 2;
+      for (var d = 0; d < totalDots; d++) {
+        cx.beginPath();
+        cx.arc(startX + d * dotSpacing, dotY, 7, 0, Math.PI * 2);
+        if (d < checksTotal) {
+          cx.fillStyle = TEAL;
+        } else {
+          cx.fillStyle = 'rgba(46,197,182,0.22)';
+        }
+        cx.fill();
+      }
+
+      // subtitle
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      if (!BOT && !DEMO && !runStartTs) {
+        cx.fillText('tap to check in', CX, dotY + 32);
+      } else if (phase === 'idle') {
+        cx.fillText('tap when ready', CX, dotY + 32);
+      } else if (phase === 'resolved') {
+        cx.fillStyle = 'rgba(46,197,182,0.7)';
+        cx.fillText('session complete', CX, dotY + 32);
+      }
+    }
+
+    // top score label (always)
+    if (runStartTs && phase !== 'cta') {
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 52px -apple-system, Helvetica, Arial';
+      cx.fillText(checksTotal, CX, 130);
+      cx.fillStyle = 'rgba(255,255,255,0.28)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + sessionBest, CX, 156);
+    }
+
+    // ---- title when not started ----
+    if (!runStartTs && !DEMO && !BOT) {
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '800 32px -apple-system, Helvetica, Arial';
+      cx.fillText('SOFT CHECK', CX, 220);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '500 15px -apple-system, Helvetica, Arial';
+      cx.fillText('one tap. confirmed.', CX, 252);
+    }
+
+    // ---- game over card ----
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.65)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('session ended', CX, 280);
+      cx.fillStyle = TEAL;
+      cx.font = '900 64px -apple-system, Helvetica, Arial';
+      cx.fillText(checksTotal, CX, 365);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '500 15px -apple-system, Helvetica, Arial';
+      cx.fillText(checksTotal === 1 ? 'check completed' : 'checks completed', CX, 398);
+      if (!DEMO && !BOT) {
+        var p2 = 0.65 + 0.35 * Math.sin(now / 320);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('tap to go again', CX, 448);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(46,197,182,0.12)';
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 22);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ SHARE YOUR CHECK', CX, SHARE_R.y + 28);
+      }
+    }
+
+    // ---- resolved (all clear) ----
+    if (phase === 'resolved') {
+      // handled above via circle label + dot indicators
+    }
+
+    // ---- flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, CX, CY - circleR - 28 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // ---- demo CTA card ----
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.80 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 40px -apple-system, Helvetica, Arial';
+      cx.fillText('SOFT CHECK', CX, 292);
+      cx.fillStyle = 'rgba(255,255,255,0.62)';
+      cx.font = '500 18px -apple-system, Helvetica, Arial';
+      cx.fillText('the check that actually settles it.', CX, 334);
+      var p3 = 0.72 + 0.28 * Math.sin(now / 260);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', CX, 402);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(46,197,182,0.55)';
+      cx.font = '500 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', CX, 434);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '17px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

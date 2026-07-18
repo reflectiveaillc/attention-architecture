@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Cloud Name — Tilt</title>
+<!--
+  LOOP / attention-architecture — Cloud Name
+  Circuits: 05-ease, 06-zeigarnik, 08-investment
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s -> soft CTA -> window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs -> window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'cloud-name';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  // calm pastel palette for named clouds
+  var CALM_COLORS = ['#b8e6e2','#c5ddf7','#d4c5f0','#f0c5d4','#c5f0d4','#e2e6b8'];
+  // cloud label pool
+  var LABELS = ['work','health','future','bills','family','sleep','news','inbox','money','time','plans','doubt'];
+
+  // ---- cloud geometry ----
+  var CLOUD_RADIUS = 36;
+  // Draw a soft cloud blob at (cx, cy)
+  function drawCloud(cx2, cy, r, color, alpha) {
+    cx.save();
+    cx.globalAlpha = (alpha !== undefined ? alpha : 1);
+    cx.fillStyle = color;
+    // main body + bumps
+    cx.beginPath();
+    cx.arc(cx2, cy, r, 0, Math.PI * 2);
+    cx.arc(cx2 - r * 0.55, cy + r * 0.1, r * 0.72, 0, Math.PI * 2);
+    cx.arc(cx2 + r * 0.55, cy + r * 0.1, r * 0.72, 0, Math.PI * 2);
+    cx.arc(cx2 - r * 0.28, cy - r * 0.55, r * 0.62, 0, Math.PI * 2);
+    cx.arc(cx2 + r * 0.28, cy - r * 0.55, r * 0.62, 0, Math.PI * 2);
+    cx.fill();
+    cx.restore();
+  }
+
+  // cloud state
+  var clouds = [];
+  var flashes = [];
+  var score = 0;
+  var runStartTs = 0;
+  var phase = 'title'; // title | play | over | cta
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var ctaAt = 0, overAt = 0;
+  var namedThisRound = 0; // clouds named before sky clears
+  var clearSkyAt = 0;     // timestamp when sky cleared
+  var clearSkyFlash = 0;  // countdown for "clear sky" celebration
+  var last = performance.now();
+
+  // ---- label picker UI ----
+  // When a cloud is tapped, show 3 label choices near it
+  var picker = null; // { cloudIdx, x, y, options: [{label,rect}] }
+  var PICKER_LABELS = LABELS.slice(); // rotated pool
+
+  function pickLabels() {
+    // return 3 shuffled labels
+    var pool = PICKER_LABELS.slice();
+    for (var i = pool.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+    }
+    return pool.slice(0, 3);
+  }
+
+  // spawn a cloud with random drift direction
+  function spawnCloud() {
+    var side = rng() < 0.5 ? -1 : 1; // enters from left or right
+    var startX = side < 0 ? -CLOUD_RADIUS * 2 : W + CLOUD_RADIUS * 2;
+    var y = 160 + rng() * 380;
+    var speed = 0.28 + rng() * 0.22;
+    return {
+      x: startX,
+      y: y,
+      r: CLOUD_RADIUS * (0.85 + rng() * 0.32),
+      vx: side * speed,
+      vy: (rng() - 0.5) * 0.12,
+      color: 'rgba(200,210,230,' + (0.55 + rng() * 0.25) + ')',
+      named: false,
+      namedColor: CALM_COLORS[Math.floor(rng() * CALM_COLORS.length)],
+      label: '',
+      floatOff: false,       // floating off top after named
+      floatVy: 0,
+      floatAlpha: 1,
+      wobble: rng() * Math.PI * 2,
+      wobbleSpeed: 0.3 + rng() * 0.4,
+      id: Math.floor(rng() * 1e9)
+    };
+  }
+
+  var MAX_CLOUDS = 4;
+  var SPAWN_INTERVAL = 2600; // ms between spawns
+  var lastSpawn = 0;
+  var demoGameOverScheduled = false; // prevent double-schedule
+
+  function initClouds() {
+    clouds = [];
+    for (var i = 0; i < 3; i++) {
+      var c = spawnCloud();
+      c.x = 80 + rng() * (W - 160);
+      c.y = 200 + rng() * 300;
+      clouds.push(c);
+    }
+  }
+
+  function startRun() {
+    score = 0;
+    namedThisRound = 0;
+    clearSkyAt = 0;
+    clearSkyFlash = 0;
+    picker = null;
+    flashes = [];
+    initClouds();
+    lastSpawn = performance.now();
+    runStartTs = Date.now();
+    phase = 'play';
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    if (window.J) J.calm(0);
+  }
+
+  function flash(txt, color, size, cx2, cy) {
+    flashes.push({ txt: txt, color: color, size: size || 28, t: 0, x: cx2 || W/2, y: cy || H/2 - 60 });
+  }
+
+  // ---- naming a cloud ----
+  function nameCloud(idx, label) {
+    var c = clouds[idx];
+    if (!c || c.named || c.floatOff) return;
+    c.named = true;
+    c.label = label;
+    c.floatOff = true;
+    c.floatVy = -0.9 - rng() * 0.4;
+    c.floatAlpha = 1;
+    score++;
+    namedThisRound++;
+    picker = null;
+    // calm sound
+    if (window.J) J.calm(namedThisRound);
+    // floating reward text
+    flash(label, TEAL, 26, c.x, c.y - c.r - 10);
+    if (window.LOOP) LOOP.emit('cloud_named', { label: label, score: score });
+    // zoom-pulse (gentle)
+    zoom = 1.015;
+  }
+
+  function checkSkyCleared() {
+    // Did we just clear the sky?
+    var active = clouds.filter(function(c){ return !c.floatOff && !c.named; });
+    if (active.length === 0 && namedThisRound > 0 && clearSkyAt === 0) {
+      // all clouds are floating off or gone
+      var allGone = clouds.every(function(c){ return c.floatOff; });
+      if (allGone) {
+        clearSkyAt = performance.now();
+        clearSkyFlash = 120; // frames
+        flash('clear sky', 'rgba(200,240,235,0.95)', 34, W/2, H/2 - 40);
+        if (window.J) J.calm(10);
+        zoom = 1.03;
+        hitStop = 20; // gentle pause
+      }
+    }
+  }
+
+  // BOT state
+  var botRunsDone = 0;
+  var botNamed = 0;
+  var BOT_MAX_NAMES = 6; // bot names this many clouds then stops (game_over fires on timeout)
+
+  // DEMO scripted arc — purely setTimeout-driven for reliability
+  var demoSpawnFrozen = false;
+  var demoScheduled = false; // prevent double-scheduling
+
+  function demoNameNext(delay) {
+    if (demoScheduled) return;
+    demoScheduled = true;
+    setTimeout(function () {
+      demoScheduled = false;
+      if (phase !== 'play') return;
+      var targets = clouds.filter(function(c){ return !c.named && !c.floatOff; });
+      if (targets.length === 0) {
+        // no clouds available yet — retry
+        demoNameNext(400);
+        return;
+      }
+      var idx = clouds.indexOf(targets[0]);
+      var labels = pickLabels();
+      nameCloud(idx, labels[0]);
+      // schedule next or finalize
+      if (clouds.filter(function(c){ return !c.named && !c.floatOff; }).length > 0) {
+        // more unnamed clouds — name them with hesitation
+        demoNameNext(800 + Math.floor(rng() * 800));
+      } else {
+        // all named — freeze spawner, wait for fade, then end
+        demoSpawnFrozen = true;
+        setTimeout(function () {
+          if (!demoGameOverScheduled) {
+            demoGameOverScheduled = true;
+            gameOver();
+          }
+        }, 3000); // clouds fade in ~1.4s, then extra pause for resolve beat
+      }
+    }, delay);
+  }
+
+  function autopilot(now) {
+    if (phase !== 'play') return;
+    if (DEMO) {
+      // demo arc driven by demoNameNext() timeouts — nothing to do here per-frame
+      return;
+    } else if (BOT) {
+      // Bot names clouds then stops so game_over fires via timeout
+      if (botNamed >= BOT_MAX_NAMES) return;
+      if (picker) {
+        // pick first option
+        if (picker.options.length > 0) {
+          nameCloud(picker.cloudIdx, picker.options[0].label);
+        }
+        picker = null;
+        return;
+      }
+      // tap first available cloud
+      var botTargets = clouds.filter(function(c){ return !c.named && !c.floatOff; });
+      if (botTargets.length === 0) return;
+      var bc = botTargets[Math.floor(rng() * botTargets.length)];
+      var bidx = clouds.indexOf(bc);
+      if (bidx >= 0) {
+        // skip picker, name directly with a random label
+        var blabels = pickLabels();
+        nameCloud(bidx, blabels[Math.floor(rng() * blabels.length)]);
+        botNamed++;
+      }
+    }
+  }
+
+  // game over: triggered by timeout or bot completing
+  function gameOver() {
+    if (phase === 'over' || phase === 'cta') return;
+    phase = 'over';
+    overAt = performance.now();
+    picker = null;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+      // Show over briefly, then CTA
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 1800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () {
+          botNamed = 0;
+          startRun();
+        }, 600);
+      }
+    }
+  }
+
+  // Bot timeout: after BOT_MAX_NAMES named + some idle time, trigger game_over
+  var botIdleFrames = 0;
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, px, py) { return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      botNamed = 0; startRun(); return;
+    }
+    if (phase !== 'play') return;
+
+    // If picker is open, check if a label was tapped
+    if (picker) {
+      for (var i = 0; i < picker.options.length; i++) {
+        var opt = picker.options[i];
+        var r2 = opt.rect;
+        if (px >= r2.x && px <= r2.x + r2.w && py >= r2.y && py <= r2.y + r2.h) {
+          nameCloud(picker.cloudIdx, opt.label);
+          return;
+        }
+      }
+      // tapped outside picker — dismiss
+      picker = null;
+      return;
+    }
+
+    // Check if a cloud was tapped
+    for (var ci = 0; ci < clouds.length; ci++) {
+      var c = clouds[ci];
+      if (c.named || c.floatOff) continue;
+      var dx = px - c.x, dy = py - c.y;
+      if (Math.sqrt(dx*dx + dy*dy) < c.r * 1.4) {
+        // Open label picker near the cloud
+        var opts = pickLabels();
+        var optRects = [];
+        var pw = 80, ph = 30, gap = 8;
+        var totalW = opts.length * pw + (opts.length - 1) * gap;
+        var startX = Math.max(10, Math.min(W - totalW - 10, c.x - totalW / 2));
+        var optY = c.y - c.r - 60;
+        if (optY < 80) optY = c.y + c.r + 20;
+        for (var j = 0; j < opts.length; j++) {
+          optRects.push({
+            label: opts[j],
+            rect: { x: startX + j * (pw + gap), y: optY, w: pw, h: ph }
+          });
+        }
+        picker = { cloudIdx: ci, x: c.x, y: c.y, options: optRects };
+        return;
+      }
+    }
+    // tapped nothing — dismiss picker
+    picker = null;
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- render helpers ----
+  function drawStar(x, y, r2, color, alpha) {
+    cx.save();
+    cx.globalAlpha = alpha || 1;
+    cx.fillStyle = color;
+    cx.beginPath();
+    for (var i2 = 0; i2 < 5; i2++) {
+      var a = (i2 * 4 * Math.PI / 5) - Math.PI / 2;
+      var a2 = ((i2 * 4 + 2) * Math.PI / 5) - Math.PI / 2;
+      if (i2 === 0) { cx.moveTo(x + r2 * Math.cos(a), y + r2 * Math.sin(a)); }
+      else { cx.lineTo(x + r2 * Math.cos(a), y + r2 * Math.sin(a)); }
+      cx.lineTo(x + r2 * 0.42 * Math.cos(a2), y + r2 * 0.42 * Math.sin(a2));
+    }
+    cx.closePath(); cx.fill();
+    cx.restore();
+  }
+
+  // Draw the teal gradient sky background
+  function drawSky(t) {
+    var g = cx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#0e1a2e');
+    g.addColorStop(0.5, '#0f2030');
+    g.addColorStop(1, '#0b0d12');
+    cx.fillStyle = g; cx.fillRect(0, 0, W, H);
+    // subtle teal glow at top
+    var glow = cx.createRadialGradient(W/2, -30, 0, W/2, -30, 300);
+    glow.addColorStop(0, 'rgba(46,197,182,0.10)');
+    glow.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = glow; cx.fillRect(0, 0, W, H);
+  }
+
+  // ---- frame loop ----
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // hitStop decay
+    if (hitStop > 0) hitStop -= dt;
+
+    // Spawn new clouds during play (demo freezes spawning after initial wave)
+    if (phase === 'play' && !demoSpawnFrozen && now - lastSpawn > SPAWN_INTERVAL) {
+      var active = clouds.filter(function(c){ return !c.floatOff; }).length;
+      if (active < MAX_CLOUDS) {
+        clouds.push(spawnCloud());
+        lastSpawn = now;
+      }
+    }
+
+    // Update clouds
+    if (phase === 'play') {
+      var allDone = true;
+      for (var i = 0; i < clouds.length; i++) {
+        var c = clouds[i];
+        c.wobble += c.wobbleSpeed * 0.018 * dt;
+        if (c.floatOff) {
+          // float off top
+          c.y += c.floatVy * dt;
+          c.floatAlpha -= 0.012 * dt;
+          if (c.floatAlpha < 0) c.floatAlpha = 0;
+        } else {
+          allDone = false;
+          // drift across screen
+          if (hitStop <= 0) {
+            c.x += c.vx * dt;
+            c.y += c.vy * dt;
+            // gentle vertical wander
+            c.vy += (rng() - 0.5) * 0.01 * dt;
+            if (c.y < 140) { c.y = 140; c.vy = Math.abs(c.vy) * 0.5; }
+            if (c.y > H - 120) { c.y = H - 120; c.vy = -Math.abs(c.vy) * 0.5; }
+          }
+        }
+      }
+      // remove offscreen floated clouds
+      clouds = clouds.filter(function(c){
+        return !(c.floatOff && (c.y < -120 || c.floatAlpha <= 0));
+      });
+      // check for clear sky
+      checkSkyCleared();
+
+      // After clear sky, after a short pause, spawn fresh clouds and continue
+      // (not in demo mode — demo ends after the clear-sky moment)
+      if (!demoSpawnFrozen && clearSkyAt > 0 && now - clearSkyAt > 2200) {
+        namedThisRound = 0;
+        clearSkyAt = 0;
+        for (var ni = 0; ni < 3; ni++) {
+          var nc = spawnCloud();
+          nc.x = 80 + rng() * (W - 160);
+          nc.y = 200 + rng() * 300;
+          clouds.push(nc);
+        }
+        lastSpawn = now;
+      }
+
+      // Bot idle detection: if bot has named enough, trigger game_over
+      if (BOT && botNamed >= BOT_MAX_NAMES) {
+        botIdleFrames += dt;
+        if (botIdleFrames > 90) {
+          botIdleFrames = 0;
+          gameOver();
+        }
+      }
+
+      autopilot(now);
+    }
+
+    // clearSkyFlash decay
+    if (clearSkyFlash > 0) clearSkyFlash -= dt;
+
+    // ---- DRAW ----
+    cx.save();
+    // Juice transforms
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W/2 + sx, H/2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W/2, -H/2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // background
+    drawSky(now);
+
+    // clear sky glow overlay
+    if (clearSkyFlash > 0) {
+      var cf = clearSkyFlash / 120;
+      cx.fillStyle = 'rgba(46,197,182,' + (cf * 0.12) + ')';
+      cx.fillRect(0, 0, W, H);
+    }
+
+    // ---- title screen ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(180,220,240,0.95)';
+      cx.font = '800 42px -apple-system, Helvetica, Arial';
+      cx.fillText('CLOUD NAME', W/2, 280);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('name what drifts through.', W/2, 316);
+      var pulse = 0.5 + 0.5 * Math.sin(now / 700);
+      cx.globalAlpha = 0.5 + 0.4 * pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap a cloud to begin', W/2, 370);
+      cx.globalAlpha = 1;
+      // draw a demo cloud
+      drawCloud(W/2, 450, 42, 'rgba(180,210,235,0.55)', 0.8 + 0.15 * Math.sin(now/900));
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('worry', W/2, 455);
+    }
+
+    // ---- play screen ----
+    if (phase === 'play' || phase === 'over') {
+      // score
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(200,225,240,0.8)';
+      cx.font = '700 52px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W/2, 80);
+      cx.fillStyle = 'rgba(255,255,255,0.28)';
+      cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('named', W/2, 100);
+
+      // clouds
+      for (var ci = 0; ci < clouds.length; ci++) {
+        var c = clouds[ci];
+        var wobbleY = Math.sin(c.wobble + now * 0.001) * 3.5;
+        var drawY = c.y + wobbleY;
+        var drawAlpha = c.floatOff ? Math.max(0, c.floatAlpha) : 1;
+        var cloudColor = c.named ? c.namedColor : c.color;
+        drawCloud(c.x, drawY, c.r, cloudColor, drawAlpha);
+        // label on named clouds
+        if (c.named && c.label && c.floatOff) {
+          cx.save();
+          cx.globalAlpha = drawAlpha * 0.85;
+          cx.textAlign = 'center';
+          cx.fillStyle = 'rgba(40,80,100,0.9)';
+          cx.font = '600 13px -apple-system, Helvetica, Arial';
+          cx.fillText(c.label, c.x, drawY + 5);
+          cx.restore();
+        }
+        // tap hint for unnamed clouds (human only)
+        if (!c.named && !c.floatOff && !DEMO && !BOT && picker === null) {
+          cx.save();
+          cx.globalAlpha = 0.25 + 0.15 * Math.sin(now/600 + ci);
+          cx.textAlign = 'center';
+          cx.fillStyle = 'rgba(255,255,255,0.7)';
+          cx.font = '500 11px -apple-system, Helvetica, Arial';
+          cx.fillText('tap', c.x, drawY + c.r + 16);
+          cx.restore();
+        }
+      }
+
+      // picker overlay
+      if (picker && !DEMO && !BOT) {
+        for (var pi = 0; pi < picker.options.length; pi++) {
+          var opt = picker.options[pi];
+          var r3 = opt.rect;
+          // pill
+          cx.fillStyle = 'rgba(46,197,182,0.18)';
+          cx.strokeStyle = TEAL;
+          cx.lineWidth = 1.5;
+          cx.beginPath();
+          if (cx.roundRect) cx.roundRect(r3.x, r3.y, r3.w, r3.h, 15);
+          else cx.rect(r3.x, r3.y, r3.w, r3.h);
+          cx.fill(); cx.stroke();
+          cx.textAlign = 'center';
+          cx.fillStyle = 'rgba(220,240,240,0.95)';
+          cx.font = '600 13px -apple-system, Helvetica, Arial';
+          cx.fillText(opt.label, r3.x + r3.w/2, r3.y + 20);
+        }
+        // connector line from cloud to picker
+        var pc = clouds[picker.cloudIdx];
+        if (pc) {
+          cx.strokeStyle = 'rgba(46,197,182,0.22)';
+          cx.lineWidth = 1;
+          cx.setLineDash([4,4]);
+          cx.beginPath();
+          cx.moveTo(pc.x, pc.y - pc.r - 5);
+          cx.lineTo(W/2, picker.options[1] ? picker.options[1].rect.y + 30 : pc.y - pc.r - 30);
+          cx.stroke();
+          cx.setLineDash([]);
+        }
+      }
+    }
+
+    // ---- floating text ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 55);
+      cx.save();
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + fl.size + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.55);
+      cx.restore();
+      if (fl.t > 60) flashes.splice(k, 1);
+    }
+
+    // ---- over screen ----
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.65)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(180,240,235,0.92)';
+      cx.font = '800 36px -apple-system, Helvetica, Arial';
+      cx.fillText('sky at rest.', W/2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '600 20px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' clouds named', W/2, 342);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('you gave them all a name.', W/2, 374);
+      if (!DEMO && !BOT) {
+        var pulse2 = 0.55 + 0.35 * Math.sin(now / 700);
+        cx.globalAlpha = pulse2;
+        cx.fillStyle = TEAL;
+        cx.font = '600 15px -apple-system, Helvetica, Arial';
+        cx.fillText('tap to try again', W/2, 440);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // ---- demo CTA card ----
+    if (phase === 'cta') {
+      var ct = (now - ctaAt) / 1000;
+      var ease = Math.min(1, ct * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(180,240,235,0.95)';
+      cx.font = '800 42px -apple-system, Helvetica, Arial';
+      cx.fillText('CLOUD NAME', W/2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.65)';
+      cx.font = '500 17px -apple-system, Helvetica, Arial';
+      cx.fillText('name what drifts through.', W/2, 328);
+      var pulse3 = 0.7 + 0.3 * Math.sin(now / 600);
+      cx.globalAlpha = ease * pulse3;
+      cx.fillStyle = TEAL;
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ GROW YOURS', W/2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W/2, 434);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w/2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- bootstrap ----
+  if (DEMO) {
+    // Skip title; start the calm arc immediately with 4 pre-placed clouds
+    clouds = [];
+    for (var si = 0; si < 4; si++) {
+      var sc = spawnCloud();
+      sc.x = 70 + si * 85;
+      sc.y = 200 + (si % 2) * 140;
+      clouds.push(sc);
+    }
+    lastSpawn = performance.now();
+    runStartTs = Date.now();
+    phase = 'play';
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    // Start the scripted naming arc after a settle pause
+    demoNameNext(1200);
+  } else if (BOT) {
+    startRun();
+  }
+  // Human: stays on title, tap to start
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

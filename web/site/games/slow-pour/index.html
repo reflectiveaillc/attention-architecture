@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Slow Pour — Tilt</title>
+<!--
+  LOOP / attention-architecture — Slow Pour
+  Circuits: 05-ease, 07-timing, 01-rpe
+  Engine: calm
+  Conditioned path: the pull-to-refresh lever as a self-soothing gesture.
+  Hold to tip a vessel; pour at exactly the right speed.
+  Modes:
+    ?demo=1&seed=7    scripted calm arc ~16s → soft CTA, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'slow-pour';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL2 = '#1a9e96', SOFT = '#a8e6e2', CREAM = '#f5f0e8';
+
+  // ---- game constants ----
+  // Top vessel (pitcher): x-center, top-y, angled
+  var PITCHER = { cx: W / 2, cy: 190, w: 80, h: 120 };
+  // Bottom vessel (cup): fixed center
+  var CUP = { cx: W / 2, cy: 540, w: 90, h: 100 };
+
+  // Pour mechanics
+  var MAX_TILT = 55;      // degrees max tilt
+  var IDEAL_FLOW_MIN = 0.18;  // ideal flow rate (fill fraction per second)
+  var IDEAL_FLOW_MAX = 0.38;
+  var SPLASH_RATE = 0.58;    // flow fraction above which splash starts
+  var MIN_FLOW = 0.04;       // drip threshold
+
+  var state, flashes, hitStop, zoom, shakeAmt;
+  var runStartTs, best = 0;
+  try { best = +localStorage.getItem('sp_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',   // title | play | over | cta
+      tilt: 0,          // current tilt angle (degrees, 0 = upright, MAX_TILT = fully tipped)
+      fill: 0,          // cup fill fraction [0..1]
+      splashAccum: 0,   // accumulated splash penalty
+      score: 0,         // computed on complete
+      held: false,      // is user holding down
+      runComplete: false,
+      overAt: 0,
+      ctaAt: 0,
+      // particles
+      drops: [],
+      splashes: [],
+      // running time in ideal zone
+      idealTime: 0,
+      totalPourTime: 0,
+      // ripples in cup
+      ripples: []
+    };
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0;
+    if (DEMO) { setTimeout(startRun, 100); return; }
+    if (BOT) { startRun(); return; }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function gameOver(completed) {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    // Score: base fill% 0-100 + ideal-zone bonus up to 50, minus splash penalty up to 30
+    var fillPct = Math.round(state.fill * 100);
+    var idealBonus = Math.round((state.idealTime / Math.max(state.totalPourTime, 0.01)) * 50);
+    var splashPenalty = Math.round(Math.min(state.splashAccum * 25, 30));
+    state.score = Math.max(0, fillPct + idealBonus - splashPenalty);
+    if (completed) {
+      // Completion bonus
+      state.score = Math.min(150, state.score + 20);
+    }
+    var newBest = state.score > best;
+    if (window.__demoScore === undefined && DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('sp_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (window.J) J.calm(completed ? 4 : 1);
+    if (newBest && window.J) setTimeout(function () { J.calm(5); }, 400);
+    // zoom-pulse on complete
+    if (completed) { zoom = 1.025; }
+
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2500);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 800);
+    }
+  }
+
+  function resetRun() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    newGame();
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 120, y: 490, w: 240, h: 44 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function pointerDown(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { state.held = true; return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'ml poured' }); return;
+      }
+      resetRun();
+    }
+  }
+  function pointerUp() {
+    if (DEMO || BOT) return;
+    state.held = false;
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointerup', pointerUp);
+  window.addEventListener('pointercancel', pointerUp);
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') { e.preventDefault(); if (state.phase === 'play') state.held = true; else pointerDown(); }
+  });
+  window.addEventListener('keyup', function (e) {
+    if (e.code === 'Space') state.held = false;
+  });
+
+  // ---- demo / bot autopilots ----
+  // Demo: calm arc — settle → deepen → resolve
+  // Phase 1 (0-4s): gently find the flow, hesitate
+  // Phase 2 (4-10s): steady ideal pour
+  // Phase 3 (10-14s): deepen, complete the cup
+  var demoElapsed = 0;
+  var botRunsDone = 0;
+  var botElapsed = 0;
+  var botTargetTilt = 0;
+  var botHoldTimer = 0;
+
+  function autopilot(dt) {
+    if (!state || state.phase !== 'play') return;
+    if (DEMO) {
+      demoElapsed += dt * (1 / 60);  // approximate seconds
+      // settle: slowly increase tilt in first 3s, then hold steady
+      var t = demoElapsed;
+      var targetHeld;
+      if (t < 1.5) {
+        // hesitation — barely tilt
+        targetHeld = (t / 1.5) > 0.5;
+      } else if (t < 5) {
+        // gently find the zone
+        targetHeld = true;
+      } else if (t < 7) {
+        // brief pause to "check"
+        targetHeld = (Math.floor(t * 2) % 4) < 3;
+      } else {
+        // steady pour to completion
+        targetHeld = true;
+      }
+      state.held = targetHeld;
+    } else if (BOT) {
+      botElapsed += dt * (1 / 60);
+      botHoldTimer -= dt * (1 / 60);
+      // imperfect: sometimes tilt too much (splash), sometimes too little
+      if (botHoldTimer <= 0) {
+        var r = rng();
+        if (r < 0.6) {
+          state.held = true;
+          botHoldTimer = 0.3 + rng() * 0.8;
+        } else {
+          state.held = false;
+          botHoldTimer = 0.1 + rng() * 0.4;
+        }
+      }
+      // Bot intentionally overshoots sometimes → splash → eventually cup fills or they fail
+    }
+  }
+
+  // ---- physics ----
+  function updatePhysics(dt) {
+    if (state.phase !== 'play') return;
+
+    var s = state;
+    var dtS = dt * (1 / 60); // convert frames to seconds
+
+    // Tilt smoothly toward target
+    var targetTilt = s.held ? MAX_TILT : 0;
+    var tiltSpeed = s.held ? 110 : 90; // deg/s
+    var diff = targetTilt - s.tilt;
+    var step = tiltSpeed * dtS;
+    s.tilt += Math.sign(diff) * Math.min(Math.abs(diff), step);
+
+    // Flow rate based on tilt (sine curve, 0 at 0deg, MAX at MAX_TILT)
+    var tiltFrac = s.tilt / MAX_TILT;
+    var flowRate = tiltFrac * tiltFrac; // quadratic — needs commitment
+
+    var isSplashing = flowRate > SPLASH_RATE;
+    var isPouring = flowRate > MIN_FLOW && s.fill < 1;
+
+    if (isPouring) {
+      s.totalPourTime += dtS;
+      var fillGain = flowRate * 0.5 * dtS; // fill rate
+      if (isSplashing) {
+        // Splash: only some liquid goes in
+        var spillFrac = (flowRate - SPLASH_RATE) / (1 - SPLASH_RATE);
+        fillGain *= (1 - spillFrac * 0.7);
+        s.splashAccum += spillFrac * dtS;
+        shakeAmt = Math.max(shakeAmt, spillFrac * 3);
+        // spawn splash particles
+        if (rng() < spillFrac * 0.4) {
+          spawnSplash();
+        }
+      } else {
+        // Ideal zone
+        if (flowRate >= IDEAL_FLOW_MIN && flowRate <= IDEAL_FLOW_MAX) {
+          s.idealTime += dtS;
+        }
+        // spawn a drop
+        if (rng() < flowRate * 0.3) {
+          spawnDrop(flowRate);
+        }
+      }
+      s.fill = Math.min(1, s.fill + fillGain);
+
+      // Ripples in cup on drops
+      if (rng() < flowRate * 0.08) {
+        spawnRipple();
+      }
+    }
+
+    // Check completion
+    if (s.fill >= 1 && !s.runComplete) {
+      s.runComplete = true;
+      zoom = 1.03;
+      flash('FULL', TEAL, 52);
+      if (window.J) J.calm(5);
+      if (window.LOOP) LOOP.emit('vessel_full', { score: state.score });
+      setTimeout(function () { gameOver(true); }, 800);
+    }
+
+    // Update drops
+    for (var i = s.drops.length - 1; i >= 0; i--) {
+      var d = s.drops[i];
+      d.x += d.vx * dtS;
+      d.y += d.vy * dtS;
+      d.vy += 320 * dtS; // gravity
+      d.life -= dtS;
+      // Bounce into cup when reaching cup top
+      var cupTop = CUP.cy - CUP.h / 2;
+      if (d.y > cupTop && d.y < cupTop + 30 && Math.abs(d.x - CUP.cx) < CUP.w / 2) {
+        spawnRipple();
+        s.drops.splice(i, 1);
+      } else if (d.life <= 0 || d.y > H + 20) {
+        s.drops.splice(i, 1);
+      }
+    }
+    // Update splashes
+    for (var j = s.splashes.length - 1; j >= 0; j--) {
+      var sp = s.splashes[j];
+      sp.x += sp.vx * dtS;
+      sp.y += sp.vy * dtS;
+      sp.vy += 280 * dtS;
+      sp.life -= dtS;
+      if (sp.life <= 0 || sp.y > H + 20) s.splashes.splice(j, 1);
+    }
+    // Update ripples
+    for (var k = s.ripples.length - 1; k >= 0; k--) {
+      var rp = s.ripples[k];
+      rp.r += 30 * dtS;
+      rp.life -= dtS;
+      if (rp.life <= 0) s.ripples.splice(k, 1);
+    }
+  }
+
+  function spawnDrop(flowRate) {
+    // Pour spout tip: pitcher rotated, spout at bottom-right
+    var angle = (state.tilt * Math.PI / 180);
+    // Pitcher center
+    var px = PITCHER.cx + Math.cos(angle) * (PITCHER.h / 2 - 5);
+    var py = PITCHER.cy + Math.sin(angle) * (PITCHER.h / 2 - 5);
+    // Offset to right edge of pitcher (spout)
+    var spx = px + Math.cos(angle + Math.PI / 2) * (PITCHER.w / 2);
+    var spy = py + Math.sin(angle + Math.PI / 2) * (PITCHER.w / 2);
+    var speed = 80 + flowRate * 200;
+    state.drops.push({
+      x: spx, y: spy,
+      vx: Math.cos(angle + Math.PI / 2) * speed * 0.3 + (rng() - 0.5) * 20,
+      vy: speed * 0.6 + rng() * 20,
+      r: 2 + rng() * 2,
+      life: 2,
+      alpha: 0.85 + rng() * 0.15
+    });
+  }
+
+  function spawnSplash() {
+    // Splash near the cup rim
+    var rx = CUP.cx + (rng() - 0.5) * CUP.w * 0.8;
+    var ry = CUP.cy - CUP.h / 2 + 5;
+    var ang = -(Math.PI / 2) + (rng() - 0.5) * 1.4;
+    var speed = 60 + rng() * 100;
+    state.splashes.push({
+      x: rx, y: ry,
+      vx: Math.cos(ang) * speed,
+      vy: Math.sin(ang) * speed - 40,
+      r: 1.5 + rng() * 2,
+      life: 0.5 + rng() * 0.4
+    });
+  }
+
+  function spawnRipple() {
+    var fillY = CUP.cy + CUP.h / 2 - 10 - state.fill * (CUP.h - 20);
+    state.ripples.push({
+      x: CUP.cx + (rng() - 0.5) * CUP.w * 0.5,
+      y: fillY,
+      r: 2,
+      life: 0.6
+    });
+  }
+
+  // ---- render helpers ----
+  function drawPitcher(angle) {
+    cx.save();
+    cx.translate(PITCHER.cx, PITCHER.cy);
+    cx.rotate(angle);
+
+    var pw = PITCHER.w, ph = PITCHER.h;
+    // Vessel body (trapezoidal pitcher)
+    cx.beginPath();
+    cx.moveTo(-pw / 2 + 6, -ph / 2);
+    cx.lineTo(pw / 2 - 2, -ph / 2);
+    cx.lineTo(pw / 2 + 8, ph / 2);   // spout lip on right
+    cx.lineTo(-pw / 2 - 4, ph / 2);
+    cx.closePath();
+    var g = cx.createLinearGradient(-pw / 2, -ph / 2, pw / 2, ph / 2);
+    g.addColorStop(0, 'rgba(46,197,182,0.25)');
+    g.addColorStop(1, 'rgba(46,197,182,0.08)');
+    cx.fillStyle = g;
+    cx.fill();
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 2;
+    cx.stroke();
+
+    // Spout detail line
+    cx.beginPath();
+    cx.moveTo(pw / 2 - 2, -ph / 2 + 8);
+    cx.lineTo(pw / 2 + 8, ph / 2);
+    cx.strokeStyle = 'rgba(46,197,182,0.6)';
+    cx.lineWidth = 1.5;
+    cx.stroke();
+
+    // Handle on left
+    cx.beginPath();
+    cx.arc(-pw / 2 - 12, 0, 14, -Math.PI * 0.6, Math.PI * 0.6, false);
+    cx.strokeStyle = 'rgba(46,197,182,0.5)';
+    cx.lineWidth = 2.5;
+    cx.stroke();
+
+    // Liquid inside pitcher (fill indicator)
+    cx.beginPath();
+    cx.moveTo(-pw / 2 + 8, -ph / 2 + 6);
+    cx.lineTo(pw / 2 - 6, -ph / 2 + 6);
+    cx.lineTo(pw / 2 + 4, ph / 2 - 4);
+    cx.lineTo(-pw / 2 - 2, ph / 2 - 4);
+    cx.closePath();
+    var lg = cx.createLinearGradient(0, -ph / 2, 0, ph / 2);
+    lg.addColorStop(0, 'rgba(168,230,226,0.35)');
+    lg.addColorStop(1, 'rgba(46,197,182,0.55)');
+    cx.fillStyle = lg;
+    cx.fill();
+
+    cx.restore();
+  }
+
+  function drawCup() {
+    var cx_ = CUP.cx, cy_ = CUP.cy, cw = CUP.w, ch = CUP.h;
+    var top = cy_ - ch / 2, bot = cy_ + ch / 2;
+    // Cup outline (slightly wider at top)
+    cx.beginPath();
+    cx.moveTo(cx_ - cw / 2 - 4, top);
+    cx.lineTo(cx_ + cw / 2 + 4, top);
+    cx.lineTo(cx_ + cw / 2, bot);
+    cx.lineTo(cx_ - cw / 2, bot);
+    cx.closePath();
+    cx.strokeStyle = 'rgba(46,197,182,0.7)';
+    cx.lineWidth = 2;
+    cx.stroke();
+
+    // Fill level
+    var fillH = state.fill * (ch - 8);
+    var fillTop = bot - fillH - 4;
+    if (state.fill > 0.01) {
+      cx.save();
+      cx.beginPath();
+      cx.moveTo(cx_ - cw / 2, top);
+      cx.lineTo(cx_ + cw / 2 + 4, top);
+      cx.lineTo(cx_ + cw / 2, bot);
+      cx.lineTo(cx_ - cw / 2, bot);
+      cx.closePath();
+      cx.clip();
+
+      // Liquid body
+      cx.fillStyle = 'rgba(46,197,182,0.22)';
+      cx.fillRect(cx_ - cw / 2 - 4, fillTop, cw + 8, fillH + 6);
+
+      // Surface shimmer
+      cx.fillStyle = 'rgba(168,230,226,0.5)';
+      cx.fillRect(cx_ - cw / 2, fillTop, cw, 3);
+
+      // Ripples on liquid surface
+      for (var k = 0; k < state.ripples.length; k++) {
+        var rp = state.ripples[k];
+        var a = rp.life / 0.6;
+        cx.beginPath();
+        cx.ellipse(rp.x, fillTop + 1, rp.r, rp.r * 0.35, 0, 0, Math.PI * 2);
+        cx.strokeStyle = 'rgba(168,230,226,' + (a * 0.5) + ')';
+        cx.lineWidth = 1;
+        cx.stroke();
+      }
+      cx.restore();
+    }
+
+    // Graduation marks on cup
+    for (var m = 1; m <= 4; m++) {
+      var my = bot - (ch - 8) * (m / 4) - 4;
+      cx.beginPath();
+      cx.moveTo(cx_ + cw / 2 - 2, my);
+      cx.lineTo(cx_ + cw / 2 + 4, my);
+      cx.strokeStyle = 'rgba(46,197,182,0.3)';
+      cx.lineWidth = 1;
+      cx.stroke();
+    }
+  }
+
+  function drawDrops() {
+    for (var i = 0; i < state.drops.length; i++) {
+      var d = state.drops[i];
+      cx.save();
+      cx.globalAlpha = d.alpha * Math.min(1, d.life * 4);
+      cx.beginPath();
+      cx.ellipse(d.x, d.y, d.r * 0.7, d.r, 0, 0, Math.PI * 2);
+      cx.fillStyle = TEAL;
+      cx.fill();
+      cx.restore();
+    }
+  }
+
+  function drawSplashes() {
+    for (var j = 0; j < state.splashes.length; j++) {
+      var sp = state.splashes[j];
+      cx.save();
+      cx.globalAlpha = sp.life / 0.9 * 0.7;
+      cx.beginPath();
+      cx.arc(sp.x, sp.y, sp.r, 0, Math.PI * 2);
+      cx.fillStyle = 'rgba(168,230,226,0.8)';
+      cx.fill();
+      cx.restore();
+    }
+  }
+
+  function drawFlowIndicator() {
+    // Calm tilt guide — subtle arc indicator
+    var pctFill = state.fill;
+    var tiltFrac = state.tilt / MAX_TILT;
+    var flowOk = tiltFrac >= (IDEAL_FLOW_MIN * 1.5) && tiltFrac * tiltFrac <= SPLASH_RATE;
+
+    // Flow zone bar: left side, vertical
+    var bx = 30, by = 280, bh = 160, bw = 8;
+    cx.fillStyle = 'rgba(255,255,255,0.08)';
+    roundRect(bx, by, bw, bh, 4);
+    cx.fill();
+
+    // Ideal zone highlight
+    var idealLo = IDEAL_FLOW_MIN / 1 * bh;
+    var idealHi = IDEAL_FLOW_MAX * bh;
+    cx.fillStyle = 'rgba(46,197,182,0.2)';
+    cx.fillRect(bx, by + bh - idealHi, bw, idealHi - idealLo);
+
+    // Current flow dot
+    var flowDotY = by + bh - tiltFrac * tiltFrac * bh;
+    cx.beginPath();
+    cx.arc(bx + bw / 2, flowDotY, 6, 0, Math.PI * 2);
+    cx.fillStyle = flowOk ? TEAL : (tiltFrac > 0.01 ? GOLD : 'rgba(255,255,255,0.3)');
+    cx.fill();
+
+    // Labels
+    cx.textAlign = 'left';
+    cx.fillStyle = 'rgba(255,255,255,0.3)';
+    cx.font = '500 10px -apple-system, Helvetica, Arial';
+    cx.fillText('FAST', bx + 12, by + 10);
+    cx.fillText('SLOW', bx + 12, by + bh + 4);
+    cx.fillStyle = 'rgba(46,197,182,0.5)';
+    cx.fillText('ideal', bx + 12, by + bh - idealLo + 2);
+
+    // Fill % label
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.6)';
+    cx.font = '700 14px -apple-system, Helvetica, Arial';
+    cx.fillText(Math.round(pctFill * 100) + '%', W / 2, CUP.cy + CUP.h / 2 + 28);
+  }
+
+  function roundRect(x, y, w, h, r) {
+    cx.beginPath();
+    if (cx.roundRect) { cx.roundRect(x, y, w, h, r); }
+    else {
+      cx.moveTo(x + r, y);
+      cx.lineTo(x + w - r, y);
+      cx.quadraticCurveTo(x + w, y, x + w, y + r);
+      cx.lineTo(x + w, y + h - r);
+      cx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      cx.lineTo(x + r, y + h);
+      cx.quadraticCurveTo(x, y + h, x, y + h - r);
+      cx.lineTo(x, y + r);
+      cx.quadraticCurveTo(x, y, x + r, y);
+      cx.closePath();
+    }
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // autopilot must be called BEFORE physics so held is set
+    if (DEMO || BOT) autopilot(dt);
+
+    // physics
+    if (hitStop > 0) { hitStop -= dt; }
+    else { updatePhysics(dt); }
+
+    // juice decay
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // ---- draw ----
+    cx.save();
+    // screen shake + zoom
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(26,158,150,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    if (state.phase === 'title') {
+      drawTitle(now);
+    } else if (state.phase === 'play' || state.phase === 'over') {
+      drawGame(now);
+      if (state.phase === 'over') drawOver(now);
+    } else if (state.phase === 'cta') {
+      drawGame(now);
+      drawCta(now);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 50);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 320 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL;
+    cx.font = '900 48px -apple-system, Helvetica, Arial';
+    cx.fillText('SLOW POUR', W / 2, 270);
+    cx.fillStyle = 'rgba(255,255,255,0.6)';
+    cx.font = '500 17px -apple-system, Helvetica, Arial';
+    cx.fillText('hold to tip · find the steady flow', W / 2, 308);
+    var pulse = 0.55 + 0.45 * Math.sin(now / 480);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = TEAL;
+    cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO BEGIN', W / 2, 370);
+    cx.globalAlpha = 1;
+    // Draw a small preview vessel pair
+    cx.save();
+    cx.translate(0, -60);
+    cx.globalAlpha = 0.35;
+    drawPitcher(0);
+    drawCup();
+    cx.restore();
+  }
+
+  function drawGame(now) {
+    // Pitcher angle
+    var angle = state.tilt * Math.PI / 180;
+    drawPitcher(angle);
+    drawDrops();
+    drawSplashes();
+    drawCup();
+    if (state.phase === 'play') drawFlowIndicator();
+
+    // Score / session info during play
+    if (state.phase === 'play') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '800 52px -apple-system, Helvetica, Arial';
+      // Show fill % as main score
+      cx.fillText(Math.round(state.fill * 100), W / 2, 100);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 122);
+
+      // Hold instruction pulse if not holding
+      if (!state.held && state.fill < 0.99) {
+        var p2 = 0.4 + 0.4 * Math.sin(now / 600);
+        cx.globalAlpha = p2;
+        cx.fillStyle = SOFT;
+        cx.font = '600 13px -apple-system, Helvetica, Arial';
+        cx.fillText('hold to pour', W / 2, 640);
+        cx.globalAlpha = 1;
+      }
+    }
+  }
+
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+
+    if (state.runComplete) {
+      cx.fillStyle = TEAL;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('STEADY.', W / 2, 280);
+    } else {
+      cx.fillStyle = GOLD;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('SPILLED.', W / 2, 280);
+    }
+    cx.fillStyle = '#fff';
+    cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score + ' pts', W / 2, 326);
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText(Math.round(state.fill * 100) + '% poured', W / 2, 352);
+
+    if (!DEMO && !BOT) {
+      var p3 = 0.55 + 0.45 * Math.sin(now / 350);
+      cx.globalAlpha = p3;
+      cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — POUR AGAIN', W / 2, 420);
+      cx.globalAlpha = 1;
+
+      // Share pill
+      cx.fillStyle = 'rgba(46,197,182,0.12)';
+      cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+      roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 22);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 28);
+    }
+  }
+
+  function drawCta(now) {
+    var t = (now - state.ctaAt) / 1000, ease = Math.min(1, t * 2.5);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL;
+    cx.font = '900 44px -apple-system, Helvetica, Arial';
+    cx.fillText('SLOW POUR', W / 2, 290);
+    cx.fillStyle = 'rgba(255,255,255,0.75)';
+    cx.font = '600 18px -apple-system, Helvetica, Arial';
+    cx.fillText('find the steady flow', W / 2, 328);
+    var p = 0.7 + 0.3 * Math.sin(now / 320);
+    cx.globalAlpha = ease * p;
+    cx.fillStyle = TEAL;
+    cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 400);
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 15px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 432);
+    cx.globalAlpha = 1;
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

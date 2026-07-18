@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Rhythm Trace — Tilt</title>
+<!--
+  LOOP / attention-architecture — Rhythm Trace
+  Circuits: 05-ease, 07-timing, 01-rpe
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N    imperfect autopilot, N runs, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'rhythm-trace';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = Math.max(1, +qs.get('runs') || 2);
+  var SEED = +qs.get('seed') || 42;
+
+  // Seeded RNG — mulberry32
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  // canvas
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL2 = '#1fa99c', SOFT = 'rgba(46,197,182,';
+
+  // ---- Game parameters ----
+  // The wave: a slow sin curve that scrolls across the screen.
+  // Player traces it by holding their finger on the canvas.
+  // Score = continuous time spent within MATCH_BAND of the wave.
+  // A "run" ends when the player has been tracing for RUN_DURATION seconds
+  // (calm game: there is no death — the run ends naturally).
+  // For bot mode we need a game_over event, so runs are time-limited.
+
+  var RUN_DURATION   = 14;     // seconds per run (bot + human)
+  var MATCH_BAND     = 28;     // px tolerance around the wave to count as "on it"
+  var WAVE_AMP       = 90;     // wave amplitude (px)
+  var WAVE_FREQ      = 0.016;  // wave spatial frequency (rad/px)
+  var WAVE_SPEED     = 0.9;    // px/frame the wave phase scrolls (gives scroll feel)
+  var GLOW_FADE      = 0.04;   // how fast untraced glow decays per frame
+  var CALM_STEPS     = 0;      // tracks J.calm call steps
+
+  // game state
+  var phase;          // 'title' | 'play' | 'over' | 'cta'
+  var wavePhase;      // current phase offset of the wave (scrolls)
+  var score;          // 0–100 = % of run time spent on the wave
+  var matchTime;      // seconds spent matching
+  var runStart;       // performance.now() at run start
+  var runElapsed;     // seconds into the run
+  var touching;       // is the player currently touching?
+  var touchY;         // current touch Y (canvas coords)
+  var glowBuf;        // Float32Array[W] — per-column glow intensity 0–1
+  var flashes;        // [{txt, color, size, t}]
+  var overAt;         // time game ended
+  var ctaAt;          // time CTA started
+
+  // juice
+  var hitStop   = 0;
+  var zoom      = 1;
+  var shakeAmt  = 0;
+
+  // bot
+  var botRunsDone = 0;
+
+  // demo
+  var demoStartAt;
+  var demoDone = false;
+
+  function newGame() {
+    phase      = 'title';
+    wavePhase  = 0;
+    score      = 0;
+    matchTime  = 0;
+    runElapsed = 0;
+    touching   = false;
+    touchY     = H / 2;
+    glowBuf    = new Float32Array(W);
+    flashes    = [];
+    overAt     = 0;
+    ctaAt      = 0;
+    hitStop    = 0; zoom = 1; shakeAmt = 0;
+    CALM_STEPS = 0;
+
+    if (DEMO) {
+      // start immediately into play
+      startRun();
+      demoStartAt = performance.now();
+      demoDone    = false;
+      return;
+    }
+    if (BOT) {
+      startRun();
+    }
+  }
+
+  function startRun() {
+    phase      = 'play';
+    wavePhase  = 0;
+    score      = 0;
+    matchTime  = 0;
+    runElapsed = 0;
+    touching   = false;
+    touchY     = H / 2;
+    glowBuf    = new Float32Array(W);
+    runStart   = performance.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function endRun() {
+    phase  = 'over';
+    overAt = performance.now();
+    var dur = (performance.now() - runStart) / 1000;
+    score  = Math.round((matchTime / Math.max(dur, 0.1)) * 100);
+    touching = false;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    // calm bell on resolution
+    if (window.J) J.calm && J.calm(CALM_STEPS++);
+
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () {
+          if (window.LOOP) LOOP.emit('restart', {});
+          startRun();
+        }, 800);
+      }
+    }
+  }
+
+  // ---- Wave helpers ----
+  function waveY(x, phase) {
+    // layered sine for organic feel
+    return H / 2
+      + Math.sin(x * WAVE_FREQ + phase) * WAVE_AMP
+      + Math.sin(x * WAVE_FREQ * 1.7 + phase * 0.6) * (WAVE_AMP * 0.3);
+  }
+
+  // ---- Input (human only) ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function onDown(cx_, cy_) {
+    if (DEMO || BOT) return;
+    if (cx_ !== undefined && inR(MUTE_R, cx_, cy_) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (window.LOOP) LOOP.emit('restart', {});
+      startRun(); return;
+    }
+    touching = true;
+    touchY   = cy_;
+  }
+  function onMove(cx_, cy_) {
+    if (DEMO || BOT) return;
+    if (phase !== 'play') return;
+    touching = true;
+    touchY   = cy_;
+  }
+  function onUp() {
+    if (DEMO || BOT) return;
+    touching = false;
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    onDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener('pointermove', function (e) {
+    if (e.buttons === 0) return;
+    var r = cv.getBoundingClientRect();
+    onMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', onUp);
+  cv.addEventListener('pointercancel', onUp);
+
+  // ---- Bot / Demo autopilot ----
+  // Bot: smoothly follows the wave with slight lag/noise. After RUN_DURATION it stops.
+  var botPhase = 0;   // tracks the wave for bot
+  function botTouchY(x, phase) {
+    // follow wave with some noise from RNG
+    return waveY(x, phase) + (rng() - 0.5) * 20;
+  }
+
+  // Demo: smooth sinusoidal trace that matches the wave well, with gentle drift
+  var demoHoldX = W * 0.4;   // x column we treat as the "finger" position
+  function demoTouchY(now) {
+    var t = (now - demoStartAt) / 1000;
+    var x = demoHoldX;
+    var wy = waveY(x, wavePhase);
+    // first 3s: settle onto wave (drift in)
+    if (t < 3) {
+      return H / 2 + (wy - H / 2) * (t / 3);
+    }
+    // 3–12s: trace the wave with gentle micro-wobble
+    if (t < 12) {
+      return wy + Math.sin(t * 2.3) * 6;
+    }
+    // 12–16s: deepen — follow more precisely (resolve)
+    return wy + Math.sin(t * 1.1) * 2;
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- Main loop ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+    requestAnimationFrame(frame);
+
+    // ---- update ----
+    if (phase === 'play') {
+      runElapsed = (now - runStart) / 1000;
+
+      // scroll the wave
+      wavePhase += WAVE_SPEED * dt * 0.04;
+
+      // autopilot for demo / bot
+      if (DEMO) {
+        touching = true;
+        touchY   = demoTouchY(now);
+        // end run after ~16s
+        if (runElapsed >= 16) { endRun(); return; }
+      } else if (BOT) {
+        // bot traces the wave imperfectly
+        touching = true;
+        touchY = botTouchY(demoHoldX, wavePhase) + (rng() - 0.5) * 30;
+        // end run after RUN_DURATION
+        if (runElapsed >= RUN_DURATION) { endRun(); return; }
+      } else {
+        // human: end run after RUN_DURATION
+        if (runElapsed >= RUN_DURATION) { endRun(); return; }
+      }
+
+      // check if touch is on the wave
+      var fingerX = demoHoldX;   // for demo/bot we use fixed X; for human we use center
+      if (!DEMO && !BOT) fingerX = W / 2;
+
+      var wy = waveY(fingerX, wavePhase);
+      var onWave = touching && Math.abs(touchY - wy) < MATCH_BAND;
+
+      if (onWave) {
+        matchTime += (dt * 16.667) / 1000;
+        // update glow along the full wave width
+        for (var gx = 0; gx < W; gx++) {
+          var gy = waveY(gx, wavePhase);
+          var dist = touching ? Math.abs(touchY - gy) : MATCH_BAND + 1;
+          // glow based on proximity to match
+          var g = Math.max(0, 1 - dist / MATCH_BAND);
+          if (g > glowBuf[gx]) glowBuf[gx] = g;
+        }
+        // calm sound pulse every ~2s of match
+        if (window.J && J.calm && Math.floor(matchTime) > Math.floor(matchTime - dt * 16.667 / 1000)) {
+          J.calm(CALM_STEPS++);
+        }
+      } else {
+        // fade glow
+        for (var fx = 0; fx < W; fx++) {
+          glowBuf[fx] = Math.max(0, glowBuf[fx] - GLOW_FADE * dt);
+        }
+      }
+
+      // hit-stop decay (CRITICAL: always decay, never gate autopilot on hitStop)
+      if (hitStop > 0) hitStop -= dt;
+    }
+
+    // ---- render ----
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (rng() - 0.5) * shakeAmt * 2;
+      var sy = (rng() - 0.5) * shakeAmt * 2;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.88, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    // subtle ambient gradient
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    if (phase === 'play' || phase === 'over') {
+      drawGame(now, dt);
+    }
+
+    if (phase === 'title')    drawTitle(now);
+    if (phase === 'over')     drawOver(now);
+    if (phase === 'cta')      drawCta(now);
+
+    // floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 240 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+  }
+
+  function drawGame(now, dt) {
+    // ---- draw dotted wave (base) ----
+    var dotR = 3, dotSpacing = 12;
+    for (var x = 0; x < W; x += dotSpacing) {
+      var wy = waveY(x, wavePhase);
+      var g  = glowBuf[x] || 0;
+      // base dot: dim teal
+      cx.beginPath();
+      cx.arc(x, wy, dotR, 0, Math.PI * 2);
+      cx.fillStyle = 'rgba(46,197,182,0.18)';
+      cx.fill();
+      // glow overlay
+      if (g > 0.01) {
+        cx.beginPath();
+        cx.arc(x, wy, dotR + g * 4, 0, Math.PI * 2);
+        cx.fillStyle = SOFT + (g * 0.9) + ')';
+        cx.fill();
+        // outer halo
+        cx.beginPath();
+        cx.arc(x, wy, dotR + g * 10, 0, Math.PI * 2);
+        cx.fillStyle = SOFT + (g * 0.15) + ')';
+        cx.fill();
+      }
+    }
+
+    // ---- draw finger indicator ----
+    if (touching && phase === 'play') {
+      var fx = (!DEMO && !BOT) ? W / 2 : demoHoldX;
+      var wy2 = waveY(fx, wavePhase);
+      var dist2 = Math.abs(touchY - wy2);
+      var onW = dist2 < MATCH_BAND;
+
+      // touch ring
+      var ringColor = onW ? TEAL : 'rgba(255,255,255,0.3)';
+      cx.beginPath();
+      cx.arc(fx, touchY, 22, 0, Math.PI * 2);
+      cx.strokeStyle = ringColor;
+      cx.lineWidth = onW ? 2.5 : 1.5;
+      cx.stroke();
+
+      // inner fill
+      cx.beginPath();
+      cx.arc(fx, touchY, 10, 0, Math.PI * 2);
+      cx.fillStyle = onW ? 'rgba(46,197,182,0.5)' : 'rgba(255,255,255,0.12)';
+      cx.fill();
+
+      // connector line from finger to wave
+      if (!onW) {
+        cx.beginPath();
+        cx.moveTo(fx, touchY);
+        cx.lineTo(fx, wy2);
+        cx.strokeStyle = 'rgba(255,255,255,0.08)';
+        cx.lineWidth = 1;
+        cx.stroke();
+      }
+    }
+
+    // ---- progress bar (match %) ----
+    var pct  = Math.min(runElapsed / RUN_DURATION, 1);
+    var mpct = runElapsed > 0 ? Math.min(matchTime / runElapsed, 1) : 0;
+    // time bar (thin, bottom)
+    cx.fillStyle = 'rgba(255,255,255,0.08)';
+    cx.fillRect(0, H - 4, W, 4);
+    cx.fillStyle = TEAL;
+    cx.fillRect(0, H - 4, W * pct, 4);
+    // match quality (soft glow bar, top)
+    cx.fillStyle = 'rgba(255,255,255,0.05)';
+    cx.fillRect(30, 30, W - 60, 6);
+    var qw = (W - 60) * mpct;
+    var qGrad = cx.createLinearGradient(30, 0, 30 + qw, 0);
+    qGrad.addColorStop(0, 'rgba(46,197,182,0.5)');
+    qGrad.addColorStop(1, TEAL);
+    cx.fillStyle = qGrad;
+    cx.fillRect(30, 30, qw, 6);
+
+    // label
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '500 11px Menlo, monospace';
+    cx.fillText('FLOW', W / 2, 26);
+
+    // live flow % label (center, large)
+    if (phase === 'play') {
+      var livePct = Math.round(mpct * 100);
+      cx.fillStyle = 'rgba(46,197,182,' + (0.15 + mpct * 0.5) + ')';
+      cx.font = '800 72px -apple-system, Helvetica, Arial';
+      cx.fillText(livePct, W / 2, H / 2 + 170);
+      cx.fillStyle = 'rgba(255,255,255,0.2)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('%', W / 2 + 44, H / 2 + 155);
+    }
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '900 42px -apple-system, Helvetica, Arial';
+    cx.fillText('RHYTHM TRACE', W / 2, 290);
+    cx.fillStyle = TEAL;
+    cx.font = '600 16px -apple-system, Helvetica, Arial';
+    var pulse = 0.55 + 0.45 * Math.sin(now / 700);
+    cx.globalAlpha = pulse;
+    cx.fillText('hold the wave', W / 2, 336);
+    cx.globalAlpha = 1;
+    cx.fillStyle = 'rgba(255,255,255,0.28)';
+    cx.font = '500 12px -apple-system, Helvetica, Arial';
+    cx.fillText('tap to begin', W / 2, 368);
+
+    // draw a still preview wave
+    for (var x = 0; x < W; x += 10) {
+      var wy = waveY(x, 0);
+      cx.beginPath();
+      cx.arc(x, wy, 2.5, 0, Math.PI * 2);
+      cx.fillStyle = 'rgba(46,197,182,0.22)';
+      cx.fill();
+    }
+  }
+
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.5)';
+    cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+
+    var pct = score;
+    var label = pct >= 80 ? 'deep flow' : pct >= 50 ? 'finding it' : 'settling in';
+
+    cx.fillStyle = TEAL;
+    cx.font = '900 72px -apple-system, Helvetica, Arial';
+    cx.fillText(pct + '%', W / 2, 320);
+    cx.fillStyle = 'rgba(255,255,255,0.6)';
+    cx.font = '600 18px -apple-system, Helvetica, Arial';
+    cx.fillText(label, W / 2, 356);
+    cx.fillStyle = 'rgba(255,255,255,0.28)';
+    cx.font = '500 13px -apple-system, Helvetica, Arial';
+    cx.fillText('flow score', W / 2, 380);
+
+    if (!DEMO && !BOT) {
+      var p2 = 0.55 + 0.45 * Math.sin(now / 600);
+      cx.globalAlpha = p2;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to trace again', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawCta(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+
+    cx.fillStyle = '#fff';
+    cx.font = '900 36px -apple-system, Helvetica, Arial';
+    cx.fillText('RHYTHM TRACE', W / 2, 298);
+
+    cx.fillStyle = 'rgba(255,255,255,0.62)';
+    cx.font = '600 17px -apple-system, Helvetica, Arial';
+    cx.fillText('trace the wave. feel yours.', W / 2, 336);
+
+    // CTA button
+    var p3 = 0.7 + 0.3 * Math.sin(now / 500);
+    cx.fillStyle = TEAL;
+    cx.globalAlpha = ease * p3;
+    cx.font = '900 26px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 406);
+
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 440);
+
+    cx.globalAlpha = 1;
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Undo Stack — Tilt</title>
+<!--
+  LOOP / attention-architecture — Undo Stack
+  Engine: calm. Circuits: 05-ease, 06-zeigarnik, 08-investment.
+  Mechanic: soft action tiles stack up as you tap them. Every action is visible
+  in a stack on the right. Swipe up on the stack to undo any step — every move
+  is reversible. Nothing is permanent until you choose to commit.
+  The lose condition: time runs out without committing (a calm pressure — the
+  draft expires, the moment passes).
+  Modes:
+    ?demo=1&seed=7     scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed M  imperfect autoplay N runs → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'undo-stack';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // palette
+  var INK  = '#0b0d12';
+  var TEAL = '#2ec5b6';
+  var GOLD = '#f2b134';
+  var SOFT = '#c8d8e8';  // calm off-white
+  var DIM  = 'rgba(200,216,232,0.38)';
+
+  // ---- action vocabulary ----
+  var ACTIONS = [
+    { label: 'send it',    color: '#5bbfb0' },
+    { label: 'wait',       color: '#7aafcc' },
+    { label: 'edit',       color: '#8e9fcf' },
+    { label: 'delete',     color: '#b09ecf' },
+    { label: 'read again', color: '#6bbfaa' },
+    { label: 'breathe',    color: '#7fccaa' },
+    { label: 'keep it',    color: '#a0c8b0' },
+    { label: 'sleep on it',color: '#6699bb' },
+    { label: 'let go',     color: '#88b8c8' },
+    { label: 'send now',   color: '#5bbfb0' }
+  ];
+
+  // ---- game layout ----
+  // Left area: 260px wide play field where tiles appear
+  // Right area: 130px — visible stack panel
+  var PLAY_W   = 258;
+  var STACK_X  = 270;   // left edge of stack panel
+  var STACK_W  = 122;   // width of stack panel
+  var TILE_H   = 52;
+  var TILE_GAP = 6;
+  var TILE_PAD = 10;
+
+  // timer config
+  var ROUND_TIME  = 18;  // seconds per round (calm, generous)
+  var COMMIT_THRESHOLD = 6;  // must have ≥6 tiles to be allowed to commit
+
+  // ---- state ----
+  var phase, stack, floaters, shakeAmt, zoom, hitStop;
+  var timeLeft, runStartTs, score, bestScore, botRunsDone;
+  var demoStartTs, demoPhase, demoStepAt, demoStep;
+  var ctaAt;
+
+  try { bestScore = +localStorage.getItem('us_best') || 0; } catch (_) { bestScore = 0; }
+
+  function newGame() {
+    phase     = DEMO ? 'play' : (BOT ? 'play' : 'title');
+    stack     = [];   // array of {label, color, y, targetY, alpha, removing}
+    floaters  = [];   // {txt, x, y, alpha, vy, color, size}
+    shakeAmt  = 0;
+    zoom      = 1;
+    hitStop   = 0;
+    timeLeft  = ROUND_TIME;
+    score     = 0;
+    botRunsDone = 0;
+    demoPhase = 'settle';
+    demoStep  = 0;
+    demoStepAt = 0;
+    ctaAt     = 0;
+
+    if (DEMO || BOT) {
+      startRun();
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    timeLeft = ROUND_TIME;
+    stack = [];
+    floaters = [];
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- core mechanics ----
+  function addTile() {
+    var idx = Math.floor(rng() * ACTIONS.length);
+    var act = ACTIONS[idx];
+    // push to bottom of stack (newest at bottom of visible list)
+    var entry = {
+      label: act.label,
+      color: act.color,
+      alpha: 0,
+      removing: false
+    };
+    stack.push(entry);
+    score++;
+    if (window.J) J.calm(score);
+    floatText('+' + score, TEAL, PLAY_W / 2, 320);
+    if (window.LOOP) LOOP.emit('tile_added', { n: score, label: act.label });
+    // small zoom pulse
+    zoom = 1.02;
+  }
+
+  function undoTile() {
+    if (stack.length === 0) return;
+    var last = stack[stack.length - 1];
+    last.removing = true;
+    if (window.J) J.calm(0);
+    floatText('undone', DIM, STACK_X + STACK_W / 2, 400);
+    if (window.LOOP) LOOP.emit('tile_undone', { remaining: stack.length - 1 });
+    // remove after brief animation
+    setTimeout(function () {
+      var i = stack.indexOf(last);
+      if (i !== -1) stack.splice(i, 1);
+    }, 350);
+  }
+
+  function commitStack() {
+    if (stack.length < COMMIT_THRESHOLD) return;  // not enough built up
+    // beautiful commit moment
+    var committed = stack.length;
+    hitStop = 6;
+    zoom = 1.04;
+    shakeAmt = 2;  // very gentle
+    if (window.J) J.calm(committed);
+    floatText('sent  ✓', TEAL, W / 2, 300);
+    floatText(committed + ' steps', GOLD, W / 2, 350);
+    score += committed * 2;
+    if (score > bestScore) {
+      bestScore = score;
+      try { localStorage.setItem('us_best', String(bestScore)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('stack_committed', { tiles: committed, score: score });
+    phase = 'committed';
+    // brief settled moment then game over
+    setTimeout(function () { gameOver(true); }, 2200);
+  }
+
+  function gameOver(committed) {
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (DEMO) window.__demoScore = score;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (!committed) {
+      // time expired — the draft expired, soft sadness
+      shakeAmt = 3;
+      floatText('time passed', DIM, W / 2, 320);
+    }
+    phase = 'over';
+    var overAt = performance.now();
+
+    if (DEMO) {
+      // after over screen show, show CTA
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () {
+          startRun();
+        }, 800);
+      }
+    }
+  }
+
+  function floatText(txt, color, x, y, size) {
+    floaters.push({ txt: txt, color: color, x: x, y: y, alpha: 1, vy: -0.6, size: size || 22, t: 0 });
+  }
+
+  // ---- input handling ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var COMMIT_R = { x: 40, y: H - 120, w: PLAY_W - 60, h: 48 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  var touchStartY = null, touchStartX = null;
+
+  function tapDown(x, y) {
+    if (DEMO || BOT) return;
+    touchStartX = x; touchStartY = y;
+  }
+
+  function tapUp(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+
+    if (phase === 'title') { startRun(); return; }
+
+    if (phase === 'play') {
+      // tap in play area → add tile
+      if (x < STACK_X && y < H - 100) {
+        addTile();
+        return;
+      }
+      // tap commit button
+      if (inR(COMMIT_R, x, y)) {
+        commitStack();
+        return;
+      }
+    }
+
+    if (phase === 'over' || phase === 'committed') {
+      // restart
+      if (performance.now() - (ctaAt || 0) > 300) {
+        startRun();
+      }
+    }
+  }
+
+  function swipeOnStack(dy) {
+    // swipe up on stack area → undo
+    if (dy < -30 && phase === 'play') {
+      undoTile();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tapDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointerup', function (e) {
+    var r  = cv.getBoundingClientRect();
+    var cx2 = (e.clientX - r.left) / scale;
+    var cy2 = (e.clientY - r.top) / scale;
+    // detect swipe
+    if (touchStartY !== null) {
+      var dy = cy2 - touchStartY;
+      var dx = cx2 - touchStartX;
+      if (Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 28 && touchStartX >= STACK_X) {
+        swipeOnStack(dy);
+        touchStartY = null; touchStartX = null;
+        return;
+      }
+    }
+    tapUp(cx2, cy2);
+    touchStartY = null; touchStartX = null;
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') tapUp(PLAY_W / 2, 300);
+    if (e.code === 'KeyZ' || e.code === 'Backspace') undoTile();
+    if (e.code === 'Enter') commitStack();
+  });
+
+  // ---- DEMO autopilot ----
+  // Calm arc: settle → deepen → resolve → soft invitation
+  // settle (0-5s): add tiles slowly, let viewer see the stack grow
+  // deepen (5-10s): undo a couple, redraft, settle again — the anxiety loop
+  // resolve (10-14s): commit the stack — the satisfaction moment
+  // over (14-16s): rest screen
+  var DEMO_SCRIPT = [
+    // [delay_ms, action] action: 'add' | 'undo' | 'commit'
+    [1200, 'add'],
+    [1400, 'add'],
+    [1600, 'add'],
+    [1800, 'add'],
+    [2200, 'add'],
+    [2800, 'add'],   // 6 tiles — settle phase done
+    [4200, 'undo'],  // deepen: reconsider
+    [5000, 'add'],   // redraft
+    [5600, 'undo'],  // reconsider again
+    [6400, 'add'],   // try again
+    [7200, 'add'],   // building back up
+    [8000, 'add'],   // 7 tiles
+    [8800, 'add'],   // 8 tiles — resolve
+    [10200, 'commit'] // commit — the satisfaction
+  ];
+  var demoScriptIdx = 0;
+  var demoTimeRef = 0;
+
+  // ---- BOT autopilot ----
+  // Bot: add tiles with slight hesitation, then eventually let time run out
+  var BOT_ACTIONS_LEFT = 8;  // bot adds 8 tiles then goes passive → timer expires → game_over
+  var botLastAction = 0;
+  var botPassive = false;
+
+  // ---- render helpers ----
+  function stackTileY(i) {
+    // draw from bottom of stack panel upward, newest at bottom
+    var totalVisible = Math.min(stack.length, 9);
+    var baseY = H - 160;
+    return baseY - (totalVisible - 1 - (i - (stack.length - totalVisible))) * (TILE_H + TILE_GAP);
+  }
+
+  function drawRoundRect(x, y, w, h, r) {
+    cx.beginPath();
+    if (cx.roundRect) { cx.roundRect(x, y, w, h, r); }
+    else {
+      cx.moveTo(x + r, y);
+      cx.lineTo(x + w - r, y); cx.quadraticCurveTo(x + w, y, x + w, y + r);
+      cx.lineTo(x + w, y + h - r); cx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      cx.lineTo(x + r, y + h); cx.quadraticCurveTo(x, y + h, x, y + h - r);
+      cx.lineTo(x, y + r); cx.quadraticCurveTo(x, y, x + r, y);
+      cx.closePath();
+    }
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  var demoElapsed = 0;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // ---- autopilots ----
+    if (DEMO && phase === 'play') {
+      demoElapsed += dt * 16.667;  // ms elapsed
+      // feed demo script
+      if (demoScriptIdx < DEMO_SCRIPT.length) {
+        if (demoElapsed >= DEMO_SCRIPT[demoScriptIdx][0]) {
+          var action = DEMO_SCRIPT[demoScriptIdx][1];
+          if (action === 'add') addTile();
+          else if (action === 'undo') undoTile();
+          else if (action === 'commit') commitStack();
+          demoScriptIdx++;
+        }
+      }
+      // let timer run out if script done without commit (shouldn't happen)
+    }
+
+    if (BOT && phase === 'play') {
+      var botNow = Date.now();
+      if (!botPassive && BOT_ACTIONS_LEFT > 0 && botNow - botLastAction > 700 + rng() * 600) {
+        // mostly add, occasionally undo
+        if (BOT_ACTIONS_LEFT <= 2 && stack.length > 2 && rng() < 0.4) {
+          undoTile();
+        } else {
+          addTile();
+          BOT_ACTIONS_LEFT--;
+        }
+        botLastAction = botNow;
+        if (BOT_ACTIONS_LEFT <= 0) botPassive = true;
+      }
+      // passive: let timer expire → game_over fires
+    }
+
+    // ---- timer ----
+    if (phase === 'play') {
+      timeLeft -= dt * 16.667 / 1000;
+      if (timeLeft <= 0) {
+        timeLeft = 0;
+        gameOver(false);
+      }
+    }
+
+    // ---- juice decay ----
+    if (hitStop > 0) hitStop -= dt; else hitStop = 0;
+    shakeAmt *= Math.pow(0.88, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // ---- floaters ----
+    for (var f = floaters.length - 1; f >= 0; f--) {
+      var fl = floaters[f];
+      fl.t += dt;
+      fl.y += fl.vy * dt;
+      fl.alpha = Math.max(0, 1 - fl.t / 55);
+      if (fl.alpha <= 0) floaters.splice(f, 1);
+    }
+
+    // ---- draw ----
+    cx.save();
+    // juice transforms
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    // subtle gradient
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(110,130,180,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // divider between play area and stack panel
+    cx.strokeStyle = 'rgba(200,216,232,0.1)';
+    cx.lineWidth = 1;
+    cx.beginPath(); cx.moveTo(STACK_X - 6, 80); cx.lineTo(STACK_X - 6, H - 80); cx.stroke();
+
+    if (phase === 'title') drawTitle(now);
+    else if (phase === 'play') drawPlay(now);
+    else if (phase === 'committed') drawCommitted(now);
+    else if (phase === 'over') drawOver(now);
+    else if (phase === 'cta') drawCta(now);
+
+    // floaters (on top of everything)
+    for (var k = 0; k < floaters.length; k++) {
+      var fo = floaters[k];
+      cx.globalAlpha = fo.alpha;
+      cx.fillStyle = fo.color;
+      cx.font = '700 ' + fo.size + 'px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText(fo.txt, fo.x, fo.y);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle — human only
+    if (!DEMO && !BOT && window.J) {
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.textAlign = 'center';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = SOFT;
+    cx.font = '800 40px -apple-system, Helvetica, Arial';
+    cx.fillText('UNDO STACK', W / 2, 300);
+    cx.fillStyle = 'rgba(200,216,232,0.55)';
+    cx.font = '500 16px -apple-system, Helvetica, Arial';
+    cx.fillText('every move reversible.', W / 2, 338);
+    cx.fillText('nothing locked in until you say so.', W / 2, 360);
+    var pulse = 0.55 + 0.35 * Math.sin(now / 700);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = TEAL;
+    cx.font = '600 15px -apple-system, Helvetica, Arial';
+    cx.fillText('tap to begin', W / 2, 410);
+    cx.globalAlpha = 1;
+  }
+
+  function drawPlay(now) {
+    // ---- left panel: prompt / tap zone ----
+    cx.textAlign = 'center';
+
+    // Heading
+    cx.fillStyle = 'rgba(200,216,232,0.5)';
+    cx.font = '500 13px Menlo, monospace';
+    cx.fillText('DRAFT IN PROGRESS', PLAY_W / 2, 110);
+
+    // Big tap zone visual
+    var pulse = 0.06 + 0.04 * Math.sin(now / 800);
+    cx.fillStyle = 'rgba(46,197,182,' + pulse + ')';
+    drawRoundRect(28, 140, PLAY_W - 36, 340, 18);
+    cx.fill();
+
+    cx.strokeStyle = 'rgba(46,197,182,0.18)';
+    cx.lineWidth = 1.5;
+    drawRoundRect(28, 140, PLAY_W - 36, 340, 18);
+    cx.stroke();
+
+    cx.fillStyle = 'rgba(200,216,232,0.28)';
+    cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText('tap to add', PLAY_W / 2, 298);
+    cx.fillStyle = 'rgba(200,216,232,0.16)';
+    cx.font = '400 12px -apple-system, Helvetica, Arial';
+    cx.fillText('a step to your stack', PLAY_W / 2, 320);
+
+    // score
+    cx.fillStyle = 'rgba(200,216,232,0.85)';
+    cx.font = '700 44px -apple-system, Helvetica, Arial';
+    cx.fillText(score, PLAY_W / 2, 440);
+    cx.fillStyle = 'rgba(200,216,232,0.3)';
+    cx.font = '400 11px -apple-system, Helvetica, Arial';
+    cx.fillText('steps taken', PLAY_W / 2, 458);
+
+    // timer arc
+    var timerFrac = Math.max(0, timeLeft / ROUND_TIME);
+    var cx0 = PLAY_W / 2, cy0 = 540, rad = 28;
+    cx.strokeStyle = 'rgba(200,216,232,0.1)';
+    cx.lineWidth = 4;
+    cx.beginPath(); cx.arc(cx0, cy0, rad, 0, Math.PI * 2); cx.stroke();
+    var timerColor = timerFrac > 0.35 ? TEAL : (timerFrac > 0.15 ? GOLD : 'rgba(200,216,232,0.6)');
+    cx.strokeStyle = timerColor;
+    cx.lineWidth = 4;
+    cx.beginPath();
+    cx.arc(cx0, cy0, rad, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * timerFrac);
+    cx.stroke();
+    cx.fillStyle = 'rgba(200,216,232,0.6)';
+    cx.font = '600 13px Menlo, monospace';
+    cx.fillText(Math.ceil(timeLeft) + 's', cx0, cy0 + 5);
+
+    // commit button (only enabled if enough tiles)
+    var canCommit = stack.filter(function (t) { return !t.removing; }).length >= COMMIT_THRESHOLD;
+    var cAlpha = canCommit ? 1 : 0.25;
+    cx.globalAlpha = cAlpha;
+    cx.fillStyle = canCommit ? 'rgba(46,197,182,0.18)' : 'rgba(200,216,232,0.04)';
+    drawRoundRect(COMMIT_R.x, COMMIT_R.y, COMMIT_R.w, COMMIT_R.h, 24);
+    cx.fill();
+    cx.strokeStyle = canCommit ? TEAL : 'rgba(200,216,232,0.15)';
+    cx.lineWidth = 1.5;
+    drawRoundRect(COMMIT_R.x, COMMIT_R.y, COMMIT_R.w, COMMIT_R.h, 24);
+    cx.stroke();
+    cx.fillStyle = canCommit ? TEAL : 'rgba(200,216,232,0.4)';
+    cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText(canCommit ? 'SEND IT ▸' : 'build to ' + COMMIT_THRESHOLD + ' steps', W / 2 - 40, COMMIT_R.y + 31);
+    cx.globalAlpha = 1;
+
+    // ---- right panel: stack ----
+    drawStackPanel(now);
+  }
+
+  function drawStackPanel(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(200,216,232,0.28)';
+    cx.font = '500 11px Menlo, monospace';
+    cx.fillText('STACK', STACK_X + STACK_W / 2, 105);
+
+    // swipe hint
+    cx.fillStyle = 'rgba(200,216,232,0.18)';
+    cx.font = '400 10px -apple-system, Helvetica, Arial';
+    cx.fillText('↑ swipe to undo', STACK_X + STACK_W / 2, 120);
+
+    if (stack.length === 0) {
+      cx.fillStyle = 'rgba(200,216,232,0.15)';
+      cx.font = '400 12px -apple-system, Helvetica, Arial';
+      cx.fillText('empty', STACK_X + STACK_W / 2, 390);
+      return;
+    }
+
+    var visible = Math.min(stack.length, 9);
+    var startIdx = stack.length - visible;
+    var baseY = H - 160;
+
+    for (var i = startIdx; i < stack.length; i++) {
+      var tile = stack[i];
+      var slotIdx = i - startIdx;  // 0 = oldest visible
+      var tileY = baseY - (visible - 1 - slotIdx) * (TILE_H + TILE_GAP);
+      var tileAlpha = tile.removing ? 0.3 : Math.min(1, 0.35 + slotIdx * 0.08);
+
+      cx.globalAlpha = tileAlpha;
+      // bg
+      cx.fillStyle = tile.color + '33';
+      drawRoundRect(STACK_X + 4, tileY, STACK_W - 8, TILE_H - 2, 10);
+      cx.fill();
+      // border
+      cx.strokeStyle = tile.color + '88';
+      cx.lineWidth = 1.2;
+      drawRoundRect(STACK_X + 4, tileY, STACK_W - 8, TILE_H - 2, 10);
+      cx.stroke();
+      // label
+      cx.fillStyle = tile.removing ? 'rgba(200,216,232,0.3)' : SOFT;
+      cx.font = '500 11px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText(tile.label, STACK_X + STACK_W / 2, tileY + TILE_H / 2 + 4);
+
+      // newest tile gets a subtle glow
+      if (i === stack.length - 1 && !tile.removing) {
+        cx.strokeStyle = tile.color;
+        cx.lineWidth = 1.5;
+        cx.globalAlpha = tileAlpha * (0.5 + 0.3 * Math.sin(performance.now() / 500));
+        drawRoundRect(STACK_X + 4, tileY, STACK_W - 8, TILE_H - 2, 10);
+        cx.stroke();
+      }
+
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawCommitted(now) {
+    // peaceful settled screen
+    cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL;
+    cx.font = '700 28px -apple-system, Helvetica, Arial';
+    cx.fillText('sent.', W / 2, 310);
+    cx.fillStyle = 'rgba(200,216,232,0.65)';
+    cx.font = '400 15px -apple-system, Helvetica, Arial';
+    cx.fillText('that felt right.', W / 2, 346);
+    cx.fillStyle = GOLD;
+    cx.font = '700 36px -apple-system, Helvetica, Arial';
+    cx.fillText(score, W / 2, 410);
+    cx.fillStyle = 'rgba(200,216,232,0.4)';
+    cx.font = '400 12px -apple-system, Helvetica, Arial';
+    cx.fillText('total score', W / 2, 432);
+  }
+
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.58)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    // soft — time passed, not failure
+    cx.fillStyle = 'rgba(200,216,232,0.6)';
+    cx.font = '400 15px -apple-system, Helvetica, Arial';
+    cx.fillText('the moment passed.', W / 2, 296);
+    cx.fillStyle = SOFT;
+    cx.font = '800 48px -apple-system, Helvetica, Arial';
+    cx.fillText(score, W / 2, 368);
+    cx.fillStyle = 'rgba(200,216,232,0.38)';
+    cx.font = '400 12px -apple-system, Helvetica, Arial';
+    cx.fillText('steps   ·   best ' + bestScore, W / 2, 392);
+
+    if (!DEMO && !BOT) {
+      var pulse = 0.5 + 0.35 * Math.sin(now / 700);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to try again', W / 2, 448);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawCta(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2.0);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+
+    cx.fillStyle = TEAL;
+    cx.font = '800 36px -apple-system, Helvetica, Arial';
+    cx.fillText('UNDO STACK', W / 2, 294);
+
+    cx.fillStyle = 'rgba(200,216,232,0.7)';
+    cx.font = '400 15px -apple-system, Helvetica, Arial';
+    cx.fillText('every step reversible.', W / 2, 330);
+    cx.fillText('until you\'re ready.', W / 2, 352);
+
+    var pulse = 0.65 + 0.25 * Math.sin(now / 500);
+    cx.fillStyle = TEAL;
+    cx.globalAlpha = ease * pulse;
+    cx.font = '700 20px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ GROW YOURS', W / 2, 416);
+
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(200,216,232,0.4)';
+    cx.font = '400 13px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 446);
+    cx.globalAlpha = 1;
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

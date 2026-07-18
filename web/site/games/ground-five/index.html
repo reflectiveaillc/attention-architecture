@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Ground Five — Tilt</title>
+<!--
+  LOOP / attention-architecture — Ground Five
+  Mechanic: 5-4-3-2-1 grounding technique. Five sense cards appear one at a time.
+  Tap each card to confirm you've noticed that sense right now. All five arcs
+  fill → warm glow → done.
+  Circuits: 06-zeigarnik, 05-ease, 07-timing.
+  Engine: calm.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'ground-five';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var SOFT_TEAL = 'rgba(46,197,182,0.18)';
+  var SOFT_GOLD = 'rgba(242,177,52,0.22)';
+
+  // Sense data: label, emoji-free prompt
+  var SENSES = [
+    { key: 'see',   label: 'SEE',   prompt: 'Name 1 thing you see right now.',     color: '#2ec5b6' },
+    { key: 'hear',  label: 'HEAR',  prompt: 'Name 1 sound you can hear.',           color: '#5bb8f5' },
+    { key: 'feel',  label: 'FEEL',  prompt: 'Notice 1 physical sensation.',         color: '#8fa8e8' },
+    { key: 'smell', label: 'SMELL', prompt: 'Notice any smell in the air.',         color: '#a98fe8' },
+    { key: 'taste', label: 'TASTE', prompt: 'Notice any taste on your tongue.',     color: '#e88fcb' }
+  ];
+
+  // Visual juice state
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var flashes = [];
+
+  // Game state
+  var phase = 'title';   // title | play | glow | cta
+  var step = 0;          // 0..4 current sense index
+  var confirmed = 0;     // how many senses confirmed
+  var runStartTs = 0;
+  var glowAt = 0;
+  var ctaAt  = 0;
+
+  // Card animation state
+  var cardY = H;         // slides in from bottom
+  var cardTargetY = 0;
+  var cardPulse = 0;     // 0..1 glow ring on confirm
+  var cardPulseActive = false;
+  var arcProgress = 0;   // 0..1 arc fill for current step (animates after confirm)
+  var totalArcs = [];    // array of 0..1 fill amounts for each sense
+  for (var i = 0; i < 5; i++) totalArcs.push(0);
+
+  var botRunsDone = 0;
+  var botWait = 0;
+
+  // Demo script: wait time (frames at 60fps) before tapping each card
+  // ~16s total: each card ~2.2s wait + 0.6s confirm animation + card slide
+  var demoWaits = [95, 110, 100, 115, 105]; // frames to wait per card
+  var demoIdx = 0, demoTimer = 0;
+
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 32, t: 0 });
+  }
+
+  function startRun() {
+    phase = 'play';
+    step = 0;
+    confirmed = 0;
+    cardPulse = 0;
+    cardPulseActive = false;
+    arcProgress = 0;
+    for (var i = 0; i < 5; i++) totalArcs[i] = 0;
+    cardY = H + 200;
+    cardTargetY = 0;
+    demoIdx = 0;
+    demoTimer = 0;
+    botWait = 60 + Math.floor(rng() * 40);
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function confirmSense() {
+    if (phase !== 'play') return;
+    if (confirmed !== step) return; // already confirmed this step, waiting
+    confirmed = step + 1;
+
+    // Sound
+    if (window.J) J.calm(step);
+
+    // Juice
+    hitStop = 3;
+    zoom = 1.015;
+
+    // Set arc fill target for this step
+    totalArcs[step] = 1;
+
+    // Flash
+    var labels = ['SEEING', 'HEARING', 'FEELING', 'SMELLING', 'TASTING'];
+    flash(labels[step], SENSES[step].color, 28);
+
+    // Emit sense event
+    if (window.LOOP) LOOP.emit('sense_confirmed', { sense: SENSES[step].key, step: step + 1 });
+
+    // Card pulse
+    cardPulseActive = true;
+    cardPulse = 0;
+
+    if (confirmed >= 5) {
+      // All done after short delay for pulse animation
+      setTimeout(triggerGlow, 900);
+    } else {
+      // Advance to next card after pulse
+      setTimeout(function () {
+        step = confirmed;
+        cardY = H + 200;
+        cardPulseActive = false;
+        cardPulse = 0;
+        botWait = 60 + Math.floor(rng() * 40);
+        demoTimer = 0;
+      }, 700);
+    }
+  }
+
+  function triggerGlow() {
+    phase = 'glow';
+    glowAt = performance.now();
+    shakeAmt = 2;
+    if (window.J) J.calm(5);
+    var dur = (Date.now() - runStartTs) / 1000;
+    window.__demoScore = 5;
+    if (window.LOOP) LOOP.emit('game_over', { score: 5, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 3200);
+    }
+
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () {
+          resetRun();
+        }, 1200);
+      }
+    }
+  }
+
+  function resetRun() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- Input ----
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') {
+      // tap anywhere on the card area
+      if (confirmed === step) confirmSense();
+      return;
+    }
+    if (phase === 'glow') { resetRun(); return; }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.code === 'Enter') tap();
+  });
+
+  // ---- Autopilots ----
+  function autopilot() {
+    if (phase !== 'play') return;
+    if (confirmed !== step) return; // waiting for next card to slide in
+
+    if (DEMO) {
+      demoTimer++;
+      var wait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)];
+      if (demoTimer >= wait) {
+        demoIdx++;
+        demoTimer = 0;
+        confirmSense();
+      }
+    } else if (BOT) {
+      if (botWait > 0) { botWait--; return; }
+      botWait = 50 + Math.floor(rng() * 50);
+      confirmSense();
+    }
+  }
+
+  // ---- Drawing helpers ----
+  function drawArc(cx2, x, y, r, fill, color, alpha) {
+    cx2.save();
+    cx2.globalAlpha = alpha !== undefined ? alpha : 1;
+    // background ring
+    cx2.beginPath();
+    cx2.arc(x, y, r, 0, Math.PI * 2);
+    cx2.strokeStyle = 'rgba(255,255,255,0.08)';
+    cx2.lineWidth = 5;
+    cx2.stroke();
+    // filled arc
+    if (fill > 0) {
+      cx2.beginPath();
+      cx2.arc(x, y, r, -Math.PI / 2, -Math.PI / 2 + fill * Math.PI * 2);
+      cx2.strokeStyle = color;
+      cx2.lineWidth = 5;
+      cx2.lineCap = 'round';
+      cx2.stroke();
+    }
+    cx2.restore();
+  }
+
+  function drawCard(now) {
+    if (step >= 5) return;
+    var s = SENSES[step];
+    var cw = 300, ch = 180;
+    var cx2x = W / 2, cy2 = cardY + H / 2 - 20;
+
+    var cardAlpha = cardPulseActive ? Math.max(0.3, 1 - cardPulse * 0.4) : 1;
+
+    cx.save();
+    cx.globalAlpha = cardAlpha;
+
+    // Card shadow
+    cx.shadowColor = s.color;
+    cx.shadowBlur = 20 + (cardPulseActive ? cardPulse * 30 : 0);
+
+    // Card background
+    var grad = cx.createLinearGradient(cx2x - cw / 2, cy2 - ch / 2, cx2x + cw / 2, cy2 + ch / 2);
+    grad.addColorStop(0, 'rgba(30,40,60,0.95)');
+    grad.addColorStop(1, 'rgba(20,28,48,0.98)');
+    cx.fillStyle = grad;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(cx2x - cw / 2, cy2 - ch / 2, cw, ch, 18);
+    else cx.rect(cx2x - cw / 2, cy2 - ch / 2, cw, ch);
+    cx.fill();
+
+    // Card border
+    cx.strokeStyle = cardPulseActive
+      ? s.color
+      : 'rgba(255,255,255,0.12)';
+    cx.lineWidth = cardPulseActive ? 2 + cardPulse * 2 : 1.5;
+    cx.stroke();
+
+    cx.shadowBlur = 0;
+
+    // Sense label
+    cx.textAlign = 'center';
+    cx.fillStyle = s.color;
+    cx.font = '900 28px -apple-system, Helvetica, Arial';
+    cx.fillText(s.label, cx2x, cy2 - 42);
+
+    // Prompt text — wrap manually
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.font = '500 17px -apple-system, Helvetica, Arial';
+    wrapText(s.prompt, cx2x, cy2 - 8, 250, 26);
+
+    // Tap hint (only if not confirmed)
+    if (!cardPulseActive) {
+      var pulse = 0.5 + 0.5 * Math.sin(now / 450);
+      cx.globalAlpha = cardAlpha * (0.4 + 0.3 * pulse);
+      cx.fillStyle = TEAL;
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to confirm', cx2x, cy2 + 58);
+    }
+
+    cx.restore();
+  }
+
+  function wrapText(text, x, y, maxW, lineH) {
+    var words = text.split(' ');
+    var line = '';
+    var lines = [];
+    for (var i = 0; i < words.length; i++) {
+      var test = line + (line ? ' ' : '') + words[i];
+      if (cx.measureText(test).width > maxW && line) {
+        lines.push(line);
+        line = words[i];
+      } else {
+        line = test;
+      }
+    }
+    if (line) lines.push(line);
+    var startY = y - (lines.length - 1) * lineH / 2;
+    for (var j = 0; j < lines.length; j++) {
+      cx.fillText(lines[j], x, startY + j * lineH);
+    }
+  }
+
+  function drawProgressArcs(now) {
+    // Draw 5 small arcs in a row at top
+    var totalW = 5 * 32 + 4 * 14;
+    var startX = W / 2 - totalW / 2 + 16;
+    var y = 80;
+    for (var i = 0; i < 5; i++) {
+      var fill = totalArcs[i];
+      // Animate fills toward their targets
+      var target = (i < confirmed) ? 1 : 0;
+      totalArcs[i] += (target - totalArcs[i]) * 0.08;
+      if (totalArcs[i] > 0.98 && target === 1) totalArcs[i] = 1;
+
+      var col = SENSES[i].color;
+      var alpha = (i <= step) ? 1 : 0.35;
+      drawArc(cx, startX + i * 46, y, 15, totalArcs[i], col, alpha);
+
+      // label below arc
+      cx.save();
+      cx.globalAlpha = alpha * 0.6;
+      cx.textAlign = 'center';
+      cx.fillStyle = col;
+      cx.font = '600 9px -apple-system, Helvetica, Arial';
+      cx.fillText(SENSES[i].label, startX + i * 46, y + 25);
+      cx.restore();
+    }
+  }
+
+  function drawGlow(now) {
+    var t = (now - glowAt) / 1000;
+    var ease = Math.min(1, t * 1.4);
+
+    // Warm background pulse
+    var alpha = ease * (0.5 + 0.15 * Math.sin(t * 2.5));
+    var grad = cx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, H * 0.7);
+    grad.addColorStop(0, 'rgba(46,197,182,' + (alpha * 0.5) + ')');
+    grad.addColorStop(0.5, 'rgba(242,177,52,' + (alpha * 0.25) + ')');
+    grad.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = grad;
+    cx.fillRect(0, 0, W, H);
+
+    // All arcs completed
+    var y = 80;
+    var startX = W / 2 - (5 * 32 + 4 * 14) / 2 + 16;
+    for (var i = 0; i < 5; i++) {
+      totalArcs[i] += (1 - totalArcs[i]) * 0.12;
+      drawArc(cx, startX + i * 46, y, 15, totalArcs[i], SENSES[i].color, 1);
+      cx.save();
+      cx.globalAlpha = 0.7;
+      cx.textAlign = 'center';
+      cx.fillStyle = SENSES[i].color;
+      cx.font = '600 9px -apple-system, Helvetica, Arial';
+      cx.fillText(SENSES[i].label, startX + i * 46, y + 25);
+      cx.restore();
+    }
+
+    // Center message
+    cx.save();
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '700 22px -apple-system, Helvetica, Arial';
+    cx.fillText('you are here', W / 2, H / 2 - 30);
+
+    cx.fillStyle = TEAL;
+    cx.font = '900 36px -apple-system, Helvetica, Arial';
+    cx.fillText('grounded.', W / 2, H / 2 + 14);
+
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText('all five senses found', W / 2, H / 2 + 48);
+
+    if (!DEMO && !BOT) {
+      var p = 0.5 + 0.5 * Math.sin(now / 500);
+      cx.globalAlpha = ease * (0.5 + 0.3 * p);
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to go again', W / 2, H / 2 + 90);
+    }
+    cx.restore();
+  }
+
+  function drawCTA(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2.2);
+
+    cx.save();
+    cx.fillStyle = 'rgba(11,13,18,' + (0.7 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+
+    cx.fillStyle = TEAL;
+    cx.font = '900 40px -apple-system, Helvetica, Arial';
+    cx.fillText('GROUND FIVE', W / 2, 300);
+
+    cx.fillStyle = 'rgba(255,255,255,0.75)';
+    cx.font = '500 17px -apple-system, Helvetica, Arial';
+    cx.fillText('five senses. one breath. right now.', W / 2, 342);
+
+    var p = 0.7 + 0.3 * Math.sin(now / 350);
+    cx.fillStyle = TEAL;
+    cx.globalAlpha = ease * p;
+    cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 404);
+
+    cx.globalAlpha = ease * 0.7;
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 440);
+
+    cx.restore();
+  }
+
+  // ---- Main loop ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Animate card slide-in
+    if (phase === 'play') {
+      cardTargetY = 0;
+      cardY += (cardTargetY - cardY) * 0.13 * dt;
+      // Animate card pulse
+      if (cardPulseActive) {
+        cardPulse = Math.min(1, cardPulse + 0.06 * dt);
+      }
+    }
+
+    // Juice
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (phase === 'play') { autopilot(); }
+
+    // Draw
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.84, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // Background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // Ambient gradient
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('GROUND FIVE', W / 2, 280);
+
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('five senses. one breath. right now.', W / 2, 318);
+
+      var pulse = 0.55 + 0.45 * Math.sin(now / 420);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to begin', W / 2, 370);
+      cx.globalAlpha = 1;
+    }
+
+    if (phase === 'play') {
+      drawProgressArcs(now);
+      drawCard(now);
+    }
+
+    if (phase === 'glow') {
+      drawGlow(now);
+    }
+
+    if (phase === 'cta') {
+      drawGlow(now);
+      drawCTA(now);
+    }
+
+    // Floating reward text
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 200 - fl.t * 1.2);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- Boot ----
+  function boot() {
+    phase = 'title';
+    if (DEMO || BOT) {
+      startRun();
+    }
+  }
+
+  boot();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

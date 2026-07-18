@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Safe Count — Tilt</title>
+<!--
+  LOOP / attention-architecture — Safe Count
+  Circuits: 01-rpe (variable reward per tap), 04-loss, 05-ease (reassurance-seeking scroll)
+  Conditioned path: the thumb already knows this move from Instagram/TikTok — tap the green signals, ignore the red.
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip → __demoDone
+    ?bot=1&runs=N    imperfect autoplay → __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'safe-count';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- tile config ----
+  var TILE_W = 72, TILE_H = 72, COLS = 4, GAP = 12;
+  var GRID_W = COLS * TILE_W + (COLS - 1) * GAP;  // 336
+  var GRID_X = (W - GRID_W) / 2;                   // 34.5
+  var SPAWN_Y = -TILE_H;
+  var FLOOR_Y = H + TILE_H + 20;                   // tiles that pass floor are "missed"
+
+  // spawn lanes (x centers)
+  var LANES = [];
+  for (var li = 0; li < COLS; li++) LANES.push(GRID_X + li * (TILE_W + GAP) + TILE_W / 2);
+
+  // palette: safe = soft green family, threat = soft red family
+  var SAFE_COLORS  = ['#56c26d','#6fd48a','#43b05c','#7edda0'];
+  var THREAT_COLORS = ['#e8502e','#d94429','#f06040','#c43a20'];
+
+  // ---- game state ----
+  var phase, tiles, flashes, runStartTs;
+  var score, best, combo, lives, runsDone;
+  var hitStop, zoom, shakeAmt, dareBeaten;
+  var challengeAt, ctaAt, overAt;
+
+  try { best = +localStorage.getItem('sc_best') || 0; } catch (_) { best = 0; }
+
+  // juice helpers
+  var hitStopVal = 0;
+  function applyHitStop(frames) { hitStopVal = frames; }
+
+  function newGame() {
+    phase = DEMO ? 'challenge' : (BOT ? 'play' : 'title');
+    tiles = []; flashes = [];
+    score = 0; combo = 0; lives = 3; runsDone = 0;
+    hitStopVal = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    spawnTimer = 0; spawnInterval = 90; // frames between spawns (starts moderate)
+    tileSpeed = 1.2;
+
+    if (DEMO) {
+      challengeAt = performance.now();
+      setTimeout(startPlay, 1250);
+    } else if (BOT) {
+      startPlay();
+    }
+    // human starts on tap
+  }
+
+  var spawnTimer = 0, spawnInterval = 90, tileSpeed = 1.2;
+
+  function startPlay() {
+    phase = 'play';
+    runStartTs = Date.now();
+    tiles = []; flashes = [];
+    score = 0; combo = 0; lives = 3;
+    tileSpeed = 1.2; spawnInterval = 90; spawnTimer = 0;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- tile spawning ----
+  function spawnTile() {
+    // 60% safe, 40% threat — leans safe so scrolling feels productive
+    var isSafe = rng() < 0.60;
+    // pick a random lane
+    var lane = Math.floor(rng() * COLS);
+    var x = LANES[lane];
+    tiles.push({
+      x: x, y: SPAWN_Y,
+      safe: isSafe,
+      color: isSafe ? SAFE_COLORS[Math.floor(rng() * SAFE_COLORS.length)]
+                    : THREAT_COLORS[Math.floor(rng() * THREAT_COLORS.length)],
+      alive: true,
+      tapped: false,
+      alpha: 1,
+      glow: 0,
+      vx: 0,
+      vy: tileSpeed,
+      r: 0,           // rotation (for death anim)
+      vr: 0
+    });
+  }
+
+  // ---- tap handling ----
+  function tapAt(px, py) {
+    if (DEMO || BOT) return;
+    if (!px && !py) { /* space key */ }
+    if (phase === 'title') { startPlay(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      // check SHARE zone
+      if (px !== undefined && window.SHARE) {
+        var sr = SHARE_R;
+        if (px >= sr.x && px <= sr.x + sr.w && py >= sr.y && py <= sr.y + sr.h) {
+          SHARE.send({ score: score, unit: 'safe' }); return;
+        }
+      }
+      resetRun(); return;
+    }
+    if (phase !== 'play') return;
+    // check mute
+    if (px !== undefined && window.J) {
+      var mr = MUTE_R;
+      if (px >= mr.x && px <= mr.x + mr.w && py >= mr.y && py <= mr.y + mr.h) {
+        J.toggleMute(); return;
+      }
+    }
+    // find tapped tile (closest to tap point, not yet tapped)
+    var best_d = 9999, best_t = null;
+    for (var i = 0; i < tiles.length; i++) {
+      var t = tiles[i];
+      if (!t.alive || t.tapped) continue;
+      var dx = Math.abs((px || W/2) - t.x), dy = Math.abs((py || H/2) - t.y);
+      if (dx < TILE_W/2 + 10 && dy < TILE_H/2 + 10) {
+        var d = dx + dy;
+        if (d < best_d) { best_d = d; best_t = t; }
+      }
+    }
+    if (best_t) {
+      hitTile(best_t);
+    }
+  }
+
+  function hitTile(t) {
+    t.tapped = true;
+    if (t.safe) {
+      // good tap — bank it
+      score++;
+      combo++;
+      t.glow = 1;
+      if (window.J) {
+        if (combo >= 5) J.perfect(combo);
+        else J.hit(combo);
+        J.tension(Math.min(score / 30, 1));
+      }
+      if (combo >= 5) {
+        applyHitStop(5); zoom = 1.03;
+        flash('×' + combo + '!', GOLD, 42);
+      } else if (combo >= 3) {
+        flash('+' + combo, TEAL, 36);
+      } else {
+        flash('+1', TEAL, 30);
+      }
+      // floating text already handled by flash; animate tile up
+      t.vy = -3; t.vx = (rng() - 0.5) * 2;
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(score);
+      }
+      if (window.LOOP) LOOP.emit('tile_banked', { score: score, combo: combo });
+    } else {
+      // threat tap — hand shake penalty
+      combo = 0;
+      shakeAmt = 6;
+      if (window.J) J.near();
+      flash('!', VERM, 48);
+      // tile spins away
+      t.vr = (rng() - 0.5) * 0.15;
+      t.vy = -1;
+      if (window.LOOP) LOOP.emit('threat_tapped', { score: score });
+    }
+  }
+
+  // miss a safe tile (it falls past the floor)
+  function missedSafe(t) {
+    lives--;
+    combo = 0;
+    shakeAmt = 8;
+    if (window.J) J.near();
+    flash('MISSED', VERM, 38);
+    if (window.LOOP) LOOP.emit('near_miss', { score: score, lives: lives });
+    if (lives <= 0) {
+      gameOver();
+    }
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 12;
+    var newBest = score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + score / 30, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (newBest) { best = score; try { localStorage.setItem('sc_best', String(best)); } catch(_) {} }
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2300);
+    }
+    if (BOT) {
+      runsDone++;
+      if (runsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    tiles = []; flashes = [];
+    score = 0; combo = 0; lives = 3;
+    tileSpeed = 1.2; spawnInterval = 90; spawnTimer = 0;
+    shakeAmt = 0; hitStopVal = 0; zoom = 1;
+    // reset bot state for next run
+    botState.waitFrames = 0; botState.tapsLeft = 10; botState.passive = false;
+    // reset demo state for next run (shouldn't happen in demo but safety)
+    demoState.phase = 'normal'; demoState.tappedCount = 0; demoState.hesitIdx = 0; demoState.waitFrames = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startPlay();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 32, t: 0,
+                   x: W/2 + (rng()-0.5)*60, y: H/2 - 40 });
+  }
+
+  // ---- input wiring ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W/2 - 125, y: 500, w: 250, h: 46 };
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tapAt((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') tapAt();
+  });
+
+  // ---- demo / bot autopilot ----
+  // demo script: index into tiles list — tap safe, skip threat, near-miss then save, then die
+  // Phase pattern: tap most safes → skip one just-in-time (near-fail) → save it → then miss (lives run out)
+  var demoState = {
+    idx: 0,
+    waitFrames: 0,
+    // Human hesitation per tile: beats to wait before tapping
+    hesitations: [28, 22, 35, 18, 42, 24, 16, 50, 20, 30, 12, 38, 26, 44, 18, 22, 36, 28],
+    hesitIdx: 0,
+    phase: 'normal', // normal | near_fail | save | die
+    tappedCount: 0
+  };
+
+  // bot: play K taps then go passive so lives drain and game_over fires
+  var botState = { waitFrames: 0, tapsLeft: 10, passive: false };
+
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+    if (DEMO) {
+      demoAutopilot(dt);
+    } else if (BOT) {
+      botAutopilot(dt);
+    }
+  }
+
+  function demoAutopilot(dt) {
+    if (demoState.waitFrames > 0) { demoState.waitFrames -= dt; return; }
+
+    // find untapped visible safe tiles sorted by y descending (closest to floor)
+    var safeTiles = tiles.filter(function(t) { return t.alive && !t.tapped && t.safe && t.y > 100; });
+
+    var tappedCount = demoState.tappedCount;
+
+    // at ~60% through (after ~8 taps), do the near-fail
+    if (tappedCount >= 8 && demoState.phase === 'normal') {
+      demoState.phase = 'near_fail';
+    }
+
+    if (demoState.phase === 'near_fail') {
+      // wait for a safe tile to get very close to the floor, then save it
+      var urgentSafe = safeTiles.filter(function(t) { return t.y > H - 150; });
+      if (urgentSafe.length > 0) {
+        hitTile(urgentSafe[0]);
+        demoState.tappedCount++;
+        demoState.phase = 'save';
+        demoState.waitFrames = 20;
+        if (window.LOOP) LOOP.emit('near_miss', { score: score, saved: true });
+        return;
+      }
+      return; // wait — don't tap anything
+    }
+
+    if (demoState.phase === 'save') {
+      // go passive → lives drain → game over
+      demoState.phase = 'die';
+      demoState.waitFrames = 30;
+      return;
+    }
+
+    if (demoState.phase === 'die') {
+      // don't tap — let lives drain naturally
+      return;
+    }
+
+    // Normal phase: tap safe tiles with hesitation
+    if (safeTiles.length > 0) {
+      safeTiles.sort(function(a,b) { return b.y - a.y; });
+      hitTile(safeTiles[0]);
+      demoState.tappedCount++;
+      var hes = demoState.hesitations[demoState.hesitIdx % demoState.hesitations.length];
+      demoState.hesitIdx++;
+      demoState.waitFrames = hes;
+    }
+  }
+
+  function botAutopilot(dt) {
+    // once passive, do nothing — tiles fall, lives drain, game_over fires
+    if (botState.passive) return;
+    if (botState.waitFrames > 0) { botState.waitFrames -= dt; return; }
+
+    var safeTiles = tiles.filter(function(t) { return t.alive && !t.tapped && t.safe && t.y > 80; });
+    if (safeTiles.length === 0) { botState.waitFrames = 8; return; }
+
+    safeTiles.sort(function(a,b) { return b.y - a.y; });
+    // tap with ~80% success
+    if (rng() < 0.80) {
+      hitTile(safeTiles[0]);
+    }
+    botState.tapsLeft--;
+    if (botState.tapsLeft <= 0) {
+      // go passive — let lives drain to force game_over
+      botState.passive = true;
+      return;
+    }
+    botState.waitFrames = 10 + Math.floor(rng() * 18);
+  }
+
+  // ---- draw helpers ----
+  function drawTile(t, now) {
+    var x = t.x, y = t.y;
+    var hw = TILE_W / 2, hh = TILE_H / 2;
+    cx.save();
+    cx.translate(x, y);
+    if (t.r) cx.rotate(t.r);
+    cx.globalAlpha = t.alpha;
+
+    // glow effect on safe tiles
+    if (t.safe && t.glow > 0.01) {
+      cx.shadowColor = t.color;
+      cx.shadowBlur = 20 * t.glow;
+    }
+
+    // tile body: rounded rect
+    cx.fillStyle = t.color;
+    cx.beginPath();
+    if (cx.roundRect) {
+      cx.roundRect(-hw, -hh, TILE_W, TILE_H, 14);
+    } else {
+      cx.rect(-hw, -hh, TILE_W, TILE_H);
+    }
+    cx.fill();
+
+    // icon
+    cx.shadowBlur = 0;
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.font = '900 26px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    cx.fillText(t.safe ? '✓' : '✕', 0, 0);
+
+    cx.globalAlpha = 1;
+    cx.restore();
+  }
+
+  function drawHeart(x, y, filled) {
+    cx.save();
+    cx.translate(x, y);
+    cx.fillStyle = filled ? VERM : 'rgba(255,255,255,0.15)';
+    cx.font = '18px -apple-system';
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    cx.fillText('♥', 0, 0);
+    cx.restore();
+  }
+
+  function pctTop(s) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 12))));
+  }
+
+  // ---- main loop ----
+  var last = performance.now(), ctaStarted = false;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // decay hit-stop
+    if (hitStopVal > 0) {
+      hitStopVal -= dt;
+    } else {
+      // update sim only when not frozen
+      updateSim(dt, now);
+    }
+    // always run autopilot timing (not sim)
+    if (phase === 'play') autopilot(dt);
+
+    // juice: shake + zoom decay
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W/2 + sx, H/2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W/2, -H/2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // clear
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W+40, H+40);
+    // soft gradient bg
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(86,194,109,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // draw by phase
+    if (phase === 'challenge') drawChallenge(now);
+    else if (phase === 'title')  drawTitle(now);
+    else if (phase === 'play')   drawPlay(now);
+    else if (phase === 'over')   drawOver(now);
+    else if (phase === 'cta')    drawCTA(now);
+
+    // floating flashes
+    drawFlashes(dt);
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w/2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function updateSim(dt, now) {
+    if (phase !== 'play') return;
+
+    // spawn new tiles
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) {
+      spawnTile();
+      spawnTimer = spawnInterval;
+      // speed up gradually
+      tileSpeed = Math.min(4, 1.2 + score * 0.04);
+      spawnInterval = Math.max(35, 90 - score * 1.5);
+    }
+
+    // move tiles
+    for (var i = tiles.length - 1; i >= 0; i--) {
+      var t = tiles[i];
+      if (!t.alive) { tiles.splice(i, 1); continue; }
+
+      if (t.tapped) {
+        // fade out tapped tiles
+        t.y += t.vy * dt;
+        t.x += t.vx * dt;
+        t.r  += t.vr * dt;
+        t.alpha -= 0.04 * dt;
+        t.glow  *= 0.9;
+        if (t.alpha <= 0) { tiles.splice(i, 1); }
+        continue;
+      }
+
+      t.y += t.vy * dt;
+
+      // check if it fell past the floor
+      if (t.y > FLOOR_Y) {
+        if (t.safe) {
+          missedSafe(t);
+        }
+        tiles.splice(i, 1);
+      }
+    }
+  }
+
+  function drawPlay(now) {
+    // lane dividers (subtle)
+    for (var l = 0; l < COLS; l++) {
+      var lx = GRID_X + l * (TILE_W + GAP);
+      cx.fillStyle = 'rgba(255,255,255,0.03)';
+      cx.fillRect(lx, 0, TILE_W, H);
+    }
+
+    // danger zone at bottom
+    cx.fillStyle = 'rgba(232,80,46,0.07)';
+    cx.fillRect(0, H - 110, W, 110);
+    cx.fillStyle = 'rgba(232,80,46,0.18)';
+    cx.fillRect(0, H - 6, W, 6);
+
+    // tiles
+    for (var i = 0; i < tiles.length; i++) {
+      drawTile(tiles[i], now);
+    }
+
+    // score (top)
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.92)';
+    cx.font = '800 58px -apple-system, Helvetica, Arial';
+    cx.fillText(score, W/2, 82);
+
+    cx.fillStyle = 'rgba(255,255,255,0.38)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + best, W/2, 104);
+
+    // lives (hearts)
+    var heartX = W/2 - 28;
+    for (var h = 0; h < 3; h++) {
+      drawHeart(heartX + h * 28, H - 40, h < lives);
+    }
+
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare, W/2, 130);
+    }
+
+    // combo glow
+    if (combo >= 3) {
+      cx.textAlign = 'center';
+      cx.fillStyle = GOLD;
+      cx.globalAlpha = 0.7 + 0.3 * Math.sin(now/200);
+      cx.font = '900 20px -apple-system, Helvetica, Arial';
+      cx.fillText('×' + combo + ' STREAK', W/2, 124);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '900 44px -apple-system, Helvetica, Arial';
+    cx.fillText('SAFE COUNT', W/2, 268);
+
+    cx.fillStyle = 'rgba(86,194,109,0.9)';
+    cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('tap the green. skip the red.', W/2, 308);
+
+    var pulse = 0.6 + 0.4 * Math.sin(now/300);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = VERM;
+    cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO START', W/2, 360);
+    cx.globalAlpha = 1;
+
+    // demo tiles
+    var ty = 430;
+    for (var di = 0; di < 4; di++) {
+      var dsafe = di % 3 !== 1;
+      cx.fillStyle = dsafe ? SAFE_COLORS[di % SAFE_COLORS.length] : THREAT_COLORS[0];
+      var tx = GRID_X + di * (TILE_W + GAP) + TILE_W/2;
+      cx.save(); cx.translate(tx, ty);
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(-TILE_W/2, -TILE_H/2, TILE_W, TILE_H, 14);
+      else cx.rect(-TILE_W/2, -TILE_H/2, TILE_W, TILE_H);
+      cx.fill();
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '900 26px -apple-system';
+      cx.textAlign = 'center'; cx.textBaseline = 'middle';
+      cx.fillText(dsafe ? '✓' : '✕', 0, 0);
+      cx.restore();
+    }
+  }
+
+  function drawChallenge(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '800 16px Menlo, monospace';
+    cx.fillText('SCORE TO BEAT', W/2, 300);
+    cx.fillStyle = GOLD;
+    cx.font = '900 96px -apple-system, Helvetica, Arial';
+    cx.fillText('18', W/2, 400);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText("today's top run", W/2, 432);
+  }
+
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.55)';
+    cx.fillRect(0, 0, W, H);
+
+    cx.textAlign = 'center';
+    cx.fillStyle = VERM;
+    cx.font = '900 40px -apple-system, Helvetica, Arial';
+    cx.fillText('ALARM ON.', W/2, 292);
+
+    cx.fillStyle = '#fff';
+    cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText(score + ' safe', W/2, 338);
+
+    var pt = pctTop(score);
+    cx.fillStyle = GOLD;
+    cx.font = '900 22px -apple-system, Helvetica, Arial';
+    cx.fillText('TOP ' + pt + '% TODAY', W/2, 382);
+
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('better than ' + (100 - pt) + '% of players', W/2, 406);
+
+    if (!DEMO && !BOT) {
+      var p2 = 0.6 + 0.4 * Math.sin(now/280);
+      cx.globalAlpha = p2;
+      cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — ONE MORE TRY', W/2, 456);
+      cx.globalAlpha = 1;
+
+      // share pill
+      cx.fillStyle = 'rgba(242,177,52,0.14)';
+      cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+      else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = GOLD;
+      cx.font = '800 16px -apple-system, Helvetica, Arial';
+      cx.fillText(
+        (window.SHARE && SHARE.dare !== null && dareBeaten) ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+        W/2, SHARE_R.y + 30
+      );
+    }
+  }
+
+  function drawCTA(now) {
+    var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '900 46px -apple-system, Helvetica, Arial';
+    cx.fillText('SAFE COUNT', W/2, 292);
+    cx.fillStyle = 'rgba(255,255,255,0.75)';
+    cx.font = '700 20px -apple-system, Helvetica, Arial';
+    cx.fillText('they got ' + (window.__demoScore || 18) + '. can you beat it?', W/2, 334);
+    var p3 = 0.7 + 0.3 * Math.sin(now/240);
+    cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+    cx.font = '900 30px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ BEAT ' + (window.__demoScore || 18), W/2, 402);
+    cx.globalAlpha = ease;
+    cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W/2, 436);
+    cx.globalAlpha = 1;
+  }
+
+  function drawFlashes(dt) {
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

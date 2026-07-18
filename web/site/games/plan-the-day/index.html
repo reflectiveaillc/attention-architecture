@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Plan the Day — Tilt</title>
+<!--
+  LOOP / attention-architecture — Plan the Day
+  Conditioned path: the productive-scroll planning loop — consuming planning
+  content to feel prepared without committing. Mechanic: drag activity tiles
+  into a 6-block day grid; DONE softly locks the grid.
+  Circuits: 05-ease, 08-investment, 06-zeigarnik
+  Engine: CALM (teal/soft tones, J.calm only)
+
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=M  imperfect autopilot, N runs, window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'plan-the-day';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // --- deterministic RNG (mulberry32) ---
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // --- palette ---
+  var TEAL  = '#2ec5b6';
+  var GOLD  = '#f2b134';
+  var INK   = '#0b0d12';
+  var WHITE = 'rgba(255,255,255,0.92)';
+
+  // --- tile definitions ---
+  var TILES = [
+    { id: 'rest',    label: 'REST',    icon: '◑', color: '#7b8cde' },
+    { id: 'move',    label: 'MOVE',    icon: '⇧', color: '#2ec5b6' },
+    { id: 'eat',     label: 'EAT',     icon: '◉', color: '#f2b134' },
+    { id: 'connect', label: 'CONNECT', icon: '✦', color: '#e8a2c4' },
+    { id: 'work',    label: 'WORK',    icon: '▣', color: '#6ac4a8' },
+    { id: 'play',    label: 'PLAY',    icon: '◈', color: '#a78bde' }
+  ];
+
+  // --- layout constants ---
+  var GRID_X = 52, GRID_Y = 200;
+  var BLOCK_W = 301, BLOCK_H = 64, BLOCK_GAP = 10;
+  var TRAY_Y  = H - 148;
+  var TRAY_TILE_W = 54, TRAY_TILE_H = 54, TRAY_GAP = 8;
+  var DONE_X  = W / 2 - 80, DONE_Y = H - 72, DONE_W = 160, DONE_H = 46;
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 120, y: 500, w: 240, h: 46 };
+
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // tray tile bounding rect (index i)
+  function trayRect(i) {
+    var totalW = TILES.length * TRAY_TILE_W + (TILES.length - 1) * TRAY_GAP;
+    var sx = (W - totalW) / 2 + i * (TRAY_TILE_W + TRAY_GAP);
+    return { x: sx, y: TRAY_Y, w: TRAY_TILE_W, h: TRAY_TILE_H };
+  }
+
+  // grid block bounding rect (index i)
+  function gridRect(i) {
+    return { x: GRID_X, y: GRID_Y + i * (BLOCK_H + BLOCK_GAP), w: BLOCK_W, h: BLOCK_H };
+  }
+
+  // --- state ---
+  var phase;        // 'title' | 'play' | 'over' | 'cta'
+  var grid;         // array[6] of tile id or null
+  var trayUsed;     // set of tile ids placed in grid
+  var drag;         // { tileId, x, y, srcGrid: index|-1 }
+  var lockAnim;     // countdown for the lock animation (frames)
+  var overAt;
+  var ctaAt;
+  var flashes;
+  var shakeAmt = 0, zoom = 1, hitStop = 0;
+  var runStartTs;
+  var botRunsDone = 0;
+
+  // step counter for J.calm
+  var calmStep = 0;
+
+  function newGame() {
+    phase    = 'title';
+    grid     = [null, null, null, null, null, null];
+    trayUsed = {};
+    drag     = null;
+    lockAnim = 0;
+    overAt   = 0;
+    ctaAt    = 0;
+    flashes  = [];
+    shakeAmt = 0;
+    zoom     = 1;
+    hitStop  = 0;
+    calmStep = 0;
+
+    if (DEMO) { phase = 'play'; startRun(); }
+    else if (BOT) { phase = 'play'; startRun(); }
+  }
+
+  function startRun() {
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function gridFilled() {
+    for (var i = 0; i < 6; i++) { if (!grid[i]) return false; }
+    return true;
+  }
+
+  function placedCount() {
+    var n = 0;
+    for (var i = 0; i < 6; i++) { if (grid[i]) n++; }
+    return n;
+  }
+
+  // score = number of blocks placed (1–6) × 10 + bonus for all 6 filled
+  function calcScore() {
+    var n = placedCount();
+    return n * 10 + (n === 6 ? 40 : 0);
+  }
+
+  function completePlan() {
+    phase   = 'over';
+    overAt  = performance.now();
+    lockAnim = 60;  // 60-frame lock animation
+    var score = calcScore();
+    var dur   = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.calm(calmStep++);
+    zoom     = 1.03;
+    if (window.LOOP) LOOP.emit('plan_complete', { score: score, blocks: placedCount() });
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 900);
+      }
+    }
+  }
+
+  function resetRun() {
+    grid     = [null, null, null, null, null, null];
+    trayUsed = {};
+    drag     = null;
+    lockAnim = 0;
+    flashes  = [];
+    phase    = 'play';
+    calmStep = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 28, t: 0 });
+  }
+
+  // --- input ---
+  function tileAt(x, y) {
+    // check grid blocks first
+    for (var i = 0; i < 6; i++) {
+      if (grid[i]) {
+        var r = gridRect(i);
+        if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+          return { tileId: grid[i], srcGrid: i };
+        }
+      }
+    }
+    // check tray
+    for (var j = 0; j < TILES.length; j++) {
+      var t = TILES[j];
+      if (!trayUsed[t.id]) {
+        var tr = trayRect(j);
+        if (x >= tr.x && x <= tr.x + tr.w && y >= tr.y && y <= tr.y + tr.h) {
+          return { tileId: t.id, srcGrid: -1 };
+        }
+      }
+    }
+    return null;
+  }
+
+  function pointerDown(x, y) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+
+    if (phase === 'title') {
+      phase = 'play';
+      startRun();
+      return;
+    }
+
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: calcScore(), unit: 'blocks' });
+        return;
+      }
+      resetRun();
+      return;
+    }
+
+    if (phase !== 'play') return;
+
+    // check DONE button
+    if (placedCount() > 0 &&
+        x >= DONE_X && x <= DONE_X + DONE_W &&
+        y >= DONE_Y && y <= DONE_Y + DONE_H) {
+      completePlan();
+      return;
+    }
+
+    // start drag
+    var hit = tileAt(x, y);
+    if (hit) {
+      drag = { tileId: hit.tileId, x: x, y: y, srcGrid: hit.srcGrid };
+      if (hit.srcGrid >= 0) {
+        grid[hit.srcGrid] = null;
+        delete trayUsed[hit.tileId];
+      }
+    }
+  }
+
+  function pointerMove(x, y) {
+    if (drag) { drag.x = x; drag.y = y; }
+  }
+
+  function pointerUp(x, y) {
+    if (!drag) return;
+    var dropped = false;
+
+    // try to drop on a grid slot
+    for (var i = 0; i < 6; i++) {
+      var r = gridRect(i);
+      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+        var prev = grid[i];
+        if (prev) delete trayUsed[prev];      // displaced tile returns to tray
+        grid[i]            = drag.tileId;
+        trayUsed[drag.tileId] = true;
+        dropped = true;
+        if (window.J) J.calm(calmStep++);
+        zoom = 1.015;
+        if (window.LOOP) LOOP.emit('tile_placed', { tile: drag.tileId, slot: i });
+        // if all 6 filled, gentle flash
+        if (gridFilled()) {
+          flash('DAY SHAPED', TEAL, 32);
+          if (window.J) J.calm(calmStep++);
+        } else {
+          flash('✦', TEAL, 26);
+        }
+        break;
+      }
+    }
+
+    // if not dropped on grid, tile returns to tray (no-op needed)
+    drag = null;
+  }
+
+  // pointer events
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointermove', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' && phase === 'play' && !DEMO && !BOT) {
+      // space: auto-fill next empty slot with a random available tile
+      for (var i = 0; i < 6; i++) {
+        if (!grid[i]) {
+          for (var j = 0; j < TILES.length; j++) {
+            if (!trayUsed[TILES[j].id]) {
+              grid[i] = TILES[j].id;
+              trayUsed[TILES[j].id] = true;
+              break;
+            }
+          }
+          break;
+        }
+      }
+    }
+  });
+
+  // --- demo / bot autopilot ---
+  // The demo places tiles one by one with calm hesitation pauses,
+  // then presses DONE; a calm completion arc.
+  var demoQueue = null; // built lazily
+  var demoTimer = 0;
+  var demoState = 'idle'; // 'idle' | 'placing' | 'done'
+  var demoPlacedCount = 0;
+
+  // Hesitation waits between placements (frames at ~60fps)
+  var DEMO_WAITS = [70, 55, 80, 60, 75, 90];
+
+  function buildDemoQueue() {
+    // order: shuffle tiles slightly with RNG for organic feel
+    var order = [0, 1, 2, 3, 4, 5];
+    // small shuffle
+    for (var i = order.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+    }
+    demoQueue = order; // grid slot order to fill
+    demoTimer = DEMO_WAITS[0];
+    demoState = 'placing';
+  }
+
+  function autopilot() {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      if (demoState === 'idle') { buildDemoQueue(); return; }
+      if (demoState === 'placing') {
+        demoTimer--;
+        if (demoTimer > 0) return;
+        if (demoPlacedCount < 6) {
+          var slot = demoQueue[demoPlacedCount];
+          var tile = TILES[demoPlacedCount]; // place in order
+          grid[slot] = tile.id;
+          trayUsed[tile.id] = true;
+          if (window.J) J.calm(calmStep++);
+          zoom = 1.012;
+          if (window.LOOP) LOOP.emit('tile_placed', { tile: tile.id, slot: slot });
+          demoPlacedCount++;
+          demoTimer = DEMO_WAITS[Math.min(demoPlacedCount, DEMO_WAITS.length - 1)];
+          if (demoPlacedCount === 6) {
+            flash('DAY SHAPED', TEAL, 32);
+            if (window.J) J.calm(calmStep++);
+            demoTimer = 80; // pause before DONE
+            demoState = 'done';
+          }
+        }
+        return;
+      }
+      if (demoState === 'done') {
+        demoTimer--;
+        if (demoTimer <= 0) { completePlan(); demoState = 'finished'; }
+        return;
+      }
+    }
+
+    if (BOT) {
+      // bot: fill one slot every 40 frames, then press done
+      if (!drag && phase === 'play') {
+        if (!botTimer) botTimer = 40;
+        botTimer--;
+        if (botTimer > 0) return;
+        // find next empty slot
+        for (var i = 0; i < 6; i++) {
+          if (!grid[i]) {
+            for (var j = 0; j < TILES.length; j++) {
+              if (!trayUsed[TILES[j].id]) {
+                grid[i] = TILES[j].id;
+                trayUsed[TILES[j].id] = true;
+                if (window.LOOP) LOOP.emit('tile_placed', { tile: TILES[j].id, slot: i });
+                botTimer = 35 + Math.floor(rng() * 20);
+                return;
+              }
+            }
+          }
+        }
+        // all filled — press done
+        completePlan();
+        botTimer = 0;
+      }
+    }
+  }
+  var botTimer = 0;
+
+  // --- drawing helpers ---
+  function roundRect(x, y, w, h, r) {
+    if (cx.roundRect) {
+      cx.roundRect(x, y, w, h, r);
+    } else {
+      cx.moveTo(x + r, y);
+      cx.lineTo(x + w - r, y);
+      cx.quadraticCurveTo(x + w, y, x + w, y + r);
+      cx.lineTo(x + w, y + h - r);
+      cx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      cx.lineTo(x + r, y + h);
+      cx.quadraticCurveTo(x, y + h, x, y + h - r);
+      cx.lineTo(x, y + r);
+      cx.quadraticCurveTo(x, y, x + r, y);
+      cx.closePath();
+    }
+  }
+
+  function drawTile(tileId, x, y, w, h, alpha, locked) {
+    var tile = null;
+    for (var i = 0; i < TILES.length; i++) {
+      if (TILES[i].id === tileId) { tile = TILES[i]; break; }
+    }
+    if (!tile) return;
+    cx.save();
+    cx.globalAlpha = alpha || 1;
+
+    // background
+    cx.fillStyle = tile.color;
+    cx.globalAlpha = (alpha || 1) * (locked ? 0.85 : 0.22);
+    cx.beginPath(); roundRect(x, y, w, h, 12); cx.fill();
+
+    // border
+    cx.globalAlpha = (alpha || 1) * (locked ? 0.9 : 0.55);
+    cx.strokeStyle = tile.color;
+    cx.lineWidth = locked ? 2 : 1.5;
+    cx.beginPath(); roundRect(x, y, w, h, 12); cx.stroke();
+
+    // icon + label (grid-size vs tray-size)
+    cx.globalAlpha = alpha || 1;
+    var isGrid = w > 80;
+    if (isGrid) {
+      cx.textAlign = 'left';
+      cx.fillStyle = tile.color;
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText(tile.icon, x + 20, y + h / 2 + 8);
+      cx.fillStyle = 'rgba(255,255,255,' + (locked ? '0.92' : '0.75') + ')';
+      cx.font = (locked ? '700' : '600') + ' 16px -apple-system, Helvetica, Arial';
+      cx.fillText(tile.label, x + 52, y + h / 2 + 6);
+    } else {
+      cx.textAlign = 'center';
+      cx.fillStyle = tile.color;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText(tile.icon, x + w / 2, y + h / 2 - 4);
+      cx.fillStyle = 'rgba(255,255,255,0.8)';
+      cx.font = '600 8px -apple-system, Helvetica, Arial';
+      cx.fillText(tile.label, x + w / 2, y + h / 2 + 10);
+    }
+    cx.restore();
+  }
+
+  function drawEmptySlot(i, x, y, w, h) {
+    var labels = ['Morning', 'Late Morning', 'Midday', 'Afternoon', 'Early Evening', 'Evening'];
+    cx.save();
+    cx.globalAlpha = 0.18;
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 1.5;
+    cx.setLineDash([5, 5]);
+    cx.beginPath(); roundRect(x, y, w, h, 12); cx.stroke();
+    cx.setLineDash([]);
+    cx.globalAlpha = 0.28;
+    cx.fillStyle = 'rgba(255,255,255,0.28)';
+    cx.textAlign = 'left';
+    cx.font = '500 12px -apple-system, Helvetica, Arial';
+    cx.fillStyle = 'rgba(255,255,255,0.3)';
+    cx.fillText(labels[i], x + 16, y + h / 2 + 5);
+    cx.restore();
+  }
+
+  // --- render ---
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // decay juice
+    if (hitStop > 0) { hitStop -= dt; }
+    else { autopilot(); }
+
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom     += (1 - zoom) * 0.12 * dt;
+    if (lockAnim > 0) lockAnim -= dt;
+
+    cx.save();
+    // screen shake + zoom
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (rng() - 0.5) * shakeAmt, sy = (rng() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.07)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.02)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    var locked = phase === 'over' || phase === 'cta';
+
+    // --- TITLE phase ---
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = WHITE;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('PLAN THE DAY', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '400 15px -apple-system, Helvetica, Arial';
+      cx.fillText('Drag activities into your day', W / 2, 298);
+      var pulse = 0.55 + 0.45 * Math.sin(now / 500);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, 355);
+      cx.globalAlpha = 1;
+    }
+
+    // --- PLAY / OVER phase: draw grid and tray ---
+    if (phase === 'play' || phase === 'over' || phase === 'cta') {
+
+      // header
+      cx.textAlign = 'left';
+      cx.fillStyle = WHITE;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('YOUR DAY', GRID_X, GRID_Y - 28);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText(placedCount() + ' of 6', GRID_X + 220, GRID_Y - 28);
+
+      // progress bar
+      var prog = placedCount() / 6;
+      cx.fillStyle = 'rgba(46,197,182,0.18)';
+      cx.beginPath(); roundRect(GRID_X, GRID_Y - 14, BLOCK_W, 5, 3); cx.fill();
+      cx.fillStyle = TEAL;
+      cx.beginPath(); roundRect(GRID_X, GRID_Y - 14, BLOCK_W * prog, 5, 3); cx.fill();
+
+      // grid blocks
+      for (var i = 0; i < 6; i++) {
+        var gr = gridRect(i);
+        // lock anim: glow if just locked
+        if (locked && lockAnim > 0) {
+          var glowA = Math.max(0, lockAnim / 60) * 0.35;
+          cx.save();
+          cx.shadowColor = TEAL;
+          cx.shadowBlur  = 18 * (lockAnim / 60);
+          cx.globalAlpha = 0.5 + 0.5 * (lockAnim / 60);
+        }
+        if (grid[i]) {
+          drawTile(grid[i], gr.x, gr.y, gr.w, gr.h, 1, locked);
+        } else if (!locked) {
+          drawEmptySlot(i, gr.x, gr.y, gr.w, gr.h);
+        } else {
+          // locked empty slot — subtle placeholder
+          cx.save();
+          cx.globalAlpha = 0.12;
+          cx.strokeStyle = TEAL;
+          cx.lineWidth = 1;
+          cx.beginPath(); roundRect(gr.x, gr.y, gr.w, gr.h, 12); cx.stroke();
+          cx.restore();
+        }
+        if (locked && lockAnim > 0) { cx.restore(); }
+      }
+
+      // tray (only in play)
+      if (phase === 'play') {
+        cx.fillStyle = 'rgba(255,255,255,0.08)';
+        cx.textAlign = 'center';
+        cx.font = '500 11px -apple-system, Helvetica, Arial';
+        cx.fillStyle = 'rgba(255,255,255,0.25)';
+        cx.fillText('DRAG TO YOUR DAY', W / 2, TRAY_Y - 14);
+
+        for (var j = 0; j < TILES.length; j++) {
+          var tr = trayRect(j);
+          var used = trayUsed[TILES[j].id];
+          if (drag && drag.tileId === TILES[j].id) continue; // being dragged
+          if (used) {
+            // grayed out placeholder
+            cx.save();
+            cx.globalAlpha = 0.18;
+            cx.strokeStyle = TILES[j].color;
+            cx.lineWidth = 1;
+            cx.beginPath(); roundRect(tr.x, tr.y, tr.w, tr.h, 10); cx.stroke();
+            cx.restore();
+          } else {
+            drawTile(TILES[j].id, tr.x, tr.y, tr.w, tr.h, 1, false);
+          }
+        }
+
+        // DONE button (visible when at least 1 placed)
+        if (placedCount() > 0) {
+          var pulse2 = gridFilled() ? (0.75 + 0.25 * Math.sin(now / 350)) : 1;
+          cx.save();
+          cx.globalAlpha = pulse2;
+          cx.fillStyle = gridFilled() ? 'rgba(46,197,182,0.22)' : 'rgba(46,197,182,0.12)';
+          cx.beginPath(); roundRect(DONE_X, DONE_Y, DONE_W, DONE_H, 23); cx.fill();
+          cx.strokeStyle = TEAL;
+          cx.lineWidth = gridFilled() ? 2 : 1.5;
+          cx.beginPath(); roundRect(DONE_X, DONE_Y, DONE_W, DONE_H, 23); cx.stroke();
+          cx.fillStyle = TEAL;
+          cx.textAlign = 'center';
+          cx.font = (gridFilled() ? '800' : '700') + ' 16px -apple-system, Helvetica, Arial';
+          cx.fillText(gridFilled() ? '▶ DONE — LOCK IT IN' : '▶ DONE', W / 2, DONE_Y + 30);
+          cx.restore();
+        }
+      }
+
+      // dragged tile follows pointer
+      if (drag) {
+        drawTile(drag.tileId, drag.x - TRAY_TILE_W / 2, drag.y - TRAY_TILE_H / 2,
+                 TRAY_TILE_W, TRAY_TILE_H, 0.9, false);
+      }
+    }
+
+    // --- OVER phase overlay ---
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '900 34px -apple-system, Helvetica, Arial';
+      cx.fillText('DAY SHAPED.', W / 2, 340);
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '500 15px -apple-system, Helvetica, Arial';
+      cx.fillText('Your day has a shape now.', W / 2, 374);
+      var score = calcScore();
+      cx.fillStyle = GOLD;
+      cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' pts — ' + placedCount() + ' blocks placed', W / 2, 408);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 380);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — PLAN AGAIN', W / 2, 458);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD;
+        cx.lineWidth = 1.5;
+        cx.beginPath();
+        roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // --- CTA phase (demo only) ---
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = WHITE;
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('PLAN THE DAY', W / 2, 298);
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('shape the day before it shapes you', W / 2, 334);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 300);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL;
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ GROW YOURS', W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // --- floating flashes ---
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 50);
+      cx.save();
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 170 - fl.t * 0.8);
+      cx.restore();
+      if (fl.t > 50) flashes.splice(k, 1);
+    }
+
+    // --- mute toggle (human only) ---
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

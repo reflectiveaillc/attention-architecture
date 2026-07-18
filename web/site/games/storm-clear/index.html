@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Storm Clear — Tilt</title>
+<!--
+  LOOP / attention-architecture — Storm Clear
+  Mechanic: threat words rain down — tap to neutralize before they pile below the line.
+  Circuits: 01 RPE (variable reward), 04 loss (pile-up fail), 06 Zeigarnik (one more try).
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron run → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'storm-clear';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // Threat words (threat loop — the scroll-for-bad-news conditioned reflex)
+  var WORDS = [
+    'BREAKING','URGENT','WARNING','ALERT','THREAT',
+    'CRISIS','DANGER','PANIC','RISK','FLOOD',
+    'ATTACK','EXPOSED','CRITICAL','LOSS','ALARMING',
+    'SHOCKING','MASSIVE','DEADLY','EXTREME','CHAOS',
+    'SURGE','FAILURE','COLLAPSE','VIRAL','TRENDING',
+    'SCANDAL','OUTRAGE','MELTDOWN','TERROR','ESCALATE'
+  ];
+
+  var DANGER_LINE = H - 80; // words below this line cause game over accumulation
+
+  // Game state
+  var phase, words, rings, flashes, cleared, lives, runStartTs;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var dareBeaten = false, challengeAt = 0, ctaAt = 0;
+  var calmAlpha = 0; // calm horizon fade-in after clear sky
+  var best = 0;
+  try { best = +localStorage.getItem('sc_best') || 0; } catch (_) {}
+
+  // Bot state
+  var botRunsDone = 0, botActionsLeft = 0, botPassive = false;
+
+  // Demo state
+  var demoPhase = 0; // 0=challenge card, 1=play, 2=near-fail zone, 3=dead
+  var demoTimer = 0;
+  var demoNearFail = false;
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 15))));
+  }
+
+  // Spawn a single word token
+  function spawnWord() {
+    var idx = Math.floor(rng() * WORDS.length);
+    var x = 30 + rng() * (W - 60);
+    var speed = 0.55 + rng() * 0.6 + cleared * 0.015;
+    speed = Math.min(speed, 2.8);
+    var size = 11 + Math.floor(rng() * 6); // 11-16px
+    words.push({
+      txt: WORDS[idx],
+      x: x,
+      y: -24,
+      vy: speed,
+      size: size,
+      col: rng() < 0.15 ? VERM : (rng() < 0.2 ? GOLD : 'rgba(255,255,255,0.88)'),
+      alpha: 1,
+      dying: false,   // being dissolved
+      dieT: 0
+    });
+  }
+
+  // Dissolve ring particles
+  function addRing(x, y, col) {
+    rings.push({ x: x, y: y, r: 8, maxR: 38, col: col, alpha: 1.0, t: 0 });
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function newGame() {
+    phase = 'title';
+    words = []; rings = []; flashes = [];
+    cleared = 0; lives = 3;
+    dareBeaten = false; calmAlpha = 0;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    botPassive = false; botActionsLeft = 0;
+    demoPhase = 0; demoTimer = 0; demoNearFail = false;
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1200);
+    } else if (BOT) {
+      startRun();
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    words = []; rings = []; flashes = [];
+    cleared = 0; lives = 3;
+    calmAlpha = 0; dareBeaten = false;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    runStartTs = Date.now();
+    spawnSchedule = 0;
+    // bot: decide how many taps before going passive
+    if (BOT) {
+      botPassive = false;
+      botActionsLeft = 8 + Math.floor(rng() * 10); // tap 8-18 words then go passive
+    }
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  var spawnSchedule = 0;
+
+  function hitWord(w) {
+    if (w.dying) return;
+    w.dying = true;
+    cleared++;
+    var combo = cleared;
+    if (window.J) {
+      if (combo > 0 && combo % 5 === 0) {
+        J.perfect(Math.floor(combo / 5));
+        hitStop = 5;
+        zoom = 1.025;
+        flash('CLEARED!', TEAL, 38);
+      } else {
+        J.hit(combo);
+      }
+      J.tension(Math.min(words.filter(function(ww){return !ww.dying;}).length / 12, 1));
+    }
+    addRing(w.x, w.y, w.col === VERM ? VERM : TEAL);
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && cleared > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 40);
+      if (window.J) J.fanfare();
+      SHARE.beaten(cleared);
+    }
+    if (window.LOOP) LOOP.emit('word_cleared', { n: cleared, word: w.txt });
+  }
+
+  function loseLife(w) {
+    lives--;
+    shakeAmt = 7;
+    if (window.J) J.near();
+    flash(lives > 0 ? 'MISSED!' : '', VERM, 36);
+    if (window.LOOP) LOOP.emit('near_miss', { n: cleared, lives: lives });
+    if (lives <= 0) {
+      gameOver();
+    }
+  }
+
+  function gameOver() {
+    phase = 'over';
+    var dur = (Date.now() - runStartTs) / 1000;
+    shakeAmt = 10;
+    if (window.J) {
+      J.death(Math.min(0.3 + cleared / 30, 1));
+    }
+    if (!DEMO && !BOT && cleared > best) {
+      best = cleared;
+      try { localStorage.setItem('sc_best', String(best)); } catch (_) {}
+      setTimeout(function() { if (window.J) J.fanfare(); }, 500);
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: cleared, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = cleared;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function skyCleared() {
+    // All words gone, none incoming — calm sky moment
+    phase = 'calm';
+    calmAlpha = 0;
+    if (window.LOOP) LOOP.emit('sky_cleared', { n: cleared });
+    if (window.J) J.fanfare();
+    flash('SKY CLEAR', TEAL, 42);
+    setTimeout(function () {
+      // show score over calm horizon for 2s then treat as game_over
+      var dur = (Date.now() - runStartTs) / 1000;
+      if (window.LOOP) LOOP.emit('game_over', { score: cleared, dur_s: +dur.toFixed(1) });
+      if (DEMO) {
+        window.__demoScore = cleared;
+        setTimeout(function () {
+          phase = 'cta';
+          ctaAt = performance.now();
+          setTimeout(function () { window.__demoDone = true; }, 3600);
+        }, 800);
+      }
+      if (BOT) {
+        botRunsDone++;
+        if (botRunsDone >= BOT_RUNS) {
+          window.__botDone = true;
+        } else {
+          setTimeout(function () { resetRun(); }, 800);
+        }
+      }
+      if (!DEMO && !BOT) {
+        phase = 'over';
+        if (cleared > best) {
+          best = cleared;
+          try { localStorage.setItem('sc_best', String(best)); } catch (_) {}
+          if (window.J) J.fanfare();
+        }
+      }
+    }, 2000);
+  }
+
+  function resetRun() {
+    words = []; rings = []; flashes = [];
+    cleared = 0; lives = 3;
+    calmAlpha = 0; dareBeaten = false;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    botPassive = false;
+    botActionsLeft = 8 + Math.floor(rng() * 10);
+    spawnSchedule = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // --- Input ---
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(cx_, cy_) {
+    if (DEMO || BOT) return;
+    if (cx_ !== undefined && inR(MUTE_R, cx_, cy_) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') {
+      // find nearest word to tap
+      var best_ = null, bestD = 999;
+      for (var i = 0; i < words.length; i++) {
+        var w = words[i];
+        if (w.dying) continue;
+        var dx = (cx_ || W/2) - w.x, dy = (cy_ || H/2) - w.y;
+        var d = Math.sqrt(dx*dx + dy*dy);
+        if (d < bestD && d < 60) { best_ = w; bestD = d; }
+      }
+      if (best_) hitWord(best_);
+      return;
+    }
+    if (phase === 'over' && performance.now() - (window._overAt||0) > 350) {
+      if (cx_ !== undefined && inR(SHARE_R, cx_, cy_) && window.SHARE) {
+        SHARE.send({ score: cleared, unit: 'cleared' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // --- Demo autopilot ---
+  // Arc: good clearing → near-fail (let 2 slip) → recovery burst → real fail (go passive)
+  var demoHesitateT = 0;  // countdown before next demo action
+  var demoNearFailDone = false;
+  var demoRecoveryDone = false;
+  var demoPassive = false; // final stage — let words pile up
+  var demoClearedBeforePassive = 0;
+
+  function demoAutopilot() {
+    if (phase !== 'play') return;
+    demoHesitateT -= 1;
+    if (demoHesitateT > 0) return;
+
+    var active = words.filter(function(w){ return !w.dying && w.y > 50; });
+    if (active.length === 0) return;
+
+    // Arc: ~60% through mark a near-fail window by letting words slip
+    // We track cleared count to pace demo arc
+    if (!demoNearFailDone && cleared >= 12) {
+      // Near-fail: let next 2 words pass — only tap every 3rd
+      demoNearFail = true;
+    }
+    if (demoNearFail && !demoRecoveryDone) {
+      // let slip: only act if a word is very close to danger line
+      var close = null;
+      for (var i = 0; i < active.length; i++) {
+        if (active[i].y > DANGER_LINE - 80) { close = active[i]; break; }
+      }
+      if (close) {
+        hitWord(close);
+        demoNearFailDone = true;
+        demoRecoveryDone = true; // recovery burst next
+        demoNearFail = false;
+        // rapid burst of 3 taps (recovery)
+        var burst = active.slice(0, 3);
+        var delay = 180;
+        burst.forEach(function(ww) {
+          setTimeout(function() { if(!ww.dying && phase==='play') hitWord(ww); }, delay);
+          delay += 200;
+        });
+        demoHesitateT = 40;
+      } else {
+        // just wait — let words drift lower (near-fail tension)
+        demoHesitateT = 12;
+      }
+      return;
+    }
+
+    // Post-recovery: go passive so words pile up → game_over
+    if (demoRecoveryDone && !demoPassive && cleared >= 18) {
+      demoPassive = true;
+    }
+
+    if (demoPassive) {
+      // stop tapping — let failure happen naturally
+      demoHesitateT = 60;
+      return;
+    }
+
+    // Normal play with human-feeling hesitation
+    var target = active[0];
+    hitWord(target);
+    demoHesitateT = 18 + Math.floor(rng() * 22); // 18-40 frames hesitation
+  }
+
+  // --- Bot autopilot ---
+  var botHesitateT = 0;
+  function botAutopilot() {
+    if (phase !== 'play') return;
+    botHesitateT -= 1;
+    if (botHesitateT > 0) return;
+    if (botPassive) {
+      botHesitateT = 30;
+      return;
+    }
+    var active = words.filter(function(w){ return !w.dying && w.y > 40; });
+    if (active.length === 0) { botHesitateT = 8; return; }
+    // tap lowest word (most urgent)
+    var target = active.reduce(function(a,b){ return b.y > a.y ? b : a; });
+    hitWord(target);
+    botActionsLeft--;
+    if (botActionsLeft <= 0) {
+      botPassive = true; // let words pile up → natural game_over
+    }
+    botHesitateT = 12 + Math.floor(rng() * 20);
+  }
+
+  // --- Main loop ---
+  var last = performance.now();
+  var overAt = 0;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Spawn words during play
+    if (phase === 'play') {
+      spawnSchedule -= dt;
+      if (spawnSchedule <= 0) {
+        spawnWord();
+        // spawn interval decreases as cleared increases (pressure rises)
+        var interval = Math.max(28, 80 - cleared * 1.2);
+        spawnSchedule = interval * (0.7 + rng() * 0.6);
+      }
+
+      // Bot in "calm" win state: stop spawning and let it resolve
+      // Update words
+      var lostThisFrame = 0;
+      for (var i = words.length - 1; i >= 0; i--) {
+        var w = words[i];
+        if (w.dying) {
+          w.dieT += dt;
+          w.alpha = Math.max(0, 1 - w.dieT / 18);
+          if (w.dieT > 18) words.splice(i, 1);
+          continue;
+        }
+        w.y += w.vy * dt;
+        if (w.y > DANGER_LINE) {
+          words.splice(i, 1);
+          lostThisFrame++;
+        }
+      }
+      if (lostThisFrame > 0 && phase === 'play') {
+        for (var j = 0; j < lostThisFrame; j++) loseLife(null);
+        if (phase === 'over') { overAt = performance.now(); window._overAt = overAt; }
+      }
+
+      // Demo / bot autopilot
+      if (hitStop > 0) { hitStop -= dt; }
+      else {
+        if (DEMO) demoAutopilot();
+        else if (BOT) botAutopilot();
+      }
+    } else if (phase === 'calm') {
+      calmAlpha = Math.min(1, calmAlpha + dt * 0.02);
+      // Update dying rings
+      for (var i = rings.length - 1; i >= 0; i--) {
+        var rr = rings[i];
+        rr.t += dt;
+        rr.r = rr.r + dt * 1.2;
+        rr.alpha = Math.max(0, 1 - rr.t / 28);
+        if (rr.alpha <= 0) rings.splice(i, 1);
+      }
+    } else {
+      // non-play: still animate dying words
+      if (hitStop > 0) hitStop -= dt;
+    }
+
+    // Update rings always
+    for (var i = rings.length - 1; i >= 0; i--) {
+      var rr = rings[i];
+      if (phase !== 'calm') {
+        rr.t += dt;
+        rr.r = rr.r + dt * 1.5;
+        rr.alpha = Math.max(0, 1 - rr.t / 22);
+        if (rr.alpha <= 0) rings.splice(i, 1);
+      }
+    }
+
+    // Update flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      flashes[k].t += dt;
+      if (flashes[k].t > 45) flashes.splice(k, 1);
+    }
+
+    // === DRAW ===
+    cx.save();
+
+    // Juice transforms: shake + zoom
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W/2 + sx, H/2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W/2, -H/2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W+40, H+40);
+
+    // Calm horizon gradient (fades in after sky cleared)
+    if (calmAlpha > 0 || phase === 'calm') {
+      var hg = cx.createLinearGradient(0, H*0.4, 0, H);
+      hg.addColorStop(0, 'rgba(46,197,182,' + (0.18 * calmAlpha) + ')');
+      hg.addColorStop(1, 'rgba(46,197,182,' + (0.06 * calmAlpha) + ')');
+      cx.fillStyle = hg; cx.fillRect(0, 0, W, H);
+    }
+
+    // Storm atmosphere — subtle vignette when playing
+    if (phase === 'play' && words.length > 4) {
+      var vg = cx.createRadialGradient(W/2, H/2, H*0.2, W/2, H/2, H*0.7);
+      vg.addColorStop(0, 'rgba(0,0,0,0)');
+      vg.addColorStop(1, 'rgba(11,13,18,0.55)');
+      cx.fillStyle = vg; cx.fillRect(0, 0, W, H);
+    }
+
+    // Danger line
+    if (phase === 'play') {
+      cx.strokeStyle = 'rgba(232,80,46,0.25)'; cx.lineWidth = 1.5;
+      cx.setLineDash([8, 6]);
+      cx.beginPath(); cx.moveTo(0, DANGER_LINE); cx.lineTo(W, DANGER_LINE);
+      cx.stroke(); cx.setLineDash([]);
+      // lives dots
+      for (var li = 0; li < 3; li++) {
+        cx.beginPath();
+        cx.arc(W/2 - 20 + li*20, DANGER_LINE + 16, 5, 0, Math.PI*2);
+        cx.fillStyle = li < lives ? VERM : 'rgba(255,255,255,0.18)';
+        cx.fill();
+      }
+    }
+
+    // Word tokens
+    for (var i = 0; i < words.length; i++) {
+      var w = words[i];
+      cx.globalAlpha = w.alpha;
+      var fs_ = w.size + 'px -apple-system, Helvetica, Arial';
+      cx.font = '700 ' + fs_;
+      cx.textAlign = 'center';
+      // glow for dangerous words
+      if (w.col === VERM) {
+        cx.shadowColor = VERM; cx.shadowBlur = 10;
+      }
+      cx.fillStyle = w.col;
+      cx.fillText(w.txt, w.x, w.y);
+      cx.shadowBlur = 0;
+      cx.globalAlpha = 1;
+    }
+
+    // Dissolve rings
+    for (var i = 0; i < rings.length; i++) {
+      var rr = rings[i];
+      cx.globalAlpha = rr.alpha;
+      cx.strokeStyle = rr.col;
+      cx.lineWidth = 2.5;
+      cx.beginPath();
+      cx.arc(rr.x, rr.y, rr.r, 0, Math.PI*2);
+      cx.stroke();
+      cx.globalAlpha = 1;
+    }
+
+    // Score (during play)
+    if (phase === 'play' || phase === 'calm') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 58px -apple-system, Helvetica, Arial';
+      cx.fillText(cleared, W/2, 88);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W/2, 112);
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W/2, 136);
+      }
+    }
+
+    // Floating reward flashes
+    for (var k = 0; k < flashes.length; k++) {
+      var fl = flashes[k];
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W/2, 240 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+    }
+
+    // Challenge card (demo beat 1)
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '800 15px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W/2, 290);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('22', W/2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W/2, 420);
+    }
+
+    // Title screen
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('STORM CLEAR', W/2, 270);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap threats before they land', W/2, 310);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 310);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W/2, 360);
+      cx.globalAlpha = 1;
+    }
+
+    // Game over card
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('OVERWHELMED.', W/2, 295);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(cleared + ' cleared', W/2, 340);
+      var pt = pctTop(cleared);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W/2, 385);
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('calmer than ' + (100-pt) + '% of players', W/2, 408);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL; cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — CLEAR AGAIN', W/2, 456);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.13)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W/2, SHARE_R.y + 30);
+      }
+    }
+
+    // Demo CTA card
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('STORM CLEAR', W/2, 296);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('they cleared ' + (window.__demoScore || 22) + '. beat it.', W/2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 230);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 22), W/2, 406);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W/2, 438);
+      cx.globalAlpha = 1;
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w/2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
