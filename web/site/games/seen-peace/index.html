@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Seen Peace — Tilt</title>
+<!--
+  LOOP / attention-architecture — Seen Peace (CALM engine, contract v2)
+  Conditioned path: seen-receipt anticipation — the thumb already knows this move
+  from Instagram/TikTok DMs. The game IS that gesture.
+  Mechanic: messages send with no status labels. Only a slow ripple; you wait
+  until it fades. The loop teaches that 'delivered' does not need a reply.
+  Circuits: 03 social, 05 ease, 07 timing (variable-reward ripple fade).
+  Modes (query params):
+    ?demo=1&seed=7        scripted calm arc (settle → deepen → resolve → soft CTA),
+                          sets window.__demoDone + __demoScore
+    ?bot=1&runs=N&seed=5 imperfect autoplay for traffic simulation, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL            event sink override
+  Calm rules: NO dares, NO challenge card, NO tension riser. Sound = J.calm(step) only.
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'seen-peace';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  // canvas + dpr-aware fit (from reference)
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // CALM palette: ink + teal + soft gold accent + mist. No vermillion.
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134', MIST = '#9d8cff';
+
+  // ---- conversation config ----
+  var CONV_LEN = 10;             // messages per thread
+  var BW = 170, BH = 36, ROW = 46, baseY = H - 94;   // bubble layout (right-aligned)
+  var BUBBLE_X = W - 14 - BW;    // 221
+
+  // ---- state ----
+  var phase, messages, score, streak, combo, peaceful, sentCount, doneCount;
+  var convEnded, overAt, runStartTs;
+  var best = 0;
+  try { best = +localStorage.getItem('sp_best') || 0; } catch (_) {}
+
+  // v2 juice state
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var flashes = [];
+  var motes = [];
+
+  // demo / bot autopilot state
+  var demoRipples = [], hesisMs = [], demoIdx = 0, demoNextAt = 0, demoHoldStart = 0, ctaPhase = false, ctaAt = 0;
+  var botNextAt = 0, botMode = 'send', botRunsDone = 0;
+
+  function now() { return performance.now(); }
+
+  function newGame() {
+    messages = []; score = 0; streak = 0; combo = 0; peaceful = 0;
+    sentCount = 0; doneCount = 0; convEnded = false;
+    ctaPhase = false; demoHoldStart = 0; demoIdx = 0;
+    hitStop = 0; zoom = 1; shakeAmt = 0; flashes = [];
+    phase = 'title';
+    if (DEMO)  { buildDemo(); startRun(); demoNextAt = now() + 1500; }
+    else if (BOT) { startRun(); botNextAt = now() + 700; botMode = 'send'; }
+  }
+
+  function buildDemo() {
+    demoRipples = []; hesisMs = [];
+    for (var i = 0; i < CONV_LEN; i++) {
+      demoRipples.push(40 + Math.floor(rng() * 16));                       // 0.67–0.93s
+      hesisMs.push(400 + Math.round((1 - i / CONV_LEN) * 420) + Math.round((rng() - 0.5) * 140)); // settle → deepen
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- message lifecycle ----
+  function activeSending() {
+    var m = messages[messages.length - 1];
+    return (m && m.state === 'sending') ? m : null;
+  }
+
+  function sendNew(rdf) {
+    if (messages.length + (activeSending() ? 1 : 0) >= CONV_LEN) return;
+    var msg = { state: 'sending', rippleT: 0, rippleDur: rdf, hue: 168 + rng() * 14, born: now() };
+    messages.push(msg);
+    sentCount++;
+    zoom = 1.012;                                  // gentle send pulse
+    if (window.LOOP) LOOP.emit('message_sent', { n: sentCount });
+  }
+
+  function resolveSeen(m) {
+    m.state = 'seen'; m.seenAt = now();
+    streak++; combo = streak; peaceful++; doneCount++;
+    if (window.J) J.calm(streak);                  // calm bell only — pitch climbs with streak
+    var milestone = (streak % 3 === 0) || streak === CONV_LEN;
+    if (milestone) { hitStop = 4; zoom = 1.03; shakeAmt = 1.2; flash('×' + streak, GOLD, 24); }
+    else            { hitStop = 2; zoom = 1.012; flash('seen', TEAL, 16); }
+    if (window.LOOP) LOOP.emit('message_held', { n: doneCount, combo: streak });
+    maybeEndConv();
+  }
+
+  function resolveAnxious(m) {
+    m.state = 'anxious'; m.seenAt = now();
+    streak = 0; combo = 0; doneCount++;             // no bell — silence is the lesson
+    hitStop = 1; zoom = 1.006; flash('too soon', MIST, 14);
+    if (window.LOOP) LOOP.emit('message_anxious', { n: doneCount });
+    maybeEndConv();
+  }
+
+  function maybeEndConv() {
+    if (!convEnded && doneCount >= CONV_LEN && phase === 'play') {
+      convEnded = true;
+      setTimeout(gameOver, 900);                    // let the last resolve breathe
+    }
+  }
+
+  function gameOver() {
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (DEMO) window.__demoScore = score;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      /* CTA handled by demo autopilot hold arc */
+    } else if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) window.__botDone = true;
+      else setTimeout(resetRun, 900);
+    } else {
+      phase = 'over'; overAt = now();
+      var newBest = score > best;
+      if (newBest) { best = score; try { localStorage.setItem('sp_best', String(best)); } catch (_) {} }
+    }
+  }
+
+  function resetRun() {
+    messages = []; score = 0; streak = 0; combo = 0; peaceful = 0;
+    sentCount = 0; doneCount = 0; convEnded = false;
+    phase = 'play';
+    if (window.LOOP) LOOP.emit('restart', {});
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    if (BOT) { botNextAt = now() + 700; botMode = 'send'; }
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 110, y: 478, w: 220, h: 42 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;                         // scripted modes ignore human taps
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') {
+      var am = activeSending();
+      if (am) { resolveAnxious(am); return; }        // tapped during ripple → too soon
+      if (sentCount < CONV_LEN) sendNew(42 + Math.floor(rng() * 30));  // 0.7–1.2s ripple (variable timing)
+      return;
+    }
+    if (phase === 'over' && now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: peaceful, unit: 'held', text: 'I held ' + peaceful + ' of ' + CONV_LEN + ' messages in Seen Peace — find yours:' });
+        return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilots ----
+  function autopilot() {
+    if (DEMO && !ctaPhase) {
+      if (phase === 'play' && demoIdx < CONV_LEN && !activeSending() && now() >= demoNextAt) {
+        sendNew(demoRipples[demoIdx]);
+        demoIdx++;
+        if (demoIdx < CONV_LEN) {
+          var rdm = (demoRipples[demoIdx - 1] / 60) * 1000;
+          demoNextAt = now() + rdm + hesisMs[demoIdx - 1];   // always past the fade → peaceful
+        }
+      }
+      // resolve beat: hold, then soft CTA
+      if (demoIdx >= CONV_LEN && doneCount >= CONV_LEN && !demoHoldStart) demoHoldStart = now();
+      if (demoHoldStart && !ctaPhase && now() - demoHoldStart > 2200) {
+        ctaPhase = true; ctaAt = now(); window.__demoScore = score;
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }
+    }
+    if (BOT && phase === 'play' && !window.__botDone) {
+      if (now() < botNextAt) return;
+      if (botMode === 'interrupt') {
+        var am = activeSending();
+        if (am) { resolveAnxious(am); botMode = 'send'; botNextAt = now() + 400 + rng() * 400; }
+        else   { botMode = 'send'; botNextAt = now() + 200; }
+      } else { // send
+        if (sentCount < CONV_LEN && !activeSending()) {
+          var rdf = 42 + Math.floor(rng() * 30);
+          sendNew(rdf);
+          var rdm = (rdf / 60) * 1000;
+          if (sentCount < CONV_LEN && rng() < 0.22) {           // imperfect: early interrupt
+            botMode = 'interrupt'; botNextAt = now() + rdm * (0.3 + rng() * 0.4);
+          } else {                                              // peaceful: wait past the fade
+            botMode = 'send'; botNextAt = now() + rdm + 250 + rng() * 400;
+          }
+        } else { botNextAt = now() + 200; }
+      }
+    }
+  }
+
+  // ---- motes (calm ambient) ----
+  var moteTimer = 0;
+  function spawnMote() {
+    motes.push({ x: rng() * W, y: H + 10 + rng() * 40, size: 2 + rng() * 3.5,
+      hue: rng() < 0.6 ? 168 + rng() * 14 : 250 + rng() * 20,
+      vy: 0.25 + rng() * 0.4, phase: rng() * Math.PI * 2 });
+  }
+
+  // ---- render helpers ----
+  function rr(x, y, w, h, r) {
+    if (cx.roundRect) cx.roundRect(x, y, w, h, r);
+    else cx.rect(x, y, w, h);
+  }
+
+  function drawBubble(m, i, lastIdx) {
+    var y = baseY - (lastIdx - i) * ROW;
+    if (y > H + BH || y < -BH) return;
+    var x = BUBBLE_X;
+    var sending = m.state === 'sending', seen = m.state === 'seen';
+    cx.save();
+    // bubble body
+    var g = cx.createLinearGradient(0, y, 0, y + BH);
+    if (seen)        { g.addColorStop(0, 'rgba(46,197,182,0.22)'); g.addColorStop(1, 'rgba(46,197,182,0.14)'); }
+    else if (sending){ g.addColorStop(0, 'hsl(' + m.hue + ',52%,52%)'); g.addColorStop(1, 'hsl(' + m.hue + ',58%,42%)'); }
+    else             { g.addColorStop(0, 'rgba(157,140,255,0.18)'); g.addColorStop(1, 'rgba(157,140,255,0.10)'); } // anxious = mist/grey
+    cx.fillStyle = g;
+    cx.beginPath(); rr(x, y, BW, BH, 14); cx.fill();
+    if (sending) { cx.strokeStyle = 'rgba(255,255,255,0.30)'; cx.lineWidth = 1; cx.beginPath(); rr(x + 0.5, y + 0.5, BW - 1, BH - 1, 14); cx.stroke(); }
+    cx.restore();
+
+    // content: sending = three typing dots, seen = check, anxious = ellipsis
+    var cxp = x + BW / 2, cyp = y + BH / 2;
+    if (sending) {
+      var t = now() / 240;
+      for (var d = 0; d < 3; d++) {
+        var a = 0.25 + 0.75 * Math.abs(Math.sin(t + d * 0.9));
+        cx.globalAlpha = a;
+        cx.fillStyle = '#fff';
+        cx.beginPath(); cx.arc(cxp - 14 + d * 14, cyp, 3, 0, Math.PI * 2); cx.fill();
+      }
+      cx.globalAlpha = 1;
+    } else if (seen) {
+      cx.strokeStyle = TEAL; cx.lineWidth = 2.4; cx.lineCap = 'round'; cx.lineJoin = 'round';
+      cx.beginPath(); cx.moveTo(cxp - 9, cyp + 1); cx.lineTo(cxp - 3, cyp + 7); cx.lineTo(cxp + 9, cyp - 6); cx.stroke();
+    } else {
+      cx.fillStyle = 'rgba(157,140,255,0.6)'; cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center'; cx.textBaseline = 'middle';
+      cx.fillText('…', cxp, cyp + 1); cx.textBaseline = 'alphabetic';
+    }
+
+    // ripple from the sending bubble (the slow fade the player waits through)
+    if (sending) {
+      var p = m.rippleT / m.rippleDur;
+      for (var ring = 0; ring < 2; ring++) {
+        var rp = Math.min(1, p + ring * 0.18);
+        var rad = 18 + rp * 120;
+        var a = (1 - rp) * (ring === 0 ? 0.45 : 0.22);
+        if (a <= 0) continue;
+        cx.globalAlpha = a;
+        cx.strokeStyle = 'hsl(' + m.hue + ',60%,' + (62 - ring * 6) + '%)';
+        cx.lineWidth = 2 - ring;
+        cx.beginPath(); cx.arc(cxp, cyp, rad, 0, Math.PI * 2); cx.stroke();
+      }
+      cx.globalAlpha = 1;
+    }
+    // soft seen glow pulse right after resolve
+    if (seen && now() - m.seenAt < 600) {
+      var ga = 1 - (now() - m.seenAt) / 600;
+      cx.globalAlpha = ga * 0.4;
+      cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+      cx.beginPath(); rr(x - 3, y - 3, BW + 6, BH + 6, 16); cx.stroke();
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawMote(m) {
+    cx.save();
+    cx.translate(m.x + Math.sin(m.phase + m.y * 0.02) * 5, m.y);
+    cx.beginPath();
+    cx.ellipse(0, 0, m.size, m.size * 0.55, 0, 0, Math.PI * 2);
+    cx.fillStyle = 'hsla(' + m.hue + ',60%,72%,0.3)';
+    cx.fill();
+    cx.restore();
+  }
+
+  // progress dots (the conversation, 10 circles)
+  function drawDots() {
+    var span = (CONV_LEN - 1) * 24, startX = W / 2 - span / 2, y = 52;
+    for (var i = 0; i < CONV_LEN; i++) {
+      var cxp = startX + i * 24, m = messages[i], fill = INK, stroke = 'rgba(255,255,255,0.18)', r = 5;
+      if (m) {
+        if (m.state === 'seen')        { fill = TEAL; stroke = TEAL; }
+        else if (m.state === 'anxious'){ fill = 'rgba(157,140,255,0.5)'; stroke = MIST; }
+        else                           { fill = 'rgba(46,197,182,0.25)'; stroke = TEAL; r = 6; } // sending
+      }
+      cx.fillStyle = fill; cx.strokeStyle = stroke; cx.lineWidth = 1.5;
+      cx.beginPath(); cx.arc(cxp, y, r, 0, Math.PI * 2); cx.fill(); cx.stroke();
+    }
+  }
+
+  // ---- main loop ----
+  var last = now();
+  function frame(t) {
+    var dt = Math.min((t - last) / 16.667, 3); last = t;
+    if (hitStop > 0) hitStop -= dt;
+
+    // advance the active ripple (frozen during hit-stop)
+    var am = activeSending();
+    if (am && hitStop <= 0) {
+      am.rippleT += dt;
+      if (am.rippleT >= am.rippleDur) resolveSeen(am);
+    }
+
+    // motes
+    moteTimer += dt;
+    if (moteTimer > 90 + rng() * 120) { spawnMote(); moteTimer = 0; }
+    for (var mi = motes.length - 1; mi >= 0; mi--) {
+      var p = motes[mi];
+      p.y -= p.vy * dt; p.phase += 0.02 * dt;
+      if (p.y < -20) motes.splice(mi, 1);
+    }
+
+    autopilot();
+
+    // ---- juice transforms: gentle zoom + micro shake (save/transform/restore) ----
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)');
+    bg.addColorStop(0.6, 'rgba(157,140,255,0.035)');
+    bg.addColorStop(1, 'rgba(242,177,52,0.04)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // motes
+    for (var mmi = 0; mmi < motes.length; mmi++) drawMote(motes[mmi]);
+
+    // thread bubbles
+    var lastIdx = messages.length - 1;
+    for (var bi = 0; bi < messages.length; bi++) drawBubble(messages[bi], bi, lastIdx);
+
+    // progress dots + score (play/over)
+    if (phase === 'play' || phase === 'over') {
+      drawDots();
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 30px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 92);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best + '  ·  ' + peaceful + ' / ' + CONV_LEN + ' HELD', W / 2, 112);
+      if (streak > 1) {
+        var gl = 0.6 + 0.4 * Math.sin(t / 300);
+        cx.globalAlpha = gl; cx.fillStyle = GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText('streak ×' + streak, W / 2, 132);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // send hint (when idle, waiting for the player to send)
+    if (phase === 'play' && !activeSending() && sentCount < CONV_LEN && !convEnded) {
+      var hp = 0.45 + 0.25 * Math.sin(t / 320);
+      cx.globalAlpha = hp; cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to send', W / 2, H - 36);
+      cx.globalAlpha = 1;
+    }
+    // waiting cue (ripple active) — the discipline: don't tap
+    if (phase === 'play' && activeSending()) {
+      cx.globalAlpha = 0.35; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('let it land.', W / 2, H - 36);
+      cx.globalAlpha = 1;
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, H / 2 - 30 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // title
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('SEEN PEACE', W / 2, 286);
+      cx.fillStyle = TEAL; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(t / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO SEND', W / 2, 322); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('delivered doesn’t need a reply.', W / 2, 352);
+      // sample bubble
+      cx.globalAlpha = 0.5;
+      var g = cx.createLinearGradient(0, 380, 0, 416);
+      g.addColorStop(0, 'hsl(172,52%,48%)'); g.addColorStop(1, 'hsl(172,58%,40%)');
+      cx.fillStyle = g; cx.beginPath(); rr(BUBBLE_X, 384, BW, BH, 14); cx.fill();
+      cx.globalAlpha = 1;
+    }
+
+    // over screen (human only) — calm, no competitive rank
+    if (phase === 'over' && !DEMO && !BOT) {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '900 34px -apple-system, Helvetica, Arial';
+      cx.fillText('THREAD COMPLETE', W / 2, 286);
+      cx.fillStyle = '#fff'; cx.font = '800 30px -apple-system, Helvetica, Arial';
+      cx.fillText(peaceful + ' / ' + CONV_LEN + ' held', W / 2, 332);
+      cx.fillStyle = GOLD; cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' pts', W / 2, 366);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText(peaceful === CONV_LEN ? 'fully held. nothing needed back.' : 'all delivered. nothing needed back.', W / 2, 396);
+      // share pill
+      cx.fillStyle = 'rgba(46,197,182,0.12)'; cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+      cx.beginPath(); rr(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 21); cx.fill(); cx.stroke();
+      cx.fillStyle = TEAL; cx.font = '800 16px -apple-system, Helvetica, Arial';
+      cx.fillText('⚡ SHARE THE CALM', W / 2, SHARE_R.y + 27);
+      var p2 = 0.55 + 0.35 * Math.sin(t / 300);
+      cx.globalAlpha = p2; cx.fillStyle = 'rgba(255,255,255,0.8)';
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap — another thread', W / 2, 542);
+      cx.globalAlpha = 1;
+    }
+
+    // demo CTA card — soft invitation, no dare
+    if (ctaPhase) {
+      var el = (t - ctaAt) / 1000, ease = Math.min(1, el * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('SEEN PEACE', W / 2, 296);
+      cx.fillStyle = 'rgba(255,255,255,0.78)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText((window.__demoScore || 0) + ' of ' + CONV_LEN + ' held', W / 2, 338);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('delivered doesn’t need a reply.', W / 2, 366);
+      var p3 = 0.7 + 0.3 * Math.sin(t / 260);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶  REACH IT', W / 2, 408);
+      cx.globalAlpha = ease;
+      cx.fillStyle = MIST; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  // abandon capture (human only) — emit game_over if a thread is left mid-flight
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden && !DEMO && !BOT && phase === 'play' && !convEnded) {
+      convEnded = true; gameOver();
+    }
+  });
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

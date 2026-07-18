@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Long Yawn — Tilt</title>
+<!--
+  LOOP / attention-architecture — Long Yawn
+  Circuits: 03-social (contagious yawn reflex), 07-timing (hold duration), 05-ease (calm settle).
+  Engine: calm.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone=true
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone=true
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'long-yawn';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  // calm palette: teal, soft blue, muted lavender — no vermillion
+  var YAWN_COLORS = ['#2ec5b6', '#4ab8c9', '#7ec8d8', '#a8d8e8'];
+
+  // ---- game constants ----
+  // A "yawn" has 3 phases: RISE (ripple expands), HOLD (player holds), RELEASE (settle).
+  // The player must hold during HOLD phase for HOLD_TARGET ms to complete a yawn.
+  // Missing (releasing too early) resets the yawn's stretch.
+  // 3 complete yawns → game over (success — screen fades to black).
+  // If a yawn ripple collapses before hold threshold, that yawn "fails" — score accumulates
+  // only on complete yawns. Bot plays K successful yawns then intentionally fails.
+  var TOTAL_YAWNS = 3;          // yawns to complete for win path
+  var HOLD_TARGET = 1600;       // ms to hold for a complete yawn
+  var RISE_DUR    = 1200;       // ms for ripple to fully expand
+  var RELEASE_DUR = 900;        // ms for settle animation after release
+  var INTER_YAWN  = 1400;       // ms pause between yawns
+  var FAIL_GRACE  = 400;        // ms into HOLD before a premature release counts as fail
+
+  // scoring: each complete yawn = hold_ms (how long they held, roughly HOLD_TARGET)
+  // score is total ms held across all yawns (meaningful number ~4800 for perfect)
+
+  var phase, yawnCount, holdMs, totalHeldMs, runStartTs, isHolding;
+  var rippleR, rippleAlpha, dimLevel;   // dimLevel 0..1 across all 3 yawns
+  var yawnPhase;  // 'idle' | 'rise' | 'hold' | 'release' | 'inter' | 'done'
+  var yawnPhaseT; // ms in current yawnPhase
+  var flashes, shakeAmt, zoom, hitStop;
+  var overAt, ctaAt;
+  var failCount;  // failed yawns in current run; too many = game over (resisted sleep)
+  var MAX_FAILS = 3;
+  var botRunsDone = 0;
+  var particles = [];
+
+  function newGame() {
+    phase = DEMO || BOT ? 'play' : 'title';
+    yawnCount = 0; holdMs = 0; totalHeldMs = 0; failCount = 0;
+    isHolding = false;
+    rippleR = 0; rippleAlpha = 0;
+    dimLevel = 0;
+    yawnPhase = 'idle'; yawnPhaseT = 0;
+    flashes = []; shakeAmt = 0; zoom = 1; hitStop = 0;
+    particles = [];
+    overAt = 0; ctaAt = 0;
+    if (DEMO || BOT) {
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      startNextYawn();
+    }
+  }
+
+  function startNextYawn() {
+    yawnPhase = 'rise';
+    yawnPhaseT = 0;
+    holdMs = 0;
+    isHolding = false;
+    rippleR = 0;
+    rippleAlpha = 1;
+  }
+
+  function completeYawn() {
+    // called when hold threshold reached
+    yawnCount++;
+    totalHeldMs += holdMs;
+    if (window.J) J.calm(yawnCount);
+    // juice: gentle zoom pulse
+    zoom = 1.015;
+    var label = yawnCount === 1 ? 'FIRST WAVE' : yawnCount === 2 ? 'DEEPER…' : 'GONE UNDER';
+    flash(label, TEAL, 28);
+    spawnParticles();
+    dimLevel = yawnCount / TOTAL_YAWNS;
+    if (window.LOOP) LOOP.emit('yawn_complete', { n: yawnCount, held_ms: Math.round(holdMs) });
+    if (yawnCount >= TOTAL_YAWNS) {
+      // game over — success (sleep claimed)
+      yawnPhase = 'done';
+      setTimeout(function () { gameOver(true); }, 1200);
+    } else {
+      yawnPhase = 'release';
+      yawnPhaseT = 0;
+    }
+  }
+
+  function failYawn() {
+    // released too early — yawn collapses
+    failCount++;
+    shakeAmt = 2.5;
+    flash('SLIPPED AWAY', GOLD, 22);
+    if (window.LOOP) LOOP.emit('yawn_miss', { n: yawnCount, fails: failCount });
+    if (window.J) J.calm(0);
+    if (failCount >= MAX_FAILS) {
+      // resisted sleep too many times — game over
+      yawnPhase = 'done';
+      setTimeout(function () { gameOver(false); }, 800);
+    } else {
+      yawnPhase = 'release';
+      yawnPhaseT = 0;
+    }
+  }
+
+  function gameOver(won) {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    // score = total ms held (meaningful number)
+    var score = Math.round(totalHeldMs);
+    if (!won) score = Math.round(totalHeldMs * 0.5); // partial credit for incomplete run
+    if (DEMO) window.__demoScore = yawnCount;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1), yawns: yawnCount });
+    if (won && window.J) J.calm(4);
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { restartRun(); }, 700);
+    }
+  }
+
+  function restartRun() {
+    yawnCount = 0; holdMs = 0; totalHeldMs = 0; failCount = 0;
+    isHolding = false; rippleR = 0; rippleAlpha = 0;
+    dimLevel = 0; yawnPhase = 'idle'; yawnPhaseT = 0;
+    flashes = []; shakeAmt = 0; zoom = 1; hitStop = 0;
+    particles = [];
+    botHoldFired = false; botRequestedFail = false;
+    demoHoldFired = false;
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startNextYawn();
+  }
+
+  // ---- particles for calm celebration ----
+  function spawnParticles() {
+    for (var i = 0; i < 12; i++) {
+      var angle = rng() * Math.PI * 2;
+      var speed = 0.5 + rng() * 1.5;
+      particles.push({
+        x: W / 2 + (rng() - 0.5) * 60,
+        y: H / 2 + (rng() - 0.5) * 40,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 1.2,
+        r: 2 + rng() * 3,
+        alpha: 0.7 + rng() * 0.3,
+        color: YAWN_COLORS[Math.floor(rng() * YAWN_COLORS.length)]
+      });
+    }
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function onPress(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { beginPlay(); return; }
+    if (phase === 'play' && yawnPhase === 'hold') {
+      isHolding = true;
+      return;
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      restartRun();
+    }
+  }
+
+  function onRelease(x, y) {
+    if (DEMO || BOT) return;
+    if (phase === 'play' && isHolding) {
+      isHolding = false;
+      if (holdMs < FAIL_GRACE) {
+        // released instantly — ignore (too quick to count as attempt)
+      } else if (holdMs < HOLD_TARGET) {
+        failYawn();
+      }
+      // if holdMs >= HOLD_TARGET the completeYawn() already fired in the tick
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    onPress((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    onRelease((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') { e.preventDefault(); onPress(); }
+  });
+  window.addEventListener('keyup', function (e) {
+    if (e.code === 'Space') onRelease();
+  });
+
+  function beginPlay() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    startNextYawn();
+  }
+
+  // ---- demo / bot autopilots ----
+  // Demo arc (calm): settle(~3s) → deepen(~5s) → resolve(~6s) → done
+  // 3 yawns, each held perfectly. Then CTA.
+  var demoHoldFired = false;
+  var demoYawnHoldStart = 0;
+  var demoInterWait = 0;
+
+  // Bot: completes K yawns then intentionally fails — so game_over fires every run
+  var botHoldFired = false;
+  var botRequestedFail = false; // set by botAutopilot to trigger failYawn() in tick
+  var botPassiveAfter = 1; // complete 1 yawn perfectly, then fail the next → game_over
+
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      demoAutopilot(dt);
+    } else if (BOT) {
+      botAutopilot(dt);
+    }
+  }
+
+  function demoAutopilot(dt) {
+    if (yawnPhase === 'hold') {
+      // hold for full duration to complete each yawn
+      if (!demoHoldFired) {
+        demoHoldFired = true;
+        isHolding = true;
+      }
+    } else {
+      if (demoHoldFired) {
+        demoHoldFired = false;
+        isHolding = false;
+      }
+    }
+  }
+
+  function botAutopilot(dt) {
+    if (yawnPhase === 'hold') {
+      if (!botHoldFired) {
+        botHoldFired = true;
+        isHolding = true;
+      }
+      // after botPassiveAfter yawns done, release early mid-hold to trigger fail
+      if (yawnCount >= botPassiveAfter && holdMs > FAIL_GRACE + 150 && holdMs < HOLD_TARGET * 0.55) {
+        isHolding = false;
+        botHoldFired = false;
+        botRequestedFail = true; // tick will call failYawn()
+      }
+    } else {
+      if (botHoldFired) {
+        botHoldFired = false;
+        isHolding = false;
+      }
+    }
+  }
+
+  // ---- main tick ----
+  var last = performance.now();
+  function frame(now) {
+    var dtMs = Math.min(now - last, 100); last = now;
+    var dt = dtMs / 16.667; // ~1 per frame at 60fps
+
+    // decay juice
+    if (hitStop > 0) {
+      hitStop -= dt;
+      if (hitStop < 0) hitStop = 0;
+    }
+    shakeAmt *= Math.pow(0.88, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // update yawn state machine
+    if (phase === 'play') {
+      yawnPhaseT += dtMs;
+
+      if (yawnPhase === 'idle') {
+        // brief idle after game start
+        if (yawnPhaseT > 600) startNextYawn();
+
+      } else if (yawnPhase === 'rise') {
+        var riseP = Math.min(yawnPhaseT / RISE_DUR, 1);
+        rippleR = riseP * (W * 0.38);
+        rippleAlpha = 1;
+        if (riseP >= 1) {
+          yawnPhase = 'hold';
+          yawnPhaseT = 0;
+          holdMs = 0;
+          isHolding = false;
+          botHoldFired = false;
+          demoHoldFired = false;
+        }
+
+      } else if (yawnPhase === 'hold') {
+        // run autopilot BEFORE we check hitStop so it can set isHolding / botRequestedFail
+        autopilot(dt);
+
+        // bot requested an early release — call failYawn() once
+        if (botRequestedFail) {
+          botRequestedFail = false;
+          failYawn();
+        } else if (hitStop > 0) {
+          // frozen — do not advance hold timer
+        } else {
+          if (isHolding) {
+            holdMs += dtMs;
+            if (holdMs >= HOLD_TARGET) {
+              isHolding = false;
+              completeYawn();
+            }
+          }
+        }
+
+      } else if (yawnPhase === 'release') {
+        rippleR = (W * 0.38) * (1 - Math.min(yawnPhaseT / RELEASE_DUR, 1));
+        rippleAlpha = 1 - Math.min(yawnPhaseT / RELEASE_DUR, 1);
+        if (yawnPhaseT >= RELEASE_DUR) {
+          yawnPhase = 'inter';
+          yawnPhaseT = 0;
+        }
+
+      } else if (yawnPhase === 'inter') {
+        if (yawnPhaseT >= INTER_YAWN) {
+          startNextYawn();
+        }
+      }
+      // 'done' phase — just wait for gameOver timeout
+    }
+
+    // update particles
+    for (var i = particles.length - 1; i >= 0; i--) {
+      var p = particles[i];
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vy += 0.04 * dt; // gentle gravity
+      p.alpha -= 0.012 * dt;
+      if (p.alpha <= 0) particles.splice(i, 1);
+    }
+
+    // update flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      flashes[k].t += dt;
+      if (flashes[k].t > 50) flashes.splice(k, 1);
+    }
+
+    // ---- draw ----
+    cx.save();
+    // juice transforms
+    if (shakeAmt > 0.15 || zoom > 1.001) {
+      var sx = (rng() - 0.5) * shakeAmt, sy = (rng() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background — dims progressively with each yawn
+    var bgDark = Math.min(dimLevel, 1);
+    // base: ink; dimming adds layers of near-black overlay
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // ambient teal glow that fades as screen dims
+    if (bgDark < 0.98) {
+      var glow = cx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, W * 0.65);
+      glow.addColorStop(0, 'rgba(46,197,182,' + (0.08 * (1 - bgDark)) + ')');
+      glow.addColorStop(1, 'rgba(46,197,182,0)');
+      cx.fillStyle = glow;
+      cx.fillRect(0, 0, W, H);
+    }
+
+    // dim overlay
+    if (bgDark > 0) {
+      cx.fillStyle = 'rgba(0,0,4,' + (bgDark * 0.78) + ')';
+      cx.fillRect(-20, -20, W + 40, H + 40);
+    }
+
+    // title screen
+    if (phase === 'title') {
+      drawTitle(now);
+    }
+
+    // play screen
+    if (phase === 'play' || phase === 'over') {
+      drawPlay(now, dtMs);
+    }
+
+    // game over overlay
+    if (phase === 'over') {
+      drawOver(now);
+    }
+
+    // CTA card (demo only)
+    if (phase === 'cta') {
+      // still draw play bg
+      drawPlay(now, 0);
+      drawCTA(now);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '800 48px -apple-system, Helvetica, Arial';
+    cx.fillText('LONG YAWN', W / 2, 290);
+
+    cx.fillStyle = 'rgba(46,197,182,0.9)';
+    cx.font = '600 17px -apple-system, Helvetica, Arial';
+    var pulse = 0.55 + 0.45 * Math.sin(now / 600);
+    cx.globalAlpha = pulse;
+    cx.fillText('hold to yawn', W / 2, 335);
+    cx.globalAlpha = 1;
+
+    cx.fillStyle = 'rgba(255,255,255,0.3)';
+    cx.font = '500 13px -apple-system, Helvetica, Arial';
+    cx.fillText('three waves. let go.', W / 2, 365);
+
+    // small ripple demo
+    var demoR = 38 + 12 * Math.sin(now / 800);
+    cx.beginPath();
+    cx.arc(W / 2, H / 2 + 50, demoR, 0, Math.PI * 2);
+    cx.strokeStyle = 'rgba(46,197,182,0.35)';
+    cx.lineWidth = 2;
+    cx.stroke();
+  }
+
+  function drawPlay(now, dtMs) {
+    // yawn progress dots
+    var dotY = 52, dotR = 7, dotGap = 28;
+    var dotsX = W / 2 - (TOTAL_YAWNS - 1) * dotGap / 2;
+    for (var i = 0; i < TOTAL_YAWNS; i++) {
+      cx.beginPath();
+      cx.arc(dotsX + i * dotGap, dotY, dotR, 0, Math.PI * 2);
+      if (i < yawnCount) {
+        cx.fillStyle = TEAL;
+      } else {
+        cx.fillStyle = 'rgba(46,197,182,0.2)';
+      }
+      cx.fill();
+      if (i < yawnCount) {
+        // soft glow on completed
+        cx.shadowColor = TEAL; cx.shadowBlur = 8;
+        cx.beginPath(); cx.arc(dotsX + i * dotGap, dotY, dotR, 0, Math.PI * 2);
+        cx.fillStyle = TEAL; cx.fill();
+        cx.shadowBlur = 0;
+      }
+    }
+
+    // center circle — the "mouth" / yawn aperture
+    var mouthR = 28;
+    cx.beginPath();
+    cx.arc(W / 2, H / 2, mouthR, 0, Math.PI * 2);
+    cx.fillStyle = 'rgba(46,197,182,0.12)';
+    cx.fill();
+    cx.strokeStyle = 'rgba(46,197,182,0.5)';
+    cx.lineWidth = 1.5;
+    cx.stroke();
+
+    // ripple rings (3 expanding rings)
+    if (yawnPhase === 'rise' || yawnPhase === 'hold' || yawnPhase === 'release') {
+      var rings = 3;
+      for (var r = 0; r < rings; r++) {
+        var ringR = rippleR * (0.55 + r * 0.22);
+        var a = rippleAlpha * (0.55 - r * 0.14);
+        if (a <= 0 || ringR <= 0) continue;
+        cx.beginPath();
+        cx.arc(W / 2, H / 2, ringR, 0, Math.PI * 2);
+        cx.strokeStyle = 'rgba(46,197,182,' + a + ')';
+        cx.lineWidth = 2.5 - r * 0.5;
+        cx.stroke();
+      }
+    }
+
+    // hold progress arc (shown during HOLD phase)
+    if (yawnPhase === 'hold') {
+      var holdP = Math.min(holdMs / HOLD_TARGET, 1);
+      var arcR = 68;
+      // background track
+      cx.beginPath();
+      cx.arc(W / 2, H / 2, arcR, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2, false);
+      cx.strokeStyle = 'rgba(46,197,182,0.15)';
+      cx.lineWidth = 4;
+      cx.stroke();
+      // filled arc
+      if (holdP > 0) {
+        cx.beginPath();
+        cx.arc(W / 2, H / 2, arcR, -Math.PI / 2, -Math.PI / 2 + holdP * Math.PI * 2, false);
+        cx.strokeStyle = TEAL;
+        cx.lineWidth = 4;
+        cx.stroke();
+      }
+
+      // breathe prompt
+      if (!isHolding) {
+        var bPulse = 0.5 + 0.5 * Math.sin(now / 400);
+        cx.globalAlpha = bPulse;
+        cx.textAlign = 'center';
+        cx.fillStyle = TEAL;
+        cx.font = '600 15px -apple-system, Helvetica, Arial';
+        cx.fillText('hold', W / 2, H / 2 + arcR + 28);
+        cx.globalAlpha = 1;
+      } else {
+        cx.textAlign = 'center';
+        cx.fillStyle = 'rgba(46,197,182,0.7)';
+        cx.font = '600 15px -apple-system, Helvetica, Arial';
+        cx.fillText('…yawning', W / 2, H / 2 + arcR + 28);
+      }
+    }
+
+    // particles
+    for (var pi = 0; pi < particles.length; pi++) {
+      var p2 = particles[pi];
+      cx.beginPath();
+      cx.arc(p2.x, p2.y, p2.r, 0, Math.PI * 2);
+      cx.fillStyle = p2.color;
+      cx.globalAlpha = Math.max(0, p2.alpha);
+      cx.fill();
+    }
+    cx.globalAlpha = 1;
+
+    // flashes
+    for (var fk = 0; fk < flashes.length; fk++) {
+      var fl = flashes[fk];
+      var fa = Math.max(0, 1 - fl.t / 50);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, H / 2 - 100 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+    }
+
+    // yawn count / instruction
+    if (phase === 'play' && yawnPhase !== 'done') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.18)';
+      cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText(yawnCount + ' / ' + TOTAL_YAWNS + ' waves', W / 2, H - 80);
+    }
+  }
+
+  function drawOver(now) {
+    // soft overlay
+    cx.fillStyle = 'rgba(11,13,18,0.6)';
+    cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+
+    if (yawnCount >= TOTAL_YAWNS) {
+      // won — sleep claimed
+      cx.fillStyle = TEAL;
+      cx.font = '700 28px -apple-system, Helvetica, Arial';
+      cx.fillText('sleep claimed', W / 2, 295);
+
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText(Math.round(totalHeldMs / 1000) + 's held', W / 2, 330);
+    } else {
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '700 26px -apple-system, Helvetica, Arial';
+      cx.fillText('the wave slipped', W / 2, 295);
+
+      cx.fillStyle = 'rgba(46,197,182,0.7)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText(yawnCount + ' of ' + TOTAL_YAWNS + ' waves', W / 2, 328);
+    }
+
+    if (!DEMO && !BOT) {
+      var pulse = 0.55 + 0.45 * Math.sin(now / 550);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to breathe again', W / 2, 385);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawCTA(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2.0);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.72 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+
+    cx.fillStyle = '#fff';
+    cx.font = '800 38px -apple-system, Helvetica, Arial';
+    cx.fillText('LONG YAWN', W / 2, 298);
+
+    cx.fillStyle = 'rgba(255,255,255,0.65)';
+    cx.font = '500 16px -apple-system, Helvetica, Arial';
+    cx.fillText('how deep can you go?', W / 2, 335);
+
+    var p2 = 0.65 + 0.35 * Math.sin(now / 600);
+    cx.fillStyle = TEAL;
+    cx.globalAlpha = ease * p2;
+    cx.font = '700 22px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 402);
+
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(46,197,182,0.55)';
+    cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 434);
+    cx.globalAlpha = 1;
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

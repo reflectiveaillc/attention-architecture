@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Badge Sunset — Tilt</title>
+<!--
+  LOOP / attention-architecture — Badge Sunset
+  Circuits: 01-soft-rpe, 05-ease, 07-timing.
+  Conditioned path: red badge compulsion, inverted — don't tap, wait for it to fade.
+  Modes:
+    ?demo=1&seed=7    scripted calm arc (~16s) → soft CTA, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect no-input runs, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'badge-sunset';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function rand(min, max) { return rng() * (max - min) + min; }
+  function pick(arr) { return arr[Math.floor(rng() * arr.length)]; }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134', VERM = '#e8502e';
+  var CORNERS = [
+    { cx: 46, cy: 66 },
+    { cx: W - 46, cy: 66 },
+    { cx: 46, cy: H - 66 },
+    { cx: W - 46, cy: H - 66 }
+  ];
+  var BADGE_R = 26, FLOAT_R = 36;
+
+  var state, runStartMs, overAt, best = 0, dareBeaten = false;
+  var badges = [], particles = [], floats = [];
+  var spawnTimer = 0, nextSpawn = 60, ctaAt = 0, last = performance.now();
+  var hitStop = 0, zoom = 1, shakeAmt = 0, botRunsDone = 0;
+  try { best = +localStorage.getItem('bs_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      score: 0,
+      runFrames: 0,
+      startFrame: 0,
+      botSlipFrame: 0,
+      botEndFrame: 0,
+      demoSpawnIdx: 0
+    };
+    badges = []; particles = []; floats = [];
+    spawnTimer = 0; nextSpawn = DEMO ? 999999 : rand(50, 110);
+    dareBeaten = false;
+    if (DEMO || BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.runFrames = 0;
+    state.startFrame = 0;
+    runStartMs = Date.now();
+    if (BOT) planBotRun();
+    if (DEMO) state.demoSpawnIdx = 0;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function planBotRun() {
+    // imperfect autopilot: sometimes "slips" and taps a badge before the run ends
+    state.botSlipFrame = rand(90, 720);
+    state.botEndFrame = rand(420, 900);
+  }
+
+  function spawnBadge() {
+    var c = pick(CORNERS);
+    // spawn just off-screen on the side nearest the corner
+    var sx, sy;
+    if (c.cx < W / 2) sx = -BADGE_R - rand(4, 22); else sx = W + BADGE_R + rand(4, 22);
+    if (c.cy < H / 2) sy = rand(-BADGE_R - 10, H / 2); else sy = rand(H / 2, H + BADGE_R + 10);
+    var dx = c.cx - sx, dy = c.cy - sy, dist = Math.hypot(dx, dy);
+    var maxLife = rand(260, 420); // frames (~4.3-7s)
+    var travelFrames = maxLife * rand(0.45, 0.6);
+    var badge = {
+      x: sx, y: sy,
+      cx: c.cx, cy: c.cy,
+      corner: CORNERS.indexOf(c),
+      r: BADGE_R,
+      vx: dx / travelFrames,
+      vy: dy / travelFrames,
+      maxLife: maxLife,
+      life: maxLife,
+      arrived: false,
+      num: Math.floor(rand(1, 10)),
+      pulse: rand(0, Math.PI * 2)
+    };
+    badges.push(badge);
+    if (window.LOOP) LOOP.emit('badge_spawn', { corner: badge.corner, life: badge.maxLife });
+  }
+
+  function dissolveBadge(idx) {
+    var b = badges[idx];
+    badges.splice(idx, 1);
+    state.score++;
+    spawnParticles(b.x, b.y, b.arrived ? TEAL : GOLD, 14);
+    flash('+1', TEAL, 28);
+    hitStop = 2; zoom = 1.015;
+    // "clears the corner" — any other arrived badges in the same corner drift away softly
+    for (var i = badges.length - 1; i >= 0; i--) {
+      var o = badges[i];
+      if (o.corner === b.corner && o.arrived) {
+        o.vx = (o.x - o.cx) * 0.05 + rand(-1.5, 1.5);
+        o.vy = (o.y - o.cy) * 0.05 + rand(-1.5, 1.5);
+        o.life = Math.min(o.life, 45);
+      }
+    }
+    if (window.J) J.calm(Math.min(state.score / 12, 1));
+    if (window.LOOP) LOOP.emit('badge_dissolved', { corner: b.corner, score: state.score });
+  }
+
+  function spawnParticles(x, y, color, count) {
+    for (var i = 0; i < count; i++) {
+      var ang = rand(0, Math.PI * 2), sp = rand(0.6, 2.4);
+      particles.push({
+        x: x, y: y,
+        vx: Math.cos(ang) * sp,
+        vy: Math.sin(ang) * sp,
+        life: rand(35, 70),
+        maxLife: 0,
+        r: rand(1.5, 3.5),
+        color: color
+      });
+    }
+  }
+
+  function badgeTapped(b) {
+    state.phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 6;
+    spawnParticles(b.x, b.y, VERM, 24);
+    if (window.LOOP) LOOP.emit('badge_tapped', { corner: b.corner, score: state.score });
+    gameOverCommon();
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    overAt = performance.now();
+    gameOverCommon();
+  }
+
+  function gameOverCommon() {
+    var dur = (Date.now() - runStartMs) / 1000;
+    var newBest = state.score > best;
+    if (newBest) {
+      best = state.score;
+      try { localStorage.setItem('bs_best', String(best)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      window.__demoScore = state.score;
+      state.phase = 'cta';
+      ctaAt = performance.now();
+      setTimeout(function () { window.__demoDone = true; }, 3500);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(resetRun, 700);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.score = 0;
+    badges = []; particles = []; floats = [];
+    spawnTimer = 0; nextSpawn = DEMO ? 999999 : rand(50, 110);
+    dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    floats.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 7))));
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') {
+      for (var i = 0; i < badges.length; i++) {
+        var b = badges[i];
+        var dx = x - b.x, dy = y - b.y;
+        if (dx * dx + dy * dy <= b.r * b.r) { badgeTapped(badges[i]); return; }
+      }
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'badges' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  var demoSpawnTimes = [45, 135, 240, 360, 500, 680, 860];
+  function autopilot() {
+    if (!state.mover && state.phase !== 'play') return;
+    if (DEMO) {
+      while (state.demoSpawnIdx < demoSpawnTimes.length && state.runFrames >= demoSpawnTimes[state.demoSpawnIdx]) {
+        spawnBadge();
+        state.demoSpawnIdx++;
+      }
+      if (state.runFrames >= 960) { // ~16s calm arc
+        window.__demoScore = state.score;
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }
+    } else if (BOT) {
+      if (state.runFrames >= state.botSlipFrame && badges.length > 0) {
+        badgeTapped(pick(badges));
+        return;
+      }
+      if (state.runFrames >= state.botEndFrame) {
+        gameOver();
+      }
+    }
+  }
+
+  // ---- render ----
+  function badgeColor(now) {
+    // soft vermillion, pulsing gently
+    var pulse = 0.92 + 0.08 * Math.sin(now / 250);
+    return 'rgba(232,80,46,' + pulse + ')';
+  }
+
+  function drawBadge(b, now) {
+    var fadeStart = b.maxLife * 0.45;
+    var alpha = b.life < fadeStart ? b.life / fadeStart : 1;
+    var ring = 0.5 + 0.5 * Math.sin(now / 300 + b.pulse);
+    cx.save();
+    cx.globalAlpha = alpha;
+    cx.translate(b.x, b.y);
+    // outer glow ring
+    cx.beginPath();
+    cx.arc(0, 0, b.r + 4 + ring * 2, 0, Math.PI * 2);
+    cx.strokeStyle = 'rgba(232,80,46,' + (0.15 * alpha) + ')';
+    cx.lineWidth = 2;
+    cx.stroke();
+    // badge body
+    cx.beginPath();
+    cx.arc(0, 0, b.r, 0, Math.PI * 2);
+    var g = cx.createRadialGradient(-6, -6, 3, 0, 0, b.r);
+    g.addColorStop(0, 'rgba(240,110,80,' + alpha + ')');
+    g.addColorStop(1, 'rgba(190,62,42,' + alpha + ')');
+    cx.fillStyle = g;
+    cx.fill();
+    cx.lineWidth = 2;
+    cx.strokeStyle = 'rgba(255,255,255,' + (0.55 * alpha) + ')';
+    cx.stroke();
+    // number
+    cx.fillStyle = 'rgba(255,255,255,' + alpha + ')';
+    cx.font = '800 17px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    cx.fillText(String(b.num), 0, 1);
+    cx.restore();
+  }
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // simulation
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') {
+      state.runFrames += dt;
+      // spawns (human + bot use timer; demo uses scripted times in autopilot)
+      if (!DEMO) {
+        spawnTimer += dt;
+        if (spawnTimer >= nextSpawn) {
+          spawnTimer = 0;
+          spawnBadge();
+          nextSpawn = Math.max(36, rand(55, 120) * (1 - state.score * 0.015));
+        }
+      }
+      // update badges
+      for (var i = badges.length - 1; i >= 0; i--) {
+        var b = badges[i];
+        if (!b.arrived) {
+          var dx = b.cx - b.x, dy = b.cy - b.y, dist = Math.hypot(dx, dy);
+          var step = Math.hypot(b.vx, b.vy) * dt;
+          if (step >= dist || dist < 2) {
+            b.x = b.cx; b.y = b.cy; b.arrived = true;
+          } else {
+            b.x += (dx / dist) * step;
+            b.y += (dy / dist) * step;
+          }
+        }
+        b.life -= dt;
+        if (b.life <= 0) dissolveBadge(i);
+      }
+      autopilot();
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK;
+    cx.fillRect(-30, -30, W + 60, H + 60);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.02)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    // soft corner pools
+    for (var c = 0; c < CORNERS.length; c++) {
+      var corner = CORNERS[c];
+      var load = 0;
+      for (var j = 0; j < badges.length; j++) if (badges[j].corner === c) load += 0.25;
+      var a = 0.08 + 0.08 * Math.sin(now / 600 + c) + load * 0.08;
+      cx.beginPath();
+      cx.arc(corner.cx, corner.cy, FLOAT_R, 0, Math.PI * 2);
+      cx.fillStyle = 'rgba(46,197,182,' + a + ')';
+      cx.fill();
+    }
+
+    // particles
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pt = particles[p];
+      pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.life -= dt;
+      var pa = Math.max(0, pt.life / 60);
+      cx.globalAlpha = pa;
+      cx.fillStyle = pt.color;
+      cx.beginPath();
+      cx.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2);
+      cx.fill();
+      if (pt.life <= 0) particles.splice(p, 1);
+    }
+    cx.globalAlpha = 1;
+
+    // badges
+    for (var k = 0; k < badges.length; k++) drawBadge(badges[k], now);
+
+    // floating text
+    for (var f = floats.length - 1; f >= 0; f--) {
+      var fl = floats[f];
+      fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 50);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.25) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 260 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) floats.splice(f, 1);
+    }
+
+    // score / best
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 120);
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 146);
+        if (state.score > SHARE.dare && !dareBeaten) {
+          dareBeaten = true;
+          flash('DARE BEATEN', TEAL, 44);
+          if (window.J) J.calm(1);
+          if (window.SHARE) SHARE.beaten(state.score);
+          if (window.LOOP) LOOP.emit('challenge_beaten', { dare: SHARE.dare, score: state.score });
+        }
+      }
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('BADGE SUNSET', W / 2, 280);
+      cx.fillStyle = TEAL;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse;
+      cx.fillText('WAIT FOR THEM TO FADE', W / 2, 330);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('the red badge wants your thumb. let it go.', W / 2, 360);
+    }
+
+    // game over
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.5)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('YOU TAPPED.', W / 2, 300);
+      cx.fillStyle = '#fff';
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' faded', W / 2, 345);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — BREATHE AGAIN', W / 2, 462);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD;
+        cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.72 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('BADGE SUNSET', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('let the red badges fade', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(46,197,182,0.8)';
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

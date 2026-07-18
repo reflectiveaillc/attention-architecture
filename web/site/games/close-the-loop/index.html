@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Close the Loop — Tilt</title>
+<!--
+  LOOP / attention-architecture — Close the Loop
+  Circuits: 06-zeigarnik, 05-ease, 01-rpe
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:none; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'close-the-loop';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = Math.max(1, +qs.get('runs') || 3);
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  // canvas / fit
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // palette
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL2 = '#1a8f87', SOFT = '#a8e6e2', WHITE = '#ffffff';
+
+  // ---- game constants ----
+  var CIRCLE_R = 48;          // radius of open arcs
+  var GAP_DEG  = 48;          // gap size in degrees (the open end)
+  var CLOSE_THRESH = 18;      // px from gap-endpoint to trigger close
+  var SPAWN_INTERVAL = 2200;  // ms between new circles appearing
+  var MAX_CIRCLES = 6;
+
+  // ---- state ----
+  var phase = 'title';        // title | play | over | cta
+  var circles = [];
+  var floats = [];
+  var score = 0;
+  var runStartTs = 0;
+  var overAt = 0;
+  var ctaAt = 0;
+
+  // juice
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+
+  // bot
+  var botRunsDone = 0;
+  var botActive = false;
+  var botTarget = null;        // {cx,cy,gx,gy} – gap endpoint to drag toward
+
+  // demo
+  var demoStep = 0;
+  var demoTimer = 0;
+  var demoPointer = null;      // {x,y} fake pointer position
+
+  // drag state (human)
+  var drag = null;             // {id, x, y}
+
+  // mute rect
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  // share rect
+  var SHARE_R = { x: W/2 - 120, y: 490, w: 240, h: 46 };
+
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- Circle factory ----
+  var CIRCLE_COLORS = ['#2ec5b6','#1ab8a8','#5dd5c8','#a8e6e2','#7fccc5','#3db8b0'];
+  var circleId = 0;
+
+  function spawnCircle() {
+    var margin = CIRCLE_R + 30;
+    var attempts = 0, cx2, cy2;
+    do {
+      cx2 = margin + rng() * (W - margin * 2);
+      cy2 = 180 + rng() * (H - 360);
+      attempts++;
+    } while (attempts < 20 && circles.some(function(c){ return dist(c.cx,c.cy,cx2,cy2) < CIRCLE_R*2.6; }));
+    // gap start angle: random, but avoid pointing straight up (toward HUD)
+    var startAngle = rng() * Math.PI * 2;
+    circles.push({
+      id: ++circleId,
+      cx: cx2, cy: cy2,
+      r: CIRCLE_R,
+      gapStart: startAngle,
+      gapDeg: GAP_DEG,
+      color: CIRCLE_COLORS[Math.floor(rng() * CIRCLE_COLORS.length)],
+      closed: false,
+      closingT: 0,         // animation timer 0→1 when closing
+      sinkT: 0,            // sinks and fades after closing
+      alpha: 0,            // fade in
+      birthT: performance.now()
+    });
+  }
+
+  function dist(ax,ay,bx,by){ var dx=ax-bx,dy=ay-by; return Math.sqrt(dx*dx+dy*dy); }
+
+  // Returns the two endpoints of the gap (the open ends)
+  function gapEndpoints(c) {
+    var gs = c.gapStart, ge = gs + (c.gapDeg * Math.PI / 180);
+    return {
+      p1: { x: c.cx + Math.cos(gs) * c.r, y: c.cy + Math.sin(gs) * c.r },
+      p2: { x: c.cx + Math.cos(ge) * c.r, y: c.cy + Math.sin(ge) * c.r }
+    };
+  }
+
+  // ---- close attempt ----
+  function tryClose(c, px, py) {
+    if (c.closed) return;
+    var ep = gapEndpoints(c);
+    var d1 = dist(px, py, ep.p1.x, ep.p1.y);
+    var d2 = dist(px, py, ep.p2.x, ep.p2.y);
+    if (d1 < CLOSE_THRESH || d2 < CLOSE_THRESH) {
+      closeCircle(c);
+      return true;
+    }
+    return false;
+  }
+
+  function closeCircle(c) {
+    c.closed = true;
+    c.closingT = 0;
+    score++;
+    hitStop = 3;
+    zoom = 1.02;
+    // floating "+1" reward
+    floats.push({ txt: '+1', x: c.cx, y: c.cy - 10, t: 0, color: SOFT });
+    if (window.J) J.calm(score);
+    if (window.LOOP) LOOP.emit('loop_closed', { n: score, cx: Math.round(c.cx), cy: Math.round(c.cy) });
+    // check if all non-sunk closed
+    checkAllClear();
+  }
+
+  function checkAllClear() {
+    // All currently alive circles closed?
+    var alive = circles.filter(function(c){ return c.sinkT < 1; });
+    var allClosed = alive.length > 0 && alive.every(function(c){ return c.closed; });
+    if (allClosed && !DEMO && !BOT) {
+      // give a moment then end the round
+      setTimeout(function(){ if (phase === 'play') endRound(); }, 600);
+    }
+  }
+
+  function endRound() {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (window.J) J.calm(score + 2);
+  }
+
+  // ---- game lifecycle ----
+  function startGame() {
+    circles = []; floats = [];
+    score = 0; hitStop = 0; zoom = 1; shakeAmt = 0;
+    drag = null; botTarget = null; botActive = false;
+    phase = 'play';
+    runStartTs = Date.now();
+    // seed fresh set of circles
+    var count = 4 + Math.floor(rng() * 2);
+    for (var i = 0; i < count; i++) spawnCircle();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    // schedule further spawns
+    scheduleSpawn();
+  }
+
+  var spawnTimeout = null;
+  function scheduleSpawn() {
+    if (DEMO || BOT) return; // bot/demo manage their own
+    if (spawnTimeout) clearTimeout(spawnTimeout);
+    spawnTimeout = setTimeout(function() {
+      if (phase !== 'play') return;
+      if (circles.filter(function(c){ return !c.closed; }).length < MAX_CIRCLES) {
+        spawnCircle();
+      }
+      scheduleSpawn();
+    }, SPAWN_INTERVAL + rng() * 800);
+  }
+
+  function resetGame() {
+    if (spawnTimeout) clearTimeout(spawnTimeout);
+    if (window.LOOP) LOOP.emit('restart', {});
+    startGame();
+  }
+
+  // ---- input (human) ----
+  function pointerDown(px, py) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startGame(); return; }
+    if (phase === 'play') {
+      // find nearest open circle to start dragging
+      drag = null;
+      var best = Infinity, bestC = null;
+      for (var i = 0; i < circles.length; i++) {
+        var c = circles[i];
+        if (c.closed) continue;
+        var ep = gapEndpoints(c);
+        var d1 = dist(px, py, ep.p1.x, ep.p1.y);
+        var d2 = dist(px, py, ep.p2.x, ep.p2.y);
+        var d = Math.min(d1, d2);
+        if (d < 50 && d < best) { best = d; bestC = c; }
+      }
+      if (bestC) drag = { id: bestC.id, x: px, y: py };
+      return;
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'loops' }); return;
+      }
+      resetGame();
+    }
+  }
+
+  function pointerMove(px, py) {
+    if (DEMO || BOT || !drag) return;
+    drag.x = px; drag.y = py;
+    for (var i = 0; i < circles.length; i++) {
+      var c = circles[i];
+      if (c.id === drag.id && !c.closed) {
+        if (tryClose(c, px, py)) { drag = null; return; }
+      }
+    }
+  }
+
+  function pointerUp() {
+    drag = null;
+  }
+
+  cv.addEventListener('pointerdown', function(e) {
+    var r = cv.getBoundingClientRect();
+    pointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointermove', function(e) {
+    var r = cv.getBoundingClientRect();
+    pointerMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', pointerUp);
+  cv.addEventListener('pointercancel', pointerUp);
+
+  // ---- BOT autopilot ----
+  // Bot: picks open circles one at a time, moves a fake pointer to the gap endpoint,
+  // then "closes" it. After K circles it goes passive so the run timer eventually
+  // triggers game_over via endRound path, or we force it.
+  var BOT_CLOSE_MAX = 4;   // close this many per run then stop → endRound fires
+  var botClosedCount = 0;
+  var botPhase = 'idle';   // idle | moving | waiting
+  var botMoveT = 0;
+  var botMoveFrom = null;
+  var botMoveTo = null;
+  var botMoveDur = 0;
+  var botWaitT = 0;
+  var botWaitDur = 0;
+
+  function botPickTarget() {
+    var open = circles.filter(function(c){ return !c.closed && c.sinkT < 0.5; });
+    if (!open.length || botClosedCount >= BOT_CLOSE_MAX) {
+      botPhase = 'idle';
+      return;
+    }
+    var c = open[Math.floor(rng() * open.length)];
+    var ep = gapEndpoints(c);
+    // pick one endpoint
+    var target = rng() > 0.5 ? ep.p1 : ep.p2;
+    // start from random nearby position
+    var fromX = target.x + (rng()-0.5)*80;
+    var fromY = target.y + (rng()-0.5)*80;
+    botMoveFrom = { x: fromX, y: fromY };
+    botMoveTo   = { x: target.x, y: target.y, cid: c.id };
+    botMoveDur  = 400 + rng() * 400;
+    botMoveT    = 0;
+    botPhase    = 'moving';
+    demoPointer = { x: fromX, y: fromY };
+  }
+
+  function botTick(dt) {
+    if (!BOT || phase !== 'play') return;
+    if (botPhase === 'idle') {
+      // check if we need to force game_over
+      if (botClosedCount >= BOT_CLOSE_MAX) {
+        // force game over
+        var dur = (Date.now() - runStartTs) / 1000;
+        phase = 'over';
+        overAt = performance.now();
+        if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+        botRunsDone++;
+        if (botRunsDone >= BOT_RUNS) {
+          window.__botDone = true;
+        } else {
+          setTimeout(function() {
+            botClosedCount = 0;
+            botPhase = 'idle';
+            resetGame();
+          }, 600);
+        }
+        return;
+      }
+      botPickTarget();
+      return;
+    }
+    if (botPhase === 'moving') {
+      botMoveT += dt * 16.667;
+      var prog = Math.min(1, botMoveT / botMoveDur);
+      // ease in-out
+      var ep = prog < 0.5 ? 2*prog*prog : 1-Math.pow(-2*prog+2,2)/2;
+      var px = botMoveFrom.x + (botMoveTo.x - botMoveFrom.x) * ep;
+      var py = botMoveFrom.y + (botMoveTo.y - botMoveFrom.y) * ep;
+      demoPointer = { x: px, y: py };
+      if (prog >= 1) {
+        // arrive — try close
+        var cid = botMoveTo.cid;
+        var found = null;
+        for (var i=0;i<circles.length;i++) if(circles[i].id===cid && !circles[i].closed) found=circles[i];
+        if (found) { closeCircle(found); botClosedCount++; }
+        demoPointer = null;
+        botPhase = 'waiting';
+        botWaitT = 0;
+        botWaitDur = 200 + rng() * 300;
+      }
+      return;
+    }
+    if (botPhase === 'waiting') {
+      botWaitT += dt * 16.667;
+      if (botWaitT >= botWaitDur) {
+        botPhase = 'idle';
+      }
+    }
+  }
+
+  // ---- DEMO autopilot ----
+  // Calm arc: settle → deepen → resolve → soft invitation
+  // ~16s total
+  // Steps: appear (2s) → close circles one by one (~1.5s each, 4 circles) →
+  //        last circle closes with a brief pause → canvas goes quiet → CTA
+  var DEMO_CIRCLES_TO_CLOSE = 5;
+  var demoClosedCount = 0;
+  var demoCurTarget = null;  // {from,to,dur,t,cid} movement
+  var demoIdleT = 0;
+  var demoIdleDur = 0;
+  var demoSubphase = 'settle'; // settle|close|quiet|cta
+  var demoSettleT = 0;
+  var demoQuietT = 0;
+
+  function demoPickNext() {
+    var open = circles.filter(function(c){ return !c.closed && c.sinkT < 0.3; });
+    if (!open.length || demoClosedCount >= DEMO_CIRCLES_TO_CLOSE) {
+      demoSubphase = 'quiet';
+      demoPointer = null;
+      return;
+    }
+    var c = open[0]; // pick first
+    var ep = gapEndpoints(c);
+    var tgt = ep.p1;
+    var fromX = tgt.x + (rng()-0.5)*100;
+    var fromY = tgt.y + (rng()-0.5)*100;
+    // hesitation: approach slowly, pause near target, then close
+    demoCurTarget = {
+      from: { x: fromX, y: fromY },
+      to:   { x: tgt.x, y: tgt.y, cid: c.id },
+      dur:  900 + rng()*400,
+      t: 0
+    };
+    demoPointer = { x: fromX, y: fromY };
+  }
+
+  function demoTick(dt) {
+    if (!DEMO || phase !== 'play') return;
+    demoSettleT += dt * 16.667;
+
+    if (demoSubphase === 'settle') {
+      // wait 1.8s before starting
+      if (demoSettleT > 1800) {
+        demoSubphase = 'close';
+        demoPickNext();
+      }
+      return;
+    }
+
+    if (demoSubphase === 'close') {
+      if (!demoCurTarget) { demoPickNext(); return; }
+      demoCurTarget.t += dt * 16.667;
+      var prog = Math.min(1, demoCurTarget.t / demoCurTarget.dur);
+      // ease out (slow arrival = human feeling)
+      var ep2 = 1 - Math.pow(1 - prog, 3);
+      var px = demoCurTarget.from.x + (demoCurTarget.to.x - demoCurTarget.from.x) * ep2;
+      var py = demoCurTarget.from.y + (demoCurTarget.to.y - demoCurTarget.from.y) * ep2;
+      demoPointer = { x: px, y: py };
+      if (prog >= 1) {
+        // close
+        var cid2 = demoCurTarget.to.cid;
+        var fc = null;
+        for (var i=0;i<circles.length;i++) if(circles[i].id===cid2&&!circles[i].closed) fc=circles[i];
+        if (fc) { closeCircle(fc); demoClosedCount++; }
+        demoCurTarget = null;
+        demoPointer = null;
+        demoIdleT = 0;
+        demoIdleDur = 600 + rng()*400; // pause between circles
+      }
+      return;
+    }
+
+    if (demoSubphase === 'quiet') {
+      demoQuietT += dt * 16.667;
+      if (demoQuietT > 1200 && phase === 'play') {
+        // End demo run gracefully
+        var dur2 = (Date.now() - runStartTs) / 1000;
+        phase = 'over';
+        overAt = performance.now();
+        window.__demoScore = score;
+        if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur2.toFixed(1) });
+        // after brief over screen, go to CTA
+        setTimeout(function() {
+          phase = 'cta';
+          ctaAt = performance.now();
+          setTimeout(function() { window.__demoDone = true; }, 3500);
+        }, 1500);
+        demoSubphase = 'done';
+      }
+      return;
+    }
+  }
+
+  // idle pause between demo moves
+  var demoIdleActive = false;
+  // we fold idle pause into demoCurTarget === null check above
+
+  // ---- render helpers ----
+  function drawArc(c, now) {
+    var alpha = Math.min(1, c.alpha);
+    if (c.sinkT > 0) {
+      alpha *= Math.max(0, 1 - c.sinkT);
+    }
+    if (alpha <= 0) return;
+
+    cx.save();
+    cx.globalAlpha = alpha;
+
+    var translateY = c.sinkT > 0 ? c.sinkT * 30 : 0;
+    cx.translate(c.cx, c.cy + translateY);
+
+    if (c.closed) {
+      // complete ring, pulsing glow
+      var glowA = Math.max(0, 1 - c.closingT * 1.5);
+      if (glowA > 0) {
+        cx.shadowColor = c.color;
+        cx.shadowBlur = 18 * glowA;
+      }
+      cx.strokeStyle = c.color;
+      cx.lineWidth = 4;
+      cx.beginPath();
+      cx.arc(0, 0, c.r, 0, Math.PI * 2);
+      cx.stroke();
+      cx.shadowBlur = 0;
+      // inner soft fill
+      cx.fillStyle = c.color;
+      cx.globalAlpha = alpha * 0.1 * Math.max(0, 1 - c.closingT);
+      cx.beginPath();
+      cx.arc(0, 0, c.r, 0, Math.PI * 2);
+      cx.fill();
+    } else {
+      // open arc — draw the arc minus the gap
+      var gs = c.gapStart;
+      var ge = gs + (c.gapDeg * Math.PI / 180);
+      cx.strokeStyle = c.color;
+      cx.lineWidth = 4;
+      cx.lineCap = 'round';
+      cx.beginPath();
+      cx.arc(0, 0, c.r, ge, gs + Math.PI * 2);
+      cx.stroke();
+
+      // Draw the open gap endpoints as small dots (hint for the player)
+      cx.fillStyle = c.color;
+      cx.globalAlpha = alpha * (0.5 + 0.5 * Math.sin(now / 400));
+      var ep = gapEndpoints(c);
+      cx.beginPath();
+      cx.arc(ep.p1.x - c.cx, ep.p1.y - c.cy, 5, 0, Math.PI*2);
+      cx.fill();
+      cx.beginPath();
+      cx.arc(ep.p2.x - c.cx, ep.p2.y - c.cy, 5, 0, Math.PI*2);
+      cx.fill();
+    }
+    cx.restore();
+  }
+
+  // ---- draw floating text ----
+  function drawFloats(dt) {
+    for (var k = floats.length - 1; k >= 0; k--) {
+      var fl = floats[k];
+      fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 50);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) floats.splice(k, 1);
+    }
+  }
+
+  // ---- draw demo pointer ----
+  function drawPointer(now) {
+    if (!demoPointer && !drag) return;
+    var px, py;
+    if (demoPointer) { px = demoPointer.x; py = demoPointer.y; }
+    else if (drag)   { px = drag.x; py = drag.y; }
+    else return;
+
+    // subtle ripple cursor
+    var pulse = 0.6 + 0.4 * Math.sin(now / 200);
+    cx.save();
+    cx.globalAlpha = 0.5 * pulse;
+    cx.strokeStyle = SOFT;
+    cx.lineWidth = 2;
+    cx.beginPath();
+    cx.arc(px, py, 10, 0, Math.PI*2);
+    cx.stroke();
+    cx.globalAlpha = 0.85;
+    cx.fillStyle = SOFT;
+    cx.beginPath();
+    cx.arc(px, py, 4, 0, Math.PI*2);
+    cx.fill();
+    cx.restore();
+  }
+
+  // ---- main render loop ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // update circles
+    for (var i = 0; i < circles.length; i++) {
+      var c = circles[i];
+      // fade in
+      if (c.alpha < 1) c.alpha += dt * 0.04;
+      // closing animation
+      if (c.closed) {
+        c.closingT += dt * 0.04;
+        if (c.closingT > 0.5) c.sinkT += dt * 0.025;
+      }
+    }
+
+    // autopilots
+    if (hitStop > 0) { hitStop -= dt; }
+    else {
+      if (BOT)  botTick(dt);
+      if (DEMO) demoTick(dt);
+    }
+
+    // handle idle between demo moves
+    if (DEMO && demoSubphase === 'close' && !demoCurTarget) {
+      demoIdleT += dt * 16.667;
+      if (!demoIdleDur) demoIdleDur = 500;
+      if (demoIdleT > demoIdleDur) {
+        demoIdleT = 0;
+        demoIdleDur = 0;
+        demoPickNext();
+      }
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random()-0.5)*shakeAmt, sy = (Math.random()-0.5)*shakeAmt;
+      cx.translate(W/2+sx, H/2+sy); cx.scale(zoom, zoom); cx.translate(-W/2, -H/2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W+40, H+40);
+
+    // subtle radial glow center
+    var bg = cx.createRadialGradient(W/2, H/2, 0, W/2, H/2, 340);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)');
+    bg.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // === phase renders ===
+    if (phase === 'title') {
+      drawTitle(now);
+    }
+
+    if (phase === 'play' || phase === 'over') {
+      // draw circles
+      for (var j = 0; j < circles.length; j++) drawArc(circles[j], now);
+      drawFloats(dt);
+      drawPointer(now);
+
+      // score display
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '800 58px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W/2, 88);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('LOOPS CLOSED', W/2, 108);
+    }
+
+    if (phase === 'over') {
+      drawOverlay(now);
+    }
+
+    if (phase === 'cta') {
+      drawCTA(now);
+    }
+
+    // mute toggle (human)
+    if (!DEMO && !BOT && window.J) {
+      cx.globalAlpha = 0.45;
+      cx.textAlign = 'center';
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w/2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    // large title
+    cx.fillStyle = WHITE;
+    cx.font = '800 40px -apple-system, Helvetica, Arial';
+    cx.fillText('CLOSE THE LOOP', W/2, 290);
+
+    cx.fillStyle = 'rgba(46,197,182,0.9)';
+    cx.font = '500 16px -apple-system, Helvetica, Arial';
+    cx.fillText('drag the open ends shut', W/2, 326);
+
+    var pulse = 0.6 + 0.4 * Math.sin(now / 500);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = TEAL;
+    cx.font = '700 17px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO BEGIN', W/2, 380);
+    cx.globalAlpha = 1;
+
+    // draw a small example arc hint
+    cx.save();
+    cx.translate(W/2, 460);
+    cx.strokeStyle = 'rgba(46,197,182,0.5)';
+    cx.lineWidth = 3;
+    cx.lineCap = 'round';
+    cx.beginPath();
+    cx.arc(0, 0, 28, 0.4, 0.4 + Math.PI*1.7);
+    cx.stroke();
+    cx.fillStyle = 'rgba(46,197,182,0.4)';
+    cx.beginPath(); cx.arc(Math.cos(0.4)*28, Math.sin(0.4)*28, 4, 0, Math.PI*2); cx.fill();
+    cx.beginPath(); cx.arc(Math.cos(0.4+Math.PI*1.7)*28, Math.sin(0.4+Math.PI*1.7)*28, 4, 0, Math.PI*2); cx.fill();
+    cx.restore();
+  }
+
+  function drawOverlay(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.62)';
+    cx.fillRect(0, 0, W, H);
+
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL;
+    cx.font = '800 38px -apple-system, Helvetica, Arial';
+    cx.fillText('ALL LOOPS CLOSED', W/2, 300);
+
+    cx.fillStyle = WHITE;
+    cx.font = '700 24px -apple-system, Helvetica, Arial';
+    cx.fillText(score + ' loops', W/2, 342);
+
+    cx.fillStyle = GOLD;
+    cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('everything resolved', W/2, 374);
+
+    if (!DEMO && !BOT) {
+      var p2 = 0.65 + 0.35 * Math.sin(now / 300);
+      cx.globalAlpha = p2;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — CLOSE MORE', W/2, 456);
+      cx.globalAlpha = 1;
+
+      // share pill
+      cx.fillStyle = 'rgba(242,177,52,0.12)';
+      cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+      else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText('⚡ DARE A FRIEND', W/2, SHARE_R.y + 30);
+    }
+  }
+
+  function drawCTA(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2.0);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    cx.fillStyle = WHITE;
+    cx.font = '800 38px -apple-system, Helvetica, Arial';
+    cx.fillText('CLOSE THE LOOP', W/2, 300);
+
+    cx.fillStyle = 'rgba(168,230,226,0.85)';
+    cx.font = '500 17px -apple-system, Helvetica, Arial';
+    cx.fillText('they closed ' + (window.__demoScore || score) + '. grow yours.', W/2, 340);
+
+    var pulse = 0.75 + 0.25 * Math.sin(now / 260);
+    cx.fillStyle = TEAL;
+    cx.globalAlpha = ease * pulse;
+    cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W/2, 405);
+
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W/2, 438);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- boot ----
+  if (DEMO) {
+    // pre-spawn circles silently
+    var demoCount = DEMO_CIRCLES_TO_CLOSE + 1;
+    circles = [];
+    for (var i2 = 0; i2 < demoCount; i2++) spawnCircle();
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  } else if (BOT) {
+    startGame();
+  }
+  // human → title screen (starts on tap)
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

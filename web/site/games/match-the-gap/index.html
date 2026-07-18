@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Match the Gap — Tilt</title>
+<!--
+  LOOP / attention-architecture — Match the Gap
+  Circuits: 06-zeigarnik, 05-ease, 01-rpe
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA card → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'match-the-gap';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL_DIM = 'rgba(46,197,182,0.35)';
+  var SNAP_PX = 3;          // gap difference ≤ this to auto-lock
+  var GOOD_PX = 12;         // within this = very close / "near match"
+
+  // Object geometry (three horizontal circles/squares in a row)
+  var OBJ_R  = 38;          // radius of each dot
+  var OBJ_Y  = H / 2 + 40; // vertical centre of the row
+  var LEFT_X = 80;          // left object fixed x
+  var RIGHT_X= W - 80;      // right object fixed x
+  // mid object x is what the player moves
+
+  // Palette: rotating soft tones (calm)
+  var PALETTES = [
+    { obj: '#2ec5b6', bg: 'rgba(46,197,182,0.07)' },
+    { obj: '#7ec8e3', bg: 'rgba(126,200,227,0.07)' },
+    { obj: '#a8d8a8', bg: 'rgba(168,216,168,0.07)' },
+    { obj: '#d4a5c9', bg: 'rgba(212,165,201,0.07)' },
+    { obj: '#f2b134', bg: 'rgba(242,177,52,0.07)'  },
+    { obj: '#85c1e9', bg: 'rgba(133,193,233,0.07)' },
+  ];
+
+  var state, hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  var runStartTs, botRunsDone = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('mtg_best') || 0; } catch(_) {}
+
+  // ---- Game state ----
+  function newRound(keepScore) {
+    // Generate a random uneven gap for this round
+    // Left gap: space between left obj edge and mid obj left edge
+    // We place mid randomly off-center so the gaps differ visibly
+    var totalSpace = RIGHT_X - LEFT_X - 2 * OBJ_R * 2; // space between inner edges of L and R
+    // perfect mid position: LEFT_X + OBJ_R*2 + totalSpace/2 + OBJ_R (center)
+    var perfectMid = (LEFT_X + OBJ_R + RIGHT_X - OBJ_R) / 2;
+    // offset mid by ±30–70px so it's visibly wrong
+    var minOff = 28, maxOff = 68;
+    var off = (minOff + rng() * (maxOff - minOff)) * (rng() < 0.5 ? 1 : -1);
+    // clamp so mid stays between objects
+    var minX = LEFT_X + OBJ_R * 2 + OBJ_R + 4;
+    var maxX = RIGHT_X - OBJ_R * 2 - OBJ_R - 4;
+    var midX = Math.min(maxX, Math.max(minX, perfectMid + off));
+
+    var palIdx = Math.floor(rng() * PALETTES.length);
+
+    return {
+      phase: keepScore ? 'play' : 'title',
+      midX: midX,
+      perfectMid: perfectMid,
+      dragging: false,
+      dragOffX: 0,
+      locked: false,
+      lockAnim: 0,       // 0..1 lock animation progress
+      lockAt: 0,
+      roundScore: keepScore ? state.roundScore : 0,
+      totalScore: keepScore ? state.totalScore : 0,
+      combo: keepScore ? state.combo : 0,
+      streak: keepScore ? state.streak : 0,
+      pal: PALETTES[palIdx],
+      roundNum: keepScore ? state.roundNum + 1 : 1,
+      // how many rounds in this run
+      lives: keepScore ? state.lives : 5,
+    };
+  }
+
+  function initGame() {
+    state = {
+      phase: 'title',
+      midX: (LEFT_X + OBJ_R + RIGHT_X - OBJ_R) / 2,
+      perfectMid: (LEFT_X + OBJ_R + RIGHT_X - OBJ_R) / 2,
+      dragging: false, dragOffX: 0, locked: false, lockAnim: 0, lockAt: 0,
+      roundScore: 0, totalScore: 0, combo: 0, streak: 0,
+      pal: PALETTES[0], roundNum: 0, lives: 5,
+    };
+    flashes = [];
+  }
+
+  function startGame() {
+    state = newRound(false);
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function currentGaps(midX) {
+    // left gap: between right edge of left obj and left edge of mid obj
+    var lg = (midX - OBJ_R) - (LEFT_X + OBJ_R);
+    // right gap: between right edge of mid obj and left edge of right obj
+    var rg = (RIGHT_X - OBJ_R) - (midX + OBJ_R);
+    return { lg: lg, rg: rg, diff: Math.abs(lg - rg) };
+  }
+
+  function tryLock() {
+    if (state.locked) return;
+    var g = currentGaps(state.midX);
+    var perfect = g.diff <= SNAP_PX;
+    var near    = g.diff <= GOOD_PX;
+
+    if (perfect) {
+      // snap to exact center
+      state.midX = state.perfectMid;
+      state.locked = true;
+      state.lockAt = performance.now();
+      state.lockAnim = 0;
+
+      // scoring: base + streak bonus
+      var pts = 100 + state.streak * 20;
+      state.totalScore += pts;
+      state.roundScore = pts;
+      state.combo++;
+      state.streak++;
+      hitStop = 5;
+      zoom = 1.025;
+
+      flash('+' + pts, GOLD, 44);
+      if (window.J) J.calm(state.streak);
+      if (window.LOOP) LOOP.emit('gap_matched', { n: state.roundNum, streak: state.streak, pts: pts });
+
+      // advance to next round after lock anim
+      setTimeout(function () { advanceRound(true); }, 900);
+
+    } else if (near) {
+      // near miss: vibrate and show hint
+      shakeAmt = 3;
+      flash('SO CLOSE', TEAL, 32);
+      if (window.J) J.calm(0);
+      if (window.LOOP) LOOP.emit('near_miss', { diff: +g.diff.toFixed(1) });
+    } else {
+      // miss: lose a life
+      state.lives--;
+      state.streak = 0;
+      shakeAmt = 5;
+      flash('OFF ' + Math.round(g.diff) + 'px', 'rgba(232,80,46,0.9)', 30);
+      if (window.LOOP) LOOP.emit('gap_missed', { diff: +g.diff.toFixed(1), lives: state.lives });
+
+      if (state.lives <= 0) {
+        setTimeout(function () { endGame(); }, 400);
+      } else {
+        // shuffle a new gap after brief pause
+        setTimeout(function () { advanceRound(false); }, 700);
+      }
+    }
+  }
+
+  function advanceRound(success) {
+    if (state.phase !== 'play') return;
+    var next = newRound(true);
+    next.phase = 'play';
+    if (!success) next.streak = 0;
+    state = next;
+    flashes = [];
+  }
+
+  function endGame() {
+    if (state.phase === 'over' || state.phase === 'cta') return;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.totalScore > best;
+    if (newBest) {
+      best = state.totalScore;
+      try { localStorage.setItem('mtg_best', String(best)); } catch(_) {}
+      if (window.J) setTimeout(function() { J.calm(5); }, 300);
+    }
+    if (window.J) J.calm(0);
+    window.__demoScore = state.totalScore;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.totalScore, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { restartGame(); }, 600);
+      }
+    }
+  }
+
+  function restartGame() {
+    flashes = [];
+    startGame();
+    if (window.LOOP) LOOP.emit('restart', {});
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- Input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 120, y: 510, w: 240, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function pointerDown(x, y) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startGame(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.totalScore, unit: 'pts' }); return;
+      }
+      restartGame(); return;
+    }
+    if (state.phase === 'play' && !state.locked) {
+      // check if touching the mid object
+      var dx = x - state.midX, dy = y - OBJ_Y;
+      if (dx * dx + dy * dy <= (OBJ_R + 24) * (OBJ_R + 24)) {
+        state.dragging = true;
+        state.dragOffX = x - state.midX;
+      }
+    }
+  }
+
+  function pointerMove(x) {
+    if (DEMO || BOT) return;
+    if (state.phase === 'play' && state.dragging && !state.locked) {
+      var minX = LEFT_X + OBJ_R * 2 + OBJ_R + 2;
+      var maxX = RIGHT_X - OBJ_R * 2 - OBJ_R - 2;
+      state.midX = Math.min(maxX, Math.max(minX, x - state.dragOffX));
+    }
+  }
+
+  function pointerUp(x, y) {
+    if (DEMO || BOT) return;
+    if (state.phase === 'play' && state.dragging) {
+      state.dragging = false;
+      tryLock();
+    }
+  }
+
+  cv.addEventListener('pointerdown', function(e) {
+    e.preventDefault();
+    var r = cv.getBoundingClientRect();
+    pointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointermove', function(e) {
+    e.preventDefault();
+    var r = cv.getBoundingClientRect();
+    pointerMove((e.clientX - r.left) / scale);
+  });
+  cv.addEventListener('pointerup', function(e) {
+    e.preventDefault();
+    var r = cv.getBoundingClientRect();
+    pointerUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointercancel', function() { if (!DEMO && !BOT) state.dragging = false; });
+
+  // ---- Demo / Bot autopilots ----
+  // Demo: scripted calm arc — 4 perfect rounds then endGame triggers the CTA.
+  // Steps: [offset from perfect (px), waitFrames before starting to move]
+  // All offsets 0 = perfect snap each time (calm completion arc)
+  var demoSteps = [
+    { off: 0, wait: 75 },   // round 1: settle in
+    { off: 0, wait: 65 },   // round 2: deepen
+    { off: 0, wait: 58 },   // round 3: deeper still
+    { off: 0, wait: 50 },   // round 4: resolve
+  ];
+  var DEMO_TOTAL_ROUNDS = demoSteps.length;
+  var demoStep = 0;
+  var demoPhase = 'wait';   // 'wait' | 'moving' | 'done'
+  var demoWait = 0;
+  var demoMoveSpeed = 0;
+  var demoTargetX = 0;
+  var demoStarted = false;
+  var demoRoundsPlayed = 0;
+
+  function initDemo() {
+    demoStarted = true;
+    demoStep = 0;
+    demoRoundsPlayed = 0;
+    demoPhase = 'wait';
+    demoWait = 55;
+  }
+
+  // Bot: random imperfect autopilot — must eventually lose (exhaust lives)
+  var botPhase = 'wait';
+  var botWait = 0;
+  var botTargetX = 0;
+  var botMoveSpeed = 0;
+  // Bot is deliberately bad enough to miss and drain lives
+  // It uses large errors so it will eventually exhaust all 5 lives.
+  var BOT_MAX_ERR = 55;   // big error -> frequent misses -> game_over reached
+
+  function autopilot(dt) {
+    if (state.phase !== 'play' || state.locked) return;
+
+    if (DEMO) {
+      if (!demoStarted) { initDemo(); }
+
+      if (demoPhase === 'done') return;
+
+      if (demoPhase === 'wait') {
+        demoWait -= dt;
+        if (demoWait <= 0) {
+          if (demoStep >= demoSteps.length) {
+            // All demo rounds played — end the game to show CTA
+            demoPhase = 'done';
+            endGame();
+            return;
+          }
+          var step = demoSteps[demoStep];
+          demoTargetX = state.perfectMid + step.off;
+          var dist = demoTargetX - state.midX;
+          // approach speed: cover most of the distance in ~step.wait frames
+          demoMoveSpeed = dist / Math.max(1, step.wait * 0.55);
+          demoPhase = 'moving';
+        }
+        return;
+      }
+
+      if (demoPhase === 'moving') {
+        var dist2 = demoTargetX - state.midX;
+        if (Math.abs(dist2) <= 2) {
+          state.midX = demoTargetX;
+          demoPhase = 'wait';
+          demoRoundsPlayed++;
+          demoStep++;
+          // After tryLock the game will call advanceRound(true) after 900ms
+          // which will reset state; we just need to set up the next wait
+          var nextStep = demoSteps[demoStep];
+          demoWait = nextStep ? nextStep.wait : 50;
+          tryLock();
+        } else {
+          state.midX += demoMoveSpeed * dt;
+        }
+      }
+      return;
+    }
+
+    if (BOT) {
+      if (botPhase === 'wait') {
+        botWait -= dt;
+        if (botWait <= 0) {
+          // Large random error to cause misses and drain lives
+          var err = (rng() - 0.5) * 2 * BOT_MAX_ERR;
+          botTargetX = state.perfectMid + err;
+          var minX = LEFT_X + OBJ_R * 2 + OBJ_R + 2;
+          var maxX = RIGHT_X - OBJ_R * 2 - OBJ_R - 2;
+          botTargetX = Math.min(maxX, Math.max(minX, botTargetX));
+          var dBot = botTargetX - state.midX;
+          botMoveSpeed = dBot / Math.max(1, 12 + rng() * 18);
+          botPhase = 'moving';
+        }
+        return;
+      }
+      if (botPhase === 'moving') {
+        var dBot2 = botTargetX - state.midX;
+        if (Math.abs(dBot2) <= 2) {
+          state.midX = botTargetX;
+          tryLock();
+          botPhase = 'wait';
+          botWait = 18 + Math.floor(rng() * 22);
+        } else {
+          state.midX += botMoveSpeed * dt;
+        }
+      }
+    }
+  }
+
+  // ---- Render helpers ----
+  function drawObj(x, y, r, color, glow) {
+    cx.save();
+    if (glow) {
+      cx.shadowColor = color;
+      cx.shadowBlur  = 18;
+    }
+    cx.beginPath();
+    cx.arc(x, y, r, 0, Math.PI * 2);
+    cx.fillStyle = color;
+    cx.fill();
+    cx.restore();
+  }
+
+  function drawGapLine(x1, x2, y, color, alpha) {
+    cx.save();
+    cx.globalAlpha = alpha;
+    cx.strokeStyle = color;
+    cx.lineWidth   = 1.5;
+    cx.setLineDash([4, 4]);
+    cx.beginPath();
+    cx.moveTo(x1, y);
+    cx.lineTo(x2, y);
+    cx.stroke();
+    cx.setLineDash([]);
+    cx.restore();
+  }
+
+  function drawGapLabel(x, y, txt, color, alpha) {
+    cx.save();
+    cx.globalAlpha = alpha;
+    cx.textAlign = 'center';
+    cx.fillStyle = color;
+    cx.font = '600 11px Menlo, monospace';
+    cx.fillText(txt, x, y);
+    cx.restore();
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 300))));
+  }
+
+  // ---- Main loop ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // hit-stop & autopilot
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      autopilot(dt);
+    }
+
+    // juice decay
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // --- draw ---
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, state.pal ? state.pal.bg : 'rgba(46,197,182,0.07)');
+    bg.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    var phase = state.phase;
+
+    // ---- title ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('MATCH THE GAP', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '400 16px -apple-system, Helvetica, Arial';
+      cx.fillText('drag the middle dot until the gaps are equal', W / 2, 300);
+
+      // preview objects
+      drawObj(LEFT_X, OBJ_Y, OBJ_R, TEAL, false);
+      drawObj(W / 2 + 30, OBJ_Y, OBJ_R, TEAL, false);
+      drawObj(RIGHT_X, OBJ_Y, OBJ_R, TEAL, false);
+
+      var pulse = 0.6 + 0.4 * Math.sin(now / 400);
+      cx.globalAlpha = pulse;
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, OBJ_Y + OBJ_R + 60);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- play ----
+    if (phase === 'play') {
+      var g = currentGaps(state.midX);
+      var matchPct = Math.max(0, 1 - g.diff / 80); // 0..1 closeness
+      var objColor = state.locked
+        ? TEAL
+        : 'hsl(' + (168 + matchPct * 30) + ',62%,' + (48 + matchPct * 12) + '%)';
+
+      // gap lines (dashed guides — calm visual aid)
+      var lgMid  = LEFT_X + OBJ_R + g.lg / 2;
+      var rgMid  = state.midX + OBJ_R + g.rg / 2;
+      var lineY  = OBJ_Y;
+      var guideAlpha = Math.max(0.1, 0.4 - matchPct * 0.3);
+      drawGapLine(LEFT_X + OBJ_R, state.midX - OBJ_R, lineY - OBJ_R - 8, TEAL_DIM, guideAlpha);
+      drawGapLine(state.midX + OBJ_R, RIGHT_X - OBJ_R, lineY - OBJ_R - 8, TEAL_DIM, guideAlpha);
+
+      // gap numbers
+      if (!state.locked) {
+        drawGapLabel(lgMid, OBJ_Y - OBJ_R - 18, Math.round(g.lg) + 'px', 'rgba(46,197,182,0.7)', 0.85);
+        drawGapLabel(rgMid, OBJ_Y - OBJ_R - 18, Math.round(g.rg) + 'px', 'rgba(46,197,182,0.7)', 0.85);
+      }
+
+      // locked animation: connecting line blooms
+      if (state.locked) {
+        state.lockAnim = Math.min(1, state.lockAnim + dt * 0.05);
+        var bloom = state.lockAnim;
+        cx.save();
+        cx.globalAlpha = bloom * 0.35;
+        cx.strokeStyle = TEAL;
+        cx.lineWidth = 2.5;
+        cx.beginPath();
+        cx.moveTo(LEFT_X + OBJ_R, OBJ_Y);
+        cx.lineTo(RIGHT_X - OBJ_R, OBJ_Y);
+        cx.stroke();
+        cx.restore();
+      }
+
+      // objects
+      drawObj(LEFT_X,  OBJ_Y, OBJ_R, objColor, state.locked);
+      drawObj(RIGHT_X, OBJ_Y, OBJ_R, objColor, state.locked);
+      drawObj(state.midX, OBJ_Y, OBJ_R,
+        state.locked ? GOLD : (state.dragging ? '#fff' : objColor),
+        state.locked);
+
+      // drag hint pulse if not yet dragging
+      if (!state.dragging && !state.locked && state.roundNum <= 2) {
+        var hp = 0.3 + 0.25 * Math.sin(now / 350);
+        cx.save();
+        cx.globalAlpha = hp;
+        cx.strokeStyle = TEAL;
+        cx.lineWidth = 2;
+        cx.beginPath();
+        cx.arc(state.midX, OBJ_Y, OBJ_R + 8, 0, Math.PI * 2);
+        cx.stroke();
+        cx.restore();
+      }
+
+      // HUD: score + lives + round
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '800 56px -apple-system, Helvetica, Arial';
+      cx.fillText(state.totalScore, W / 2, 90);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 112);
+
+      // streak indicator
+      if (state.streak > 1) {
+        cx.fillStyle = GOLD;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('× ' + state.streak + ' STREAK', W / 2, 136);
+      }
+
+      // lives dots
+      var dotR = 5, dotSpacing = 16;
+      var totalLivesW = (5 - 1) * dotSpacing + dotR * 2;
+      var livesX = W / 2 - totalLivesW / 2 + dotR;
+      for (var i = 0; i < 5; i++) {
+        cx.beginPath();
+        cx.arc(livesX + i * dotSpacing, H - 60, dotR, 0, Math.PI * 2);
+        cx.fillStyle = i < state.lives ? TEAL : 'rgba(255,255,255,0.15)';
+        cx.fill();
+      }
+
+      // match indicator bar (closeness meter)
+      var barW = 180, barH = 6, barX = W / 2 - barW / 2, barY = OBJ_Y + OBJ_R + 28;
+      cx.fillStyle = 'rgba(255,255,255,0.1)';
+      cx.beginPath();
+      cx.roundRect ? cx.roundRect(barX, barY, barW, barH, 3) : cx.rect(barX, barY, barW, barH);
+      cx.fill();
+      var fillW = barW * matchPct;
+      var barColor = matchPct > 0.85 ? TEAL : (matchPct > 0.6 ? GOLD : 'rgba(255,255,255,0.35)');
+      cx.fillStyle = barColor;
+      cx.beginPath();
+      cx.roundRect ? cx.roundRect(barX + (barW - fillW) / 2, barY, fillW, barH, 3) : cx.rect(barX + (barW - fillW) / 2, barY, fillW, barH);
+      cx.fill();
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.28)';
+      cx.font = '500 11px Menlo, monospace';
+      cx.fillText(state.locked ? 'MATCHED ✓' : 'DRAG TO ALIGN', W / 2, barY + barH + 16);
+    }
+
+    // ---- game over ----
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.65)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('BALANCED', W / 2, 280);
+      cx.fillStyle = '#fff';
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(state.totalScore + ' pts', W / 2, 326);
+      var pt = pctTop(state.totalScore);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 372);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.65 + 0.35 * Math.sin(now / 320);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — PLAY AGAIN', W / 2, 426);
+        cx.globalAlpha = 1;
+
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD;
+        cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect
+          ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23)
+          : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- demo CTA ----
+    if (phase === 'cta') {
+      var t = (now - state.ctaAt) / 1000, ease = Math.min(1, t * 2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('MATCH THE GAP', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '400 18px -apple-system, Helvetica, Arial';
+      cx.fillText('feel the gap close', W / 2, 332);
+      var p3 = 0.75 + 0.25 * Math.sin(now / 300);
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = ease * p3;
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(46,197,182,0.6)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 36);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 200 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 36) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  initGame();
+
+  // Demo skips title
+  if (DEMO) {
+    startGame();
+  } else if (BOT) {
+    startGame();
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

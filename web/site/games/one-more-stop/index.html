@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>One More Stop — Tilt</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'one-more-stop';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // Game constants
+  var MAX_SWIPES  = 5;      // allowed total swipes before game over
+  var DARK_RATE   = 0.018;  // darkness gained per second of holding still
+  var BRIGHT_HIT  = 0.32;   // darkness lost per swipe
+
+  // FYP card captions (apostrophes must be escaped in single-quoted strings)
+  var CAPTIONS = [
+    'this went viral for a reason',
+    'wait for it',
+    'POV you can\'t stop scrolling',
+    'she said WHAT??',
+    'I need you to see this',
+    'they really said one more',
+    'the algorithm knows',
+    'not me watching this 3x',
+    'why is this so accurate',
+    'ok but actually though',
+    'part 2 dropped',
+    'this is your sign to stop',
+    'last one I promise',
+    'you needed to see this today'
+  ];
+
+  var CARD_H = 500, CARD_W = W - 60, CARD_X = 30;
+  var CARD_CENTER_Y = (H - CARD_H) / 2;  // top of card when centered
+
+  // Card pool: each card has {hue, label, scrollOffset}
+  // cards[0] = current center, cards[1] = above (next to scroll up to), etc.
+  var cards = [];
+  function makeCard() {
+    return { hue: Math.floor(rng() * 360), label: CAPTIONS[Math.floor(rng() * CAPTIONS.length)] };
+  }
+  function initCards() {
+    cards = [];
+    for (var i = 0; i < 4; i++) cards.push(makeCard());
+  }
+
+  // State
+  var state, flashes, hitStop, zoom, shakeAmt, dareBeaten;
+  var runStartTs, best = 0, botRunsDone = 0;
+  try { best = +localStorage.getItem('oms_best') || 0; } catch (_) {}
+
+  // scrollPos: 0 = on card 0; 1.0 = on card 1; etc.
+  // Each swipe advances scrollPos by 1 (animates to next card)
+  var scrollPos = 0, scrollVel = 0, scrollTarget = 0;
+
+  function newGame() {
+    hitStop = 0; zoom = 1; shakeAmt = 0; flashes = []; dareBeaten = false;
+    scrollPos = 0; scrollVel = 0; scrollTarget = 0;
+    initCards();
+
+    state = {
+      phase: 'title',
+      darkness: 0,       // 0=bright, 1=black
+      holdTime: 0,       // seconds spent holding this session
+      score: 0,          // integer: deciseconds held in darkness
+      swipeCount: 0,     // how many times gave in
+      overAt: 0
+    };
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1300);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function doSwipe() {
+    if (state.phase !== 'play') return;
+    state.swipeCount++;
+    // Reset darkness brightness
+    var prevDark = state.darkness;
+    state.darkness = Math.max(0, state.darkness - BRIGHT_HIT);
+    state.holdTime = 0;  // reset hold timer
+
+    // Animate to next card
+    scrollTarget = Math.floor(scrollPos) + 1;
+    scrollVel = 18;
+
+    // Add new card to pool
+    cards.push(makeCard());
+
+    // Sound
+    if (window.J) J.near();
+    shakeAmt = 3;
+    flash('one more', VERM, 30);
+
+    if (window.LOOP) LOOP.emit('swiped', { count: state.swipeCount, darkness: +prevDark.toFixed(2) });
+
+    // Warning on last swipe remaining
+    if (state.swipeCount === MAX_SWIPES - 1) {
+      if (window.J) J.tension(0.9);
+      flash('LAST CHANCE', GOLD, 26);
+      if (window.LOOP) LOOP.emit('near_miss', { swipes: state.swipeCount });
+    }
+
+    if (state.swipeCount >= MAX_SWIPES) {
+      // Death: too many swipes, gave in completely
+      gameOver();
+    }
+  }
+
+  function gameOver() {
+    if (state.phase !== 'play') return;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 10;
+    hitStop = 6;
+    if (window.J) J.death(Math.min(0.4 + state.swipeCount / 10, 1));
+    var dur = (Date.now() - runStartTs) / 1000;
+    var finalScore = state.score;
+    if (DEMO) window.__demoScore = finalScore;
+    if (finalScore > best) {
+      best = finalScore;
+      try { localStorage.setItem('oms_best', String(best)); } catch (_) {}
+      if (window.J) setTimeout(function () { J.fanfare(); }, 500);
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: finalScore, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3700);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(resetRun, 700);
+      }
+    }
+  }
+
+  function resetRun() {
+    scrollPos = 0; scrollVel = 0; scrollTarget = 0;
+    initCards();
+    state.darkness = 0;
+    state.score = 0;
+    state.swipeCount = 0;
+    state.holdTime = 0;
+    hitStop = 0; zoom = 1; shakeAmt = 0; flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // Input
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { doSwipe(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'seconds dark' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // Demo / bot autopilot
+  // Demo: scripted hold times then swipes → game_over after MAX_SWIPES
+  // Hold times per swipe: [3.5, 3.0, 2.0, 1.0, 0.5]  (getting shorter, tension rises)
+  var DEMO_HOLDS = [3.5, 3.0, 2.0, 1.0, 0.5];
+  var demoIdx = 0, demoHoldLeft = 3.5, demoDone = false;
+
+  // Bot: random hold times averaging ~1.2s, eventually hits MAX_SWIPES
+  var botTimer = 0, botWait = 0;
+
+  function autopilot(dt) {
+    if (state.phase !== 'play') return;
+    var dtSec = dt / 60;
+
+    if (DEMO) {
+      if (demoDone) return;
+      demoHoldLeft -= dtSec;
+      if (demoHoldLeft <= 0) {
+        doSwipe();
+        demoIdx++;
+        if (demoIdx < DEMO_HOLDS.length) {
+          demoHoldLeft = DEMO_HOLDS[demoIdx];
+        } else {
+          demoDone = true;
+        }
+      }
+    } else if (BOT) {
+      botTimer += dtSec;
+      if (botTimer >= botWait) {
+        botTimer = 0;
+        botWait = 0.5 + rng() * 1.5;  // 0.5-2.0s between swipes
+        doSwipe();
+      }
+    }
+  }
+
+  // Render helpers
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 28))));
+  }
+
+  function drawSingleCard(card, screenY, alpha) {
+    if (alpha <= 0.01) return;
+    var x = CARD_X, y = screenY, cw = CARD_W, ch = CARD_H;
+    cx.save();
+    cx.globalAlpha = alpha;
+
+    // Background gradient
+    var g = cx.createLinearGradient(x, y, x, y + ch);
+    g.addColorStop(0, 'hsl(' + card.hue + ',18%,14%)');
+    g.addColorStop(1, 'hsl(' + card.hue + ',22%,9%)');
+    cx.fillStyle = g;
+    if (cx.roundRect) {
+      cx.beginPath(); cx.roundRect(x, y, cw, ch, 14); cx.fill();
+    } else {
+      cx.fillRect(x, y, cw, ch);
+    }
+
+    // Border
+    cx.strokeStyle = 'hsl(' + card.hue + ',40%,32%)';
+    cx.lineWidth = 1.2;
+    if (cx.roundRect) {
+      cx.beginPath(); cx.roundRect(x, y, cw, ch, 14); cx.stroke();
+    } else {
+      cx.strokeRect(x, y, cw, ch);
+    }
+
+    // Mock video area
+    var vidH = ch * 0.54;
+    cx.fillStyle = 'hsl(' + card.hue + ',25%,17%)';
+    cx.fillRect(x + 12, y + 18, cw - 24, vidH);
+
+    // Play triangle
+    cx.fillStyle = 'rgba(255,255,255,0.18)';
+    cx.beginPath();
+    var px = x + cw / 2, py = y + 18 + vidH / 2;
+    cx.moveTo(px - 18, py - 14); cx.lineTo(px + 18, py); cx.lineTo(px - 18, py + 14);
+    cx.closePath(); cx.fill();
+
+    // Progress bar (fake video scrubber)
+    cx.fillStyle = 'rgba(255,255,255,0.12)';
+    cx.fillRect(x + 12, y + 18 + vidH - 4, cw - 24, 3);
+    cx.fillStyle = VERM;
+    cx.fillRect(x + 12, y + 18 + vidH - 4, (cw - 24) * (0.3 + rng() * 0.5), 3);
+
+    // "one more?" tag
+    cx.fillStyle = 'rgba(0,0,0,0.6)';
+    cx.fillRect(x, y + ch * 0.58, cw, 32);
+    cx.fillStyle = GOLD;
+    cx.font = '700 13px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.fillText('one more?', x + cw / 2, y + ch * 0.58 + 22);
+
+    // Caption
+    cx.fillStyle = 'rgba(255,255,255,0.72)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'left';
+    var capX = x + 14, capY = y + ch * 0.58 + 50;
+    var words = card.label.split(' '), line = '';
+    for (var wi = 0; wi < words.length; wi++) {
+      var test = line + (line ? ' ' : '') + words[wi];
+      if (cx.measureText(test).width > cw - 28 && line) {
+        cx.fillText(line, capX, capY); capY += 19; line = words[wi];
+      } else { line = test; }
+    }
+    if (line) cx.fillText(line, capX, capY);
+
+    // Action icons
+    cx.fillStyle = 'rgba(255,255,255,0.28)';
+    cx.font = '600 11px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'left';
+    cx.fillText('follow   share   save', x + 14, y + ch - 14);
+
+    cx.restore();
+  }
+
+  var challengeAt = 0, ctaAt = 0, last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+    var dtSec = dt / 60;
+
+    // Hit-stop: freeze sim; decay; then run autopilot
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      if (state.phase === 'play') {
+        // Darkness accumulates each frame player holds still
+        var prevDark = state.darkness;
+        state.darkness = Math.min(1, state.darkness + DARK_RATE * dt);
+        state.holdTime += dtSec;
+        state.score = Math.floor(state.darkness * state.holdTime * 10);
+
+        // Tension sound as darkness rises
+        if (window.J && state.darkness > 0.25) {
+          J.tension(Math.min((state.darkness - 0.25) / 0.75, 1));
+        }
+
+        // Milestone reward sounds/flashes
+        var prevMile = Math.floor(prevDark * 5);
+        var currMile = Math.floor(state.darkness * 5);
+        if (currMile > prevMile) {
+          if (currMile === 1) { if (window.J) J.hit(1); flash('+hold', TEAL, 24); }
+          if (currMile === 2) { if (window.J) J.hit(2); flash('+hold', TEAL, 26); }
+          if (currMile === 3) { if (window.J) J.perfect(1); flash('DEEP DARK', TEAL, 30); hitStop = 3; zoom = 1.02; }
+          if (currMile === 4) { if (window.J) J.gold(); flash('PITCH BLACK', GOLD, 34); hitStop = 5; zoom = 1.03; }
+        }
+
+        // Dare check
+        if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+          dareBeaten = true;
+          flash('DARE BEATEN', TEAL, 38);
+          if (window.J) J.fanfare();
+          SHARE.beaten(state.score);
+        }
+
+        // Scroll animation
+        if (Math.abs(scrollPos - scrollTarget) > 0.01) {
+          scrollPos += (scrollTarget - scrollPos) * 0.15 * dt;
+          if (Math.abs(scrollPos - scrollTarget) < 0.01) scrollPos = scrollTarget;
+        }
+
+        autopilot(dt);
+      }
+    }
+
+    // ---- DRAW ----
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.84, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bgG = cx.createLinearGradient(0, 0, 0, H);
+    bgG.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bgG.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bgG; cx.fillRect(0, 0, W, H);
+
+    // Title screen
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('ONE MORE STOP', W / 2, 270);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('hold still. let it go dark.', W / 2, 312);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillText('TAP TO START', W / 2, 360);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.28)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('every swipe resets the dark.', W / 2, 394);
+    }
+
+    // Challenge card (demo beat 1)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 295);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('28', W / 2, 395);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's longest hold", W / 2, 428);
+    }
+
+    // Play / Over: draw FYP cards
+    if (state.phase === 'play' || state.phase === 'over') {
+      // scrollPos is continuous: 0=first card centered, 1=second card centered, etc.
+      // Card i is at screenY = CARD_CENTER_Y + (i - scrollPos) * (CARD_H + 30)
+      var CARD_STRIDE = CARD_H + 30;
+      var i;
+      for (i = 0; i < cards.length; i++) {
+        var cardScreenY = CARD_CENTER_Y + (i - scrollPos) * CARD_STRIDE;
+        if (cardScreenY > H + 20 || cardScreenY + CARD_H < -20) continue;
+        var dist = Math.abs(cardScreenY - CARD_CENTER_Y);
+        var a = Math.max(0.08, 1 - dist / (CARD_STRIDE * 1.5));
+        drawSingleCard(cards[i], cardScreenY, a);
+      }
+
+      // Darkness overlay — the core mechanic
+      if (state.darkness > 0.01) {
+        cx.fillStyle = 'rgba(11,13,18,' + state.darkness.toFixed(3) + ')';
+        cx.fillRect(0, 0, W, H);
+      }
+
+      // HUD: score (top center)
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 58px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 86);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 108);
+
+      // Swipe lives (top right)
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'right';
+      var hearts = '';
+      for (i = 0; i < MAX_SWIPES; i++) {
+        hearts += (i < (MAX_SWIPES - state.swipeCount)) ? '|' : '.';
+        if (i < MAX_SWIPES - 1) hearts += ' ';
+      }
+      cx.fillStyle = state.swipeCount >= MAX_SWIPES - 1 ? VERM : TEAL;
+      cx.fillText(hearts, W - 14, 34);
+
+      // Darkness bar (right edge)
+      var bH = H * 0.55, bY = (H - bH) / 2;
+      cx.fillStyle = 'rgba(255,255,255,0.07)';
+      cx.fillRect(W - 8, bY, 4, bH);
+      cx.fillStyle = state.darkness > 0.7 ? GOLD : (state.darkness > 0.4 ? TEAL : 'rgba(255,255,255,0.42)');
+      cx.fillRect(W - 8, bY + bH * (1 - state.darkness), 4, bH * state.darkness);
+
+      // Dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.textAlign = 'center';
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 13px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN' : ('BEAT ' + SHARE.dare + (SHARE.by ? ' — ' + SHARE.by : '')), W / 2, 128);
+      }
+    }
+
+    // Floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 36);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.35) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 230 - fl.t * 0.65);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // Game over overlay
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.72)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('YOU GAVE IN.', W / 2, 288);
+      cx.fillStyle = '#fff'; cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' seconds dark', W / 2, 330);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 374);
+      cx.fillStyle = 'rgba(255,255,255,0.48)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('survived ' + state.swipeCount + ' swipes of ' + MAX_SWIPES, W / 2, 398);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 446);
+        cx.globalAlpha = 1;
+        // Share pill
+        cx.fillStyle = 'rgba(242,177,52,0.13)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 29);
+      }
+    }
+
+    // Demo CTA card
+    if (state.phase === 'cta') {
+      var ctaT = (now - ctaAt) / 1000, ctaE = Math.min(1, ctaT * 2.4);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ctaE).toFixed(3) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ctaE; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('ONE MORE STOP', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.72)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they held ' + (window.__demoScore || 28) + 's. your move.', W / 2, 330);
+      var ctaP = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ctaE * ctaP;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 28), W / 2, 398);
+      cx.globalAlpha = ctaE;
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 430);
+      cx.globalAlpha = 1;
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial'; cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

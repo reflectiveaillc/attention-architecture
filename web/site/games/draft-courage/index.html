@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Draft Courage — Tilt</title>
+<!--
+  LOOP / attention-architecture — Draft Courage
+  Circuits: 04-loss (drafts folder), 06-zeigarnik (one more try), 07-timing (the window).
+  Engine: viral. Conditioned path: posting anxiety / hover-before-post hesitation.
+  Mechanic: hold the Post button to fill a courage meter; release inside the green zone.
+            Zone shrinks each round. Too early or too late → Drafts (0 points).
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron arc → __demoDone
+    ?bot=1&runs=N&seed=M  imperfect autopilot N runs → __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'draft-courage';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO     = qs.get('demo') === '1';
+  var BOT      = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED     = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var GREEN = '#3ddc84';
+
+  // ---- game constants ----
+  var METER_X = W / 2 - 20, METER_Y = 220, METER_W = 40, METER_H = 320;
+  var POST_BTN = { x: W / 2 - 80, y: 600, w: 160, h: 56 };
+  var SHARE_R  = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  var MUTE_R   = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- state ----
+  var state, hitStop, zoom, shakeAmt, dareBeaten, best, flashes, runStartTs;
+  var botRunsDone, botActive, botReleased;
+  var ctaAt, challengeAt;
+
+  try { best = +localStorage.getItem('dc_best') || 0; } catch (_) { best = 0; }
+
+  // zone: the green window, fraction of meter [0..1]
+  // Each round the zone narrows. Starts at 0.42, min 0.10.
+  function zoneRange(posts) {
+    var lo = 0.30 + (rng() - 0.5) * 0.10;
+    var size = Math.max(0.10, 0.42 - posts * 0.030);
+    lo = Math.min(Math.max(lo, 0.10), 1 - size - 0.05);
+    return { lo: lo, hi: lo + size };
+  }
+
+  function newGame() {
+    rng = mulberry32(SEED);   // reset RNG for reproducibility
+    state = {
+      phase: 'title',        // title | challenge | play | over | cta
+      posts: 0,              // score
+      combo: 0,
+      hold: 0,               // 0..1, how far the meter is filled
+      pressing: false,
+      zone: null,            // { lo, hi }
+      roundOver: false,      // round just resolved (brief pause)
+      roundAt: 0,
+      overAt: 0
+    };
+    hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false; flashes = [];
+    botRunsDone = 0; botActive = false; botReleased = false;
+    ctaAt = 0; challengeAt = 0;
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.posts = 0;
+    state.combo = 0;
+    state.hold = 0;
+    state.pressing = false;
+    state.zone = zoneRange(0);
+    state.roundOver = false;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    if (BOT) { botActive = true; botReleased = false; }
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 6))));
+  }
+
+  function resolveRelease() {
+    // Called when player releases the hold button
+    var h = state.hold;
+    var z = state.zone;
+    var inZone = h >= z.lo && h <= z.hi;
+
+    state.pressing = false;
+
+    if (inZone) {
+      // POSTED
+      var perfect = Math.abs(h - (z.lo + z.hi) / 2) / ((z.hi - z.lo) / 2) < 0.18;
+      state.posts++;
+      state.combo++;
+      var size = z.hi - z.lo;
+
+      if (window.J) {
+        if (perfect) J.perfect(state.combo);
+        else J.hit(state.combo);
+        J.tension(Math.min(state.posts / 12, 1));
+      }
+      if (perfect) {
+        hitStop = 5; zoom = 1.035;
+        flash('PERFECT POST', TEAL, 38);
+      } else if (size < 0.14) {
+        // near-miss (zone was tiny and they barely made it)
+        shakeAmt = 4;
+        flash('SO CLOSE!', VERM, 34);
+        if (window.LOOP) LOOP.emit('near_miss', { posts: state.posts, fill: +h.toFixed(3) });
+      } else {
+        flash('POSTED!', GREEN, 36);
+      }
+      if (window.LOOP) LOOP.emit('post_scored', { posts: state.posts, fill: +h.toFixed(3), perfect: perfect });
+
+      // dare beaten?
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.posts > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 40);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.posts);
+      }
+
+      // next round after brief pause
+      state.roundOver = true;
+      state.roundAt = performance.now();
+    } else {
+      // DRAFTED — goes to drafts, lose the round, game over if zone too small
+      state.combo = 0;
+      shakeAmt = 7;
+      if (window.J) J.death(Math.min(0.2 + state.posts / 15, 1));
+      if (h < z.lo) flash('TOO EARLY', VERM, 36);
+      else flash('TOO LATE', GOLD, 36);
+      if (window.LOOP) LOOP.emit('drafted', { posts: state.posts, fill: +h.toFixed(3) });
+      gameOver();
+    }
+  }
+
+  function startNextRound() {
+    state.hold = 0;
+    state.pressing = false;
+    state.zone = zoneRange(state.posts);
+    state.roundOver = false;
+    if (BOT) botReleased = false;
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = Math.max(shakeAmt, 8);
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.posts > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + state.posts / 12, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = state.posts;
+    if (newBest) {
+      best = state.posts;
+      try { localStorage.setItem('dc_best', String(best)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.posts, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botActive = false;
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.posts = 0;
+    state.combo = 0;
+    state.hold = 0;
+    state.pressing = false;
+    state.roundOver = false;
+    flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- input ----
+  function pressStart(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play' && !state.roundOver) {
+      if (x === undefined || inR(POST_BTN, x, y)) {
+        state.pressing = true;
+      }
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.posts, unit: 'posts' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  function pressEnd(x, y) {
+    if (DEMO || BOT) return;
+    if (state.phase === 'play' && state.pressing && !state.roundOver) {
+      resolveRelease();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    pressStart((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    pressEnd((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') { e.preventDefault(); pressStart(); }
+  });
+  window.addEventListener('keyup', function (e) {
+    if (e.code === 'Space') pressEnd();
+  });
+
+  // ---- demo script ----
+  // mirror-neuron arc: challenge card → hesitant good runs → near-fail save → real fail
+  // Each entry: target fill fraction (0..1) for the release, or 'fail' for intentional miss.
+  // 'sliver' = release just barely outside the zone (near-miss drama)
+  var demoSteps = [
+    { release: 0.55, wait: 55 },   // round 1: safe middle
+    { release: 0.62, wait: 42 },   // round 2: slightly off-center, builds combo
+    { release: 0.48, wait: 38 },   // round 3: good
+    { release: 0.70, wait: 60 },   // round 4 (near-fail — zone is shrinking)
+    { release: 0.58, wait: 45 },   // round 5: recovery after the scare
+    { release: 0.92, wait: 35 },   // round 6: intentional miss (too late → game over)
+  ];
+  var demoIdx = 0;
+  var demoWaiting = 0;      // frames left in hesitation pause
+  var demoPressing = false;
+  var demoHoldFrames = 0;
+
+  function demoAutopilot(dt) {
+    if (state.phase !== 'play' || state.roundOver) return;
+    if (demoIdx >= demoSteps.length) return;
+    var step = demoSteps[demoIdx];
+
+    if (demoWaiting > 0) {
+      demoWaiting -= dt;
+      return;
+    }
+
+    if (!demoPressing) {
+      // start pressing
+      demoPressing = true;
+      demoHoldFrames = 0;
+      state.pressing = true;
+    }
+
+    // We need to hit step.release fill. The meter fills at HOLD_SPEED per frame-unit.
+    // Check if we're at the target fill.
+    var HOLD_SPEED = 0.38 / 60;   // fills in ~2.6s at 60fps
+    var framesNeeded = step.release / (HOLD_SPEED * 16.667);
+    demoHoldFrames += dt;
+
+    // Release when we've filled to target
+    if (state.hold >= step.release) {
+      demoPressing = false;
+      resolveRelease();
+      demoIdx++;
+      demoWaiting = step.wait;
+    }
+  }
+
+  // ---- bot autopilot ----
+  // Bot presses hold, releases at a random point in or near the zone (imperfect)
+  var botPressDone = false;
+  var botTargetFill = 0;
+
+  function botAutopilot(dt) {
+    if (!botActive || state.phase !== 'play' || state.roundOver) return;
+
+    if (!state.pressing && !botReleased) {
+      // pick a target fill with some error
+      var z = state.zone;
+      var mid = (z.lo + z.hi) / 2;
+      // 70% chance hit zone, 30% chance miss (ensures game_over eventually)
+      var hitChance = 0.70 - botRunsDone * 0.05;
+      if (rng() < hitChance) {
+        botTargetFill = mid + (rng() - 0.5) * (z.hi - z.lo) * 0.6;
+        botTargetFill = Math.max(z.lo + 0.01, Math.min(z.hi - 0.01, botTargetFill));
+      } else {
+        // intentional miss — go past hi
+        botTargetFill = z.hi + 0.05 + rng() * 0.15;
+        if (botTargetFill > 0.98) botTargetFill = 0.98;
+      }
+      state.pressing = true;
+    }
+
+    if (state.pressing && !botReleased && state.hold >= botTargetFill) {
+      botReleased = true;
+      resolveRelease();
+    }
+  }
+
+  // ---- render ----
+  var HOLD_SPEED = 0.38 / 60;   // fill rate per ms unit (adjusted per dt)
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // ---- update hold meter ----
+    if (state.phase === 'play' && !state.roundOver) {
+      if (state.pressing) {
+        state.hold = Math.min(1, state.hold + HOLD_SPEED * dt * 16.667);
+        // rising tension sound
+        if (window.J) J.tension(state.hold);
+      }
+
+      // round-over pause: wait a short moment then start next
+      if (state.roundOver && performance.now() - state.roundAt > 600) {
+        startNextRound();
+      }
+
+      // if meter hits 1.0 while pressing: auto-fail (too late)
+      if (state.hold >= 1.0 && state.pressing) {
+        state.hold = 1.0;
+        state.pressing = false;
+        flash('TOO LATE', GOLD, 36);
+        shakeAmt = 7;
+        if (window.J) J.death(Math.min(0.2 + state.posts / 15, 1));
+        if (window.LOOP) LOOP.emit('drafted', { posts: state.posts, fill: 1.0 });
+        gameOver();
+      }
+
+      if (DEMO) demoAutopilot(dt);
+      else if (BOT) botAutopilot(dt);
+    }
+
+    // advance round-over delay
+    if (state.roundOver && performance.now() - state.roundAt > 600) {
+      startNextRound();
+    }
+
+    // ---- juice ----
+    if (hitStop > 0) hitStop -= dt;
+
+    // ---- draw ----
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.08)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- title screen ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('DRAFT COURAGE', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('hold to build nerve. release in the green.', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('too early or too late → drafts.', W / 2, 326);
+      // pulsing CTA
+      var pulse = 0.65 + 0.35 * Math.sin(now / 320);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM;
+      cx.font = '800 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO POST', W / 2, 390);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- challenge card (demo beat 1) ----
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('5', W / 2, 410);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 440);
+    }
+
+    // ---- play screen ----
+    if (state.phase === 'play') {
+      // -- score display --
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(state.posts, W / 2, 92);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 116);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 140);
+      }
+
+      // -- courage meter --
+      var mX = W / 2 - 20, mY = 190, mW = 40, mH = 320;
+
+      // track bg
+      cx.fillStyle = 'rgba(255,255,255,0.08)';
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(mX, mY, mW, mH, 10);
+      else cx.rect(mX, mY, mW, mH);
+      cx.fill();
+
+      // green zone highlight (where they need to release)
+      if (state.zone) {
+        var z = state.zone;
+        var zy = mY + (1 - z.hi) * mH;
+        var zh = (z.hi - z.lo) * mH;
+        // glow behind zone
+        cx.fillStyle = 'rgba(61,220,132,0.15)';
+        cx.fillRect(mX - 4, zy - 4, mW + 8, zh + 8);
+        // zone fill
+        cx.fillStyle = 'rgba(61,220,132,0.40)';
+        cx.fillRect(mX, zy, mW, zh);
+        // zone border
+        cx.strokeStyle = GREEN;
+        cx.lineWidth = 2;
+        cx.strokeRect(mX, zy, mW, zh);
+        // zone label
+        cx.textAlign = 'right';
+        cx.fillStyle = 'rgba(61,220,132,0.8)';
+        cx.font = '700 11px Menlo, monospace';
+        cx.fillText('POST', mX - 6, zy + zh / 2 + 4);
+      }
+
+      // fill bar
+      if (state.hold > 0) {
+        var fillH = state.hold * mH;
+        var fillY = mY + mH - fillH;
+        // color: shifts from teal→gold→vermillion as it gets toward top (danger)
+        var r, g, b;
+        if (state.hold < 0.5) {
+          // teal (#2ec5b6) to gold (#f2b134)
+          var t2 = state.hold / 0.5;
+          r = Math.round(0x2e + t2 * (0xf2 - 0x2e));
+          g = Math.round(0xc5 + t2 * (0xb1 - 0xc5));
+          b = Math.round(0xb6 + t2 * (0x34 - 0xb6));
+        } else {
+          // gold (#f2b134) to vermillion (#e8502e)
+          var t3 = (state.hold - 0.5) / 0.5;
+          r = Math.round(0xf2 + t3 * (0xe8 - 0xf2));
+          g = Math.round(0xb1 + t3 * (0x50 - 0xb1));
+          b = Math.round(0x34 + t3 * (0x2e - 0x34));
+        }
+        var fillColor = 'rgb(' + r + ',' + g + ',' + b + ')';
+        var grad = cx.createLinearGradient(0, fillY, 0, fillY + fillH);
+        grad.addColorStop(0, fillColor);
+        grad.addColorStop(1, 'rgba(' + r + ',' + g + ',' + b + ',0.6)');
+        cx.fillStyle = grad;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(mX + 2, fillY, mW - 4, fillH, 8);
+        else cx.rect(mX + 2, fillY, mW - 4, fillH);
+        cx.fill();
+
+        // cursor line on top of fill
+        cx.strokeStyle = '#fff';
+        cx.lineWidth = 2;
+        cx.beginPath();
+        cx.moveTo(mX - 2, fillY);
+        cx.lineTo(mX + mW + 2, fillY);
+        cx.stroke();
+      }
+
+      // meter border
+      cx.strokeStyle = 'rgba(255,255,255,0.2)';
+      cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(mX, mY, mW, mH, 10);
+      else cx.rect(mX, mY, mW, mH);
+      cx.stroke();
+
+      // zone size label (get smaller as difficulty increases)
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 11px Menlo, monospace';
+      if (state.zone) {
+        var zonePct = Math.round((state.zone.hi - state.zone.lo) * 100);
+        cx.fillText('window ' + zonePct + '%', W / 2, mY + mH + 20);
+      }
+
+      // -- post button --
+      var pressing = state.pressing;
+      var btnAlpha = pressing ? 0.85 : 1;
+      cx.globalAlpha = btnAlpha;
+      cx.fillStyle = pressing ? 'rgba(232,80,46,0.25)' : 'rgba(232,80,46,0.15)';
+      cx.strokeStyle = VERM;
+      cx.lineWidth = 2;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(POST_BTN.x, POST_BTN.y, POST_BTN.w, POST_BTN.h, 28);
+      else cx.rect(POST_BTN.x, POST_BTN.y, POST_BTN.w, POST_BTN.h);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = pressing ? VERM : '#fff';
+      cx.font = '800 20px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText(pressing ? 'HOLD...' : 'HOLD TO POST', W / 2, POST_BTN.y + 34);
+      cx.globalAlpha = 1;
+
+      // round-over feedback
+      if (state.roundOver) {
+        cx.fillStyle = 'rgba(61,220,132,0.8)';
+        cx.font = '700 14px -apple-system, Helvetica, Arial';
+        cx.fillText('POSTED  →  NEXT', W / 2, POST_BTN.y + 68);
+      }
+
+      // combo display
+      if (state.combo > 1) {
+        var comboScale = 1 + Math.min(state.combo * 0.06, 0.5);
+        var comboSize = Math.round(22 * comboScale);
+        cx.save();
+        cx.textAlign = 'right';
+        cx.fillStyle = GOLD;
+        cx.font = '900 ' + comboSize + 'px -apple-system, Helvetica, Arial';
+        cx.fillText('×' + state.combo + ' STREAK', W - 18, 96);
+        cx.restore();
+      }
+    }
+
+    // ---- game over screen ----
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.60)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('DRAFTED.', W / 2, 298);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('went to your drafts folder.', W / 2, 332);
+      cx.fillStyle = '#fff';
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.posts + ' post' + (state.posts !== 1 ? 's' : ''), W / 2, 370);
+      var pt = pctTop(state.posts);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 402);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('braver than ' + (100 - pt) + '% of players', W / 2, 424);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — POST AGAIN', W / 2, 460);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+
+      // score also shown during over phase for reference
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.15)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 450);
+    }
+
+    // ---- demo CTA card ----
+    if (state.phase === 'cta') {
+      var t4 = (now - ctaAt) / 1000, ease = Math.min(1, t4 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.80 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('DRAFT COURAGE', W / 2, 298);
+      cx.fillStyle = 'rgba(255,255,255,0.70)';
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they posted ' + (window.__demoScore || 5) + '. still drafting?', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 5), W / 2, 406);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- floating flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 160 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(k, 1);
+    }
+
+    // ---- mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

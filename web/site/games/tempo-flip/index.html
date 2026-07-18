@@ -1,0 +1,794 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Tempo Flip — Tilt</title>
+<!--
+  LOOP / attention-architecture — Tempo Flip
+  Circuits: 02-novelty (tempo churns every 8 beats), 01-rpe (variable timing windows),
+            07-timing (beat-sync taps).
+  Mechanic: tap the pulsing dot on the beat; every 8 beats the required tempo flips
+            (double-time / half-time / off-beat-only). Six tempos total then resolve.
+  Engine: viral.
+  Modes:
+    ?demo=1&seed=7   mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N    imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'tempo-flip';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ------------------------------------------------------------------
+  // Tempo definitions: each "tempo" lasts 8 beats
+  // bpm: speed of the beat clock
+  // target: 'beat' (tap on the flash), 'double' (tap every half-beat),
+  //         'half' (tap every other beat), 'offbeat' (tap exactly between beats)
+  // ------------------------------------------------------------------
+  var TEMPOS = [
+    { label: 'TEMPO 1', name: 'ON BEAT',     bpm: 80,  type: 'beat',    color: TEAL  },
+    { label: 'TEMPO 2', name: 'DOUBLE TIME', bpm: 160, type: 'double',  color: VERM  },
+    { label: 'TEMPO 3', name: 'HALF TIME',   bpm: 40,  type: 'half',    color: GOLD  },
+    { label: 'TEMPO 4', name: 'OFF BEAT',    bpm: 80,  type: 'offbeat', color: TEAL  },
+    { label: 'TEMPO 5', name: 'RAPID FIRE',  bpm: 200, type: 'double',  color: VERM  },
+    { label: 'TEMPO 6', name: 'CHAOS',       bpm: 120, type: 'offbeat', color: GOLD  },
+  ];
+
+  // beat window tolerance (how close to perfect %)
+  var PERFECT_WIN = 0.10;  // ±10% of beat interval = perfect
+  var GOOD_WIN    = 0.22;  // ±22% = good hit
+  var TOTAL_BEATS_PER_TEMPO = 8;
+
+  // game state
+  var state, flashes, hitStop, zoom, shakeAmt, dareBeaten;
+  var runStartTs, best = 0;
+  try { best = +localStorage.getItem('tf_best') || 0; } catch (_) {}
+
+  // juice state
+  hitStop = 0; zoom = 1; shakeAmt = 0;
+
+  // ------------------------------------------------------------------
+  // State helpers
+  // ------------------------------------------------------------------
+  function newState() {
+    return {
+      phase: 'title',           // title | challenge | flip | play | over | cta
+      tempoIdx: 0,              // which TEMPOS[] we're on
+      beatsInTempo: 0,          // beats completed in this tempo phase
+      beatPhase: 0,             // 0..1 progress within current beat
+      lastBeatTime: 0,          // ms timestamp of last beat
+      nextBeatTime: 0,          // ms timestamp of next beat
+      halfBeatFlag: false,      // for double-time tracking
+      offbeatFlag: false,       // tracking offbeat window
+      score: 0,                 // total perfect+good hits
+      streak: 0,                // current hit streak
+      misses: 0,                // misses this tempo phase
+      totalMisses: 0,           // total misses
+      overAt: 0,
+      flipAt: 0,                // when the flip card started
+      flipDuration: 1200,       // ms to show the flip card
+      // pulsing dot
+      dotPulse: 0,              // 0..1 beat pulse
+      dotHit: 0,                // 0..1 flash on tap
+    };
+  }
+
+  function newGame() {
+    state = newState();
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      state.challengeAt = performance.now();
+      setTimeout(function () { startRun(); }, 1250);
+      return;
+    }
+    if (BOT) { startRun(); return; }
+    // human: show title
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.tempoIdx = 0;
+    state.beatsInTempo = 0;
+    state.beatPhase = 0;
+    runStartTs = Date.now();
+    var now = performance.now();
+    state.lastBeatTime = now;
+    state.nextBeatTime = now + beatInterval();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function beatInterval() {
+    return 60000 / TEMPOS[state.tempoIdx].bpm;
+  }
+
+  function currentTempo() { return TEMPOS[state.tempoIdx]; }
+
+  // ------------------------------------------------------------------
+  // Tap logic
+  // ------------------------------------------------------------------
+  function registerTap(now) {
+    if (state.phase !== 'play') return;
+    var t = currentTempo();
+    var interval = beatInterval();
+
+    // Determine the target window based on tempo type
+    var distFromBeat = Math.abs(now - state.nextBeatTime);
+    var distFromLast = Math.abs(now - state.lastBeatTime);
+    var minDist = Math.min(distFromBeat, distFromLast);
+
+    var isOnBeat   = minDist <= interval * GOOD_WIN;
+    var isPerfect  = minDist <= interval * PERFECT_WIN;
+    var isOffBeat  = (now - state.lastBeatTime) > interval * 0.38 &&
+                     (now - state.lastBeatTime) < interval * 0.62;
+
+    var hit = false;
+    if (t.type === 'beat' || t.type === 'half') {
+      hit = isOnBeat;
+    } else if (t.type === 'double') {
+      // half-interval taps also count
+      var halfInterval = interval / 2;
+      var lastHalfBeat = state.lastBeatTime + halfInterval;
+      var distFromHalf = Math.abs(now - lastHalfBeat);
+      hit = minDist <= interval * GOOD_WIN || distFromHalf <= halfInterval * GOOD_WIN;
+      isPerfect = minDist <= interval * PERFECT_WIN || distFromHalf <= halfInterval * PERFECT_WIN;
+    } else if (t.type === 'offbeat') {
+      hit = isOffBeat;
+      isPerfect = (now - state.lastBeatTime) > interval * 0.42 &&
+                  (now - state.lastBeatTime) < interval * 0.58;
+    }
+
+    if (hit) {
+      state.score++;
+      state.streak++;
+      state.dotHit = 1;
+      if (isPerfect) {
+        flash('PERFECT', TEAL, 38);
+        if (window.J) J.perfect(state.streak);
+        hitStop = 3; zoom = 1.025;
+        if (window.LOOP) LOOP.emit('perfect_tap', { tempoIdx: state.tempoIdx, streak: state.streak });
+      } else {
+        flash('+1', t.color, 30);
+        if (window.J) J.hit(state.streak);
+        if (window.LOOP) LOOP.emit('tap_hit', { tempoIdx: state.tempoIdx, streak: state.streak });
+      }
+      // dare check
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score);
+      }
+    } else {
+      // miss
+      state.misses++;
+      state.totalMisses++;
+      state.streak = 0;
+      shakeAmt = 3;
+      flash('MISS', VERM, 28);
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { tempoIdx: state.tempoIdx, score: state.score });
+      // 3 misses in one tempo = game over
+      if (state.misses >= 3) {
+        gameOver();
+      }
+    }
+  }
+
+  function advanceBeat(now) {
+    // advance beat clock
+    state.lastBeatTime = state.nextBeatTime;
+    state.nextBeatTime += beatInterval();
+    state.beatsInTempo++;
+    state.dotPulse = 1;
+
+    // tension ramps up within a tempo
+    if (window.J) J.tension(state.tempoIdx / (TEMPOS.length - 1));
+
+    // after TOTAL_BEATS_PER_TEMPO beats, move to next tempo or end
+    if (state.beatsInTempo >= TOTAL_BEATS_PER_TEMPO) {
+      state.beatsInTempo = 0;
+      state.misses = 0;
+      state.tempoIdx++;
+      if (state.tempoIdx >= TEMPOS.length) {
+        // All 6 tempos done — victory!
+        if (window.J) J.fanfare();
+        gameOver();
+        return;
+      }
+      // Show flip card
+      state.phase = 'flip';
+      state.flipAt = now;
+      setTimeout(function () {
+        if (state.phase === 'flip') {
+          state.phase = 'play';
+          state.lastBeatTime = performance.now();
+          state.nextBeatTime = performance.now() + beatInterval();
+        }
+      }, state.flipDuration);
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 8;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + state.score / 40, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('tf_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +(dur).toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    state = newState();
+    state.phase = 'play';
+    flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 18))));
+  }
+
+  // ------------------------------------------------------------------
+  // Input
+  // ------------------------------------------------------------------
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { registerTap(performance.now()); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'streak' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') tap();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo / Bot autopilots
+  // ------------------------------------------------------------------
+  // Demo script: array of taps described as { beatOffset, perfect }
+  // beatOffset 0 = on beat, 0.5 = offbeat
+  // We track a script index and fire taps at the right moment.
+  var demoScript = [
+    // tempo 1 (beat): 6 good hits, near-fail, recovery
+    { beat: 0.05, perfect: false },
+    { beat: 0.03, perfect: true  },
+    { beat: 0.08, perfect: false },
+    { beat: 0.02, perfect: true  },
+    { beat: 0.15, perfect: false },  // near-fail
+    { beat: 0.04, perfect: true  },  // recovery
+    { beat: 0.06, perfect: false },
+    { beat: 0.09, perfect: false },
+    // tempo 2 (double): gets harder
+    { beat: 0.05, perfect: true  },
+    { beat: 0.12, perfect: false },
+    { beat: 0.04, perfect: true  },
+    { beat: 0.18, perfect: false },  // near-miss
+    { beat: 0.05, perfect: true  },  // recovery
+    { beat: 0.08, perfect: false },
+    { beat: 0.06, perfect: false },
+    { beat: 0.20, perfect: false },
+    // tempo 3+ — bot starts making errors leading to game over
+    { beat: 0.25, perfect: false },  // miss
+    { beat: 0.30, perfect: false },  // miss
+    { beat: 0.35, perfect: false },  // miss => game over
+  ];
+  var demoScriptIdx = 0;
+  var demoNextTapTime = -1;
+  var demoScheduled = false;
+
+  // hesitation waits (ms) before each tap in demo
+  var demoWaits = [420, 380, 450, 400, 520, 380, 410, 440,
+                   360, 470, 390, 510, 380, 420, 400, 480,
+                   520, 540, 560];
+
+  function scheduleDemoTap(now) {
+    if (!DEMO || state.phase !== 'play') return;
+    if (demoScheduled) return;
+    if (demoScriptIdx >= demoScript.length) return;
+    demoScheduled = true;
+    var waitIdx = Math.min(demoScriptIdx, demoWaits.length - 1);
+    var wait = demoWaits[waitIdx];
+    // fire tap after wait ms
+    setTimeout(function () {
+      demoScheduled = false;
+      if (state.phase !== 'play') return;
+      // determine if we should fire on or near beat
+      var entry = demoScript[demoScriptIdx];
+      demoScriptIdx++;
+      var fireNow = performance.now();
+      // simulate a tap — register it
+      var interval = beatInterval();
+      var target;
+      if (entry.perfect) {
+        target = state.lastBeatTime + interval * entry.beat;
+      } else {
+        // slightly off — pick halfway between good and miss
+        target = state.lastBeatTime + interval * (GOOD_WIN + entry.beat * 0.4);
+      }
+      // just call registerTap with current time (good enough for demo feel)
+      registerTap(fireNow);
+      scheduleDemoTap(fireNow);
+    }, wait);
+  }
+
+  // Bot autopilot
+  var botRunsDone = 0;
+  var botNextTapTime = -1;
+  var BOT_MISS_RATE = 0.28; // fraction of taps that are intentional misses
+
+  function botTick(now) {
+    if (!BOT || state.phase !== 'play') return;
+    if (botNextTapTime < 0) {
+      botNextTapTime = state.nextBeatTime - beatInterval() * 0.05 + (rng() - 0.5) * beatInterval() * 0.3;
+    }
+    if (now >= botNextTapTime) {
+      registerTap(now);
+      var interval = beatInterval();
+      // schedule next tap
+      botNextTapTime = state.nextBeatTime + (rng() - 0.5) * interval * 0.3;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Render helpers
+  // ------------------------------------------------------------------
+  function drawDot(cx, x, y, radius, pulse, hitFlash, color) {
+    // outer ring (beat pulse)
+    var ringR = radius * (1 + pulse * 0.35);
+    cx.save();
+    cx.globalAlpha = 0.3 * (1 - pulse);
+    cx.strokeStyle = color;
+    cx.lineWidth = 3;
+    cx.beginPath();
+    cx.arc(x, y, ringR, 0, Math.PI * 2);
+    cx.stroke();
+    cx.restore();
+
+    // glow
+    var g = cx.createRadialGradient(x, y, 0, x, y, radius * 1.5);
+    g.addColorStop(0, color);
+    g.addColorStop(1, 'transparent');
+    cx.save();
+    cx.globalAlpha = 0.18 + hitFlash * 0.35;
+    cx.fillStyle = g;
+    cx.beginPath();
+    cx.arc(x, y, radius * 1.5, 0, Math.PI * 2);
+    cx.fill();
+    cx.restore();
+
+    // core
+    cx.save();
+    cx.globalAlpha = 0.9 + hitFlash * 0.1;
+    cx.fillStyle = color;
+    cx.beginPath();
+    cx.arc(x, y, radius, 0, Math.PI * 2);
+    cx.fill();
+    cx.restore();
+  }
+
+  function drawBeatTrack(cx, tempoType, bpm, beatPhase, color) {
+    // small beat indicators along bottom
+    var n = tempoType === 'double' ? 16 : tempoType === 'half' ? 4 : 8;
+    var spacing = (W - 60) / (n - 1);
+    var startX = 30;
+    var y = H - 80;
+    for (var i = 0; i < n; i++) {
+      var x = startX + i * spacing;
+      // which is the "current" beat
+      var frac = (beatPhase * (tempoType === 'double' ? 2 : 1)) % 1;
+      var lit = Math.abs(i / (n - 1) - frac) < 1 / n;
+      cx.save();
+      cx.globalAlpha = lit ? 1 : 0.2;
+      cx.fillStyle = color;
+      cx.beginPath();
+      cx.arc(x, y, lit ? 5 : 3, 0, Math.PI * 2);
+      cx.fill();
+      cx.restore();
+    }
+  }
+
+  function drawTempoBar(cx, tempoIdx, beatsInTempo, color) {
+    // progress bar for current tempo
+    var barW = W - 80;
+    var barH = 6;
+    var bx = 40, by = 60;
+    cx.save();
+    cx.globalAlpha = 0.2;
+    cx.fillStyle = '#fff';
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(bx, by, barW, barH, 3);
+    else cx.rect(bx, by, barW, barH);
+    cx.fill();
+    cx.globalAlpha = 1;
+    cx.fillStyle = color;
+    var fill = (beatsInTempo / TOTAL_BEATS_PER_TEMPO) * barW;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(bx, by, fill, barH, 3);
+    else cx.rect(bx, by, fill, barH);
+    cx.fill();
+    cx.restore();
+  }
+
+  // ------------------------------------------------------------------
+  // Main loop
+  // ------------------------------------------------------------------
+  var last = performance.now();
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    var dt = Math.min((now - last) / 16.667, 3);
+    last = now;
+
+    // advance beat clock
+    if (state.phase === 'play') {
+      // decay hit-stop, then advance sim
+      if (hitStop > 0) {
+        hitStop -= dt;
+      } else {
+        // check if a beat happened
+        while (now >= state.nextBeatTime) {
+          advanceBeat(now);
+          if (state.phase !== 'play') break;
+        }
+        // update beat phase (0..1 within current interval)
+        if (state.phase === 'play') {
+          var elapsed = now - state.lastBeatTime;
+          state.beatPhase = Math.min(elapsed / beatInterval(), 1);
+          state.dotPulse = Math.max(0, 1 - elapsed / (beatInterval() * 0.4));
+        }
+        // run autopilots
+        if (DEMO) scheduleDemoTap(now);
+        if (BOT)  botTick(now);
+      }
+    }
+
+    // decay dot hit flash
+    state.dotHit = Math.max(0, state.dotHit - dt * 0.08);
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+
+    var t = currentTempo ? currentTempo() : TEMPOS[0];
+    var tColor = (state.phase === 'play' || state.phase === 'flip') ? t.color : TEAL;
+
+    // background accent gradient
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.05)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    // === TITLE ===
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('TEMPO FLIP', W / 2, 300);
+      cx.fillStyle = TEAL;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse;
+      cx.fillText('TAP THE BEAT', W / 2, 346);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('tempo flips every 8 beats — keep up', W / 2, 376);
+    }
+
+    // === CHALLENGE CARD (demo beat 1) ===
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 15px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 295);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('24', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top streak", W / 2, 428);
+    }
+
+    // === FLIP CARD ===
+    if (state.phase === 'flip') {
+      var elapsed2 = now - state.flipAt;
+      var ease = Math.min(1, elapsed2 / 300);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      // dim bg
+      cx.fillStyle = 'rgba(11,13,18,0.65)';
+      cx.fillRect(0, 0, W, H);
+      // next tempo label
+      var nt = TEMPOS[state.tempoIdx];
+      cx.fillStyle = nt.color;
+      cx.font = '900 18px Menlo, monospace';
+      cx.fillText(nt.label, W / 2, 290);
+      cx.fillStyle = '#fff';
+      cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText(nt.name, W / 2, 350);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText(nt.bpm + ' BPM', W / 2, 388);
+      cx.globalAlpha = 1;
+    }
+
+    // === PLAY ===
+    if (state.phase === 'play') {
+      // tempo label top
+      cx.textAlign = 'center';
+      cx.fillStyle = tColor;
+      cx.font = '800 14px Menlo, monospace';
+      cx.fillText(t.label + ' — ' + t.name, W / 2, 36);
+
+      // beat progress bar
+      drawTempoBar(cx, state.tempoIdx, state.beatsInTempo, tColor);
+
+      // score
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 116);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 138);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare, W / 2, 162);
+      }
+
+      // miss indicators (3 = dead)
+      for (var mi = 0; mi < 3; mi++) {
+        cx.save();
+        cx.globalAlpha = mi < state.misses ? 1 : 0.2;
+        cx.fillStyle = VERM;
+        cx.beginPath();
+        cx.arc(W / 2 - 18 + mi * 18, 168, 5, 0, Math.PI * 2);
+        cx.fill();
+        cx.restore();
+      }
+
+      // CENTER DOT — the main tap target
+      var dotY = H / 2 + 30;
+      var dotRadius = 40 + state.streak * 0.8;
+      if (dotRadius > 70) dotRadius = 70;
+      drawDot(cx, W / 2, dotY, dotRadius, state.dotPulse, state.dotHit, tColor);
+
+      // beat type indicator below dot
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '700 12px Menlo, monospace';
+      var hint;
+      if (t.type === 'beat')    hint = 'TAP  ON  THE  FLASH';
+      else if (t.type === 'double') hint = 'TAP  TWICE  AS  FAST';
+      else if (t.type === 'half')   hint = 'TAP  EVERY  OTHER  BEAT';
+      else                          hint = 'TAP  BETWEEN  THE  BEATS';
+      cx.fillText(hint, W / 2, dotY + dotRadius + 30);
+
+      // beat track (bottom)
+      drawBeatTrack(cx, t.type, t.bpm, state.beatPhase, tColor);
+
+      // streak display
+      if (state.streak > 1) {
+        cx.textAlign = 'center';
+        var streakScale = 1 + Math.min(state.streak / 20, 0.6);
+        var streakAlpha = Math.min(1, 0.5 + state.streak * 0.04);
+        cx.save();
+        cx.globalAlpha = streakAlpha;
+        cx.fillStyle = tColor;
+        cx.font = '900 ' + Math.round(22 * streakScale) + 'px -apple-system, Helvetica, Arial';
+        cx.fillText('×' + state.streak, W / 2, dotY - dotRadius - 20);
+        cx.restore();
+      }
+    }
+
+    // === GAME OVER ===
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+
+      var crackTempo = TEMPOS[Math.min(state.tempoIdx, TEMPOS.length - 1)];
+      cx.fillStyle = VERM;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('CRACKED.', W / 2, 296);
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('at ' + crackTempo.label + ' — ' + crackTempo.name, W / 2, 328);
+      cx.fillStyle = '#fff';
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' hits', W / 2, 366);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 402);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 424);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 290);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 460);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD;
+        cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill();
+        cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W / 2, SHARE_R.y + 30
+        );
+      }
+    }
+
+    // === DEMO CTA ===
+    if (state.phase === 'cta') {
+      var t2 = (now - state.ctaAt) / 1000;
+      var ease2 = Math.min(1, t2 * 2.4);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease2) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease2;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('TEMPO FLIP', W / 2, 298);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('he cracked at tempo ' + (TEMPOS[Math.min(state.tempoIdx, TEMPOS.length - 1)].label.split(' ')[1]) + '. beat it.', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 250);
+      cx.fillStyle = VERM;
+      cx.globalAlpha = ease2 * p3;
+      cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 24), W / 2, 408);
+      cx.globalAlpha = ease2;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 444);
+      cx.globalAlpha = 1;
+    }
+
+    // === FLASHES ===
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 230 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // === MUTE (human only) ===
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

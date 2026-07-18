@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Stack Spell — Tilt</title>
+<!--
+  LOOP / attention-architecture — Stack Spell
+  Mechanic: tap to stack letter-blocks; each block reveals a letter of a hidden word
+            that answers the prompt shown at the top. Land the final letter → big reveal.
+  Circuits: 01-rpe (variable reward per placement), 08-investment (building toward a word),
+            06-zeigarnik (one more letter, almost there).
+  Modes:
+    ?demo=1&seed=7        mirror-neuron clip — challenge card → tense play → near-fail → fail → CTA
+    ?bot=1&runs=N&seed=5  imperfect autoplay N runs → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'stack-spell';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err')  || 14;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var BLOCK_H = 44, BASE_W = 240, PERFECT_PX = 8, NEAR_MISS_R = 0.25;
+
+  // Word puzzles: each entry has a prompt and the hidden answer
+  var PUZZLES = [
+    { prompt: 'What people call you when you go viral', word: 'FAMOUS' },
+    { prompt: 'What you lose when you doomscroll at 2am', word: 'SLEEP' },
+    { prompt: 'The feeling after posting with no likes', word: 'REGRET' },
+    { prompt: 'What every algorithm wants from you', word: 'ATTENTION' },
+    { prompt: 'What the FYP gives you at 3am', word: 'CONTENT' },
+    { prompt: 'What goes up when you go viral', word: 'FOLLOWERS' },
+    { prompt: 'What you feel before hitting post', word: 'ANXIOUS' },
+    { prompt: 'What this app steals every night', word: 'HOURS' },
+    { prompt: 'What every creator wants to go', word: 'VIRAL' },
+    { prompt: 'What you tap when you see this', word: 'LIKE' },
+    { prompt: 'What a repost gives your ego', word: 'BOOST' },
+    { prompt: 'What the comments section always has', word: 'DRAMA' },
+    { prompt: 'What you build tap by tap', word: 'WORDS' },
+    { prompt: 'The move that beats the algorithm', word: 'POSTING' },
+    { prompt: 'What this tower is spelling', word: 'ANSWER' }
+  ];
+
+  var state, flashes, fallers, cam, runStartTs, best = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  try { best = +localStorage.getItem('ss_best') || 0; } catch (_) {}
+
+  var puzzle = null, revealedCount = 0, wordRevealDone = false;
+  var revealFlash = null; // for final word reveal animation
+
+  function pickPuzzle() {
+    var idx = Math.floor(rng() * PUZZLES.length);
+    return PUZZLES[idx];
+  }
+
+  function newGame() {
+    rng = mulberry32(SEED); // reset RNG for determinism
+    puzzle = pickPuzzle();
+    state = {
+      phase: 'title',
+      stack: [{ x: W / 2, w: BASE_W, hue: 168, letter: '' }],
+      mover: null, dir: 1, speed: 2.2,
+      score: 0, combo: 0, overAt: 0
+    };
+    flashes = []; fallers = []; cam = 0; revealedCount = 0;
+    wordRevealDone = false; revealFlash = null; dareBeaten = false;
+
+    if (DEMO) {
+      prebuildDemoStack();
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function prebuildDemoStack() {
+    // Build a partial word tower — demo uses FAMOUS (6 letters), show 4 already placed
+    puzzle = PUZZLES[0]; // FAMOUS
+    var letters = puzzle.word.split('');
+    var x = W / 2;
+    var preCount = 4;
+    for (var i = 0; i < preCount; i++) {
+      var w = BASE_W - i * 18;
+      x += (rng() - 0.5) * 6;
+      state.stack.push({ x: x, w: Math.max(w, 80), hue: (168 + i * 22) % 360, letter: letters[i] });
+    }
+    revealedCount = preCount;
+    state.score = preCount;
+    cam = Math.max(0, (state.stack.length - 1) * BLOCK_H - 280);
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 8))));
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    spawnMover();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED, word: puzzle.word });
+  }
+
+  function currentLetter() {
+    var letters = puzzle.word.split('');
+    return revealedCount < letters.length ? letters[revealedCount] : '?';
+  }
+
+  function spawnMover() {
+    var top = state.stack[state.stack.length - 1];
+    var range = W / 2 + top.w / 2 - 4;
+    state.mover = {
+      x: W / 2 - range, w: top.w, range: range,
+      hue: (top.hue + 22) % 360,
+      letter: currentLetter()
+    };
+    state.dir = 1;
+    state.speed = 2.2 + state.score * 0.08;
+  }
+
+  function drop() {
+    var m = state.mover, top = state.stack[state.stack.length - 1];
+    var offset = m.x - top.x;
+    var overlap = m.w - Math.abs(offset);
+    if (overlap <= 1) {
+      // MISS — game over, drop block falls away
+      fallers.push({ x: m.x, y: topY() - BLOCK_H, w: m.w, hue: m.hue,
+                     letter: m.letter, vy: -2, vr: (offset > 0 ? 1 : -1) * 0.04, r: 0 });
+      state.mover = null;
+      gameOver();
+      return;
+    }
+    var perfect = Math.abs(offset) <= PERFECT_PX;
+    var ratio = overlap / m.w;
+    // sound
+    if (window.J) {
+      if (perfect) J.perfect(state.combo + 1);
+      else if (ratio < NEAR_MISS_R) J.near();
+      else J.hit(state.score + 1);
+      J.tension(Math.min(state.score / 20, 1));
+    }
+    // juice
+    if (perfect) { hitStop = 5; zoom = 1.03; }
+    if (ratio < NEAR_MISS_R) shakeAmt = 5;
+
+    var nx, nw;
+    if (perfect) { nx = top.x; nw = m.w; state.combo++; }
+    else {
+      nw = overlap;
+      nx = (Math.max(m.x - m.w / 2, top.x - top.w / 2) +
+            Math.min(m.x + m.w / 2, top.x + top.w / 2)) / 2;
+      state.combo = 0;
+      var cutW = m.w - overlap;
+      var cutX = offset > 0 ? nx + nw / 2 + cutW / 2 : nx - nw / 2 - cutW / 2;
+      fallers.push({ x: cutX, y: topY() - BLOCK_H, w: cutW, hue: m.hue,
+                     letter: '', vy: -1.5, vr: (offset > 0 ? 1 : -1) * 0.05, r: 0 });
+    }
+
+    // place the letter block
+    var letter = m.letter;
+    state.stack.push({ x: nx, w: nw, hue: m.hue, letter: letter });
+    state.score++;
+    revealedCount++;
+
+    // dare tracking
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+
+    // flash feedback
+    if (perfect) flash('PERFECT', TEAL, 46);
+    else if (ratio < NEAR_MISS_R) {
+      flash('SO CLOSE!', VERM, 40);
+      if (window.LOOP) LOOP.emit('near_miss', { n: state.score, ratio: +ratio.toFixed(3) });
+    }
+
+    // check if word is complete → big reveal moment
+    var wordLen = puzzle.word.length;
+    if (revealedCount >= wordLen && !wordRevealDone) {
+      wordRevealDone = true;
+      revealFlash = { t: 0, word: puzzle.word };
+      if (window.J) { J.gold(); J.fanfare(); }
+      hitStop = 8; zoom = 1.06; shakeAmt = 3;
+      flash(puzzle.word + '!', GOLD, 52);
+      if (window.LOOP) LOOP.emit('word_revealed', { word: puzzle.word, score: state.score });
+      // after word complete, pick a new puzzle and continue
+      setTimeout(function () {
+        puzzle = PUZZLES[Math.floor(rng() * PUZZLES.length)];
+        revealedCount = 0;
+        wordRevealDone = false;
+        revealFlash = null;
+      }, 1800);
+    }
+
+    if (window.LOOP) LOOP.emit('letter_placed', { letter: letter, n: state.score, perfect: perfect, ratio: +ratio.toFixed(3) });
+    spawnMover();
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 9;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) { J.death(Math.min(0.3 + state.score / 30, 1)); if (newBest) setTimeout(function () { J.fanfare(); }, 450); }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('ss_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +(dur.toFixed(1)) });
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 800);
+    }
+  }
+
+  function resetRun() {
+    rng = mulberry32(SEED + botRunsDone * 31337);
+    puzzle = pickPuzzle();
+    state.stack = [{ x: W / 2, w: BASE_W, hue: 168, letter: '' }];
+    state.score = 0; state.combo = 0; fallers = []; cam = 0;
+    revealedCount = 0; wordRevealDone = false; revealFlash = null;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+  function topY() { return H - 180 - (state.stack.length - 1) * BLOCK_H + cam; }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 496, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play' && state.mover) { drop(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'letters' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  // demo arc: 4 placed letters already (prebuild). Next: tense near-sliver, recovery, then miss
+  // Script: offsets in px from aligned position (+ = right, - = left), 'sliver', 'miss'
+  var demoScript = [5, -6, 9, 'sliver', 3, -12, 'miss'];
+  var demoIdx = 0, demoWait = 32;
+  var demoWaits = [28, 35, 22, 52, 38, 45, 25];
+
+  var botRunsDone = 0, botTarget = null;
+
+  function autopilot() {
+    if (!state.mover || state.phase !== 'play') return;
+    var m = state.mover, top = state.stack[state.stack.length - 1];
+    var offset = m.x - top.x, v = state.speed * state.dir;
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      var want = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      if (want === 'miss') {
+        if (Math.abs(offset) > m.w + 5) { demoIdx++; demoWait = 18; drop(); }
+        return;
+      }
+      var target = want === 'sliver' ? m.w * 0.80 : want;
+      if (Math.abs(offset - target) <= Math.abs(v) * 0.65) {
+        drop();
+        demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 28;
+        demoIdx++;
+      }
+    } else if (BOT) {
+      if (botTarget === null) botTarget = gauss() * BOT_ERR;
+      if (Math.abs(offset - botTarget) <= Math.abs(v) * 0.65) { botTarget = null; drop(); }
+    }
+  }
+
+  // ---- render helpers ----
+  function blockFill(hue, y) {
+    var g = cx.createLinearGradient(0, y, 0, y + BLOCK_H);
+    g.addColorStop(0, 'hsl(' + hue + ',62%,60%)');
+    g.addColorStop(1, 'hsl(' + hue + ',66%,44%)');
+    return g;
+  }
+
+  function drawBlock(x, w, y, hue, letter, alpha) {
+    if (alpha !== undefined) cx.globalAlpha = alpha;
+    cx.fillStyle = blockFill(hue, y);
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(x - w / 2, y, w, BLOCK_H - 3, 4);
+    else cx.rect(x - w / 2, y, w, BLOCK_H - 3);
+    cx.fill();
+    if (letter) {
+      cx.fillStyle = 'rgba(0,0,0,0.55)';
+      cx.textAlign = 'center';
+      var fs = Math.min(22, w * 0.55);
+      cx.font = '900 ' + fs + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(letter, x, y + BLOCK_H * 0.68);
+    }
+    if (alpha !== undefined) cx.globalAlpha = 1;
+  }
+
+  function drawWordProgress() {
+    if (!puzzle) return;
+    var letters = puzzle.word.split('');
+    var total = letters.length;
+    var boxW = 34, gap = 6;
+    var totalW = total * (boxW + gap) - gap;
+    var sx = W / 2 - totalW / 2;
+    var sy = H - 80;
+    for (var i = 0; i < total; i++) {
+      var revealed = i < revealedCount;
+      var bx = sx + i * (boxW + gap);
+      cx.strokeStyle = revealed ? GOLD : 'rgba(255,255,255,0.2)';
+      cx.lineWidth = revealed ? 2 : 1.5;
+      cx.fillStyle = revealed ? 'rgba(242,177,52,0.18)' : 'rgba(255,255,255,0.05)';
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(bx, sy, boxW, boxW, 5);
+      else cx.rect(bx, sy, boxW, boxW);
+      cx.fill(); cx.stroke();
+      if (revealed) {
+        cx.fillStyle = GOLD;
+        cx.textAlign = 'center';
+        cx.font = '900 18px Menlo, monospace';
+        cx.fillText(letters[i], bx + boxW / 2, sy + boxW * 0.72);
+      }
+    }
+  }
+
+  var ctaAt = 0, challengeAt = 0;
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // camera follows tower
+    var want = Math.max(0, (state.stack.length - 1) * BLOCK_H - 280);
+    cam += (want - cam) * 0.08 * dt;
+
+    // mover ping-pong
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play' && state.mover) {
+      var m = state.mover;
+      m.x += state.speed * state.dir * dt;
+      if (m.x > W / 2 + m.range) { m.x = W / 2 + m.range; state.dir = -1; }
+      if (m.x < W / 2 - m.range) { m.x = W / 2 - m.range; state.dir = 1; }
+      autopilot();
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx2 = (Math.random() - 0.5) * shakeAmt, sy2 = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx2, H / 2 + sy2); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.84, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)'); bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // prompt area (top)
+    if (puzzle && (state.phase === 'play' || state.phase === 'over')) {
+      var promptText = puzzle.prompt;
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      // word wrap the prompt
+      var words = promptText.split(' ');
+      var line = '', lines = [];
+      for (var wi = 0; wi < words.length; wi++) {
+        var test = line + (line ? ' ' : '') + words[wi];
+        cx.font = '600 13px -apple-system, Helvetica, Arial';
+        if (cx.measureText(test).width > W - 60 && line) { lines.push(line); line = words[wi]; }
+        else line = test;
+      }
+      if (line) lines.push(line);
+      for (var li = 0; li < lines.length; li++) cx.fillText(lines[li], W / 2, 34 + li * 17);
+      // score
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 54px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 108);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 126);
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 148);
+      }
+    }
+
+    // divider line under prompt
+    if (state.phase === 'play') {
+      cx.strokeStyle = 'rgba(255,255,255,0.08)';
+      cx.lineWidth = 1;
+      cx.beginPath(); cx.moveTo(40, 160); cx.lineTo(W - 40, 160); cx.stroke();
+    }
+
+    // stacked blocks
+    for (var i = 0; i < state.stack.length; i++) {
+      var b = state.stack[i];
+      var by = H - 180 - i * BLOCK_H + cam;
+      if (by > H + BLOCK_H || by < 100) continue;
+      drawBlock(b.x, b.w, by, b.hue, b.letter);
+    }
+
+    // mover block
+    if (state.phase === 'play' && state.mover) {
+      var mv = state.mover, my = topY() - BLOCK_H;
+      drawBlock(mv.x, mv.w, my, mv.hue, mv.letter);
+      // bright outline on mover
+      cx.strokeStyle = 'rgba(255,255,255,0.4)'; cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(mv.x - mv.w / 2 + 0.5, my + 0.5, mv.w - 1, BLOCK_H - 4, 4);
+      else cx.rect(mv.x - mv.w / 2 + 0.5, my + 0.5, mv.w - 1, BLOCK_H - 4);
+      cx.stroke();
+    }
+
+    // falling pieces
+    for (var f = fallers.length - 1; f >= 0; f--) {
+      var p = fallers[f];
+      p.vy += 0.35 * dt; p.y += p.vy * dt; p.r += p.vr * dt;
+      cx.save();
+      cx.translate(p.x, p.y + BLOCK_H / 2); cx.rotate(p.r);
+      cx.globalAlpha = 0.85;
+      cx.fillStyle = 'hsl(' + p.hue + ',60%,48%)';
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(-p.w / 2, -BLOCK_H / 2, p.w, BLOCK_H - 3, 3);
+      else cx.rect(-p.w / 2, -BLOCK_H / 2, p.w, BLOCK_H - 3);
+      cx.fill();
+      if (p.letter) {
+        cx.fillStyle = 'rgba(0,0,0,0.45)';
+        cx.textAlign = 'center';
+        cx.font = '900 18px -apple-system, Helvetica, Arial';
+        cx.fillText(p.letter, 0, BLOCK_H * 0.2);
+      }
+      cx.restore(); cx.globalAlpha = 1;
+      if (p.y > H + 80) fallers.splice(f, 1);
+    }
+
+    // word progress bar at bottom
+    if (state.phase === 'play') drawWordProgress();
+
+    // word reveal flash animation
+    if (revealFlash) {
+      revealFlash.t += dt;
+      var rf = revealFlash;
+      var rfa = Math.max(0, 1 - rf.t / 70);
+      var rfScale = 1 + rf.t * 0.015;
+      cx.save();
+      cx.translate(W / 2, H / 2);
+      cx.scale(rfScale, rfScale);
+      cx.globalAlpha = rfa * 0.9;
+      cx.fillStyle = GOLD;
+      cx.textAlign = 'center';
+      cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText(rf.word, 0, -20);
+      cx.globalAlpha = rfa * 0.5;
+      cx.fillStyle = '#fff';
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('YOU SPELLED IT', 0, 20);
+      cx.restore();
+      cx.globalAlpha = 1;
+      if (rf.t > 70) { revealFlash = null; }
+    }
+
+    // floating flash texts
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 42);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 250 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(k, 1);
+    }
+
+    // title screen
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('STACK SPELL', W / 2, 280);
+      cx.fillStyle = TEAL; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to add each letter', W / 2, 315);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('build the word. don\'t drop it.', W / 2, 342);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 390); cx.globalAlpha = 1;
+    }
+
+    // challenge card (demo beat 1)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('11', W / 2, 408);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 438);
+    }
+
+    // game over card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      // partial word reveal teaser
+      if (puzzle && revealedCount < puzzle.word.length) {
+        cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+        cx.fillText('so close to spelling...', W / 2, 262);
+        var pLetters = puzzle.word.split('');
+        var pTotal = pLetters.length;
+        var pBoxW = 30, pGap = 5;
+        var pTotalW = pTotal * (pBoxW + pGap) - pGap;
+        var psx = W / 2 - pTotalW / 2, psy = 272;
+        for (var pi = 0; pi < pTotal; pi++) {
+          var pRevealed = pi < revealedCount;
+          var pbx = psx + pi * (pBoxW + pGap);
+          cx.fillStyle = pRevealed ? 'rgba(242,177,52,0.3)' : 'rgba(255,255,255,0.05)';
+          cx.strokeStyle = pRevealed ? GOLD : 'rgba(255,255,255,0.12)';
+          cx.lineWidth = 1.5;
+          cx.beginPath();
+          if (cx.roundRect) cx.roundRect(pbx, psy, pBoxW, pBoxW, 4);
+          else cx.rect(pbx, psy, pBoxW, pBoxW);
+          cx.fill(); cx.stroke();
+          if (pRevealed) {
+            cx.fillStyle = GOLD; cx.textAlign = 'center';
+            cx.font = '900 16px Menlo, monospace';
+            cx.fillText(pLetters[pi], pbx + pBoxW / 2, psy + pBoxW * 0.72);
+          }
+        }
+      }
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('DROPPED IT.', W / 2, 346);
+      cx.fillStyle = '#fff'; cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' letters', W / 2, 384);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 422);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 442);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — SPELL ANOTHER', W / 2, 472); cx.globalAlpha = 1;
+        // share zone
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t2 = (now - ctaAt) / 1000, ease = Math.min(1, t2 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('STACK SPELL', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they spelled ' + (window.__demoScore || 11) + '. can you?', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 11), W / 2, 408);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.globalAlpha = 0.5; cx.textAlign = 'center';
+      cx.font = '16px -apple-system, Helvetica, Arial'; cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

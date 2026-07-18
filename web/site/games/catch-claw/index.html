@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Catch Claw — Tilt</title>
+<!--
+  LOOP / attention-architecture — Catch Claw
+  Circuits: 01-rpe (variable reward per catch), 04-loss (prizes fall faster),
+            06-zeigarnik (one more grab).
+  Conditioned path: the grab/catch gesture from unboxing videos.
+  Modes:
+    ?demo=1&seed=7        mirror-neuron arc clip, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'catch-claw';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  var CLAW_X      = W / 2;        // claw hangs centered
+  var CATCH_ZONE  = 28;           // ±px window for a catch (full = perfect)
+  var PERFECT_ZONE = 8;           // ±px for perfect catch
+  var PRIZE_W     = 56, PRIZE_H = 44;
+  var CLAW_REST_Y = 100;          // claw head rests here
+  var CLAW_CATCH_Y = H - 160;     // catch zone center Y
+  var CLAW_SPEED  = 320;          // px/s extend speed
+
+  // ---- state ----
+  var phase, score, combo, catches, runStartTs, overAt, ctaAt, best, dareBeaten;
+  var hitStop, zoom, shakeAmt, challengeAt;
+  var clawY, clawExtending, clawRetracting, clawHeld;
+  var prize;        // { y, vy, color, shape, caught, missed }
+  var flashes;
+  var botRunsDone, botActed;
+
+  try { best = +localStorage.getItem('cc_best') || 0; } catch (_) { best = 0; }
+
+  // prize shapes: 0=box, 1=star, 2=diamond, 3=sphere
+  var PRIZE_COLORS = [VERM, TEAL, GOLD, '#a78bfa', '#34d399'];
+
+  function newGame() {
+    phase = DEMO ? 'challenge' : (BOT ? 'play' : 'title');
+    score = 0; combo = 0; catches = 0;
+    dareBeaten = false; hitStop = 0; zoom = 1; shakeAmt = 0;
+    clawY = CLAW_REST_Y; clawExtending = false; clawRetracting = false; clawHeld = false;
+    flashes = []; prize = null;
+    botRunsDone = 0; botActed = false;
+
+    if (DEMO) {
+      challengeAt = performance.now();
+      demoIdx = 0; demoStep = 'wait'; demoTimer = 0;
+      setTimeout(startRun, 1250);
+    } else if (BOT) {
+      startRun();
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    score = 0; combo = 0; catches = 0;
+    clawY = CLAW_REST_Y; clawExtending = false; clawRetracting = false; clawHeld = false;
+    runStartTs = Date.now();
+    spawnPrize();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function prizeFallSpeed() {
+    // base 90, +15 per catch, max 320
+    return Math.min(320, 90 + catches * 15);
+  }
+
+  function spawnPrize() {
+    var color = PRIZE_COLORS[Math.floor(rng() * PRIZE_COLORS.length)];
+    var shape = Math.floor(rng() * 4);
+    prize = {
+      y: -PRIZE_H,
+      vy: prizeFallSpeed(),
+      color: color,
+      shape: shape,
+      caught: false,
+      missed: false,
+      gold: (rng() < 0.12)   // 12% chance gold prize
+    };
+    if (prize.gold) prize.color = GOLD;
+  }
+
+  function extendClaw() {
+    if (clawExtending || clawRetracting || clawHeld) return;
+    clawExtending = true;
+  }
+
+  function checkCatch() {
+    if (!prize || prize.caught || prize.missed) return false;
+    // catch zone: prize center near CLAW_CATCH_Y when claw head is near prize
+    var prizeCenter = prize.y + PRIZE_H / 2;
+    var diff = Math.abs(clawY - prizeCenter);
+    if (diff <= CATCH_ZONE) {
+      var perfect = diff <= PERFECT_ZONE;
+      prize.caught = true;
+      catches++;
+      score++;
+      combo++;
+
+      var pts = perfect ? 2 : 1;
+      if (prize.gold) pts *= 3;
+
+      // sound
+      if (window.J) {
+        if (prize.gold) J.gold();
+        else if (perfect) J.perfect(combo);
+        else J.hit(combo);
+        J.tension(Math.min(catches / 12, 1));
+      }
+
+      // juice
+      if (perfect || prize.gold) { hitStop = 5; zoom = 1.03; }
+      if (perfect) { flash('PERFECT', TEAL, 44); shakeAmt = 3; }
+      if (prize.gold) { flash('GOLD ×3', GOLD, 46); shakeAmt = 5; }
+      else if (!perfect) { flash('+' + pts, 'rgba(255,255,255,0.9)', 36); }
+
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(score);
+      }
+
+      if (window.LOOP) LOOP.emit('catch', { n: catches, perfect: perfect, gold: !!prize.gold, combo: combo });
+
+      // start retracting
+      clawExtending = false;
+      clawRetracting = true;
+      return true;
+    }
+    return false;
+  }
+
+  function missedPrize() {
+    // prize fell past the claw catch zone without being caught
+    if (!prize || prize.caught || prize.missed) return;
+    prize.missed = true;
+    combo = 0;
+    shakeAmt = 7;
+    if (window.J) J.near();
+    flash('DROPPED!', VERM, 38);
+    if (window.LOOP) LOOP.emit('near_miss', { n: catches });
+
+    // speed already bumped; after 3 misses, game over
+    missCount++;
+    if (missCount >= 3) {
+      // retract the claw then die
+      clawExtending = false;
+      clawRetracting = true;
+      setTimeout(gameOver, 400);
+    } else {
+      // spawn next prize after short delay
+      setTimeout(spawnPrize, 500);
+    }
+  }
+
+  var missCount = 0;
+
+  function gameOver() {
+    if (phase === 'over' || phase === 'cta') return;
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + score / 20, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (newBest) { best = score; try { localStorage.setItem('cc_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 800);
+    }
+  }
+
+  function resetRun() {
+    phase = 'play';
+    score = 0; combo = 0; catches = 0; missCount = 0;
+    clawY = CLAW_REST_Y; clawExtending = false; clawRetracting = false; clawHeld = false;
+    prize = null; flashes = []; shakeAmt = 0; hitStop = 0; zoom = 1;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function pctTop(s) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 8))));
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') { extendClaw(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'catches' }); return;
+      }
+      missCount = 0;
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilot ----
+  // Demo arc: challenge card → near-perfect catches → near-fail (prize barely
+  // reaches claw) → recovery save → one more → real drop → score card → CTA
+  var demoIdx = 0, demoStep = 'wait', demoTimer = 0;
+  // Each entry: [offset from perfect timing in px, hesitation_frames]
+  // 'near_miss' = wait till prize almost out of zone then catch
+  // 'miss' = intentionally drop
+  var demoScript = [
+    { offset: 2, wait: 22 },   // clean catch
+    { offset: -5, wait: 18 },  // slight off
+    { offset: 11, wait: 28 },  // a bit late — hesitation
+    { offset: -14, wait: 35 }, // near edge — tension
+    { offset: 'near_miss', wait: 42 }, // near-fail: prize nearly past, last-instant grab
+    { offset: 3, wait: 20 },   // recovery — perfect save
+    { offset: 'miss', wait: 25 } // the real drop
+  ];
+  var demoCatchPending = false, demoWaitFrames = 0;
+
+  function demoAutopilot(dt) {
+    if (!prize || prize.caught || prize.missed) return;
+    if (clawExtending || clawRetracting) return;
+
+    var entry = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+    if (!entry) return;
+
+    // wait for hesitation
+    if (demoWaitFrames > 0) { demoWaitFrames -= dt; return; }
+
+    var prizeCenter = prize.y + PRIZE_H / 2;
+    var diffToZone = prizeCenter - CLAW_CATCH_Y; // positive = prize above catch zone center
+
+    if (entry.offset === 'miss') {
+      // let prize fall past claw entirely (past CLAW_CATCH_Y + CATCH_ZONE)
+      if (prizeCenter > CLAW_CATCH_Y + CATCH_ZONE + 10) {
+        // prize already past — it will auto-miss via update loop
+        demoIdx++;
+        demoWaitFrames = entry.wait;
+      }
+    } else if (entry.offset === 'near_miss') {
+      // wait until prize center is just about to leave the catch zone
+      var nearEdge = CLAW_CATCH_Y + CATCH_ZONE - 6;
+      if (prizeCenter >= nearEdge) {
+        extendClaw();
+        demoIdx++;
+        demoWaitFrames = entry.wait;
+      }
+    } else {
+      // catch when prize center is at CLAW_CATCH_Y + offset
+      var target = CLAW_CATCH_Y + (entry.offset || 0);
+      if (prizeCenter >= target) {
+        extendClaw();
+        demoIdx++;
+        demoWaitFrames = entry.wait;
+      }
+    }
+  }
+
+  // Bot: imperfect autopilot, random offset, K runs then stop
+  var botPassiveCount = 0;
+  function botAutopilot(dt) {
+    if (!prize || prize.caught || prize.missed) return;
+    if (clawExtending || clawRetracting) return;
+
+    // after 5 catches per run go passive to allow natural miss→game_over
+    if (catches >= 5) {
+      // let prize pass without catching
+      return;
+    }
+
+    var prizeCenter = prize.y + PRIZE_H / 2;
+    // aim with random offset
+    var err = (rng() - 0.5) * 40;
+    var target = CLAW_CATCH_Y + err;
+    if (prizeCenter >= target) {
+      extendClaw();
+    }
+  }
+
+  // ---- update ----
+  function update(dt) {
+    if (phase !== 'play') return;
+
+    // claw movement
+    var maxY = CLAW_CATCH_Y + CATCH_ZONE + 20;
+    if (clawExtending) {
+      clawY += CLAW_SPEED * dt / 60;
+      if (clawY >= maxY) { clawY = maxY; clawExtending = false; clawRetracting = true; }
+      // check catch on the way down
+      checkCatch();
+    } else if (clawRetracting) {
+      clawY -= CLAW_SPEED * 0.9 * dt / 60;
+      if (clawY <= CLAW_REST_Y) {
+        clawY = CLAW_REST_Y;
+        clawRetracting = false;
+        // if we caught a prize, spawn next one
+        if (prize && prize.caught) {
+          prize = null;
+          spawnPrize();
+        }
+      }
+    }
+
+    // prize falling
+    if (prize && !prize.caught && !prize.missed) {
+      prize.y += prize.vy * dt / 60;
+      // check miss: prize center below catch zone (fell past)
+      if (prize.y + PRIZE_H / 2 > CLAW_CATCH_Y + CATCH_ZONE + 2) {
+        // also check if claw was extended at the right moment
+        if (!clawExtending && !checkCatch()) {
+          missedPrize();
+        }
+      }
+      if (prize.y > H + 20) {
+        // fully off screen — ensure miss registered
+        if (!prize.missed && !prize.caught) missedPrize();
+        if (prize && prize.missed) prize = null;
+      }
+    }
+
+    // autopilot
+    if (DEMO) demoAutopilot(dt);
+    else if (BOT) botAutopilot(dt);
+  }
+
+  // ---- draw helpers ----
+  function drawPrize(x, y, shape, color, scale_) {
+    var s = scale_ || 1;
+    var w = PRIZE_W * s, h = PRIZE_H * s;
+    cx.save();
+    cx.translate(x, y + h / 2);
+    cx.fillStyle = color;
+    cx.strokeStyle = 'rgba(255,255,255,0.3)';
+    cx.lineWidth = 1.5;
+    if (shape === 0) {
+      // box with ribbon
+      cx.fillRect(-w / 2, -h / 2, w, h);
+      cx.strokeRect(-w / 2, -h / 2, w, h);
+      cx.strokeStyle = 'rgba(255,255,255,0.5)';
+      cx.lineWidth = 2;
+      cx.beginPath(); cx.moveTo(0, -h / 2); cx.lineTo(0, h / 2); cx.stroke();
+      cx.beginPath(); cx.moveTo(-w / 2, 0); cx.lineTo(w / 2, 0); cx.stroke();
+      // bow
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.beginPath(); cx.arc(0, -h / 2, 6 * s, 0, Math.PI * 2); cx.fill();
+    } else if (shape === 1) {
+      // star shape
+      cx.beginPath();
+      for (var i = 0; i < 5; i++) {
+        var a = Math.PI * 2 * i / 5 - Math.PI / 2;
+        var a2 = a + Math.PI / 5;
+        var r1 = w / 2, r2 = w / 4;
+        if (i === 0) cx.moveTo(Math.cos(a) * r1, Math.sin(a) * r1);
+        else cx.lineTo(Math.cos(a) * r1, Math.sin(a) * r1);
+        cx.lineTo(Math.cos(a2) * r2, Math.sin(a2) * r2);
+      }
+      cx.closePath(); cx.fill(); cx.stroke();
+    } else if (shape === 2) {
+      // diamond
+      cx.beginPath();
+      cx.moveTo(0, -h / 2);
+      cx.lineTo(w / 2, 0);
+      cx.lineTo(0, h / 2);
+      cx.lineTo(-w / 2, 0);
+      cx.closePath(); cx.fill(); cx.stroke();
+    } else {
+      // sphere / orb
+      var grd = cx.createRadialGradient(-w * 0.15, -h * 0.2, w * 0.05, 0, 0, w * 0.5);
+      grd.addColorStop(0, 'rgba(255,255,255,0.7)');
+      grd.addColorStop(0.4, color);
+      grd.addColorStop(1, 'rgba(0,0,0,0.4)');
+      cx.fillStyle = grd;
+      cx.beginPath(); cx.arc(0, 0, w / 2, 0, Math.PI * 2); cx.fill();
+    }
+    cx.restore();
+  }
+
+  function drawClaw(cy, extended) {
+    var armTop = 0;    // top of canvas where arm anchors
+    var clawColor = '#ccc';
+    var glowAmt = extended ? 0.6 : 0.2;
+
+    // arm (thin line from top center to claw head)
+    cx.save();
+    cx.strokeStyle = 'rgba(180,180,200,0.6)';
+    cx.lineWidth = 3;
+    cx.setLineDash([8, 6]);
+    cx.beginPath();
+    cx.moveTo(CLAW_X, armTop);
+    cx.lineTo(CLAW_X, cy);
+    cx.stroke();
+    cx.setLineDash([]);
+    cx.restore();
+
+    // glow halo at claw head
+    var grd = cx.createRadialGradient(CLAW_X, cy, 0, CLAW_X, cy, 30);
+    grd.addColorStop(0, 'rgba(46,197,182,' + glowAmt + ')');
+    grd.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = grd;
+    cx.beginPath(); cx.arc(CLAW_X, cy, 30, 0, Math.PI * 2); cx.fill();
+
+    // claw head
+    cx.save();
+    cx.translate(CLAW_X, cy);
+    // two claw prongs
+    var openAngle = extended ? 0.35 : 0.7; // close when extended
+    for (var side = -1; side <= 1; side += 2) {
+      cx.save();
+      cx.rotate(side * openAngle);
+      cx.strokeStyle = clawColor;
+      cx.lineWidth = 4;
+      cx.lineCap = 'round';
+      cx.beginPath();
+      cx.moveTo(0, 0);
+      cx.lineTo(side * 12, 22);
+      cx.stroke();
+      // tip
+      cx.fillStyle = TEAL;
+      cx.beginPath(); cx.arc(side * 12, 22, 4, 0, Math.PI * 2); cx.fill();
+      cx.restore();
+    }
+    // center pin
+    cx.fillStyle = '#ddd';
+    cx.beginPath(); cx.arc(0, 0, 5, 0, Math.PI * 2); cx.fill();
+    cx.restore();
+  }
+
+  function drawCatchZone(cy) {
+    // visual target band at catch zone
+    var zoneTop = cy - CATCH_ZONE, zoneBot = cy + CATCH_ZONE;
+    // outer guide lines
+    cx.strokeStyle = 'rgba(46,197,182,0.15)';
+    cx.lineWidth = 1;
+    cx.setLineDash([4, 8]);
+    cx.beginPath(); cx.moveTo(0, zoneTop); cx.lineTo(W, zoneTop); cx.stroke();
+    cx.beginPath(); cx.moveTo(0, zoneBot); cx.lineTo(W, zoneBot); cx.stroke();
+    cx.setLineDash([]);
+    // perfect band
+    cx.fillStyle = 'rgba(46,197,182,0.05)';
+    cx.fillRect(0, cy - PERFECT_ZONE, W, PERFECT_ZONE * 2);
+    // center tick
+    cx.strokeStyle = 'rgba(46,197,182,0.3)';
+    cx.lineWidth = 1.5;
+    cx.beginPath(); cx.moveTo(CLAW_X - 20, cy); cx.lineTo(CLAW_X + 20, cy); cx.stroke();
+  }
+
+  // ---- render ----
+  var last = performance.now(), ctaAtLocal = 0;
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // tick sim (respects hit-stop)
+    if (hitStop > 0) { hitStop -= dt; }
+    else { update(dt); }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.13 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- CHALLENGE card (demo beat 1) ----
+    if (phase === 'challenge') {
+      var elapsed = (now - challengeAt) / 1000;
+      var ease = Math.min(1, elapsed * 3);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('12', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's best grab run", W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- PLAY ----
+    if (phase === 'play' || (phase === 'over' && prize)) {
+      // catch zone guide
+      drawCatchZone(CLAW_CATCH_Y);
+
+      // prize
+      if (prize && !prize.caught) {
+        // pulse glow on gold
+        if (prize.gold) {
+          var pg = cx.createRadialGradient(CLAW_X, prize.y + PRIZE_H / 2, 0, CLAW_X, prize.y + PRIZE_H / 2, 48);
+          pg.addColorStop(0, 'rgba(242,177,52,0.35)');
+          pg.addColorStop(1, 'rgba(242,177,52,0)');
+          cx.fillStyle = pg;
+          cx.beginPath(); cx.arc(CLAW_X, prize.y + PRIZE_H / 2, 48, 0, Math.PI * 2); cx.fill();
+        }
+        drawPrize(CLAW_X, prize.y, prize.shape, prize.color, 1);
+      }
+
+      // claw (draw over prize so it looks like it grabs it)
+      drawClaw(clawY, clawExtending || (clawY > CLAW_REST_Y + 20));
+
+      // score
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 90);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 114);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : ('BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : '')), W / 2, 140);
+      }
+
+      // speed indicator (tension visual)
+      if (catches > 0) {
+        var speedPct = Math.min(catches / 12, 1);
+        var barW = 120, barH = 6;
+        var bx = W / 2 - barW / 2, by = H - 40;
+        cx.fillStyle = 'rgba(255,255,255,0.12)';
+        cx.fillRect(bx, by, barW, barH);
+        var barColor = speedPct > 0.7 ? VERM : speedPct > 0.4 ? GOLD : TEAL;
+        cx.fillStyle = barColor;
+        cx.fillRect(bx, by, barW * speedPct, barH);
+        cx.fillStyle = 'rgba(255,255,255,0.4)';
+        cx.font = '600 11px Menlo, monospace';
+        cx.textAlign = 'center';
+        cx.fillText('SPEED', W / 2, by - 5);
+      }
+
+      // miss lives (3 strikes)
+      var livesLeft = 3 - missCount;
+      for (var li = 0; li < 3; li++) {
+        cx.fillStyle = li < livesLeft ? VERM : 'rgba(255,255,255,0.15)';
+        cx.beginPath(); cx.arc(W / 2 - 24 + li * 24, H - 66, 7, 0, Math.PI * 2); cx.fill();
+      }
+    }
+
+    // ---- TITLE ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('CATCH CLAW', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to drop the claw', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.28)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('catch the prize at the right moment', W / 2, 325);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 390);
+      cx.globalAlpha = 1;
+      // draw claw at rest + example prize midway
+      drawCatchZone(CLAW_CATCH_Y);
+      var demoY = 300 + Math.sin(now / 800) * 40;
+      drawPrize(CLAW_X, demoY, 0, VERM, 0.9);
+      drawClaw(CLAW_REST_Y, false);
+    }
+
+    // ---- GAME OVER ----
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.65)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('DROPPED.', W / 2, 290);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' catches', W / 2, 335);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 380);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 402);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE GRAB', W / 2, 450);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- DEMO CTA ----
+    if (phase === 'cta') {
+      if (!ctaAtLocal) ctaAtLocal = now;
+      var t2 = (now - ctaAtLocal) / 1000;
+      var ease2 = Math.min(1, t2 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease2) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease2; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('CATCH CLAW', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they caught ' + (window.__demoScore || 8) + '. your hands faster?', W / 2, 332);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease2 * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 8), W / 2, 400);
+      cx.globalAlpha = ease2;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // floating reward text
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

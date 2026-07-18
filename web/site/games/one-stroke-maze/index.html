@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>One Stroke Maze — Tilt</title>
+<!--
+  LOOP / attention-architecture — One Stroke Maze
+  Circuits: 01-soft-rpe, 05-ease, 07-timing
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7     calm arc ~16s → soft CTA → window.__demoDone=true
+    ?bot=1&runs=N&seed= imperfect autopilot, N runs, window.__botDone=true
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'one-stroke-maze';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL2 = '#1aaf9f', SOFT = 'rgba(46,197,182,0.18)';
+
+  // ---- Maze generation ----
+  // Grid of cells, each cell = 50x50px in a 7x11 grid = 350x550, centered in canvas
+  var COLS = 7, ROWS = 11, CELL = 50;
+  var MX = (W - COLS * CELL) / 2;  // left offset = 27.5
+  var MY = 90;                       // top offset
+
+  // Each cell tracks which walls are open (N S E W)
+  // We carve a Eulerian path through the maze using DFS
+  function makeMaze() {
+    var maze = [];
+    var i, j;
+    for (i = 0; i < ROWS; i++) {
+      maze[i] = [];
+      for (j = 0; j < COLS; j++) {
+        maze[i][j] = { n: true, s: true, e: true, w: true, visited: false };
+      }
+    }
+    // DFS carve
+    function carve(r, c) {
+      maze[r][c].visited = true;
+      var dirs = [[0,1,'e','w'],[0,-1,'w','e'],[1,0,'s','n'],[-1,0,'n','s']];
+      // shuffle dirs using seeded rng
+      for (var k = dirs.length - 1; k > 0; k--) {
+        var idx = Math.floor(rng() * (k + 1));
+        var tmp = dirs[k]; dirs[k] = dirs[idx]; dirs[idx] = tmp;
+      }
+      for (var d = 0; d < dirs.length; d++) {
+        var nr = r + dirs[d][0], nc = c + dirs[d][1];
+        if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS && !maze[nr][nc].visited) {
+          maze[r][c][dirs[d][2]] = false;   // open wall
+          maze[nr][nc][dirs[d][3]] = false;
+          carve(nr, nc);
+        }
+      }
+    }
+    carve(0, 0);
+    return maze;
+  }
+
+  // Build the single-stroke path (Eulerian path through the maze graph)
+  // For a perfect tree maze the DFS trace IS a valid single-stroke if we
+  // include backtracking edges — but for a playable game we want a
+  // non-backtracking Hamiltonian-ish path. We'll use DFS order as the
+  // "correct" stroke and record the waypoints the player should trace.
+  function buildPath(maze) {
+    var path = [];
+    var visited = [];
+    var i;
+    for (i = 0; i < ROWS; i++) visited[i] = new Array(COLS).fill(false);
+    function dfs(r, c) {
+      visited[r][c] = true;
+      path.push([r, c]);
+      var dirs = [[1,0,'s','n'],[-1,0,'n','s'],[0,1,'e','w'],[0,-1,'w','e']];
+      for (var d = 0; d < dirs.length; d++) {
+        var nr = r + dirs[d][0], nc = c + dirs[d][1];
+        if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS &&
+            !visited[nr][nc] && !maze[r][c][dirs[d][2]]) {
+          dfs(nr, nc);
+          path.push([r, c]); // backtrack to current cell
+        }
+      }
+    }
+    dfs(0, 0);
+    return path;
+  }
+
+  // Convert cell [r,c] to canvas pixel (center of cell)
+  function cellPx(r, c) {
+    return { x: MX + c * CELL + CELL / 2, y: MY + r * CELL + CELL / 2 };
+  }
+
+  // Flatten consecutive duplicate waypoints
+  function dedupe(path) {
+    var out = [path[0]];
+    for (var i = 1; i < path.length; i++) {
+      if (path[i][0] !== out[out.length-1][0] || path[i][1] !== out[out.length-1][1]) {
+        out.push(path[i]);
+      }
+    }
+    return out;
+  }
+
+  // ---- Game state ----
+  var maze, pathWaypoints, currentMaze;
+  var state; // 'title' | 'play' | 'over' | 'cta'
+  var runStartTs = 0;
+  var score = 0, best = 0;
+  var strokePts = [];   // points drawn by player/bot this stroke
+  var waypointIdx = 0;  // how far along pathWaypoints the player has reached
+  var isDrawing = false;
+  var overAt = 0, ctaAt = 0;
+  var flashes = [];
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var botRunsDone = 0;
+  var strokeComplete = false; // player completed the stroke
+  var strokeFail = false;     // player lifted finger mid-stroke
+
+  try { best = +localStorage.getItem('osm_best') || 0; } catch (_) {}
+
+  function pctTop(s) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 60)))); }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size || 32, t: 0 }); }
+
+  function newMaze() {
+    rng = mulberry32(SEED + (botRunsDone || 0) * 997);
+    maze = makeMaze();
+    var rawPath = buildPath(maze);
+    pathWaypoints = dedupe(rawPath);
+    currentMaze = maze;
+    strokePts = [];
+    waypointIdx = 0;
+    strokeComplete = false;
+    strokeFail = false;
+    isDrawing = false;
+    flashes = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+  }
+
+  function startRun() {
+    newMaze();
+    state = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function computeScore() {
+    // Score = percentage of waypoints reached × 100, smoothness bonus
+    var reached = Math.min(waypointIdx, pathWaypoints.length - 1);
+    var pct = pathWaypoints.length > 1 ? reached / (pathWaypoints.length - 1) : 0;
+    var base = Math.round(pct * 100);
+    // Time bonus: faster = better, max 20 pts bonus
+    var elapsed = (Date.now() - runStartTs) / 1000;
+    var timeBonus = strokeComplete ? Math.max(0, 20 - Math.round(elapsed)) : 0;
+    return Math.min(120, base + timeBonus);
+  }
+
+  function gameOver(completed) {
+    strokeComplete = !!completed;
+    strokeFail = !completed;
+    score = computeScore();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = score > best;
+    state = 'over';
+    overAt = performance.now();
+    shakeAmt = completed ? 3 : 7;
+    if (completed) {
+      zoom = 1.04;
+      if (window.J) { J.calm(4); }
+      hitStop = 6;
+      flash('CLEAN RUN', TEAL, 38);
+    } else {
+      if (window.J) J.calm(1);
+      flash('LIFTED', 'rgba(255,255,255,0.7)', 32);
+    }
+    if (newBest && completed) {
+      if (window.J) J.calm(5);
+      try { localStorage.setItem('osm_best', String(score)); } catch (_) {}
+      best = score;
+      flash('BEST', GOLD, 40);
+    } else if (newBest) {
+      best = score;
+      try { localStorage.setItem('osm_best', String(score)); } catch (_) {}
+    }
+    if (DEMO) window.__demoScore = score;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        state = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(resetRun, 300);
+      }
+    }
+  }
+
+  function resetRun() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    newMaze();
+    state = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED + botRunsDone });
+    if (BOT || DEMO) initAutopilot();
+  }
+
+  // ---- Stroke logic ----
+  // The player traces the maze path by drawing on the canvas.
+  // We check if the current draw position is close to the next expected waypoint.
+  var SNAP_R = 28; // px to snap to next waypoint
+
+  function onStrokeStart(x, y) {
+    if (state !== 'play') return;
+    // Must start near the start cell (waypoint 0)
+    var start = cellPx(pathWaypoints[0][0], pathWaypoints[0][1]);
+    var dx = x - start.x, dy = y - start.y;
+    if (Math.sqrt(dx*dx + dy*dy) > SNAP_R * 1.5) return; // not at start
+    isDrawing = true;
+    strokePts = [{ x: x, y: y }];
+    waypointIdx = 0;
+  }
+
+  function onStrokeMove(x, y) {
+    if (!isDrawing || state !== 'play') return;
+    strokePts.push({ x: x, y: y });
+    // Check next waypoint
+    while (waypointIdx < pathWaypoints.length - 1) {
+      var next = cellPx(pathWaypoints[waypointIdx + 1][0], pathWaypoints[waypointIdx + 1][1]);
+      var dx = x - next.x, dy = y - next.y;
+      if (Math.sqrt(dx*dx + dy*dy) < SNAP_R) {
+        waypointIdx++;
+        var step = Math.floor(waypointIdx / pathWaypoints.length * 4) + 1;
+        if (window.J) J.calm(step);
+        // Near-miss: just 1 waypoint from end
+        if (waypointIdx === pathWaypoints.length - 2) {
+          flash('SO CLOSE', TEAL, 28);
+          if (window.LOOP) LOOP.emit('near_miss', { n: waypointIdx });
+        }
+        // Completed!
+        if (waypointIdx >= pathWaypoints.length - 1) {
+          isDrawing = false;
+          gameOver(true);
+          return;
+        }
+      } else {
+        break;
+      }
+    }
+  }
+
+  function onStrokeEnd(x, y) {
+    if (!isDrawing || state !== 'play') return;
+    isDrawing = false;
+    // If they lifted before reaching the end, it's a fail
+    if (waypointIdx < pathWaypoints.length - 1) {
+      gameOver(false);
+    }
+  }
+
+  // ---- Input (human) ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state === 'title') { startRun(); return; }
+    if (state === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'strokes' }); return;
+      }
+      resetRun(); return;
+    }
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale;
+    if (DEMO || BOT) return;
+    if (state === 'play') {
+      onStrokeStart(x, y);
+    } else {
+      tap(x, y);
+    }
+  });
+  cv.addEventListener('pointermove', function (e) {
+    if (DEMO || BOT) return;
+    if (!isDrawing) return;
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale;
+    onStrokeMove(x, y);
+  });
+  cv.addEventListener('pointerup', function (e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale;
+    if (state === 'play') {
+      onStrokeEnd(x, y);
+    } else {
+      tap(x, y);
+    }
+  });
+  cv.addEventListener('pointercancel', function () {
+    if (DEMO || BOT) return;
+    if (state === 'play') onStrokeEnd(0, 0);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') tap();
+  });
+
+  // ---- Demo / Bot autopilot ----
+  // Demo: scripted calm traversal of path, hesitations, then ends
+  // Bot: follows the path with random early lifts so it reaches game_over
+
+  var autoT = 0;       // accumulated time for autopilot
+  var autoIdx = 0;     // current waypoint being approached
+  var autoX = 0, autoY = 0; // current autopilot "finger" position
+  var autoSpeed = 0;   // px/frame
+  var autoStarted = false;
+  var autoWait = 0;    // frames to hesitate
+  var demoWaits = [20, 15, 30, 12, 25, 18, 35, 10, 22, 14, 28]; // hesitation beats
+  var demoWaitIdx = 0;
+  // Bot: how many waypoints to trace before lifting (causes game_over)
+  var botLiftAt = 0;
+
+  function initAutopilot() {
+    var start = cellPx(pathWaypoints[0][0], pathWaypoints[0][1]);
+    autoX = start.x; autoY = start.y;
+    autoIdx = 0;
+    autoStarted = false;
+    autoWait = DEMO ? 40 : 3; // initial pause before starting
+    autoSpeed = DEMO ? 3.5 : 18;
+    demoWaitIdx = 0;
+    // Bot: lift mid-way
+    if (BOT) {
+      // Lift somewhere between 30% and 70% of the path
+      var minLift = Math.floor(pathWaypoints.length * 0.3);
+      var maxLift = Math.floor(pathWaypoints.length * 0.7);
+      botLiftAt = minLift + Math.floor(rng() * (maxLift - minLift + 1));
+    }
+  }
+
+  function stepAutopilot(dt) {
+    if (state !== 'play') return;
+    if (autoWait > 0) { autoWait -= dt; return; }
+
+    if (!autoStarted) {
+      // "press" at start
+      var sp = cellPx(pathWaypoints[0][0], pathWaypoints[0][1]);
+      autoX = sp.x; autoY = sp.y;
+      onStrokeStart(autoX, autoY);
+      autoStarted = true;
+      autoIdx = 0;
+      return;
+    }
+
+    if (!isDrawing || waypointIdx >= pathWaypoints.length - 1) return;
+
+    // Bot: lift early to cause game_over
+    if (BOT && waypointIdx >= botLiftAt) {
+      onStrokeEnd(autoX, autoY);
+      return;
+    }
+
+    // Move toward next waypoint
+    var target = cellPx(pathWaypoints[Math.min(waypointIdx + 1, pathWaypoints.length - 1)][0],
+                        pathWaypoints[Math.min(waypointIdx + 1, pathWaypoints.length - 1)][1]);
+    var dx = target.x - autoX, dy = target.y - autoY;
+    var dist = Math.sqrt(dx*dx + dy*dy);
+    var spd = autoSpeed * dt;
+    if (dist <= spd + 1) {
+      autoX = target.x; autoY = target.y;
+      onStrokeMove(autoX, autoY);
+      // Demo hesitation
+      if (DEMO) {
+        autoWait = (demoWaits[demoWaitIdx % demoWaits.length] || 15);
+        demoWaitIdx++;
+      }
+    } else {
+      autoX += (dx / dist) * spd;
+      autoY += (dy / dist) * spd;
+      onStrokeMove(autoX, autoY);
+    }
+  }
+
+  // ---- Draw helpers ----
+  function drawMaze() {
+    var r, c, cell, px, py;
+    var lw = 2;
+    cx.strokeStyle = 'rgba(46,197,182,0.22)';
+    cx.lineWidth = lw;
+    cx.lineCap = 'round';
+    for (r = 0; r < ROWS; r++) {
+      for (c = 0; c < COLS; c++) {
+        cell = maze[r][c];
+        px = MX + c * CELL; py = MY + r * CELL;
+        cx.beginPath();
+        if (cell.n) { cx.moveTo(px, py); cx.lineTo(px + CELL, py); }
+        cx.stroke();
+        cx.beginPath();
+        if (cell.s) { cx.moveTo(px, py + CELL); cx.lineTo(px + CELL, py + CELL); }
+        cx.stroke();
+        cx.beginPath();
+        if (cell.w) { cx.moveTo(px, py); cx.lineTo(px, py + CELL); }
+        cx.stroke();
+        cx.beginPath();
+        if (cell.e) { cx.moveTo(px + CELL, py); cx.lineTo(px + CELL, py + CELL); }
+        cx.stroke();
+      }
+    }
+    // Draw outer border
+    cx.strokeStyle = 'rgba(46,197,182,0.5)';
+    cx.lineWidth = 2;
+    cx.strokeRect(MX, MY, COLS * CELL, ROWS * CELL);
+  }
+
+  function drawPath() {
+    if (waypointIdx < 1) return;
+    // Draw reached portion
+    cx.beginPath();
+    var p0 = cellPx(pathWaypoints[0][0], pathWaypoints[0][1]);
+    cx.moveTo(p0.x, p0.y);
+    for (var i = 1; i <= waypointIdx && i < pathWaypoints.length; i++) {
+      var p = cellPx(pathWaypoints[i][0], pathWaypoints[i][1]);
+      cx.lineTo(p.x, p.y);
+    }
+    var prog = waypointIdx / (pathWaypoints.length - 1);
+    cx.strokeStyle = strokeComplete
+      ? TEAL
+      : 'rgba(' + Math.round(46 + prog * 200) + ',' + Math.round(197 - prog * 60) + ',182,0.9)';
+    cx.lineWidth = 3.5;
+    cx.lineCap = 'round';
+    cx.lineJoin = 'round';
+    cx.stroke();
+  }
+
+  function drawStrokePath() {
+    if (strokePts.length < 2) return;
+    cx.beginPath();
+    cx.moveTo(strokePts[0].x, strokePts[0].y);
+    for (var i = 1; i < strokePts.length; i++) {
+      cx.lineTo(strokePts[i].x, strokePts[i].y);
+    }
+    var prog = waypointIdx / (pathWaypoints.length - 1);
+    cx.strokeStyle = 'rgba(46,197,182,' + (0.35 + prog * 0.4) + ')';
+    cx.lineWidth = 2;
+    cx.lineCap = 'round';
+    cx.lineJoin = 'round';
+    cx.stroke();
+  }
+
+  function drawStartDot() {
+    var sp = cellPx(pathWaypoints[0][0], pathWaypoints[0][1]);
+    var ep = cellPx(pathWaypoints[pathWaypoints.length - 1][0], pathWaypoints[pathWaypoints.length - 1][1]);
+    // Start: teal ring
+    cx.beginPath(); cx.arc(sp.x, sp.y, 10, 0, Math.PI * 2);
+    cx.fillStyle = 'rgba(46,197,182,0.25)'; cx.fill();
+    cx.strokeStyle = TEAL; cx.lineWidth = 2; cx.stroke();
+    // End: gold dot
+    cx.beginPath(); cx.arc(ep.x, ep.y, 8, 0, Math.PI * 2);
+    cx.fillStyle = 'rgba(242,177,52,0.2)'; cx.fill();
+    cx.strokeStyle = GOLD; cx.lineWidth = 2; cx.stroke();
+  }
+
+  function drawProgress() {
+    var prog = pathWaypoints.length > 1 ? waypointIdx / (pathWaypoints.length - 1) : 0;
+    var bw = 220, bh = 6, bx = W/2 - bw/2, by = MY + ROWS * CELL + 22;
+    cx.fillStyle = 'rgba(255,255,255,0.08)';
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(bx, by, bw, bh, 3); else cx.rect(bx, by, bw, bh);
+    cx.fill();
+    if (prog > 0) {
+      cx.fillStyle = TEAL;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(bx, by, bw * prog, bh, 3); else cx.rect(bx, by, bw * prog, bh);
+      cx.fill();
+    }
+  }
+
+  // ---- Main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Decay hit-stop
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      // Step autopilot
+      if ((DEMO || BOT) && state === 'play') stepAutopilot(dt);
+    }
+
+    // Juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W/2 + sx, H/2 + sy); cx.scale(zoom, zoom); cx.translate(-W/2, -H/2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // BG
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(11,13,18,0.0)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- TITLE ----
+    if (state === 'title') {
+      if (maze) drawMaze();
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '700 36px -apple-system, Helvetica, Arial';
+      cx.fillText('ONE STROKE', W/2, 44);
+      cx.fillStyle = TEAL;
+      cx.font = '300 36px -apple-system, Helvetica, Arial';
+      cx.fillText('MAZE', W/2, 78);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '400 14px -apple-system, Helvetica, Arial';
+      cx.fillText('trace it all. never lift.', W/2, MY + ROWS*CELL + 52);
+      var pulse = 0.55 + 0.45 * Math.sin(now / 500);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W/2, MY + ROWS*CELL + 78);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- PLAY ----
+    if (state === 'play') {
+      drawMaze();
+      drawStrokePath();
+      drawPath();
+      drawStartDot();
+      drawProgress();
+      // Header
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '400 13px Menlo, monospace';
+      cx.fillText('ONE STROKE', W/2, 36);
+      cx.fillStyle = 'rgba(255,255,255,0.25)';
+      cx.font = '400 11px Menlo, monospace';
+      cx.fillText('trace to the gold dot — never lift', W/2, 56);
+    }
+
+    // ---- OVER ----
+    if (state === 'over') {
+      drawMaze();
+      drawPath();
+      drawStartDot();
+      drawProgress();
+      // overlay
+      cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      var msg = strokeComplete ? 'COMPLETE' : 'STROKE BROKEN';
+      cx.fillStyle = strokeComplete ? TEAL : 'rgba(255,255,255,0.6)';
+      cx.font = '800 34px -apple-system, Helvetica, Arial';
+      cx.fillText(msg, W/2, 310);
+      cx.fillStyle = '#fff';
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' / 100', W/2, 352);
+      if (strokeComplete) {
+        cx.fillStyle = GOLD;
+        cx.font = '700 18px -apple-system, Helvetica, Arial';
+        cx.fillText('TOP ' + pctTop(score) + '% TODAY', W/2, 386);
+      }
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '400 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST  ' + best, W/2, 414);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 400);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '600 15px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — TRY AGAIN', W/2, 456);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '700 14px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W/2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- CTA (demo only) ----
+    if (state === 'cta') {
+      drawMaze();
+      drawPath();
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.80 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '700 38px -apple-system, Helvetica, Arial';
+      cx.fillText('ONE STROKE', W/2, 300);
+      cx.fillStyle = TEAL;
+      cx.font = '300 38px -apple-system, Helvetica, Arial';
+      cx.fillText('MAZE', W/2, 340);
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '400 16px -apple-system, Helvetica, Arial';
+      cx.fillText('can you trace it clean?', W/2, 376);
+      var p3 = 0.75 + 0.25 * Math.sin(now / 350);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL;
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W/2, 430);
+      cx.globalAlpha = ease * 0.6;
+      cx.fillStyle = '#fff';
+      cx.font = '400 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W/2, 460);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W/2, 250 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // ---- Mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- Init ----
+  if (DEMO || BOT) {
+    newMaze();
+    state = 'play';
+    runStartTs = Date.now();
+    initAutopilot();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  } else {
+    newMaze();
+    state = 'title';
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

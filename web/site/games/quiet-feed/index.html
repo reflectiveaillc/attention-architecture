@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Quiet Feed — Tilt</title>
+<!--
+  LOOP / attention-architecture — Quiet Feed (CALM engine, contract v2)
+  Conditioned path: the like/view comparison your thumb already knows from
+  Instagram/TikTok. A feed scrolls where every like & view count is blurred to
+  '???' and only resolves if you linger. The game is to scroll PAST each post
+  before the numbers resolve — letting the comparison stay unseen. The feed ends.
+  Circuits: 01 soft-RPE, 05 ease, 08 garden, 02 novelty.
+  Modes (query params):
+    ?demo=1&seed=7        scripted calm arc (settle → deepen → resolve → soft CTA),
+                          sets window.__demoDone + __demoScore
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'quiet-feed';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so feeds are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  // canvas + fit
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // calm palette — teal/soft tones, gold accent, no vermillion edge
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134', LAV = '#9d8cff', ROSE = '#e8a0b4';
+  var HUES = [168, 250, 330, 40, 200, 300, 150];   // soft, calm families
+
+  // ---- feed geometry / tuning (post-units) ----
+  var POST_GAP = 230, FOC_Y = 372, BAND = 0.4;     // focus band in post-units
+  var BASE_DRIFT = 0.0016;                          // posts/frame — slow; you must tap
+  var RESOLVE_FRAMES = 156;                         // ~2.6s in focus → resolves
+  var TAP_V0 = 0.20, TAP_DECAY = 0.82;              // one tap flings ~1.1 posts
+  var FEED_N = 22;                                  // human feed length
+  var DEMO_N = 11, BOT_N = 11;
+
+  // ---- state ----
+  var state, flashes, motes, runStartTs, best = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  try { best = +localStorage.getItem('qf_best') || 0; } catch (_) {}
+
+  function fmt(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+    return String(Math.round(n));
+  }
+
+  function makePost(i) {
+    var h = HUES[Math.floor(rng() * HUES.length)];
+    // skewed likes (most small, a few huge), views >> likes
+    var r = rng() * rng();
+    var likes = Math.round(12 + r * 84000);
+    var views = Math.round(likes * (3 + rng() * 24) + rng() * 4000);
+    var handles = ['dusk.field', 'marena.k', 'slow.tide', 'jono', 'aeri', 'paula.b', 'kit', 'sol.ow', 'nee', 'luca.r', 'mott', 'fele', 'beny', 'iora'];
+    return {
+      i: i, hue: h,
+      handle: '@' + handles[Math.floor(rng() * handles.length)],
+      likes: likes, views: views,
+      resolve: 0, looked: false, done: false,
+      sway: rng() * Math.PI * 2, phase: rng() * Math.PI * 2
+    };
+  }
+
+  function newGame() {
+    var n = DEMO ? DEMO_N : (BOT ? BOT_N : FEED_N);
+    state = {
+      phase: 'title',          // title | play | over | cta
+      n: n, posts: [], head: 0, headVel: 0,
+      score: 0, combo: 0, looked: 0, doneCount: 0, overAt: 0
+    };
+    for (var i = 0; i < n; i++) state.posts.push(makePost(i));
+    flashes = []; motes = []; dareBeaten = false;
+    if (DEMO) { startRun(); return; }
+    if (BOT) startRun();
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 6.5))));
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- the one gesture: a flick of the thumb to scroll past ----
+  function flick() {
+    state.headVel = TAP_V0;                       // impulse; decays each frame
+    if (window.J) J.tick && J.tick();
+  }
+
+  // resolve the centered post (linger too long → the comparison resolves)
+  function checkResolve() {
+    var ci = Math.round(state.head);
+    if (ci < 0 || ci >= state.posts.length) return;
+    var p = state.posts[ci];
+    if (p.done) return;
+    if (Math.abs(ci - state.head) >= BAND) return;
+    p.resolve += 1 / RESOLVE_FRAMES;
+    if (p.resolve >= 1 && !p.looked) {
+      p.looked = true; p.resolve = 1;
+      state.looked++; state.combo = 0;
+      shakeAmt = 2.2;
+      flash('you looked', ROSE, 20);
+      if (window.LOOP) LOOP.emit('lingered', { n: p.i });
+      if (window.J) J.calm(0);                    // a low, soft bell — no edge
+    }
+  }
+
+  // a post leaves the focus band upward → outcome
+  function checkPass() {
+    for (var i = 0; i < state.posts.length; i++) {
+      var p = state.posts[i];
+      if (p.done) continue;
+      if (state.head - p.i > BAND) {              // scrolled past
+        p.done = true; state.doneCount++;
+        if (!p.looked) {                          // kept moving → clean pass
+          state.score++; state.combo++;
+          var near = p.resolve > 0.78;            // almost looked = the sliver
+          if (window.J) J.calm(Math.min(state.combo, 9) + 2);
+          hitStop = near ? 3 : 1; zoom = near ? 1.02 : 1.008;
+          flash(near ? 'close.' : '+1', near ? GOLD : TEAL, near ? 30 : 26);
+          if (near && window.LOOP) LOOP.emit('near_miss', { n: p.i, resolve: +p.resolve.toFixed(2) });
+          if (window.LOOP) LOOP.emit('passed', { n: p.i, combo: state.combo });
+          if (state.score % 5 === 0) { hitStop = 4; zoom = 1.035; shakeAmt = 1.4;
+            flash(state.score + ' kept', TEAL, 30); }
+        }
+      }
+    }
+    if (state.doneCount >= state.posts.length) endFeed();
+  }
+
+  function endFeed() {
+    if (state.phase !== 'play') return;
+    state.phase = 'over'; state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('qf_best', String(best)); } catch (_) {} }
+    if (window.J) { J.calm(11); if (newBest) setTimeout(function () { J.fanfare && J.fanfare(); }, 480); }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), kept: state.score, of: state.n });
+    if (DEMO) setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+      setTimeout(function () { window.__demoDone = true; }, 3500); }, 2100);
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) window.__botDone = true;
+      else setTimeout(resetRun, 900);
+    }
+  }
+
+  function resetRun() {
+    var n = BOT ? BOT_N : FEED_N;
+    state.posts = []; for (var i = 0; i < n; i++) state.posts.push(makePost(i));
+    state.head = 0; state.headVel = 0; state.score = 0; state.combo = 0;
+    state.looked = 0; state.doneCount = 0; flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 488, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;                       // scripted modes ignore human taps
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { flick(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'kept' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  // demo arc: settle (3 clean flicks) → deepen (a linger — one post resolves, the
+  // human beat) → resolve (clean run to the end of the feed) → soft CTA.
+  // Hesitation lives in the gaps between flicks; never a robotic even cadence.
+  var demoTaps = [800, 1650, 2500, 5300, 6200, 7050, 7900, 8750, 9600, 10450, 11300];
+  var demoIdx = 0, demoStart = 0;
+  var botRunsDone = 0, botLastTap = 0, botNextInterval = 0, botLingerSkip = false;
+
+  function initAutopilot() {
+    if (DEMO) demoStart = performance.now();
+    if (BOT) { botLastTap = performance.now(); botNextInterval = 600 + Math.abs(gauss()) * 120; }
+  }
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    if (DEMO) {
+      var t = performance.now() - demoStart;
+      while (demoIdx < demoTaps.length && t >= demoTaps[demoIdx]) { flick(); demoIdx++; }
+    } else if (BOT) {
+      var now = performance.now();
+      if (now - botLastTap >= botNextInterval) {
+        if (botLingerSkip) {                       // imperfection: a hesitation
+          botLingerSkip = false;
+          botLastTap = now; botNextInterval = 420 + Math.abs(gauss()) * 120;
+        } else {
+          flick();
+          botLastTap = now;
+          botNextInterval = 600 + Math.abs(gauss()) * 130;
+          if (Math.abs(gauss()) > 1.4) botLingerSkip = true;   // ~12% of gaps linger
+        }
+      }
+    }
+  }
+
+  // ---- motes (ambient drift, calm vibe) ----
+  function spawnMote() {
+    motes.push({ x: rng() * W, y: H + 8 + rng() * 30, s: 1.5 + rng() * 3,
+      hue: HUES[Math.floor(rng() * HUES.length)], vy: 0.18 + rng() * 0.3, ph: rng() * 6.28 });
+  }
+
+  // ---- render ----
+  function cardGrad(hue, y) {
+    var g = cx.createLinearGradient(0, y, 0, y + 210);
+    g.addColorStop(0, 'hsl(' + hue + ',34%,16%)');
+    g.addColorStop(1, 'hsl(' + hue + ',40%,11%)');
+    return g;
+  }
+  function photoGrad(hue, y) {
+    var g = cx.createLinearGradient(0, y, W, y + 90);
+    g.addColorStop(0, 'hsl(' + hue + ',48%,52%)');
+    g.addColorStop(0.5, 'hsl(' + ((hue + 40) % 360) + ',40%,46%)');
+    g.addColorStop(1, 'hsl(' + ((hue + 80) % 360) + ',52%,40%)');
+    return g;
+  }
+
+  function drawPost(p, sy, now) {
+    var cardX = 24, cardW = W - 48, cardH = 210;
+    var top = sy - cardH / 2;
+    if (top > H || top + cardH < 0) return;
+
+    // how far past focus (0 = centered, + = above/scrolled-past, − = below)
+    var rel = state.head - p.i;
+    var inFocus = Math.abs(rel) < BAND && !p.done;
+    var fade = p.done ? Math.max(0, 1 - (rel - BAND) * 2.2) : 1;
+    cx.globalAlpha = Math.max(0, Math.min(1, fade));
+
+    // card body
+    var r = 18;
+    cx.fillStyle = cardGrad(p.hue, top);
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(cardX, top, cardW, cardH, r); else cx.rect(cardX, top, cardW, cardH);
+    cx.fill();
+    // top stripe
+    cx.fillStyle = 'hsl(' + p.hue + ',52%,58%)';
+    cx.globalAlpha *= 0.6;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(cardX, top, cardW, 5, [r, r, 0, 0]); else cx.rect(cardX, top, cardW, 5);
+    cx.fill();
+    cx.globalAlpha = Math.max(0, Math.min(1, fade));
+
+    // avatar
+    var ax = cardX + 26, ay = top + 30;
+    var ag = cx.createLinearGradient(ax - 16, ay - 16, ax + 16, ay + 16);
+    ag.addColorStop(0, 'hsl(' + p.hue + ',55%,62%)');
+    ag.addColorStop(1, 'hsl(' + ((p.hue + 50) % 360) + ',50%,48%)');
+    cx.fillStyle = ag; cx.beginPath(); cx.arc(ax, ay, 16, 0, 6.28); cx.fill();
+
+    // handle
+    cx.textAlign = 'left'; cx.textBaseline = 'middle';
+    cx.fillStyle = 'rgba(255,255,255,0.88)';
+    cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText(p.handle, cardX + 52, ay);
+    cx.fillStyle = 'rgba(255,255,255,0.32)';
+    cx.font = '600 11px -apple-system, Helvetica, Arial';
+    cx.fillText('2h', cardX + 52 + cx.measureText(p.handle).width + 8, ay);
+
+    // photo block (the content you didn't open)
+    var py = top + 56, pw = cardW - 28, px = cardX + 14;
+    cx.fillStyle = photoGrad(p.hue, py);
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(px, py, pw, 92, 10); else cx.rect(px, py, pw, 92);
+    cx.fill();
+    // a soft "sun" so it reads as a photo, not a swatch
+    cx.globalAlpha *= 0.5;
+    cx.fillStyle = 'rgba(255,255,255,0.16)';
+    cx.beginPath(); cx.arc(px + pw - 30, py + 26, 14, 0, 6.28); cx.fill();
+    cx.globalAlpha = Math.max(0, Math.min(1, fade));
+
+    // footer — the comparison, blurred to '???' and resolving only if you linger
+    var fy = top + 168;
+    cx.textAlign = 'left'; cx.textBaseline = 'middle';
+    // heart glyph
+    cx.fillStyle = 'rgba(232,160,180,0.85)'; cx.font = '15px -apple-system, Helvetica, Arial';
+    cx.fillText('♥', cardX + 16, fy);
+
+    var likesTxt = fmt(p.likes), viewsTxt = fmt(p.views);
+    // ??? layer fades out as it resolves; real numbers fade in
+    var res = p.resolve;
+    cx.font = '700 16px -apple-system, Helvetica, Arial';
+    var lw = cx.measureText(likesTxt).width;
+    cx.fillStyle = 'rgba(255,255,255,' + (0.62 * (1 - res)) + ')';
+    cx.fillText('???', cardX + 38, fy);
+    cx.fillStyle = 'rgba(255,255,255,' + (0.92 * res) + ')';
+    cx.fillText(likesTxt, cardX + 38, fy);
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('likes', cardX + 38 + Math.max(lw, 22) + 5, fy);
+
+    // views on the right
+    cx.textAlign = 'right';
+    cx.fillStyle = 'rgba(255,255,255,' + (0.5 * (1 - res)) + ')';
+    cx.font = '700 14px -apple-system, Helvetica, Arial';
+    cx.fillText('??? views', cardX + cardW - 16, fy);
+    cx.fillStyle = 'rgba(255,255,255,' + (0.55 * res) + ')';
+    cx.fillText(viewsTxt + ' views', cardX + cardW - 16, fy);
+
+    // resolve meter — the visible "stakes": a thin bar filling as it sharpens
+    if (inFocus && res > 0.02) {
+      var mw = 64, mx = cardX + cardW / 2 - mw / 2, my = top + cardH - 12;
+      cx.fillStyle = 'rgba(255,255,255,0.08)';
+      cx.fillRect(mx, my, mw, 3);
+      cx.fillStyle = res >= 1 ? ROSE : (res > 0.78 ? GOLD : TEAL);
+      cx.fillRect(mx, my, mw * Math.min(1, res), 3);
+    }
+    cx.globalAlpha = 1;
+  }
+
+  var ctaAt = 0, last = performance.now(), moteTimer = 0;
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // hit-stop decays EVERY frame — never gate autopilot on it without decaying
+    if (hitStop > 0) hitStop -= dt;
+    var effDt = hitStop > 0 ? 0 : dt;
+
+    // scroll: base drift + flick velocity (decays)
+    if (state.phase === 'play') {
+      state.head += BASE_DRIFT * effDt;
+      state.headVel *= Math.pow(TAP_DECAY, dt);
+      state.head += state.headVel * dt;
+      checkResolve();
+      checkPass();
+    }
+
+    autopilot();
+
+    // motes
+    moteTimer += effDt;
+    if (moteTimer > 90 + rng() * 140) { spawnMote(); moteTimer = 0; }
+    for (var m = motes.length - 1; m >= 0; m--) {
+      var mt = motes[m];
+      mt.y -= mt.vy * effDt; mt.ph += 0.02 * effDt;
+      if (mt.y < -20) motes.splice(m, 1);
+    }
+
+    // ---- juice transforms: save → shake/zoom → restore ----
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(0.6, 'rgba(157,140,255,0.035)');
+    bg.addColorStop(1, 'rgba(232,160,180,0.04)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // motes behind cards
+    for (var mi = 0; mi < motes.length; mi++) {
+      var mm = motes[mi];
+      cx.save(); cx.translate(mm.x + Math.sin(mm.ph + mm.y * 0.02) * 5, mm.y);
+      cx.globalAlpha = 0.3; cx.fillStyle = 'hsl(' + mm.hue + ',60%,70%)';
+      cx.beginPath(); cx.ellipse(0, 0, mm.s, mm.s * 0.55, 0, 0, 6.28); cx.fill();
+      cx.restore(); cx.globalAlpha = 1;
+    }
+
+    // focus band — two soft teal rails; the lingering zone
+    var bandPx = BAND * POST_GAP;
+    cx.strokeStyle = 'rgba(46,197,182,0.18)'; cx.lineWidth = 1; cx.setLineDash([4, 6]);
+    cx.beginPath(); cx.moveTo(20, FOC_Y - bandPx); cx.lineTo(W - 20, FOC_Y - bandPx); cx.stroke();
+    cx.beginPath(); cx.moveTo(20, FOC_Y + bandPx); cx.lineTo(W - 20, FOC_Y + bandPx); cx.stroke();
+    cx.setLineDash([]);
+    // center dim
+    var cg = cx.createLinearGradient(0, FOC_Y - bandPx, 0, FOC_Y + bandPx);
+    cg.addColorStop(0, 'rgba(46,197,182,0)'); cg.addColorStop(0.5, 'rgba(46,197,182,0.05)'); cg.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = cg; cx.fillRect(0, FOC_Y - bandPx, W, bandPx * 2);
+
+    // posts (draw centered at FOC_Y + (i-head)*POST_GAP)
+    if (state.phase !== 'title') {
+      for (var i = 0; i < state.posts.length; i++) {
+        var p = state.posts[i];
+        var sy = FOC_Y + (p.i - state.head) * POST_GAP;
+        drawPost(p, sy, now);
+      }
+    }
+
+    // score
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 60px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 86);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('kept moving  ·  best ' + best, W / 2, 110);
+      if (state.looked > 0) {
+        cx.fillStyle = 'rgba(232,160,180,0.55)';
+        cx.font = '600 12px -apple-system, Helvetica, Arial';
+        cx.fillText(state.looked + ' looked', W / 2, 128);
+      }
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, FOC_Y - 30 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('QUIET FEED', W / 2, 250);
+      cx.fillStyle = TEAL; cx.font = '700 17px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO FLICK PAST', W / 2, 300); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.42)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("don't let the numbers resolve.", W / 2, 326);
+      cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('the feed ends.', W / 2, 350);
+    }
+
+    // game over — the feed ended (calm resolve, not a death)
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = TEAL; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('the feed ended.', W / 2, 296);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' of ' + state.n + ' kept moving', W / 2, 342);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 388);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText(state.looked + ' slipped by — you looked', W / 2, 412);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ANOTHER FEED', W / 2, 460);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(46,197,182,0.14)';
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = TEAL; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ PASS IT ON', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card — soft invitation, no dare
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('QUIET FEED', W / 2, 296);
+      cx.fillStyle = 'rgba(255,255,255,0.76)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText((window.__demoScore || 0) + ' of ' + (DEMO ? DEMO_N : FEED_N) + ' kept moving. yours?', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 406);
+      cx.globalAlpha = ease;
+      cx.fillStyle = GOLD; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 438);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.textBaseline = 'middle';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + MUTE_R.h / 2);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  // ---- visibility game_over (calm checkpoint on tab-hide) ----
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden && state && state.phase === 'play' && window.LOOP) {
+      var dur = (Date.now() - runStartTs) / 1000;
+      LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), kept: state.score, of: state.n });
+      state.phase = 'over';
+    }
+  });
+
+  newGame();
+  if (DEMO || BOT) initAutopilot();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

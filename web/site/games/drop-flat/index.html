@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Drop Flat — Tilt</title>
+<!--
+  LOOP / attention-architecture — Drop Flat
+  Mechanic: spinning block falls; tap to lock rotation so it lands flat.
+  Angle error is the score — 0° = perfect. Falls get faster each attempt.
+  Circuits: 01-rpe, 05-ease, 04-loss.
+  Modes:
+    ?demo=1&seed=7   mirror-neuron video, sets window.__demoDone
+    ?bot=1&runs=N    imperfect autopilot, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'drop-flat';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = Math.max(1, +qs.get('runs') || 3);
+  var SEED = +qs.get('seed') || 42;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  var BLOCK_W = 120, BLOCK_H = 28;
+  var START_Y  = 80;
+  var GROUND_Y = H - 180;  // Y where block centre rests after landing
+  var PERFECT_DEG = 4;
+  var NEAR_DEG    = 18;
+  var BEST_KEY    = 'df_best';
+
+  // ---- phase names ----
+  // 'title' | 'challenge' | 'spin' | 'dropping' | 'over' | 'cta'
+  //   spin: block is spinning and falling, player can tap
+  //   dropping: player locked angle; block falls to ground; awaiting scorecard
+  //   over: scorecard shown
+
+  var phase, attempt, bestAngle, dareBeaten;
+  var bY, bAngle, bSpinRate, bFallSpeed;  // block state
+  var bLandAngle;                          // locked angle error (degrees)
+  var flashes, hitStop, shakeAmt, zoom;
+  var runStartTs, overAt, challengeAt, ctaAt;
+  var botRunsDone;
+  // autopilot flags (reset each run)
+  var apTriggered;
+  var demoIdx;
+  // bot autopilot target for this run
+  var botTargetDeg, botTrigFrac;
+
+  try {
+    bestAngle = parseFloat(localStorage.getItem(BEST_KEY));
+    if (isNaN(bestAngle) || bestAngle < 0) bestAngle = null;
+  } catch(_) {}
+
+  function newGame() {
+    attempt = 0; dareBeaten = false;
+    flashes = []; hitStop = 0; shakeAmt = 0; zoom = 1;
+    botRunsDone = 0; demoIdx = 0; apTriggered = false;
+    bY = START_Y; bAngle = 0; bLandAngle = null;
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(beginRun, 1250);
+    } else if (BOT) {
+      beginRun();
+    } else {
+      phase = 'title';
+    }
+  }
+
+  function beginRun() {
+    phase = 'spin';
+    runStartTs = Date.now();
+    apTriggered = false;
+    // pick bot target for this run
+    if (BOT) {
+      botTargetDeg = rng() < 0.4 ? rng() * 12 : 12 + rng() * 60;
+      botTrigFrac  = 0.35 + rng() * 0.45;
+    }
+    // spawn block
+    var spinRate  = 1.5 + attempt * 0.18 + rng() * 0.22;
+    var fallSpeed = 270 + attempt * 10;
+    bY         = START_Y;
+    bAngle     = rng() * Math.PI * 2;
+    bSpinRate  = spinRate;
+    bFallSpeed = fallSpeed;
+    bLandAngle = null;
+    if (window.LOOP) LOOP.emit('play_start', { attempt: attempt, seed: SEED });
+  }
+
+  // Player (or autopilot) locks the block's rotation
+  function lock() {
+    if (phase !== 'spin') return;
+    phase = 'dropping';
+    var a = bAngle % (Math.PI * 2);
+    if (a < 0) a += Math.PI * 2;
+    var d0   = Math.min(a, Math.PI * 2 - a);
+    var d180 = Math.abs(a - Math.PI);
+    bLandAngle = Math.min(d0, d180) * 180 / Math.PI;
+  }
+
+  // Block has visually hit the ground — resolve outcome
+  function land() {
+    if (phase !== 'dropping') return;
+    var err = bLandAngle;
+    attempt++;
+    var perfect = err <= PERFECT_DEG;
+    var near    = err <= NEAR_DEG && !perfect;
+    var isBest  = bestAngle === null || err < bestAngle;
+
+    if (window.J) {
+      if (perfect)   J.perfect(attempt);
+      else if (near) J.near();
+      else           J.hit(1);
+      J.tension(Math.min(attempt / 8, 1));
+    }
+
+    if (perfect) {
+      hitStop = 5; zoom = 1.03; shakeAmt = 2;
+      flash('PERFECT', TEAL, 50);
+      if (window.J && isBest && attempt > 1) J.gold();
+    } else if (near) {
+      shakeAmt = 4;
+      flash('SO CLOSE', VERM, 42);
+      if (window.LOOP) LOOP.emit('near_miss', { deg: +err.toFixed(1) });
+    } else {
+      shakeAmt = 3;
+    }
+
+    if (isBest) {
+      bestAngle = err;
+      try { localStorage.setItem(BEST_KEY, (+err.toFixed(1)).toString()); } catch(_) {}
+      if (!perfect) flash('NEW BEST!', GOLD, 38);
+    }
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && err < SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(+err.toFixed(1));
+    }
+
+    if (window.LOOP) LOOP.emit('land', { deg: +err.toFixed(1), attempt: attempt, perfect: perfect });
+
+    // go to over
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+
+    if (window.J) {
+      J.death(Math.min(0.2 + err / 90, 1));
+      if (perfect) setTimeout(function(){ if (window.J) J.fanfare(); }, 380);
+    }
+    shakeAmt = Math.max(shakeAmt, 4 + err / 15);
+
+    if (window.LOOP) LOOP.emit('game_over', { score: +err.toFixed(1), dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      window.__demoScore = +err.toFixed(1);
+      setTimeout(function(){
+        if (demoIdx < 3) {
+          // more demo runs
+          demoIdx++;
+          apTriggered = false;
+          if (window.LOOP) LOOP.emit('restart', {});
+          beginRun();
+        } else {
+          // final score card then CTA
+          phase = 'over';  // show score for 2.8s
+          setTimeout(function(){
+            phase = 'cta';
+            ctaAt = performance.now();
+            setTimeout(function(){ window.__demoDone = true; }, 3600);
+          }, 2800);
+        }
+      }, 600);
+    }
+
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function(){
+          apTriggered = false;
+          botTargetDeg = rng() < 0.4 ? rng() * 12 : 12 + rng() * 60;
+          botTrigFrac  = 0.35 + rng() * 0.45;
+          if (window.LOOP) LOOP.emit('restart', {});
+          beginRun();
+        }, 400);
+      }
+    }
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function pctTop(err) {
+    return Math.max(1, Math.min(99, Math.round(100 * (1 - Math.exp(-err / 28)))));
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { beginRun(); return; }
+    if (phase === 'spin') { lock(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: +(bLandAngle || 99).toFixed(1), unit: '°' });
+        return;
+      }
+      apTriggered = false;
+      if (window.LOOP) LOOP.emit('restart', {});
+      beginRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function(e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function(e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilots ----
+  // Demo: target sequence of angle errors; use hesitation via lock fractions
+  var demoTargets  = [12, 22, 4, 35];   // run 0..3 target errors
+  var demoLockAt   = [0.60, 0.72, 0.88, 0.50];
+  var demoTol      = [0.15, 0.10, 0.07, 0.22];  // fraction of 90° tolerance
+
+  function autopilot() {
+    if (apTriggered || phase !== 'spin') return;
+    var frac = Math.min(1, (bY - START_Y) / Math.max(1, GROUND_Y - BLOCK_H / 2 - START_Y));
+
+    if (DEMO) {
+      var idx = Math.min(demoIdx, demoTargets.length - 1);
+      if (frac < demoLockAt[idx] - 0.06) return;
+      var targetDeg = demoTargets[idx];
+      var tol = demoTol[idx];
+      var a = bAngle % (Math.PI * 2); if (a < 0) a += Math.PI * 2;
+      var curErr = Math.min(Math.min(a, Math.PI * 2 - a), Math.abs(a - Math.PI)) * 180 / Math.PI;
+      if (Math.abs(curErr - targetDeg) < tol * 90 || frac >= 0.94) {
+        apTriggered = true; lock();
+      }
+    } else if (BOT) {
+      if (frac < botTrigFrac - 0.06) return;
+      var a2 = bAngle % (Math.PI * 2); if (a2 < 0) a2 += Math.PI * 2;
+      var curErr2 = Math.min(Math.min(a2, Math.PI * 2 - a2), Math.abs(a2 - Math.PI)) * 180 / Math.PI;
+      if (Math.abs(curErr2 - botTargetDeg) < 0.15 * 90 || frac >= 0.94) {
+        apTriggered = true; lock();
+      }
+    }
+  }
+
+  // ---- draw helpers ----
+  function drawBlock(bx, by, angle, color, alpha) {
+    cx.save();
+    cx.globalAlpha = alpha != null ? alpha : 1;
+    cx.translate(bx, by);
+    cx.rotate(angle);
+    cx.fillStyle = color;
+    cx.fillRect(-BLOCK_W / 2, -BLOCK_H / 2, BLOCK_W, BLOCK_H);
+    cx.fillStyle = 'rgba(255,255,255,0.11)';
+    cx.fillRect(-BLOCK_W / 2, -BLOCK_H / 2, BLOCK_W, BLOCK_H / 3);
+    cx.strokeStyle = 'rgba(255,255,255,0.20)'; cx.lineWidth = 1.5;
+    cx.strokeRect(-BLOCK_W / 2 + 0.5, -BLOCK_H / 2 + 0.5, BLOCK_W - 1, BLOCK_H - 1);
+    cx.restore();
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // physics
+    if (hitStop > 0) {
+      hitStop -= dt;
+      // autopilot still ticks during hitstop for timing
+      autopilot();
+    } else {
+      if (phase === 'spin') {
+        bAngle += bSpinRate * dt * (Math.PI / 60);
+        bY     += bFallSpeed * dt / 60;
+        autopilot();
+        // if player never taps and block hits ground, force lock
+        if (bY >= GROUND_Y - BLOCK_H / 2) {
+          bY = GROUND_Y - BLOCK_H / 2;
+          apTriggered = true; lock();
+        }
+      }
+
+      if (phase === 'dropping') {
+        bY += bFallSpeed * 1.4 * dt / 60;
+        if (bY >= GROUND_Y - BLOCK_H / 2) {
+          bY = GROUND_Y - BLOCK_H / 2;
+          land();  // land() sets phase = 'over'
+        }
+      }
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bgG = cx.createLinearGradient(0, 0, 0, H);
+    bgG.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bgG.addColorStop(1, 'rgba(232,80,46,0.08)');
+    cx.fillStyle = bgG; cx.fillRect(0, 0, W, H);
+
+    // ground platform
+    cx.fillStyle = 'rgba(255,255,255,0.07)';
+    cx.fillRect(W / 2 - 90, GROUND_Y, 180, 6);
+    cx.fillStyle = 'rgba(46,197,182,0.22)';
+    cx.fillRect(W / 2 - 60, GROUND_Y, 120, 6);
+    cx.fillStyle = 'rgba(46,197,182,0.55)'; cx.font = '600 11px Menlo, monospace';
+    cx.textAlign = 'center';
+    cx.fillText('FLAT ZONE', W / 2, GROUND_Y + 18);
+
+    // fall guide
+    cx.strokeStyle = 'rgba(255,255,255,0.04)'; cx.lineWidth = 1;
+    cx.setLineDash([4, 8]);
+    cx.beginPath(); cx.moveTo(W / 2, START_Y + 24); cx.lineTo(W / 2, GROUND_Y); cx.stroke();
+    cx.setLineDash([]);
+
+    // block
+    if (phase === 'spin' || phase === 'dropping' || phase === 'over') {
+      var blockColor = TEAL;
+      if (bLandAngle !== null) {
+        blockColor = bLandAngle <= PERFECT_DEG ? TEAL : bLandAngle <= NEAR_DEG ? GOLD : VERM;
+      }
+      drawBlock(W / 2, bY, bAngle, blockColor, 1.0);
+
+      // spin trail
+      if (phase === 'spin') {
+        for (var tr = 1; tr <= 3; tr++) {
+          var ty = bY - bFallSpeed / 60 * tr * 1.4;
+          if (ty < START_Y) break;
+          drawBlock(W / 2, ty,
+            bAngle - bSpinRate * (Math.PI / 60) * tr * 0.5,
+            TEAL, 0.06 / tr);
+        }
+      }
+
+      // live angle ring during spin
+      if (phase === 'spin') {
+        var ringCx = W / 2, ringCy = H / 2 - 18, ringR = 40;
+        var a = bAngle % (Math.PI * 2); if (a < 0) a += Math.PI * 2;
+        var d0r   = Math.min(a, Math.PI * 2 - a);
+        var d180r = Math.abs(a - Math.PI);
+        var liveErr = Math.min(d0r, d180r) * 180 / Math.PI;
+        var ringFrac = 1 - liveErr / 90;
+        cx.save();
+        cx.globalAlpha = 0.38;
+        cx.strokeStyle = 'rgba(255,255,255,0.12)'; cx.lineWidth = 2;
+        cx.beginPath(); cx.arc(ringCx, ringCy, ringR, 0, Math.PI * 2); cx.stroke();
+        cx.strokeStyle = ringFrac > 0.8 ? TEAL : ringFrac > 0.5 ? GOLD : VERM;
+        cx.lineWidth = 3;
+        cx.beginPath(); cx.arc(ringCx, ringCy, ringR, -Math.PI / 2, -Math.PI / 2 + ringFrac * Math.PI * 2); cx.stroke();
+        cx.globalAlpha = 1;
+        cx.restore();
+      }
+
+      // locked angle readout during drop
+      if (phase === 'dropping' && bLandAngle !== null) {
+        cx.textAlign = 'center';
+        cx.fillStyle = bLandAngle <= PERFECT_DEG ? TEAL : bLandAngle <= NEAR_DEG ? GOLD : VERM;
+        cx.font = '900 40px -apple-system, Helvetica, Arial';
+        cx.fillText(bLandAngle.toFixed(1) + '°', W / 2, H / 2 - 40);
+        cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '600 12px Menlo, monospace';
+        cx.fillText('locked', W / 2, H / 2 - 18);
+      }
+    }
+
+    // HUD
+    if (phase === 'spin' || phase === 'dropping') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.42)'; cx.font = '600 12px Menlo, monospace';
+      cx.fillText('ATTEMPT ' + (attempt + 1), W / 2, 46);
+      if (bestAngle !== null) {
+        cx.fillStyle = 'rgba(255,255,255,0.25)'; cx.font = '600 12px Menlo, monospace';
+        cx.fillText('BEST  ' + bestAngle.toFixed(1) + '°', W / 2, 64);
+      }
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓'
+          : 'BEAT ' + SHARE.dare + '°' + (SHARE.by ? ' — dared by ' + SHARE.by : ''),
+          W / 2, 88);
+      }
+    }
+
+    // challenge card
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 15px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 292);
+      cx.fillStyle = GOLD; cx.font = '900 90px -apple-system, Helvetica, Arial';
+      cx.fillText('7.2°', W / 2, 402);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 432);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 42);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + Math.round(fl.size + fl.t * 0.35) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 232 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 48) flashes.splice(k, 1);
+    }
+
+    // title
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 52px -apple-system, Helvetica, Arial';
+      cx.fillText('DROP FLAT', W / 2, 268);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText("tap when it's flat", W / 2, 308);
+      cx.fillStyle = VERM;
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 360); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.22)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('0° is perfect. falls get faster.', W / 2, 392);
+    }
+
+    // score card (over)
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      var err = bLandAngle != null ? bLandAngle : 90;
+      var isPerfect = err <= PERFECT_DEG;
+      var isNear    = err <= NEAR_DEG;
+      cx.fillStyle = isPerfect ? TEAL : isNear ? GOLD : VERM;
+      cx.font = '900 82px -apple-system, Helvetica, Arial';
+      cx.fillText(err.toFixed(1) + '°', W / 2, 296);
+      cx.fillStyle = isPerfect ? TEAL : 'rgba(255,255,255,0.9)';
+      cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText(isPerfect ? 'FLAT.' : isNear ? 'SO CLOSE.' : 'OFF BY ' + err.toFixed(1) + '°', W / 2, 336);
+      var pt = pctTop(err);
+      cx.fillStyle = GOLD; cx.font = '900 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 376);
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('flatter than ' + (100 - pt) + '% of players', W / 2, 400);
+      if (!DEMO && !BOT) {
+        var p2 = 0.65 + 0.35 * Math.sin(now / 300);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — TRY AGAIN', W / 2, 452); cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.13)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          (window.SHARE && SHARE.dare !== null && dareBeaten) ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA
+    if (phase === 'cta') {
+      var tc = (now - ctaAt) / 1000;
+      var ease = Math.min(1, tc * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 50px -apple-system, Helvetica, Arial';
+      cx.fillText('DROP FLAT', W / 2, 285);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they landed at ' + (window.__demoScore || '7.2') + '°.', W / 2, 328);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 250);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || '7.2') + '°', W / 2, 399);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 435);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial'; cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

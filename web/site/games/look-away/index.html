@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Look Away — Tilt</title>
+<!--
+  LOOP / attention-architecture — Look Away (FACE-CONTROL engine, shared lib)
+  The classic two-player pointing game (Japan's "acchi muite hoi"), solo vs the
+  machine: a giant hand POINTS up/right/down/left — you must snap your head the
+  OPPOSITE way before the timer dies. Look where it points (or any wrong way) =
+  you lose. Each correct dodge scores; the timer ramps down, the hand gets faster.
+  Control: FC.sig.headYaw / FC.sig.headPitch (nose-offset head turn/nod, mirrored-
+  screen convention, baseline-calibrated to YOUR neutral pose). FACE ONLY — taps
+  only restart. Modes: ?demo=1 / ?bot=1 run a scripted sim without the camera.
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:none;
+               font-family:-apple-system,'Helvetica Neue',Arial,sans-serif; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+  video { display:none; }
+  #ui { position:fixed; left:0; right:0; bottom:max(16px,env(safe-area-inset-bottom)); display:flex; gap:10px; justify-content:center; z-index:10; }
+  button { background:#12151d; color:#fff; border:1px solid rgba(255,255,255,.15); border-radius:99px;
+           padding:12px 20px; font-size:15px; font-weight:800; cursor:pointer; }
+  button.rec { background:#e8502e; border-color:#e8502e; }
+  button.rec.on { animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.55; } }
+  #perm { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; text-align:center; padding:24px; z-index:20; background:#0b0d12; }
+  #perm h1 { font-size:34px; font-weight:900; margin:0; }
+  #perm p { color:rgba(255,255,255,.6); font-size:15px; max-width:320px; margin:0; }
+  #perm .big { background:#e8502e; border-color:#e8502e; font-size:18px; padding:16px 28px; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="perm">
+  <h1>LOOK AWAY</h1>
+  <p>The hand <b>points</b>. You look the <b>OPPOSITE</b> way — fast. Look where it points and you lose. Your dodging face rides in the corner: record it, lose gloriously, share it.</p>
+  <button class="big" id="start">▶ ALLOW CAMERA &amp; PLAY</button>
+  <p style="font-size:12px;opacity:.5">camera stays on your device — nothing is uploaded</p>
+</div>
+<div id="ui" style="display:none">
+  <button id="rec" class="rec">● RECORD</button>
+</div>
+<script>window.LOOP_GAME = 'look-away';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script src="../../js/face-control.js"></script>
+<script type="module">
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+  var AUTO = DEMO || BOT;
+
+  function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio||1,2), scale=1;
+  function fit(){var s=Math.min(window.innerWidth/W,window.innerHeight/H);scale=s;cv.style.width=(W*s)+'px';cv.style.height=(H*s)+'px';cv.width=W*dpr;cv.height=H*dpr;cx.setTransform(dpr,0,0,dpr,0,0);}
+  window.addEventListener('resize',fit); fit();
+
+  var VERM='#e8502e', TEAL='#2ec5b6', GOLD='#f2b134', PURPLE='#a855f7', INK='#0b0d12';
+
+  var FC = window.FaceControl;
+
+  // ---- rules / tuning ----
+  // 4 directions in SCREEN space (matches the mirrored PiP — like a mirror).
+  // Each round: hand points DIR, player must move head toward OPPOSITE(DIR)
+  // before the timer dies. Moving toward DIR (or a perpendicular) = lose.
+  var DIRS = [
+    { k:'left',  emoji:'👈', ax:'yaw',   sign:-1 },  // 👈 points screen-left
+    { k:'right', emoji:'👉', ax:'yaw',   sign: 1 },  // 👉
+    { k:'up',    emoji:'👆', ax:'pitch', sign: 1 },  // 👆
+    { k:'down',  emoji:'👇', ax:'pitch', sign:-1 }   // 👇
+  ];
+  function opposite(d){ for(var i=0;i<DIRS.length;i++){ if(DIRS[i].ax===d.ax && DIRS[i].sign===-d.sign) return DIRS[i]; } }
+  var MOVE_TH   = 0.42;   // head-turn amplitude that counts as "a look" (small natural turn)
+  var CENTER_TH = 0.22;   // must return inside this to re-center between rounds
+  var TIME_START= 150;    // frames to react on round 1 (~2.5s)
+  var TIME_MIN  = 62;     // floor (~1s) — ecstasy zone
+  var TIME_RAMP = 7;      // frames shaved per correct dodge
+
+  var st, best=0, shakeAmt=0, hitStop=0, dareBeaten=false;
+  try{best=+localStorage.getItem('la_best')||0;}catch(_){}
+  // st.phase: ready | center (re-center gate) | point (hand up, clock running)
+  //           | flash (correct-dodge beat) | over | cta
+  function newRun(){
+    st={phase:'ready',score:0,dir:null,timer:0,timeMax:TIME_START,overAt:0,flashT:0,centerHold:0,lastDir:null,failWhy:''};
+    if(AUTO){ start(); }
+  }
+  function start(){
+    st.phase='center'; st.score=0; st.timeMax=TIME_START; st.centerHold=0; dareBeaten=false;
+    runStartTs=Date.now();
+    if(window.LOOP) LOOP.emit('play_start',{seed:SEED});
+  }
+  var runStartTs=0;
+  function nextPoint(){
+    var d;
+    do { d = DIRS[Math.floor(rng()*4)]; } while (st.lastDir && d.k===st.lastDir.k && rng()<0.6);
+    st.lastDir=d; st.dir=d; st.timer=st.timeMax; st.phase='point';
+    if(window.J) J.tick(1);
+  }
+  function dodged(){
+    st.score++; st.timeMax=Math.max(TIME_MIN, st.timeMax-TIME_RAMP);
+    st.phase='flash'; st.flashT=22; st.centerHold=0;
+    if(window.J) J.hit(st.score);
+    if(window.LOOP) LOOP.emit('dodge',{n:st.score});
+    if(!AUTO&&window.SHARE&&SHARE.dare!==null&&!dareBeaten&&st.score>SHARE.dare){dareBeaten=true;if(window.J)J.fanfare();SHARE.beaten(st.score);}
+  }
+  function gameOver(why){
+    st.failWhy=why; st.phase='over'; st.overAt=performance.now(); shakeAmt=12; hitStop=8;
+    var dur=(Date.now()-runStartTs)/1000;
+    var nb=st.score>best; if(nb){best=st.score;try{localStorage.setItem('la_best',String(best));}catch(_){}};
+    if(window.J){J.death(Math.min(0.3+st.score/15,1)); if(nb) setTimeout(function(){J.fanfare();},450);}
+    if(DEMO) window.__demoScore=st.score;
+    if(window.LOOP) LOOP.emit('game_over',{score:st.score,dur_s:+dur.toFixed(1),why:why});
+    if(BOT){ botRunsDone++; if(botRunsDone>=BOT_RUNS) window.__botDone=true; else setTimeout(function(){newRun();},700); }
+    if(DEMO){ setTimeout(function(){ st.phase='cta'; ctaAt=performance.now(); setTimeout(function(){window.__demoDone=true;},3200); }, 1400); }
+  }
+  var botRunsDone=0, ctaAt=0;
+
+  // Test hook — validators inspect live state headlessly.
+  window.__st = function(){ return { st:st, MOVE_TH:MOVE_TH, CENTER_TH:CENTER_TH, yaw:yawS, pitch:pitchS }; };
+
+  // ---- input: FACE ONLY. Tap/space ONLY restarts after a loss — never dodges.
+  function tapRestart(){ if(AUTO) return; if(st.phase==='over'&&performance.now()-st.overAt>500) newRun(); }
+  window.addEventListener('keydown',function(e){ if(e.code==='Space'){e.preventDefault(); tapRestart();} });
+  cv.addEventListener('pointerdown', tapRestart);
+
+  // ---- camera start (shared FC lib) ----
+  async function startCamera(){
+    document.getElementById('perm').style.display='none';
+    document.getElementById('ui').style.display='flex';
+    await FC.start();
+    newRun();
+    requestAnimationFrame(frame);
+  }
+  document.getElementById('start').addEventListener('click', startCamera);
+
+  // ---- AUTO sim (never touches FC): dodges correctly, then demo fails on purpose ----
+  var simYaw=0, simPitch=0, simTargetYaw=0, simTargetPitch=0, simDelay=0;
+  function autoTick(dt){
+    if(st.phase==='point'){
+      if(simDelay>0){ simDelay-=dt; }
+      else {
+        var giveUp = (DEMO && st.score>=6) || (BOT && st.score>=3+botRunsDone*2);
+        var t = giveUp ? st.dir : opposite(st.dir);   // giveUp = look WHERE IT POINTS (lose)
+        simTargetYaw   = t.ax==='yaw'   ? t.sign*0.85 : 0;
+        simTargetPitch = t.ax==='pitch' ? t.sign*0.85 : 0;
+      }
+    } else { simTargetYaw=0; simTargetPitch=0; simDelay=8+rng()*14; }
+    simYaw   += (simTargetYaw - simYaw)*0.25*dt;
+    simPitch += (simTargetPitch - simPitch)*0.25*dt;
+  }
+
+  // ---- per-frame head read (smoothed lightly for stability, NOT laggy) ----
+  var yawS=0, pitchS=0;
+  function readHead(now, dt){
+    if(AUTO){ autoTick(dt); yawS=simYaw; pitchS=simPitch; return; }
+    FC.update(now);
+    yawS   += (FC.sig.headYaw   - yawS)*0.5*dt;
+    pitchS += (FC.sig.headPitch - pitchS)*0.5*dt;
+  }
+  function headDir(){
+    // dominant axis over MOVE_TH → a deliberate look; null otherwise
+    var ay=Math.abs(yawS), ap=Math.abs(pitchS);
+    if(ay<MOVE_TH && ap<MOVE_TH) return null;
+    if(ay>=ap) return { ax:'yaw', sign: yawS>0?1:-1 };
+    return { ax:'pitch', sign: pitchS>0?1:-1 };
+  }
+
+  // ---- render loop ----
+  var last=performance.now();
+  function frame(now){
+    var dt=Math.min((now-last)/16.667,3); last=now;
+    readHead(now, dt);
+
+    if(hitStop>0){ hitStop-=dt; }
+    else if(st.phase==='center'){
+      // gate: hold your head near center briefly, then the hand fires
+      var centered = Math.abs(yawS)<CENTER_TH && Math.abs(pitchS)<CENTER_TH && (AUTO || FC.faceSeen);
+      st.centerHold = centered ? st.centerHold+dt : 0;
+      if(st.centerHold>10) nextPoint();
+    }
+    else if(st.phase==='point'){
+      st.timer-=dt;
+      var d=headDir();
+      if(d){
+        var want=opposite(st.dir);
+        if(d.ax===want.ax && d.sign===want.sign) dodged();
+        else if(d.ax===st.dir.ax && d.sign===st.dir.sign) gameOver('looked');   // looked where it points
+        else gameOver('wrong');                                                  // wrong way
+      } else if(st.timer<=0) gameOver('slow');
+    }
+    else if(st.phase==='flash'){
+      st.flashT-=dt; if(st.flashT<=0) st.phase='center';
+    }
+    else if(st.phase==='ready' && !AUTO){
+      // face-only start: first re-center after the camera sees you begins the run
+      if(FC.faceSeen){ start(); }
+    }
+
+    draw(now, dt);
+    requestAnimationFrame(frame);
+  }
+
+  // ---- draw ----
+  function draw(now, dt){
+    if(shakeAmt>0) shakeAmt*=Math.pow(0.88,dt);
+    var sx=(rng()-0.5)*shakeAmt, sy=(rng()-0.5)*shakeAmt;
+    cx.save(); cx.translate(sx,sy);
+    cx.fillStyle=INK; cx.fillRect(-10,-10,W+20,H+20);
+
+    // subtle grid
+    cx.strokeStyle='rgba(255,255,255,0.04)'; cx.lineWidth=1;
+    for(var gx=0;gx<=W;gx+=45){ cx.beginPath(); cx.moveTo(gx,0); cx.lineTo(gx,H); cx.stroke(); }
+    for(var gy=0;gy<=H;gy+=45){ cx.beginPath(); cx.moveTo(0,gy); cx.lineTo(W,gy); cx.stroke(); }
+
+    // score
+    cx.textAlign='center';
+    if(st&&(st.phase!=='ready')){
+      cx.fillStyle='#fff'; cx.font='900 44px -apple-system,Helvetica,Arial';
+      cx.fillText(st.score, W/2, 88);
+      cx.fillStyle='rgba(255,255,255,0.4)'; cx.font='700 12px -apple-system,Helvetica,Arial';
+      cx.fillText('BEST '+best, W/2, 108);
+    }
+
+    var cxm=W/2, cym=H/2-40;
+
+    if(st&&st.phase==='center'){
+      // re-center crosshair + live head dot
+      cx.strokeStyle='rgba(255,255,255,0.25)'; cx.lineWidth=2;
+      cx.beginPath(); cx.arc(cxm,cym,54,0,Math.PI*2); cx.stroke();
+      cx.beginPath(); cx.moveTo(cxm-70,cym); cx.lineTo(cxm+70,cym); cx.moveTo(cxm,cym-70); cx.lineTo(cxm,cym+70); cx.stroke();
+      var hx=cxm+yawS*90, hy=cym-pitchS*90;
+      var inC=Math.abs(yawS)<CENTER_TH&&Math.abs(pitchS)<CENTER_TH;
+      cx.fillStyle=inC?TEAL:GOLD; cx.beginPath(); cx.arc(hx,hy,12,0,Math.PI*2); cx.fill();
+      cx.fillStyle='rgba(255,255,255,0.6)'; cx.font='800 15px -apple-system,Helvetica,Arial';
+      cx.fillText(inC?'HOLD…':'CENTER YOUR HEAD',cxm,cym+110);
+    }
+
+    if(st&&(st.phase==='point'||st.phase==='flash'||st.phase==='over')){
+      var d=st.dir;
+      if(d){
+        // timer ring
+        if(st.phase==='point'){
+          var frac=Math.max(0,st.timer/st.timeMax);
+          cx.strokeStyle=frac<0.35?VERM:TEAL; cx.lineWidth=7;
+          cx.beginPath(); cx.arc(cxm,cym,96,-Math.PI/2,-Math.PI/2+Math.PI*2*frac); cx.stroke();
+        }
+        // the pointing hand
+        cx.font='120px -apple-system,Helvetica,Arial';
+        cx.fillText(d.emoji,cxm,cym+44);
+        // live head dot while pointing (mirrors your move)
+        if(st.phase==='point'){
+          var hx2=cxm+yawS*120, hy2=cym-pitchS*120;
+          cx.fillStyle='rgba(255,255,255,0.5)'; cx.beginPath(); cx.arc(hx2,hy2,8,0,Math.PI*2); cx.fill();
+        }
+      }
+      if(st.phase==='flash'){
+        cx.fillStyle='rgba(46,197,182,'+(st.flashT/22*0.35)+')'; cx.fillRect(-10,-10,W+20,H+20);
+        cx.fillStyle=TEAL; cx.font='900 34px -apple-system,Helvetica,Arial';
+        cx.fillText('DODGED!',cxm,cym-120);
+      }
+    }
+
+    // PiP webcam (human) / sim face (AUTO)
+    var camW=96, camH=72, cxp=W-camW-12, cyp=H-camH-46;
+    var active = st && st.phase==='point';
+    if(!AUTO){
+      FC.drawPiP(cx, cxp, cyp, camW, camH, active, Math.max(Math.abs(yawS),Math.abs(pitchS)), W, H);
+      var fcLabel=FC.statusLabel();
+      if(fcLabel){ cx.fillStyle='rgba(255,255,255,0.6)'; cx.font='700 11px -apple-system,Helvetica,Arial'; cx.fillText(fcLabel,cxp+camW/2,cyp-8); }
+    } else {
+      cx.strokeStyle=active?VERM:'rgba(255,255,255,0.3)'; cx.lineWidth=2;
+      cx.strokeRect(cxp,cyp,camW,camH);
+      cx.fillStyle='#12151d'; cx.fillRect(cxp,cyp,camW,camH);
+      // simple sim face that looks around
+      var fx=cxp+camW/2+simYaw*16, fy=cyp+camH/2-simPitch*10;
+      cx.fillStyle='#f2c9a0'; cx.beginPath(); cx.arc(fx,fy,20,0,Math.PI*2); cx.fill();
+      cx.fillStyle='#111';
+      cx.beginPath(); cx.arc(fx-7+simYaw*4,fy-4-simPitch*3,2.6,0,Math.PI*2); cx.fill();
+      cx.beginPath(); cx.arc(fx+7+simYaw*4,fy-4-simPitch*3,2.6,0,Math.PI*2); cx.fill();
+      cx.fillRect(fx-4+simYaw*4,fy+7-simPitch*3,8,2);
+    }
+
+    // prompts
+    cx.fillStyle='rgba(255,255,255,0.55)'; cx.font='800 14px -apple-system,Helvetica,Arial';
+    if(st&&st.phase==='point') cx.fillText('LOOK THE OPPOSITE WAY!',W/2,H-110);
+    else if(st&&st.phase==='center') cx.fillText('IT POINTS — YOU DODGE',W/2,H-110);
+
+    if(st&&st.phase==='ready'&&!AUTO){
+      cx.fillStyle=VERM; cx.font='800 18px -apple-system,Helvetica,Arial';
+      cx.globalAlpha=0.6+0.4*Math.sin(now/300); cx.fillText('SHOW YOUR FACE TO START',W/2,H/2-40); cx.globalAlpha=1;
+    }
+
+    if(st&&st.phase==='over'){
+      cx.fillStyle='rgba(11,13,18,0.82)'; cx.fillRect(-10,-10,W+20,H+20);
+      cx.fillStyle=VERM; cx.font='900 40px -apple-system,Helvetica,Arial';
+      var msg = st.failWhy==='looked' ? 'IT GOT YOU' : (st.failWhy==='slow' ? 'TOO SLOW' : 'WRONG WAY');
+      cx.fillText(msg,W/2,H/2-60);
+      if(st.dir){ cx.font='84px -apple-system,Helvetica,Arial'; cx.fillText(st.dir.emoji,W/2,H/2+40); }
+      cx.fillStyle='#fff'; cx.font='900 30px -apple-system,Helvetica,Arial'; cx.fillText(st.score+' dodges',W/2,H/2+100);
+      cx.fillStyle='rgba(255,255,255,0.5)'; cx.font='700 14px -apple-system,Helvetica,Arial';
+      cx.fillText('tap to run it back',W/2,H/2+130);
+    }
+    if(st&&st.phase==='cta'){
+      cx.fillStyle='rgba(11,13,18,0.9)'; cx.fillRect(-10,-10,W+20,H+20);
+      cx.fillStyle='#fff'; cx.font='900 40px -apple-system,Helvetica,Arial'; cx.fillText('LOOK AWAY',W/2,H/2-30);
+      cx.fillStyle=TEAL; cx.font='700 17px -apple-system,Helvetica,Arial'; cx.fillText('it points. you dodge. how long can you last?',W/2,H/2+6);
+      cx.fillStyle=VERM; cx.font='800 20px -apple-system,Helvetica,Arial';
+      cx.globalAlpha=0.6+0.4*Math.sin(now/280); cx.fillText('PLAY IT → tilt.games',W/2,H/2+52); cx.globalAlpha=1;
+    }
+    cx.restore();
+  }
+
+  // ---- record button (shared FC MP4 pipeline) ----
+  var recBtn=document.getElementById('rec');
+  if(recBtn) recBtn.addEventListener('click',function(){
+    var on=FC.toggleRecord(cv,'look-away-'+(st?st.score:0),function(){recBtn.classList.remove('on');recBtn.textContent='● RECORD';if(window.LOOP)LOOP.emit('recording_saved',{score:st?st.score:0});},function(msg){recBtn.textContent=msg||'● RECORD';});
+    if(on){recBtn.classList.add('on');recBtn.textContent='■ STOP';}
+  });
+
+  // Scripted modes auto-start (no camera prompt)
+  if(AUTO){ document.getElementById('perm').style.display='none'; newRun(); requestAnimationFrame(frame); }
+})();
+</script>
+</body>
+</html>

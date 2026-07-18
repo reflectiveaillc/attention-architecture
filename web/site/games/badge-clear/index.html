@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Badge Clear — Tilt</title>
+<!--
+  LOOP / attention-architecture — Badge Clear (game-contract-v2)
+  Circuits: 01 RPE (variable spawn count per clear), 06 Zeigarnik (uncleared badges nag),
+            05 Ease (fuse shortens as score climbs).
+  Modes:
+    ?demo=1&seed=7        scripted run for clip capture (human-feeling → near-fail → fail → CTA),
+                          sets window.__demoDone and window.__demoScore
+    ?bot=1&runs=2&seed=5  imperfect autoplay for traffic simulation, sets window.__botDone
+    ?dare=N               incoming dare from a friend
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'badge-clear';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var BR = 28;           // badge radius
+  var MAX_BADGES = 12;   // game over when this many live at once
+  var MARGIN = 44;
+  var TOP_PAD = 150;     // height reserved for score display
+
+  // ---- state ----
+  var state, badges, particles, flashes, runStartTs, best = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  var challengeAt = 0, ctaAt = 0;
+  var botRunsDone = 0, botClearCount = 0;
+  var demoPhase = 0, demoWait = 0;
+  try { best = +localStorage.getItem('bc_best') || 0; } catch (_) {}
+
+  // ---- helpers ----
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 13))));
+  }
+
+  function fuseMs() {
+    // fuse shrinks as score climbs (more pressure)
+    return Math.max(2400, 7000 - state.score * 180);
+  }
+
+  function spawnCount() {
+    var s = state.score, r = rng();
+    if (s < 5)  return r < 0.70 ? 1 : 2;
+    if (s < 12) return r < 0.45 ? 1 : (r < 0.85 ? 2 : 3);
+    return r < 0.30 ? 1 : (r < 0.72 ? 2 : 3);
+  }
+
+  function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+  function placeBadge() {
+    var tries = 0, b, ok;
+    do {
+      ok = true;
+      b = {
+        x: MARGIN + BR + rng() * (W - (MARGIN + BR) * 2),
+        y: TOP_PAD + BR + rng() * (H - TOP_PAD - MARGIN - BR * 2 - 50)
+      };
+      for (var i = 0; i < badges.length && ok; i++) {
+        if (dist(b, badges[i]) < BR * 2.4) ok = false;
+      }
+      tries++;
+    } while (!ok && tries < 80);
+    return b;
+  }
+
+  function spawnBadges(n) {
+    for (var i = 0; i < n; i++) {
+      if (badges.length >= MAX_BADGES) { gameOver(); return; }
+      var p = placeBadge();
+      var now = performance.now();
+      badges.push({
+        x: p.x, y: p.y,
+        n: Math.max(1, Math.min(99, Math.floor(1 + rng() * 9))),
+        born: now,
+        fuse: fuseMs(),
+        expired: false,
+        scale: 0.01,
+        shake: 0,
+        popping: false,
+        popT: 0
+      });
+    }
+  }
+
+  function expireBadge(b) {
+    if (b.expired || b.popping) return;
+    b.expired = true;
+    b.shake = 5;
+    if (window.J) J.tension(1);
+    if (window.LOOP) LOOP.emit('badge_expired', { score: state.score, active: liveCount() });
+    if (expiredCount() >= 3) gameOver();
+  }
+
+  function liveCount()    { return badges.filter(function(b){ return !b.expired && !b.popping; }).length; }
+  function expiredCount() { return badges.filter(function(b){ return b.expired; }).length; }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- clear badge ----
+  function clearBadge(b, now) {
+    if (b.expired || b.popping) return;
+    var age   = now - b.born;
+    var ratio = age / b.fuse;
+    var perfect = ratio < 0.15;
+    var near    = ratio > 0.80;
+
+    // combo: clears within 1.1s chain
+    if (now - state.lastClearAt < 1100) state.combo++;
+    else state.combo = 1;
+    state.lastClearAt = now;
+    var gain = 1 + Math.min(state.combo - 1, 7);
+    state.score += gain;
+
+    // pop animation
+    b.popping = true; b.popT = 1;
+
+    // particles
+    for (var i = 0; i < 8; i++) {
+      var ang = rng() * Math.PI * 2, sp = 1.5 + rng() * 2.5;
+      particles.push({ x: b.x, y: b.y,
+        vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp,
+        life: 1, color: near ? VERM : TEAL });
+    }
+
+    // sound
+    if (window.J) {
+      if (perfect)          J.perfect(state.combo);
+      else if (near)        J.near();
+      else                  J.hit(state.combo);
+      J.tension(Math.min(1, badges.length / MAX_BADGES));
+    }
+
+    // visual juice
+    if (perfect)        { hitStop = 4; zoom = 1.03; }
+    if (near)           shakeAmt = 5;
+
+    // floating text
+    if (perfect)        flash('PERFECT', TEAL, 38);
+    if (near)           flash('SO CLOSE', VERM, 36);
+    if (state.combo > 2) flash('×' + state.combo, GOLD, 32);
+
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score >= SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+
+    if (near && window.LOOP) LOOP.emit('near_miss', { n: state.score, ratio: +ratio.toFixed(3) });
+    if (window.LOOP) LOOP.emit('badge_cleared', { n: state.score, gain: gain, combo: state.combo, perfect: perfect, near: near });
+
+    // spawn replacements (after brief delay so screen doesn't instantly overflow)
+    var n = spawnCount();
+    setTimeout(function() {
+      if (state.phase === 'play') spawnBadges(n);
+    }, 120);
+  }
+
+  // ---- game lifecycle ----
+  function newGame() {
+    state = {
+      phase: 'title',
+      score: 0, combo: 0, lastClearAt: 0, overAt: 0
+    };
+    badges = []; particles = []; flashes = [];
+    dareBeaten = false; demoPhase = 0; demoWait = 0;
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1200);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.score = 0; state.combo = 0; state.lastClearAt = 0;
+    badges = []; particles = []; flashes = [];
+    runStartTs = Date.now();
+    spawnBadges(1);
+    botClearCount = 0;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function gameOver() {
+    if (state.phase === 'over' || state.phase === 'cta') return;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.death(Math.min(0.35 + state.score / 35, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('bc_best', String(best)); } catch(_){} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.combo = 0; state.lastClearAt = 0; state.overAt = 0;
+    badges = []; particles = []; flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10,  w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 482, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function badgeAt(x, y) {
+    for (var i = badges.length - 1; i >= 0; i--) {
+      var b = badges[i];
+      if (!b.expired && !b.popping && Math.hypot(b.x - x, b.y - y) <= BR + 10) return b;
+    }
+    return null;
+  }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') {
+      var b = badgeAt(x, y);
+      if (b) clearBadge(b, performance.now());
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'cleared' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(W / 2, H / 2); });
+
+  // ---- autopilot (demo + bot) ----
+  // Both modes must reach game_over. Strategy:
+  // - Pick the most urgent live badge
+  // - Clear it most of the time, but at a planned point go passive so badges accumulate → game over
+  var autoTick = 0;
+
+  function mostUrgent() {
+    var best = null, maxRatio = -1, now = performance.now();
+    for (var i = 0; i < badges.length; i++) {
+      var b = badges[i];
+      if (!b.expired && !b.popping) {
+        var r = (now - b.born) / b.fuse;
+        if (r > maxRatio) { maxRatio = r; best = b; }
+      }
+    }
+    return best;
+  }
+
+  function autopilot(now) {
+    if (state.phase !== 'play') return;
+
+    if (DEMO) {
+      // Demo arc:
+      //   Phase 0 (score 0-8): fast clearings, human hesitation via demoWait
+      //   Phase 1 (score 9-9): near-fail: wait until ratio >0.88 before clearing
+      //   Phase 2 (score 10-13): recovery, clearing at ratio ~0.35
+      //   Phase 3 (score 14+): go passive — stop clearing so screen fills → game_over
+
+      if (demoWait > 0) { demoWait -= 1; return; }
+      var target = mostUrgent();
+      if (!target) return;
+      var ratio = (now - target.born) / target.fuse;
+
+      if (state.score < 9) {
+        // Phase 0: clear when ratio > 0.12 (early but human-feeling)
+        if (ratio > 0.12) {
+          clearBadge(target, now);
+          // varied hesitation between 8-18 frames
+          demoWait = 8 + Math.floor(rng() * 11);
+        }
+      } else if (state.score === 9) {
+        // Phase 1: the near-fail — let fuse get very close
+        if (ratio > 0.88) {
+          clearBadge(target, now);
+          demoWait = 6;
+        }
+      } else if (state.score < 14) {
+        // Phase 2: recovery clears, slightly panicked (clear at 0.30)
+        if (ratio > 0.30) {
+          clearBadge(target, now);
+          demoWait = 5 + Math.floor(rng() * 8);
+        }
+      } else {
+        // Phase 3: go passive — let badges accumulate and expire → game_over
+        // Do nothing — the fuse timeouts will fire and expireBadge → gameOver
+      }
+
+    } else if (BOT) {
+      // Bot: clear aggressively for K clears, then go passive so we get game_over
+      // K = 8 clears per run → then stop → badges expire → gameOver
+      var K = 8;
+      if (botClearCount >= K) {
+        // passive — let badges expire
+        return;
+      }
+      if (demoWait > 0) { demoWait -= 1; return; }
+      var target = mostUrgent();
+      if (!target) return;
+      var ratio = (now - target.born) / target.fuse;
+      // clear when badge is 30-70% through its fuse (imperfect)
+      var threshold = 0.30 + rng() * 0.35;
+      if (ratio > threshold) {
+        clearBadge(target, now);
+        botClearCount++;
+        demoWait = 4 + Math.floor(rng() * 10);
+      }
+    }
+  }
+
+  // ---- render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // expire badges whose fuse ran out
+    for (var i = 0; i < badges.length; i++) {
+      var b = badges[i];
+      if (!b.expired && !b.popping && (now - b.born) > b.fuse) expireBadge(b);
+    }
+
+    // tension rising with clutter
+    if (window.J && state.phase === 'play') {
+      J.tension(Math.min(1, badges.length / MAX_BADGES));
+    }
+
+    // hit-stop decays every frame; autopilot only when not frozen
+    if (hitStop > 0) { hitStop -= dt; }
+    else { autopilot(now); }
+
+    // badge scale + shake animation
+    for (var i = 0; i < badges.length; i++) {
+      var b = badges[i];
+      var ts = b.popping ? 1.4 : 1.0;
+      b.scale += (ts - b.scale) * 0.20 * dt;
+      if (b.shake > 0.1) b.shake *= Math.pow(0.88, dt);
+    }
+
+    // particles
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pt = particles[p];
+      pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.vy += 0.12 * dt;
+      pt.life -= 0.03 * dt;
+      if (pt.life <= 0) particles.splice(p, 1);
+    }
+
+    // ---- draw ----
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)'); bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // draw badges
+    for (var i = 0; i < badges.length; i++) {
+      var b = badges[i];
+      var bx = b.x + (b.shake > 0.1 ? (Math.random() - 0.5) * b.shake : 0);
+      var by = b.y + (b.shake > 0.1 ? (Math.random() - 0.5) * b.shake : 0);
+      var s  = b.scale;
+      var ratio = !b.expired ? Math.min(1, (now - b.born) / b.fuse) : 1;
+      var alpha = b.popping ? Math.max(0, 1 - (1 - b.scale / 1.4) * 3) : 1;
+
+      cx.save();
+      cx.translate(bx, by); cx.scale(s, s); cx.globalAlpha = alpha;
+
+      if (b.expired) {
+        // dead badge: dim with X
+        cx.beginPath(); cx.arc(0, 0, BR, 0, Math.PI * 2);
+        cx.fillStyle = '#1e2129'; cx.fill();
+        cx.lineWidth = 2; cx.strokeStyle = '#3a3f4a'; cx.stroke();
+        cx.strokeStyle = VERM; cx.lineWidth = 3;
+        cx.beginPath(); cx.moveTo(-9,-9); cx.lineTo(9,9); cx.moveTo(9,-9); cx.lineTo(-9,9);
+        cx.stroke();
+      } else {
+        // fuse arc
+        var ringColor = ratio < 0.60 ? TEAL : (ratio < 0.82 ? GOLD : VERM);
+        cx.beginPath();
+        cx.arc(0, 0, BR + 5, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (1 - ratio));
+        cx.lineWidth = 4; cx.strokeStyle = ringColor; cx.stroke();
+        // body
+        cx.beginPath(); cx.arc(0, 0, BR, 0, Math.PI * 2);
+        cx.fillStyle = VERM; cx.fill();
+        var grd = cx.createRadialGradient(-8, -8, 4, 0, 0, BR);
+        grd.addColorStop(0, 'rgba(255,255,255,0.14)'); grd.addColorStop(1, 'rgba(0,0,0,0)');
+        cx.fillStyle = grd; cx.fill();
+        cx.lineWidth = 2; cx.strokeStyle = 'rgba(255,255,255,0.20)'; cx.stroke();
+        // number
+        cx.fillStyle = '#fff'; cx.textAlign = 'center'; cx.textBaseline = 'middle';
+        cx.font = '800 ' + (b.n > 9 ? 22 : 26) + 'px -apple-system, Helvetica, Arial';
+        cx.fillText(String(b.n), 0, 1);
+        // urgent pulse ring
+        if (ratio > 0.80) {
+          cx.globalAlpha = 0.20 + 0.20 * Math.sin(now / 110);
+          cx.beginPath(); cx.arc(0, 0, BR + 9 + 4 * Math.sin(now / 110), 0, Math.PI * 2);
+          cx.strokeStyle = VERM; cx.lineWidth = 2; cx.stroke();
+          cx.globalAlpha = alpha;
+        }
+      }
+      cx.restore();
+
+      // clean up popped badges
+      if (b.popping && b.scale > 1.35) {
+        badges.splice(i, 1); i--;
+      }
+    }
+
+    // particles
+    for (var p = 0; p < particles.length; p++) {
+      var pt = particles[p];
+      cx.globalAlpha = Math.max(0, pt.life);
+      cx.fillStyle = pt.color;
+      cx.beginPath(); cx.arc(pt.x, pt.y, 3, 0, Math.PI * 2); cx.fill();
+    }
+    cx.globalAlpha = 1;
+
+    // score bar
+    if (state.phase === 'play' || state.phase === 'over' || state.phase === 'cta') {
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 120);
+      // incoming dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 146);
+      }
+    }
+
+    // badge-count meter at bottom
+    if (state.phase === 'play') {
+      var full = badges.length / MAX_BADGES;
+      cx.fillStyle = 'rgba(255,255,255,0.08)';
+      cx.fillRect(MARGIN, H - 28, W - MARGIN * 2, 6);
+      cx.fillStyle = full > 0.75 ? VERM : (full > 0.50 ? GOLD : TEAL);
+      cx.fillRect(MARGIN, H - 28, (W - MARGIN * 2) * full, 6);
+    }
+
+    // floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 260 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // ---- title screen ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('BADGE CLEAR', W / 2, 310);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP A BADGE TO CLEAR', W / 2, 358); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('every clear spawns more. stay ahead.', W / 2, 390);
+    }
+
+    // ---- challenge card (demo beat 1) ----
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('14', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 432);
+    }
+
+    // ---- game over ----
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = VERM; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('OVERWHELMED.', W / 2, 298);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' cleared', W / 2, 344);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 414);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 460);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- demo CTA card ----
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('BADGE CLEAR', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they cleared ' + (window.__demoScore || 14) + '. your move.', W / 2, 342);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 14), W / 2, 412);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 444);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

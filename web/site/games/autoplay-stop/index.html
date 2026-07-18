@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Autoplay Stop — Tilt</title>
+<!--
+  LOOP / attention-architecture — Autoplay Stop
+  Circuits: 05-ease (conditioned thumb gesture), 01-rpe (variable gap timing),
+            06-zeigarnik (one more tap).
+  Modes:
+    ?demo=1&seed=7   mirror-neuron clip (~18-24s), sets window.__demoDone
+    ?bot=1&runs=N    imperfect autopilot, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'autoplay-stop';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  // Each "clip" scrolls down filling the screen. A GAP (black bar) separates clips.
+  // Player must tap inside the gap window to score. Fake "transition" gaps flash —
+  // tapping a fake ends the streak.
+
+  var CLIP_H   = H;        // each clip takes the full screen height
+  var GAP_BASE = 60;       // initial gap height in px
+  var GAP_MIN  = 18;       // minimum gap height
+  var SCROLL_BASE = 3.5;   // px/frame at 60fps
+  var SCROLL_MAX  = 9;
+  var FAKE_PROB   = 0.18;  // chance any given clip triggers a fake flash transition
+
+  // colours for fake/real clips (varied palette to mimic video thumbnails)
+  var CLIP_PALETTES = [
+    ['#1a1a2e','#16213e'], ['#2d1b69','#11998e'],
+    ['#0f3460','#e94560'], ['#1b262c','#0f3460'],
+    ['#2c003e','#6a0572'], ['#004445','#2c7873'],
+    ['#2e4057','#048a81'], ['#3d0c02','#b22222'],
+  ];
+
+  var state, flashes, hitStop, zoom, shakeAmt, dareBeaten;
+  var runStartTs, best = 0, botRunsDone = 0;
+  try { best = +localStorage.getItem('as_best') || 0; } catch (_) {}
+
+  // phase: title | challenge | play | over | cta
+  var overAt = 0, challengeAt = 0, ctaAt = 0;
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      score: 0,
+      combo: 0,
+      // scroll state
+      scrollY: 0,          // how far the feed has scrolled (px, grows each frame)
+      scrollSpeed: SCROLL_BASE,
+      clipH: CLIP_H,
+      gapH: GAP_BASE,
+      // clip sequence: array of {type:'real'|'fake', color:[bg,bg2], y, passed}
+      clips: [],
+      clipSeed: 0,
+      // active gap
+      activeGap: null,     // {y, h, fake, hit} — the gap currently on screen
+      nextClipY: 0,
+      // fake flash
+      fakeFlash: 0,        // frames remaining for fake-transition flash overlay
+      fakeFlashColor: TEAL,
+      // streak
+      streak: 0,
+    };
+    hitStop = 0; zoom = 1; shakeAmt = 0; flashes = []; dareBeaten = false;
+    rng = mulberry32(SEED); // reset RNG deterministically
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { startRun(); return; }
+    // human: show title
+  }
+
+  function initClips() {
+    // Seed initial clips filling the screen + some off-screen
+    state.clips = [];
+    // First clip starts at y=0 (top of viewport), each subsequent one below
+    var y = 0;
+    for (var i = 0; i < 6; i++) {
+      pushClip(y);
+      y += state.clipH + state.gapH;
+    }
+    state.nextClipY = y;
+    state.scrollY = 0;
+  }
+
+  function pushClip(y) {
+    var fake = rng() < FAKE_PROB;
+    var pal = CLIP_PALETTES[Math.floor(rng() * CLIP_PALETTES.length)];
+    state.clips.push({ y: y, h: state.clipH, gapH: state.gapH, fake: fake, color: pal, passed: false, id: state.clips.length });
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.score = 0; state.combo = 0; state.streak = 0;
+    state.scrollSpeed = SCROLL_BASE;
+    state.gapH = GAP_BASE;
+    runStartTs = Date.now();
+    initClips();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function gapForClip(clip) {
+    // Returns {top, bottom} in screen coords of the gap after this clip
+    var clipScreenTop = clip.y - state.scrollY;
+    var clipBottom = clipScreenTop + clip.h;
+    return { top: clipBottom, bottom: clipBottom + clip.gapH };
+  }
+
+  function getActiveGap() {
+    // Find the gap currently visible (the first unscored, unscrolled-past gap on screen)
+    for (var i = 0; i < state.clips.length; i++) {
+      var c = state.clips[i];
+      if (c.passed) continue;
+      var g = gapForClip(c);
+      // Gap top is within screen (or just approaching)
+      if (g.top < H && g.bottom > 0) return { clip: c, top: g.top, bottom: g.bottom };
+    }
+    return null;
+  }
+
+  function tapGap() {
+    var ag = getActiveGap();
+    if (!ag) return; // no gap visible
+
+    var clip = ag.clip;
+    clip.passed = true; // consume it
+
+    if (clip.fake) {
+      // Tapped a fake transition → miss
+      triggerMiss('FAKE!');
+      return;
+    }
+
+    // Real gap — check timing: was the tap inside the gap window?
+    // ag.top to ag.bottom are screen coords. Tap is valid if gap center is on screen.
+    var gapCenter = (ag.top + ag.bottom) / 2;
+    var gapHalf = (ag.bottom - ag.top) / 2;
+    // near-perfect: within 20% of center
+    var distFromCenter = Math.abs(gapCenter - H / 2);
+    var nearPerfect = distFromCenter < gapHalf * 0.35;
+    var perfect = distFromCenter < gapHalf * 0.15;
+
+    state.score++;
+    state.streak++;
+    state.combo = (perfect || nearPerfect) ? state.combo + 1 : 0;
+
+    // sounds
+    if (window.J) {
+      if (perfect) { J.perfect(state.streak); hitStop = 5; zoom = 1.025; }
+      else if (nearPerfect) { J.hit(state.combo + 1); }
+      else J.hit(Math.max(1, state.combo));
+      J.tension(Math.min(state.score / 25, 1));
+    }
+
+    // juice
+    if (perfect) {
+      shakeAmt = 2; hitStop = 5; zoom = 1.03;
+      flash('PERFECT', TEAL, 44);
+    } else if (nearPerfect) {
+      flash('NICE', GOLD, 36);
+    } else {
+      flash('+' + state.score, 'rgba(255,255,255,0.85)', 30);
+    }
+
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+
+    // speed & gap shrinkage
+    state.scrollSpeed = Math.min(SCROLL_MAX, SCROLL_BASE + state.score * 0.15);
+    state.gapH = Math.max(GAP_MIN, GAP_BASE - state.score * 1.4);
+
+    if (window.LOOP) LOOP.emit('gap_tapped', { n: state.score, perfect: perfect, near: nearPerfect });
+
+    // check new best
+    if (state.score > best) {
+      best = state.score;
+      try { localStorage.setItem('as_best', String(best)); } catch (_) {}
+    }
+  }
+
+  function triggerMiss(label) {
+    // Called when tapping a fake or tapping too early/late (scrolled-past gap)
+    shakeAmt = 8;
+    if (window.J) J.death(Math.min(0.3 + state.score / 20, 1));
+    flash(label || 'MISS', VERM, 42);
+    if (window.LOOP) LOOP.emit('near_miss', { n: state.score });
+    gameOver();
+  }
+
+  function tapOutsideGap() {
+    // Player tapped but no gap is present — tapped during clip = miss
+    if (window.J) J.near();
+    shakeAmt = 4;
+    flash('TOO EARLY', VERM, 36);
+    if (window.LOOP) LOOP.emit('near_miss', { n: state.score });
+    gameOver();
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (window.J) {
+      J.death(Math.min(0.3 + state.score / 20, 1));
+      if (state.score > 0 && state.score === best) setTimeout(function () { J.fanfare(); }, 400);
+    }
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.phase = 'play';
+    state.score = 0; state.combo = 0; state.streak = 0;
+    state.scrollSpeed = SCROLL_BASE;
+    state.gapH = GAP_BASE;
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0;
+    // reset bot per-run state
+    botActiveCount = 0; botMissTriggered = false;
+    // reset demo per-run state
+    demoIdx = 0; demoWait = 30; demoMissPhase = false;
+    runStartTs = Date.now();
+    initClips();
+    if (window.LOOP) LOOP.emit('restart', {});
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 36, t: 0 });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 9))));
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'stops' }); return;
+      }
+      resetRun(); return;
+    }
+    if (state.phase !== 'play') return;
+
+    // Check if a gap is currently on screen
+    var ag = getActiveGap();
+    if (ag) {
+      tapGap();
+    } else {
+      // Check if tap came during a clip (gap is coming but hasn't arrived)
+      tapOutsideGap();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilot ----
+  // demo: scripted arc — good stops, near-fail, recovery, then deliberate miss
+  // [hesitation frames, action: 'tap'|'wait'|'miss']
+  // demo: hesitation waits (frames) before tapping each gap
+  var demoWaits = [38, 32, 42, 55, 28, 36];
+  var demoIdx = 0, demoWait = 50, demoMissPhase = false;
+
+  // Track the first unscored gap (approaching or on screen)
+  function getApproachingGap() {
+    for (var i = 0; i < state.clips.length; i++) {
+      var c = state.clips[i];
+      if (c.passed) continue;
+      var g = gapForClip(c);
+      if (g.bottom > 0) return { clip: c, top: g.top, bottom: g.bottom };
+    }
+    return null;
+  }
+
+  // bot state
+  var botActiveCount = 0, botMaxActive = 6, botMissTriggered = false;
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+
+      var ag = getApproachingGap();
+      if (!ag) return;
+
+      if (demoMissPhase) {
+        // Wait until gap scrolls off screen, then "tap" during a clip = forced miss
+        if (ag.top < -20) {
+          // gap has fully scrolled past; tap now = during next clip = miss
+          demoMissPhase = false;
+          tapOutsideGap();
+        }
+        return;
+      }
+
+      if (demoIdx >= demoWaits.length) {
+        // Trigger final miss phase
+        demoMissPhase = true;
+        return;
+      }
+
+      // Tap when gap center crosses H/2 with small offset for human feel
+      var gapCenter = (ag.top + ag.bottom) / 2;
+      var gapH = ag.bottom - ag.top;
+      var offset = (demoIdx % 2 === 0) ? -gapH * 0.08 : gapH * 0.07;
+      var target = H / 2 + offset;
+
+      if (gapCenter <= target && ag.bottom > 0 && ag.top < H) {
+        demoWait = demoWaits[demoIdx] || 30;
+        demoIdx++;
+        tapGap();
+      }
+    } else if (BOT) {
+      if (botMissTriggered) return;
+      var ag2 = getApproachingGap();
+      if (!ag2) return;
+
+      if (botActiveCount >= botMaxActive) {
+        // Go passive: let the gap scroll past, then tap = miss during clip
+        // Gap has scrolled fully off the top
+        if (ag2.top < -10) {
+          botMissTriggered = true;
+          tapOutsideGap();
+        }
+        return;
+      }
+
+      // Active tapping: tap when gap center nears H*0.55 with RNG jitter
+      var gapCenter2 = (ag2.top + ag2.bottom) / 2;
+      var jitter = (rng() - 0.5) * (ag2.bottom - ag2.top) * 0.25;
+      if (gapCenter2 <= H * 0.55 + jitter && ag2.bottom > 0 && ag2.top < H) {
+        botActiveCount++;
+        tapGap();
+      }
+    }
+  }
+
+  // ---- render helpers ----
+  function drawClip(clip) {
+    var screenY = clip.y - state.scrollY;
+    if (screenY > H + 20 || screenY + clip.h < -20) return;
+    // Draw clip body (simulated video thumbnail)
+    var g = cx.createLinearGradient(0, screenY, 0, screenY + clip.h);
+    g.addColorStop(0, clip.color[0]);
+    g.addColorStop(1, clip.color[1]);
+    cx.fillStyle = g;
+    cx.fillRect(0, screenY, W, clip.h);
+
+    // Simulated UI chrome: play bar at bottom, account name, hearts
+    cx.fillStyle = 'rgba(0,0,0,0.4)';
+    cx.fillRect(0, screenY + clip.h - 90, W, 90);
+
+    // Username placeholder dots
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.fillRect(54, screenY + clip.h - 72, 90, 10);
+    cx.fillRect(54, screenY + clip.h - 54, 60, 8);
+
+    // Avatar circle
+    cx.beginPath();
+    cx.arc(30, screenY + clip.h - 56, 18, 0, Math.PI * 2);
+    cx.fillStyle = clip.fake ? VERM : 'rgba(255,255,255,0.3)';
+    cx.fill();
+
+    // Progress bar
+    cx.fillStyle = 'rgba(255,255,255,0.18)';
+    cx.fillRect(0, screenY + clip.h - 3, W, 3);
+    cx.fillStyle = VERM;
+    cx.fillRect(0, screenY + clip.h - 3, W * (clip.fake ? 0.3 : 0.8), 3);
+
+    // If fake, draw a subtle transition shimmer to tempt the tap
+    if (clip.fake) {
+      var fakeAlpha = 0.15 + 0.1 * Math.sin(performance.now() / 120);
+      cx.fillStyle = 'rgba(46,197,182,' + fakeAlpha + ')';
+      cx.fillRect(0, screenY + clip.h - 6, W, 6);
+    }
+  }
+
+  function drawGap(clip) {
+    var g = gapForClip(clip);
+    if (g.bottom < 0 || g.top > H) return;
+    // The gap is the black space between clips
+    cx.fillStyle = INK;
+    cx.fillRect(0, g.top, W, g.bottom - g.top);
+
+    // Glowing hint line at top and bottom of gap
+    var pulse = 0.4 + 0.35 * Math.sin(performance.now() / 180);
+    cx.strokeStyle = 'rgba(242,177,52,' + pulse + ')';
+    cx.lineWidth = 1.5;
+    cx.beginPath(); cx.moveTo(0, g.top); cx.lineTo(W, g.top); cx.stroke();
+    cx.beginPath(); cx.moveTo(0, g.bottom); cx.lineTo(W, g.bottom); cx.stroke();
+
+    // Center tap zone indicator
+    var cy = (g.top + g.bottom) / 2;
+    cx.globalAlpha = 0.22 * pulse;
+    cx.fillStyle = GOLD;
+    cx.fillRect(W / 2 - 40, cy - 1, 80, 2);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    requestAnimationFrame(frame);
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // --- simulation ---
+    if (state.phase === 'play') {
+      // scroll feed
+      if (hitStop > 0) { hitStop -= dt; }
+      else {
+        state.scrollY += state.scrollSpeed * dt;
+        autopilot();
+      }
+
+      // cull clips that have fully scrolled off top
+      for (var i = state.clips.length - 1; i >= 0; i--) {
+        var c = state.clips[i];
+        var screenBot = c.y + c.h + c.gapH - state.scrollY;
+        if (screenBot < -40) {
+          // If this gap was NOT tapped and it scrolled off → miss (for human only)
+          // (bot/demo handle their own misses via autopilot)
+          if (!c.passed && !DEMO && !BOT && !c.fake) {
+            // Gap scrolled by without being tapped — count as a miss
+            c.passed = true;
+            shakeAmt = 6;
+            flash('MISSED', VERM, 40);
+            if (window.J) J.near();
+            if (window.LOOP) LOOP.emit('near_miss', { n: state.score });
+            gameOver();
+            break;
+          }
+          state.clips.splice(i, 1);
+        }
+      }
+
+      // spawn new clips ahead
+      if (state.clips.length < 6) {
+        var lastClip = state.clips[state.clips.length - 1];
+        var nextY = lastClip ? lastClip.y + lastClip.h + state.gapH : 0;
+        var newClip = { y: nextY, h: state.clipH, gapH: state.gapH,
+          fake: rng() < FAKE_PROB,
+          color: CLIP_PALETTES[Math.floor(rng() * CLIP_PALETTES.length)],
+          passed: false, id: state.clips.length };
+        state.clips.push(newClip);
+      }
+
+      // fake flash overlay timer
+      if (state.fakeFlash > 0) state.fakeFlash -= dt;
+    }
+
+    // juice decay
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // --- draw ---
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+
+    if (state.phase === 'play' || state.phase === 'over') {
+      // Draw clips and gaps
+      for (var j = 0; j < state.clips.length; j++) {
+        drawClip(state.clips[j]);
+        drawGap(state.clips[j]);
+      }
+
+      // Score overlay
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(0,0,0,0.55)';
+      cx.fillRect(W / 2 - 55, 18, 110, 54);
+      cx.fillStyle = 'rgba(255,255,255,0.95)';
+      cx.font = '800 48px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 60);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 11px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 74);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 13px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 96);
+      }
+
+      // combo ring
+      if (state.combo > 1 && state.phase === 'play') {
+        var ringSize = 22 + state.combo * 4;
+        cx.strokeStyle = GOLD;
+        cx.lineWidth = 2 + state.combo * 0.4;
+        cx.globalAlpha = 0.6 + 0.3 * Math.sin(now / 120);
+        cx.beginPath();
+        cx.arc(W / 2, H / 2, ringSize, 0, Math.PI * 2);
+        cx.stroke();
+        cx.globalAlpha = 1;
+        cx.fillStyle = GOLD;
+        cx.font = '800 ' + (14 + state.combo) + 'px -apple-system, Helvetica, Arial';
+        cx.fillText('×' + state.combo, W / 2, H / 2 + 6);
+      }
+    }
+
+    // title screen
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('AUTOPLAY', W / 2, 280);
+      cx.fillStyle = VERM; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('STOP', W / 2, 330);
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap in the gap between clips', W / 2, 375);
+      cx.fillStyle = 'rgba(255,255,255,0.25)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('fakes flash — don\'t get tricked', W / 2, 400);
+      var p = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = p; cx.fillStyle = TEAL;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO PLAY', W / 2, 450);
+      cx.globalAlpha = 1;
+    }
+
+    // challenge card (demo beat 1)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 15px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 295);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('7', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 432);
+    }
+
+    // game over card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.72)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('TAPPED OUT.', W / 2, 290);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' stops', W / 2, 338);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 383);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 406);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 450);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.85 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('AUTOPLAY STOP', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they stopped ' + (window.__demoScore || 7) + ' times. beat it.', W / 2, 336);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 7), W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // floating reward flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, H / 2 - 80 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

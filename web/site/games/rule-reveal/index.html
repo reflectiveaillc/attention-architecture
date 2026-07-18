@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Rule Reveal — Tilt</title>
+<!--
+  LOOP / attention-architecture — Rule Reveal
+  Circuits: 06-zeigarnik, 01-rpe, 05-ease
+  Engine: calm
+  Mechanic: tap the next shape in a never-stated pattern sequence.
+            Predict 10 in a row → the rule surfaces and session closes.
+  Modes:
+    ?demo=1&seed=7  scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay → window.__botDone (bot eventually loses)
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'rule-reveal';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- Shape/colour vocabulary ----
+  // 4 shapes × 4 colours = 16 glyphs
+  // The hidden RULE is: shape cycles in a fixed order (circle→square→triangle→diamond)
+  // AND colour shifts +1 each step (TEAL→GOLD→#9b5fcf→#e87d2e).
+  // Player never sees the rule stated — they discover it by watching the sequence.
+  var SHAPE_NAMES  = ['circle', 'square', 'triangle', 'diamond'];
+  var COLOUR_NAMES = ['teal',   'gold',   'purple',   'amber'];
+  var COLOURS = ['#2ec5b6', '#f2b134', '#9b5fcf', '#e87d2e'];
+
+  var RULE_LABEL = 'shape cycles  ·  colour shifts +1 each step';
+
+  // Given step index, return {shape, colour}
+  function seqAt(n) {
+    return { shape: n % 4, colour: n % 4 };
+  }
+
+  // Draw a shape glyph at (cx,cy) radius r
+  function drawShape(cx2, shape, colour, x, y, r, alpha) {
+    cx2.save();
+    cx2.globalAlpha = (alpha === undefined ? 1 : alpha);
+    cx2.fillStyle = colour;
+    cx2.strokeStyle = colour;
+    cx2.lineWidth = 3;
+    if (shape === 0) {           // circle
+      cx2.beginPath(); cx2.arc(x, y, r, 0, Math.PI * 2); cx2.fill();
+    } else if (shape === 1) {    // square
+      cx2.fillRect(x - r * 0.85, y - r * 0.85, r * 1.7, r * 1.7);
+    } else if (shape === 2) {    // triangle
+      cx2.beginPath();
+      cx2.moveTo(x, y - r);
+      cx2.lineTo(x + r * 0.9, y + r * 0.6);
+      cx2.lineTo(x - r * 0.9, y + r * 0.6);
+      cx2.closePath(); cx2.fill();
+    } else {                     // diamond
+      cx2.beginPath();
+      cx2.moveTo(x,        y - r);
+      cx2.lineTo(x + r,    y);
+      cx2.lineTo(x,        y + r);
+      cx2.lineTo(x - r,    y);
+      cx2.closePath(); cx2.fill();
+    }
+    cx2.restore();
+  }
+
+  // ---- Game state ----
+  // phase: title | play | over | cta
+  var state, flashes, hitStop, zoom, shakeAmt;
+  var runStartTs, best = 0;
+  try { best = +localStorage.getItem('rr_best') || 0; } catch (_) {}
+
+  // Slot layout: 5 history slots across + 1 blank slot to tap
+  var SLOT_R  = 34;           // radius of each shape cell
+  var SLOT_GAP = 16;          // gap between cells
+  var COLS = 4;               // choices in choice row
+  var SEQ_LEN = 5;            // how many sequence steps shown
+
+  var ctaAt = 0;
+
+  function newGame() {
+    state = {
+      phase:   'title',
+      step:    0,               // current position in infinite sequence
+      streak:  0,               // consecutive correct answers
+      score:   0,               // total correct answers
+      fade:    1.0,             // blank slot fade (1=full, 0=gone → time-out miss)
+      fadeSpd: 0.004,           // fraction per ms
+      lastMs:  0,               // timestamp of last step start
+      over:    false,
+      overAt:  0,
+      ruleShown: false,
+      ruleAt:  0,
+    };
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0;
+    if (BOT) { startRun(); return; }
+    if (DEMO) { startDemoArc(); return; }
+  }
+
+  function startRun() {
+    state.phase   = 'play';
+    state.step    = 0;
+    state.streak  = 0;
+    state.score   = 0;
+    state.fade    = 1.0;
+    state.lastMs  = performance.now();
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // Build choice array: correct answer + 3 distractors (random other glyphs, no dupes)
+  function buildChoices(correctStep) {
+    var correct = seqAt(correctStep);
+    var pool = [];
+    for (var s = 0; s < 4; s++) {
+      for (var c = 0; c < 4; c++) {
+        if (s === correct.shape && c === correct.colour) continue;
+        pool.push({ shape: s, colour: c });
+      }
+    }
+    // shuffle pool
+    for (var i = pool.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+    }
+    var choices = pool.slice(0, 3);
+    var insAt = Math.floor(rng() * 4);
+    choices.splice(insAt, 0, correct);
+    return { choices: choices, correctIdx: insAt };
+  }
+
+  var currentChoices = null;
+
+  function ensureChoices() {
+    if (!currentChoices) currentChoices = buildChoices(state.step);
+  }
+
+  function attempt(idx) {
+    if (state.phase !== 'play') return;
+    ensureChoices();
+    if (idx === currentChoices.correctIdx) {
+      // Correct
+      state.streak++;
+      state.score++;
+      state.step++;
+      currentChoices = null;
+      if (window.J) J.calm(state.streak);
+      if (state.streak > 0 && state.streak % 3 === 0) { zoom = 1.02; }
+      flash('+1', TEAL, 34);
+      if (window.LOOP) LOOP.emit('correct_tap', { step: state.step, streak: state.streak });
+
+      if (state.streak >= 10) {
+        // Rule revealed — win path
+        state.ruleShown = true;
+        state.ruleAt = performance.now();
+        flash('RULE FOUND', GOLD, 36);
+        if (window.J) J.calm(10);
+        zoom = 1.03;
+        if (window.LOOP) LOOP.emit('rule_revealed', { step: state.step, score: state.score });
+        if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +((Date.now() - runStartTs) / 1000).toFixed(1) });
+        if (!best || state.score >= best) {
+          best = state.score; try { localStorage.setItem('rr_best', String(best)); } catch (_) {}
+        }
+        setTimeout(function () {
+          state.phase = 'over';
+          state.overAt = performance.now();
+          if (DEMO) {
+            setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+              setTimeout(function () { window.__demoDone = true; }, 3500); }, 1500);
+          }
+        }, 1200);
+        return;
+      }
+
+      // Reset fade timer
+      state.fade = 1.0;
+      state.fadeSpd = Math.max(0.0025, 0.004 - state.streak * 0.0002); // gets slightly harder
+      state.lastMs = performance.now();
+    } else {
+      // Wrong — game over
+      miss();
+    }
+  }
+
+  function timeOut() {
+    miss();
+  }
+
+  function miss() {
+    if (state.phase !== 'play') return;
+    state.phase = 'over';
+    state.over  = true;
+    state.overAt = performance.now();
+    shakeAmt = 8;
+    currentChoices = null;
+    if (window.J) J.calm(0);   // calm engine: still soft on miss
+    flash('MISSED', '#e87d2e', 36);
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (!best || state.score > best) {
+      best = state.score; try { localStorage.setItem('rr_best', String(best)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500); }, 1800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { restartRun(); }, 700);
+    }
+  }
+
+  function restartRun() {
+    state.phase  = 'play';
+    state.step   = 0;
+    state.streak = 0;
+    state.score  = 0;
+    state.fade   = 1.0;
+    state.fadeSpd = 0.004;
+    state.lastMs = performance.now();
+    state.over   = false;
+    state.ruleShown = false;
+    currentChoices = null;
+    flashes = [];
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('restart', {});
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function flash(txt, colour, size) { flashes.push({ txt: txt, colour: colour, size: size || 32, t: 0 }); }
+
+  // ---- Input ----
+  function getChoiceRects() {
+    // 4 choices in a 2×2 grid centred on the screen
+    var cellW = 80, cellH = 80, padX = 20;
+    var totalW = 2 * cellW + padX;
+    var startX = (W - totalW) / 2;
+    var startY = H / 2 + 20;
+    var rects = [];
+    for (var i = 0; i < 4; i++) {
+      var col = i % 2, row = Math.floor(i / 2);
+      rects.push({
+        x: startX + col * (cellW + padX),
+        y: startY + row * (cellH + padX),
+        w: cellW, h: cellH
+      });
+    }
+    return rects;
+  }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over') {
+      if (performance.now() - state.overAt > 350) {
+        restartRun();
+      }
+      return;
+    }
+    if (state.phase === 'play' && x !== undefined) {
+      var rects = getChoiceRects();
+      for (var i = 0; i < rects.length; i++) {
+        if (inR(rects[i], x, y)) { attempt(i); return; }
+      }
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.key >= '1' && e.key <= '4') attempt(+e.key - 1);
+    if (e.code === 'Space' && state.phase === 'title') tap();
+  });
+
+  // ---- Bot autopilot ----
+  var botRunsDone = 0;
+  var botStepCount = 0;
+  var BOT_CORRECT_LIMIT = 7;  // bot gets this many right then starts missing
+  var botNextActionAt = 0;
+
+  function botTick(now) {
+    if (!BOT || state.phase !== 'play') return;
+    if (now < botNextActionAt) return;
+    ensureChoices();
+    var idx;
+    if (botStepCount < BOT_CORRECT_LIMIT) {
+      // Answer correctly
+      idx = currentChoices.correctIdx;
+      botStepCount++;
+    } else {
+      // Pick wrong answer deliberately to trigger game_over
+      idx = (currentChoices.correctIdx + 1 + Math.floor(rng() * 3)) % 4;
+      botStepCount = 0;
+    }
+    attempt(idx);
+    botNextActionAt = now + 600 + rng() * 400;
+  }
+
+  // ---- Demo arc ----
+  // settle → deepen → resolve → soft invitation
+  // scripted sequence of correct/incorrect taps + timing
+  var demoPhase = 0;
+  var demoNextAt = 0;
+  var demoCorrectCount = 0;
+  var DEMO_CORRECT_TARGET = 8;  // show 8 correct, then time-out (fade hits 0) for drama, then CTA
+
+  function startDemoArc() {
+    startRun();
+    demoPhase = 0; demoCorrectCount = 0;
+    demoNextAt = performance.now() + 800;  // wait before first move
+  }
+
+  function demoTick(now) {
+    if (!DEMO || state.phase !== 'play') return;
+    if (now < demoNextAt) return;
+    ensureChoices();
+    if (demoCorrectCount < DEMO_CORRECT_TARGET) {
+      // Correct tap with hesitation variance
+      attempt(currentChoices.correctIdx);
+      demoCorrectCount++;
+      // Human hesitation — varies by step: early slow, speeds up as pattern clicks
+      var hesitation = demoCorrectCount < 3 ? 1800 + rng() * 600
+                     : demoCorrectCount < 6 ? 1200 + rng() * 400
+                     :                         900 + rng() * 300;
+      demoNextAt = now + hesitation;
+    } else {
+      // Let the fade timer run out naturally (time-out miss)
+      // force fade to zero now for instant miss
+      state.fade = 0;
+      timeOut();
+    }
+  }
+
+  // ---- Render ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Update fade timer during play
+    if (state.phase === 'play') {
+      var elapsed = now - state.lastMs;
+      state.fade = Math.max(0, 1 - elapsed * state.fadeSpd);
+      if (state.fade <= 0) { timeOut(); }
+    }
+
+    // Hit-stop: freeze autopilots but still decay
+    if (hitStop > 0) { hitStop -= dt; }
+    else {
+      botTick(now);
+      demoTick(now);
+    }
+
+    // Juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(242,177,52,0.04)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    if (state.phase === 'title') {
+      drawTitle(now);
+    } else if (state.phase === 'play') {
+      drawPlay(now);
+    } else if (state.phase === 'over') {
+      drawPlay(now);
+      drawOver(now);
+    } else if (state.phase === 'cta') {
+      drawCTA(now);
+    }
+
+    // Floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.save();
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.colour;
+      cx.font = '800 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 200 - fl.t * 0.7);
+      cx.restore();
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // Mute toggle
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '800 42px -apple-system, Helvetica, Arial';
+    cx.fillText('RULE REVEAL', W / 2, 240);
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.font = '500 15px -apple-system, Helvetica, Arial';
+    cx.fillText('find the pattern — tap what comes next', W / 2, 278);
+
+    // Show a mini preview sequence
+    var previewY = 360;
+    var cx2 = cx;
+    for (var i = 0; i < 4; i++) {
+      var g = seqAt(i);
+      var px = W / 2 - 1.5 * (SLOT_R * 2 + 10) + i * (SLOT_R * 2 + 10) + SLOT_R;
+      drawShape(cx2, g.shape, COLOURS[g.colour], px, previewY, SLOT_R - 4, 0.6 + 0.15 * Math.sin(now / 800 + i));
+    }
+    // Question mark slot
+    cx2.save();
+    cx2.globalAlpha = 0.4 + 0.3 * Math.sin(now / 500);
+    cx2.strokeStyle = TEAL; cx2.lineWidth = 2;
+    cx2.beginPath(); cx2.arc(W / 2 + 2 * (SLOT_R * 2 + 10) + SLOT_R - 1.5 * (SLOT_R * 2 + 10), previewY, SLOT_R - 2, 0, Math.PI * 2);
+    cx2.stroke();
+    cx2.fillStyle = TEAL; cx2.font = '700 22px -apple-system, Helvetica, Arial'; cx2.textAlign = 'center';
+    cx2.fillText('?', W / 2 + 2 * (SLOT_R * 2 + 10) + SLOT_R - 1.5 * (SLOT_R * 2 + 10), previewY + 8);
+    cx2.restore();
+
+    var pulse = 0.6 + 0.4 * Math.sin(now / 350);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = TEAL; cx.font = '700 17px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO BEGIN', W / 2, 470);
+    cx.globalAlpha = 1;
+    cx.fillStyle = 'rgba(255,255,255,0.28)';
+    cx.font = '500 12px -apple-system, Helvetica, Arial';
+    cx.fillText('10 in a row reveals the rule', W / 2, 500);
+  }
+
+  function drawPlay(now) {
+    ensureChoices();
+    var seq = currentChoices;
+    cx.textAlign = 'center';
+
+    // Header: streak counter
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '800 58px -apple-system, Helvetica, Arial';
+    cx.fillText(state.streak, W / 2, 90);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('streak', W / 2, 112);
+
+    // Progress dots (10 steps)
+    var dotY = 138, dotR = 6, dotSpacing = 26;
+    var totalDotW = 10 * dotR * 2 + 9 * (dotSpacing - dotR * 2);
+    var dotStartX = (W - totalDotW) / 2 + dotR;
+    for (var d = 0; d < 10; d++) {
+      var dx = dotStartX + d * dotSpacing;
+      cx.beginPath();
+      cx.arc(dx, dotY, dotR, 0, Math.PI * 2);
+      if (d < state.streak) {
+        cx.fillStyle = TEAL;
+      } else {
+        cx.fillStyle = 'rgba(255,255,255,0.12)';
+      }
+      cx.fill();
+    }
+
+    // Sequence history: show last SEQ_LEN shapes in a row
+    var seqY = 230, seqR = 26;
+    var seqSpacing = 68;
+    var seqStartX = W / 2 - ((SEQ_LEN - 1) / 2) * seqSpacing;
+    cx.fillStyle = 'rgba(255,255,255,0.12)';
+    cx.font = '500 11px -apple-system, Helvetica, Arial';
+    cx.fillText('sequence', W / 2, seqY - seqR - 14);
+
+    for (var si = 0; si < SEQ_LEN; si++) {
+      var stepIdx = state.step - SEQ_LEN + si;
+      var sx2 = seqStartX + si * seqSpacing;
+      if (stepIdx < 0) {
+        // Empty placeholder
+        cx.save(); cx.globalAlpha = 0.1;
+        cx.strokeStyle = '#fff'; cx.lineWidth = 1;
+        cx.beginPath(); cx.arc(sx2, seqY, seqR, 0, Math.PI * 2); cx.stroke();
+        cx.restore();
+      } else {
+        var g2 = seqAt(stepIdx);
+        // Recency alpha: older = dimmer
+        var recency = 0.35 + 0.65 * (si / (SEQ_LEN - 1));
+        drawShape(cx, g2.shape, COLOURS[g2.colour], sx2, seqY, seqR, recency);
+      }
+    }
+
+    // Blank slot (what comes next?) — animated fade ring
+    var blankX = W / 2;
+    var blankY = seqY + 105;
+    var blankR = 34;
+    var fadeCol = state.fade > 0.4 ? TEAL : '#e87d2e';
+
+    // Fade arc (timer)
+    cx.save();
+    cx.beginPath();
+    cx.arc(blankX, blankY, blankR + 4, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * state.fade);
+    cx.strokeStyle = fadeCol; cx.lineWidth = 3; cx.globalAlpha = 0.9;
+    cx.stroke();
+    cx.restore();
+
+    // Dashed circle outline
+    cx.save();
+    cx.setLineDash([6, 5]);
+    cx.beginPath(); cx.arc(blankX, blankY, blankR, 0, Math.PI * 2);
+    cx.strokeStyle = 'rgba(255,255,255,0.22)'; cx.lineWidth = 2;
+    cx.stroke(); cx.setLineDash([]);
+    cx.restore();
+
+    cx.fillStyle = 'rgba(255,255,255,0.18)'; cx.font = '700 24px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.fillText('?', blankX, blankY + 8);
+
+    cx.fillStyle = 'rgba(255,255,255,0.2)';
+    cx.font = '500 11px -apple-system, Helvetica, Arial';
+    cx.fillText('what comes next?', blankX, blankY + blankR + 18);
+
+    // Choice grid (2×2)
+    var rects = getChoiceRects();
+    for (var ci = 0; ci < 4; ci++) {
+      var r2 = rects[ci];
+      var ch = seq.choices[ci];
+      var isCorrect = ci === seq.correctIdx;
+      var cx2c = cx;
+
+      // Cell bg
+      cx2c.save();
+      cx2c.fillStyle = 'rgba(255,255,255,0.05)';
+      cx2c.strokeStyle = 'rgba(255,255,255,0.14)';
+      cx2c.lineWidth = 1.5;
+      if (cx2c.roundRect) cx2c.roundRect(r2.x, r2.y, r2.w, r2.h, 12);
+      else cx2c.rect(r2.x, r2.y, r2.w, r2.h);
+      cx2c.fill(); cx2c.stroke();
+      cx2c.restore();
+
+      // Shape
+      drawShape(cx, ch.shape, COLOURS[ch.colour], r2.x + r2.w / 2, r2.y + r2.h / 2, 22);
+    }
+
+    // Score display (bottom)
+    cx.fillStyle = 'rgba(255,255,255,0.3)';
+    cx.font = '500 12px -apple-system, Helvetica, Arial'; cx.textAlign = 'center';
+    cx.fillText('correct: ' + state.score + '  ·  best: ' + best, W / 2, H - 36);
+  }
+
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+
+    if (state.ruleShown) {
+      // Won — rule revealed
+      cx.fillStyle = GOLD;
+      cx.font = '800 32px -apple-system, Helvetica, Arial';
+      cx.fillText('RULE REVEALED', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText(RULE_LABEL, W / 2, 325);
+      cx.fillStyle = TEAL; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' found in a row', W / 2, 368);
+    } else {
+      // Lost — missed or timed out
+      cx.fillStyle = 'rgba(255,255,255,0.8)';
+      cx.font = '700 28px -apple-system, Helvetica, Arial';
+      cx.fillText('streak broken', W / 2, 295);
+      cx.fillStyle = TEAL; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText(state.streak + ' in a row', W / 2, 335);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('the pattern was right there', W / 2, 366);
+    }
+
+    if (!DEMO && !BOT) {
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL; cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO TRY AGAIN', W / 2, 430);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawCTA(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2.0);
+    cx.save();
+    cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')'; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '800 40px -apple-system, Helvetica, Arial';
+    cx.fillText('RULE REVEAL', W / 2, 290);
+    cx.fillStyle = 'rgba(255,255,255,0.65)'; cx.font = '500 16px -apple-system, Helvetica, Arial';
+    cx.fillText('the pattern was right there all along', W / 2, 326);
+    cx.fillStyle = TEAL; cx.font = '700 20px -apple-system, Helvetica, Arial';
+    var pulse = 0.75 + 0.25 * Math.sin(now / 280);
+    cx.globalAlpha = ease * pulse;
+    cx.fillText('▶ REACH IT', W / 2, 400);
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '500 13px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 432);
+    cx.restore();
+    window.__demoScore = state.score;
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

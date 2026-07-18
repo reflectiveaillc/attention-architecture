@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Duet Trace — Tilt</title>
+<!--
+  LOOP / attention-architecture — Duet Trace
+  Circuits: 03 social (duet/mirror), 01 RPE (variable overlap reward), 08 investment (duet streak).
+  Modes:
+    ?demo=1&seed=7        scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autopilot, sets window.__botDone
+    ?dare=<score>         incoming dare from SHARE
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'duet-trace';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR = +qs.get('err') || 28;
+  var SEED = +qs.get('seed') || 7;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function randn() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134';
+  var GHOST_R = 10, PLAYER_R = 12;
+  var PERFECT_Q = 0.95, GOOD_Q = 0.75, NEAR_Q = 0.42, BAD_Q = 0.15;
+
+  var state, runStartTs, lastQuality, qSum, qCount, combo, maxCombo, badStreak;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false, challengeAt = 0, ctaAt = 0;
+  var best = 0, flashes = [];
+  try { best = +localStorage.getItem('dt_best') || 0; } catch (_) {}
+
+  // path: ghost stays left of center; target is mirrored right of center
+  var pathAmp, pathFreq, pathPhase, pathWobbleAmp, pathWobbleFreq, pathWobblePhase;
+  function buildPathParams() {
+    pathAmp = 68 + rng() * 22;
+    pathFreq = 3 + rng() * 2;
+    pathPhase = rng() * Math.PI * 2;
+    pathWobbleAmp = 16 + rng() * 10;
+    pathWobbleFreq = 7 + rng() * 5;
+    pathWobblePhase = rng() * Math.PI * 2;
+  }
+  buildPathParams();
+
+  function ghostPos(p) {
+    // difficulty ramps from 0 to 1 over the first ~16s of progress
+    var diff = clamp(p * 1.4, 0, 1);
+    var a = pathAmp * (1 + diff * 0.7);
+    var x = W / 2 - 28 + a * Math.sin(p * pathFreq * Math.PI + pathPhase);
+    x += pathWobbleAmp * (1 + diff * 0.5) * Math.sin(p * pathWobbleFreq * Math.PI + pathWobblePhase);
+    return { x: clamp(x, 36, W / 2 - 24), y: 110 + p * (H - 230) };
+  }
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      p: 0, speed: 0.00105,
+      ghostX: 0, ghostY: 110,
+      playerX: W / 2 + 80,
+      targetX: W / 2 - 80,
+      score: 0, overAt: 0,
+      pointerId: null, dragging: false
+    };
+    qSum = 0; qCount = 0; combo = 0; maxCombo = 0; badStreak = 0; dareBeaten = false; flashes = [];
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    state.p = 0;
+    var g = ghostPos(0);
+    state.ghostX = g.x; state.ghostY = g.y;
+    state.targetX = W - g.x;
+    state.playerX = state.targetX + (DEMO ? 20 : (BOT ? randn() * BOT_ERR : 0));
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 18))));
+  }
+
+  function updateScore(quality, dist) {
+    qSum += quality; qCount++;
+    state.score = qCount ? Math.round(100 * qSum / qCount) : 0;
+    lastQuality = quality;
+
+    if (quality >= PERFECT_Q) {
+      combo++;
+      if (combo > maxCombo) maxCombo = combo;
+      if (combo % 8 === 0) {
+        flash('×' + combo, TEAL, 40);
+        if (window.LOOP) LOOP.emit('duet_streak', { combo: combo, score: state.score });
+        if (window.J) {
+          J.perfect(Math.min(combo, 24));
+          if (combo >= 16) J.gold();
+          hitStop = 3; zoom = 1.025;
+        }
+      } else if (combo % 4 === 0) {
+        if (window.J) J.hit(Math.min(combo, 16));
+      }
+    } else if (quality >= GOOD_Q) {
+      if (combo > 0 && combo % 6 === 0) { if (window.J) J.hit(3); }
+    } else {
+      if (quality < NEAR_Q && combo > 4) flash('DUET BROKEN', VERM, 34);
+      combo = 0;
+    }
+
+    if (quality < BAD_Q) {
+      badStreak += 1 / 60; // approx seconds at 60fps base
+      if (window.J) J.tension(clamp(badStreak / 0.8, 0, 1));
+    } else {
+      badStreak = Math.max(0, badStreak - 2 / 60);
+      if (window.J) J.tension(clamp(badStreak / 0.8, 0, 1));
+    }
+
+    if (quality < NEAR_Q && quality >= BAD_Q) {
+      if (window.LOOP && rng() < 0.08) LOOP.emit('near_miss', { p: +state.p.toFixed(3), quality: +quality.toFixed(3) });
+      if (window.J && rng() < 0.15) J.near();
+      shakeAmt = Math.max(shakeAmt, 2.5);
+    }
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+      if (window.LOOP) LOOP.emit('challenge_beaten', { dare: SHARE.dare, score: state.score });
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.death(Math.min(0.35 + state.score / 120, 1));
+      J.tension(0);
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('dt_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 800);
+    }
+  }
+
+  function resetRun() {
+    qSum = 0; qCount = 0; combo = 0; maxCombo = 0; badStreak = 0; dareBeaten = false; flashes = [];
+    state.p = 0; state.phase = 'play';
+    buildPathParams();
+    var g = ghostPos(0);
+    state.ghostX = g.x; state.ghostY = g.y;
+    state.targetX = W - g.x;
+    state.playerX = state.targetX + (BOT ? randn() * BOT_ERR : 0);
+    if (window.LOOP) LOOP.emit('restart', {});
+    runStartTs = Date.now();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 496, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: '%' });
+        if (window.LOOP) LOOP.emit('share', { channel: 'native' });
+        return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale;
+    tap(x, y);
+    state.pointerId = e.pointerId;
+    state.dragging = state.phase === 'play';
+    if (state.dragging) movePlayer(x);
+  });
+  window.addEventListener('pointermove', function (e) {
+    if (DEMO || BOT || !state.dragging || e.pointerId !== state.pointerId) return;
+    var r = cv.getBoundingClientRect();
+    movePlayer((e.clientX - r.left) / scale);
+  });
+  window.addEventListener('pointerup', function (e) {
+    if (e.pointerId === state.pointerId) { state.dragging = false; state.pointerId = null; }
+  });
+  window.addEventListener('pointercancel', function (e) {
+    if (e.pointerId === state.pointerId) { state.dragging = false; state.pointerId = null; }
+  });
+  window.addEventListener('keydown', function (e) {
+    if (DEMO || BOT) return;
+    if (state.phase === 'title' && e.code === 'Space') { startRun(); return; }
+    if (state.phase === 'play') {
+      var step = 14;
+      if (e.code === 'ArrowLeft' || e.code === 'KeyA') movePlayer(state.playerX - step);
+      if (e.code === 'ArrowRight' || e.code === 'KeyD') movePlayer(state.playerX + step);
+    }
+    if (state.phase === 'over' && e.code === 'Space') resetRun();
+  });
+
+  function movePlayer(x) {
+    state.playerX = clamp(x, 24, W - 24);
+  }
+
+  // ---- autopilots ----
+  var botRunsDone = 0, botOffset = 0;
+  var demoPhase = 0, demoTargetErr = 0;
+
+  function demoPlan(p) {
+    // scripted arc: clean -> wobble -> near-fail -> save -> good -> drift-to-fail
+    if (p < 0.16) { demoPhase = 0; return { err: randn() * 12, lag: 0.14 }; }
+    if (p < 0.30) { demoPhase = 1; return { err: 35 + randn() * 18, lag: 0.10 }; }
+    if (p < 0.44) { demoPhase = 2; return { err: randn() * 10, lag: 0.14 }; }
+    if (p < 0.58) { demoPhase = 3; return { err: 85 + randn() * 42, lag: 0.06 }; }
+    if (p < 0.72) { demoPhase = 4; return { err: 22 + randn() * 12, lag: 0.16 }; }
+    demoPhase = 5; return { err: 155 + randn() * 25, lag: 0.04 }; // the real fail
+  }
+
+  function autopilot(dt) {
+    if (state.phase !== 'play') return;
+    var target = state.targetX;
+    var plan, want;
+    if (DEMO) {
+      plan = demoPlan(state.p);
+      // smooth the error target so it feels like a thumb catching up / drifting
+      demoTargetErr += (plan.err - demoTargetErr) * plan.lag * dt;
+      want = target + demoTargetErr;
+    } else if (BOT) {
+      if (botOffset === 0 || rng() < 0.02) botOffset = randn() * BOT_ERR;
+      botOffset += (randn() * BOT_ERR * 0.08 - botOffset * 0.02) * dt;
+      want = target + botOffset;
+    } else return;
+    var dx = want - state.playerX;
+    state.playerX += dx * (DEMO ? 0.16 : 0.12) * dt;
+  }
+
+  // ---- render ----
+  function drawPathAhead(p, y) {
+    cx.strokeStyle = 'rgba(255,255,255,0.10)';
+    cx.lineWidth = 2;
+    cx.beginPath();
+    var started = false;
+    for (var i = 0; i <= 40; i++) {
+      var gp = p + i * 0.012;
+      if (gp > 1) break;
+      var pos = ghostPos(gp);
+      if (!started) { cx.moveTo(pos.x, pos.y); started = true; }
+      else cx.lineTo(pos.x, pos.y);
+    }
+    cx.stroke();
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') {
+      // advance ghost
+      state.p += state.speed * dt;
+      if (state.p >= 1) state.p = 1;
+      var g = ghostPos(state.p);
+      state.ghostX = g.x; state.ghostY = g.y;
+      state.targetX = W - g.x;
+
+      autopilot(dt);
+
+      var dist = Math.abs(state.playerX - state.targetX);
+      var quality = clamp(1 - dist / 120, 0, 1);
+      updateScore(quality, dist);
+
+      var demoSafe = DEMO && state.p < 0.72;
+      if ((!demoSafe && badStreak > 0.9) || state.p >= 0.96) gameOver();
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)'); bg.addColorStop(1, 'rgba(232,80,46,0.08)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // center mirror line
+    cx.strokeStyle = 'rgba(255,255,255,0.10)'; cx.lineWidth = 1;
+    cx.beginPath(); cx.moveTo(W / 2, 80); cx.lineTo(W / 2, H - 40); cx.stroke();
+
+    if (state.phase !== 'title' && state.phase !== 'challenge') {
+      // trace path ahead
+      drawPathAhead(state.p, state.ghostY);
+
+      // ghost hand
+      cx.fillStyle = 'rgba(46,197,182,0.35)';
+      cx.beginPath(); cx.arc(state.ghostX, state.ghostY, GHOST_R + 4, 0, Math.PI * 2); cx.fill();
+      cx.fillStyle = TEAL;
+      cx.beginPath(); cx.arc(state.ghostX, state.ghostY, GHOST_R, 0, Math.PI * 2); cx.fill();
+      cx.fillStyle = '#fff';
+      cx.beginPath(); cx.arc(state.ghostX, state.ghostY, 4, 0, Math.PI * 2); cx.fill();
+
+      // mirror target marker (faint)
+      cx.strokeStyle = 'rgba(242,177,52,0.35)'; cx.lineWidth = 2;
+      cx.beginPath(); cx.arc(state.targetX, state.ghostY, 7, 0, Math.PI * 2); cx.stroke();
+
+      // player dot
+      var pr = PLAYER_R + Math.min(combo * 0.6, 12);
+      if (combo > 2) {
+        cx.strokeStyle = TEAL; cx.lineWidth = 2;
+        cx.beginPath(); cx.arc(state.playerX, state.ghostY, pr + 4 + 2 * Math.sin(now / 120), 0, Math.PI * 2); cx.stroke();
+      }
+      var pcol = lastQuality >= PERFECT_Q ? TEAL : (lastQuality >= GOOD_Q ? GOLD : VERM);
+      cx.fillStyle = pcol;
+      cx.beginPath(); cx.arc(state.playerX, state.ghostY, PLAYER_R, 0, Math.PI * 2); cx.fill();
+      cx.fillStyle = '#fff';
+      cx.beginPath(); cx.arc(state.playerX, state.ghostY, 4, 0, Math.PI * 2); cx.fill();
+
+      // connection line when close
+      if (lastQuality > GOOD_Q) {
+        var cxMid = (state.ghostX + state.playerX) / 2;
+        var cyMid = state.ghostY;
+        var grad = cx.createLinearGradient(state.ghostX, state.ghostY, state.playerX, state.ghostY);
+        grad.addColorStop(0, 'rgba(46,197,182,0.45)'); grad.addColorStop(1, 'rgba(242,177,52,0.45)');
+        cx.strokeStyle = grad; cx.lineWidth = 2 + lastQuality * 3;
+        cx.beginPath(); cx.moveTo(state.ghostX, state.ghostY); cx.lineTo(state.playerX, state.ghostY); cx.stroke();
+      }
+
+      // duet meter
+      var mw = 220, mh = 6, mx = (W - mw) / 2, my = 76;
+      cx.fillStyle = 'rgba(255,255,255,0.12)';
+      cx.beginPath(); cx.roundRect ? cx.roundRect(mx, my, mw, mh, 3) : cx.rect(mx, my, mw, mh); cx.fill();
+      var fill = clamp(lastQuality || 0, 0, 1);
+      cx.fillStyle = fill >= PERFECT_Q ? TEAL : (fill >= GOOD_Q ? GOLD : VERM);
+      cx.beginPath(); cx.roundRect ? cx.roundRect(mx, my, mw * fill, mh, 3) : cx.rect(mx, my, mw * fill, mh); cx.fill();
+    }
+
+    // score / combo
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '800 70px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + '%', W / 2, 54);
+      if (combo > 1) {
+        cx.fillStyle = TEAL; cx.font = '800 18px -apple-system, Helvetica, Arial';
+        cx.fillText('DUET ×' + combo, W / 2, 96);
+      }
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best + '%', W / 2, 118);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + '%' + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 146);
+      }
+    }
+
+    // challenge card
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('73%', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top duet", W / 2, 430);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, state.ghostY - 50 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('DUET TRACE', W / 2, 280);
+      cx.fillStyle = TEAL; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('MIRROR THE GHOST', W / 2, 330); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('your thumb already knows this move.', W / 2, 360);
+
+      // preview dots
+      var t = now / 1000;
+      var previewY = 430;
+      var gx = W / 2 - 70 + 40 * Math.sin(t * 3);
+      var tx = W - gx;
+      cx.fillStyle = 'rgba(46,197,182,0.5)';
+      cx.beginPath(); cx.arc(gx, previewY, 10, 0, Math.PI * 2); cx.fill();
+      cx.fillStyle = 'rgba(232,80,46,0.5)';
+      cx.beginPath(); cx.arc(tx + 30 * Math.sin(t * 2.5), previewY, 10, 0, Math.PI * 2); cx.fill();
+    }
+
+    // game over
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('DUET BROKEN.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + '% synced', W / 2, 345);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 472);
+        cx.globalAlpha = 1;
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('DUET TRACE', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they synced ' + (window.__demoScore || 73) + '%. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 73) + '%', W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

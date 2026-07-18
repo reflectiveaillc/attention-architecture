@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Flappy Face — Tilt</title>
+<!--
+  LOOP / attention-architecture — Flappy Face (FACE-CONTROL engine, reference impl)
+  The player OPENS THEIR MOUTH to flap. The webcam is composited into the game
+  canvas (corner PiP) so a single recording captures BOTH the game and the funny
+  face — that recording is the shareable clip (the whole point).
+  Tech: MediaPipe FaceLandmarker (in-browser WASM, jawOpen blendshape) + getUserMedia
+        + MediaRecorder (canvas.captureStream → downloadable webm).
+  Conditioned path: face-filter / reaction-challenge videos (TikTok/IG) — the
+  algorithm already farms funny-face content; this game MANUFACTURES it.
+  Modes: face games can't be headless-validated (need a camera + real face), so
+  ?demo=1 / ?bot=1 run a KEYBOARD/auto fallback (space or auto-flap) with a
+  simulated face so the clip-capture + validation gates still work.
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:none;
+               font-family:-apple-system,'Helvetica Neue',Arial,sans-serif; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+  video { display:none; }
+  #ui { position:fixed; left:0; right:0; bottom:max(16px,env(safe-area-inset-bottom)); display:flex; gap:10px; justify-content:center; z-index:10; }
+  button { background:#12151d; color:#fff; border:1px solid rgba(255,255,255,.15); border-radius:99px;
+           padding:12px 20px; font-size:15px; font-weight:800; cursor:pointer; }
+  button.rec { background:#e8502e; border-color:#e8502e; }
+  button.rec.on { animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.55; } }
+  #perm { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; text-align:center; padding:24px; z-index:20; background:#0b0d12; }
+  #perm h1 { font-size:34px; font-weight:900; margin:0; }
+  #perm p { color:rgba(255,255,255,.6); font-size:15px; max-width:320px; margin:0; }
+  #perm .big { background:#e8502e; border-color:#e8502e; font-size:18px; padding:16px 28px; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<video id="cam" autoplay playsinline muted></video>
+<div id="perm">
+  <h1>FLAPPY FACE</h1>
+  <p>Open your <b>mouth</b> to flap. The wider you gape, the higher you fly. Your face rides in the corner — record it and share the damage.</p>
+  <button class="big" id="start">▶ ALLOW CAMERA &amp; PLAY</button>
+  <p style="font-size:12px;opacity:.5">camera stays on your device — nothing is uploaded</p>
+</div>
+<div id="ui" style="display:none">
+  <button id="rec" class="rec">● RECORD</button>
+</div>
+<script>window.LOOP_GAME = 'flappy-face';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script src="../../js/face-control.js"></script>
+<script type="module">
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+  var AUTO = DEMO || BOT;                 // no camera in scripted modes
+
+  function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var video = document.getElementById('cam');
+  var dpr = Math.min(window.devicePixelRatio||1,2), scale=1;
+  function fit(){var s=Math.min(window.innerWidth/W,window.innerHeight/H);scale=s;cv.style.width=(W*s)+'px';cv.style.height=(H*s)+'px';cv.width=W*dpr;cv.height=H*dpr;cx.setTransform(dpr,0,0,dpr,0,0);}
+  window.addEventListener('resize',fit); fit();
+
+  var VERM='#e8502e', TEAL='#2ec5b6', GOLD='#f2b134', INK='#0b0d12';
+
+  // ---- game state ----
+  // DISCRETE FLAP (like real flappy bird): each mouth-OPEN = one bump. Close your
+  // mouth to re-arm, open again to flap — open-close-open-close. Forgiving physics.
+  var BIRD_X=120, GRAV=0.32, FLAP_IMPULSE=-5.4, MAXV=7, PIPE_W=58, GAP=280, PIPE_EVERY=150, PIPE_SPEED=1.7;
+  var st, pipes, spawnT, best=0, hitStop=0, shakeAmt=0, dareBeaten=false;
+  try{best=+localStorage.getItem('ff_best')||0;}catch(_){}
+  var mouth=0, mouthSmoothed=0, faceReady=false, wasOpen=false;
+
+  function newRun(){
+    st={phase:'ready',y:H/2,vy:0,score:0,overAt:0};
+    pipes=[]; spawnT=0;
+    if(AUTO){ st.phase='play'; start(); }
+  }
+  function start(){
+    st.phase='play'; st.y=H/2; st.vy=0; st.score=0; pipes=[]; spawnT=0; dareBeaten=false;
+    runStartTs=Date.now();
+    if(window.LOOP) LOOP.emit('play_start',{seed:SEED});
+  }
+  var runStartTs=0;
+  window.__ff=function(){return {st:st,pipes:pipes,GAP:GAP,H:H};}; // test hook (harmless)
+
+  function spawnPipe(){
+    // first pipe's gap sits near center (reachable); later ones vary
+    var margin=120, gy = st.score===0 && pipes.length===0 ? H/2-GAP/2 : margin+rng()*(H-GAP-margin*2);
+    pipes.push({x:W+PIPE_W, gapY:gy, scored:false});
+  }
+  function flap(){  // one bump per mouth-open (fixed strength — predictable)
+    if(st.phase==='ready'){ st.phase='play'; start(); }
+    if(st.phase!=='play') return;
+    st.vy=FLAP_IMPULSE;
+    if(window.J) J.hit(st.score+1);
+  }
+  function gameOver(){
+    st.phase='over'; st.overAt=performance.now(); shakeAmt=10;
+    var dur=(Date.now()-runStartTs)/1000;
+    var nb=st.score>best; if(nb){best=st.score;try{localStorage.setItem('ff_best',String(best));}catch(_){}};
+    if(window.J){J.death(Math.min(0.3+st.score/20,1)); if(nb) setTimeout(function(){J.fanfare();},450);}
+    if(DEMO) window.__demoScore=st.score;
+    if(window.LOOP) LOOP.emit('game_over',{score:st.score,dur_s:+dur.toFixed(1)});
+    if(BOT){ botRunsDone++; if(botRunsDone>=BOT_RUNS) window.__botDone=true; else setTimeout(function(){newRun();},700); }
+    if(DEMO){ setTimeout(function(){ st.phase='cta'; ctaAt=performance.now(); setTimeout(function(){window.__demoDone=true;},3200); }, 1400); }
+  }
+  var botRunsDone=0, ctaAt=0;
+
+  // ---- input: FACE ONLY. Tap/space ONLY restarts after a crash — never flaps.
+  // The flap is driven exclusively by opening your mouth (FC.sig.mouthOpen).
+  function tapRestart(){ if(AUTO) return; if(st.phase==='over'&&performance.now()-st.overAt>500) newRun(); }
+  window.addEventListener('keydown',function(e){ if(e.code==='Space'){e.preventDefault(); tapRestart();} });
+  cv.addEventListener('pointerdown', tapRestart);
+
+  // ---- face tracking (shared FaceControl lib — proven detection for all face games) ----
+  var FC = window.FaceControl;
+  async function startCamera(){
+    document.getElementById('perm').style.display='none';
+    document.getElementById('ui').style.display='flex';
+    await FC.start();                 // secure-context check + camera + MediaPipe (in the lib)
+    faceReady = FC.ready;
+    newRun();
+    requestAnimationFrame(frame);
+  }
+  document.getElementById('start').addEventListener('click', startCamera);
+
+  // ---- scripted face (demo/bot) ----
+  var demoScript=[], demoIdx=0, autoCool=0;
+  function autoMouth(now){
+    // simulate mouth pulses that keep the bird flying through gaps.
+    // aim slightly ABOVE gap-center and flap (open mouth) when sinking past it,
+    // with anticipation so it clears the lip of each pipe.
+    if(st.phase!=='play'){ return 0; }
+    var next=null; for(var i=0;i<pipes.length;i++){ if(pipes[i].x+PIPE_W>BIRD_X-30){ next=pipes[i]; break; } }
+    var target = next ? next.gapY+GAP*0.40 : H*0.45;
+    // flap when below target OR falling fast → produces repeated open/close pulses
+    var need = st.y>target || st.vy>2.2;
+    return need ? 0.9 : 0.0;
+  }
+
+  // ---- render loop ----
+  var last=performance.now();
+  function frame(now){
+    var dt=Math.min((now-last)/16.667,3); last=now;
+
+    if(AUTO){
+      // AUTO does discrete flaps (matches the real control): flap when sinking below target
+      autoCool -= dt;
+      var flapped=false;
+      if(st.phase==='play'){
+        var next=null; for(var i=0;i<pipes.length;i++){ if(pipes[i].x+PIPE_W>BIRD_X-30){ next=pipes[i]; break; } }
+        var target = next ? next.gapY+GAP*0.5 : H*0.5;
+        var giveUp = (DEMO && st.score>=6) || (BOT && st.score>=3+botRunsDone*2);
+        if(!giveUp && st.y>target && st.vy>-1 && autoCool<=0){ flap(); autoCool=11; flapped=true; }
+      }
+      // PiP mouth pulses open on each flap then closes (open-close-open feel)
+      mouthSmoothed += ((flapped?1:0) - mouthSmoothed)*0.25*dt;
+    } else {
+      FC.update(now); faceReady=FC.ready;
+      mouthSmoothed += (FC.sig.mouthOpen - mouthSmoothed)*0.7*dt;  // rendering only (PiP mouth/bar)
+      // DISCRETE FLAP via the lib's edge-triggered pulse engine: the OPENING of
+      // the mouth is the signal — a 1 in a 1/0 world. FC.tap fires once per
+      // gesture (small/fast opens count), re-arms on partial close so flaps chain.
+      var open = FC.gate.mouthOpen;
+      if(FC.tap('mouthOpen')) flap();   // flap() itself starts from 'ready'
+      wasOpen = open;
+    }
+
+    if(hitStop>0){hitStop-=dt;}
+    else if(st.phase==='play'){
+      st.vy += GRAV*dt;
+      st.vy = Math.max(-MAXV, Math.min(MAXV, st.vy));
+      st.y += st.vy*dt;
+      spawnT+=dt; if(spawnT>=PIPE_EVERY){spawnT=0; spawnPipe();}
+      for(var i=pipes.length-1;i>=0;i--){
+        var p=pipes[i]; p.x-=PIPE_SPEED*dt;
+        if(!p.scored && p.x+PIPE_W<BIRD_X){ p.scored=true; st.score++; if(window.J)J.perfect(st.score);
+          if(!AUTO&&window.SHARE&&SHARE.dare!==null&&!dareBeaten&&st.score>SHARE.dare){dareBeaten=true;if(window.J)J.fanfare();SHARE.beaten(st.score);}
+        }
+        if(p.x<-PIPE_W) pipes.splice(i,1);
+        // collision
+        if(BIRD_X+18>p.x && BIRD_X-18<p.x+PIPE_W && (st.y-16<p.gapY || st.y+16>p.gapY+GAP)) gameOver();
+      }
+      if(st.y>H-20||st.y<-40) gameOver();
+    }
+
+    // ---- draw ----
+    cx.save();
+    if(shakeAmt>0.3){cx.translate((Math.random()-0.5)*shakeAmt,(Math.random()-0.5)*shakeAmt);} shakeAmt*=Math.pow(0.85,dt);
+    // bg
+    var bg=cx.createLinearGradient(0,0,0,H); bg.addColorStop(0,'#0e1830'); bg.addColorStop(1,'#0b0d12');
+    cx.fillStyle=bg; cx.fillRect(0,0,W,H);
+    // pipes
+    for(var j=0;j<pipes.length;j++){ var pp=pipes[j];
+      var g=cx.createLinearGradient(pp.x,0,pp.x+PIPE_W,0); g.addColorStop(0,'#2ec5b6'); g.addColorStop(1,'#1c8378');
+      cx.fillStyle=g; cx.fillRect(pp.x,0,PIPE_W,pp.gapY); cx.fillRect(pp.x,pp.gapY+GAP,PIPE_W,H-pp.gapY-GAP);
+    }
+    // bird
+    var by=st?st.y:H/2;
+    cx.save(); cx.translate(BIRD_X,by); cx.rotate(Math.max(-0.5,Math.min(1.1,(st?st.vy:0)*0.06)));
+    cx.fillStyle=GOLD; cx.beginPath(); cx.arc(0,0,17,0,Math.PI*2); cx.fill();
+    // open beak proportional to mouth
+    cx.fillStyle=VERM; var gap=6+mouthSmoothed*16;
+    cx.beginPath(); cx.moveTo(12,-2); cx.lineTo(26,-gap/2); cx.lineTo(26,gap/2); cx.closePath(); cx.fill();
+    cx.fillStyle='#fff'; cx.beginPath(); cx.arc(6,-6,4,0,Math.PI*2); cx.fill();
+    cx.fillStyle='#111'; cx.beginPath(); cx.arc(7,-6,2,0,Math.PI*2); cx.fill();
+    cx.restore();
+
+    // webcam PiP (composited INTO the canvas so recordings capture the face)
+    var camW=118, camH=88, cxp=W-camW-12, cyp=12;
+    cx.save();
+    cx.strokeStyle=open?VERM:'rgba(255,255,255,0.3)'; cx.lineWidth=open?3:2;
+    cx.beginPath(); cx.roundRect?cx.roundRect(cxp,cyp,camW,camH,12):cx.rect(cxp,cyp,camW,camH); cx.stroke();
+    cx.clip();
+    if(!AUTO && FC.video.readyState>=2){
+      cx.translate(cxp+camW,cyp); cx.scale(-1,1); // mirror
+      cx.drawImage(FC.video,0,0,camW,camH);
+    } else {
+      // simulated face for demo/bot: a smiley whose mouth matches the game
+      cx.fillStyle='#241a12'; cx.fillRect(cxp,cyp,camW,camH);
+      cx.fillStyle=GOLD; cx.beginPath(); cx.arc(cxp+camW/2,cyp+camH/2,30,0,Math.PI*2); cx.fill();
+      cx.fillStyle='#111'; cx.beginPath(); cx.arc(cxp+camW/2-11,cyp+camH/2-8,4,0,Math.PI*2); cx.arc(cxp+camW/2+11,cyp+camH/2-8,4,0,Math.PI*2); cx.fill();
+      var mo=6+mouthSmoothed*22; cx.beginPath(); cx.ellipse(cxp+camW/2,cyp+camH/2+12,10,mo/2,0,0,Math.PI*2); cx.fill();
+    }
+    cx.restore();
+    // live mouth-open bar under the PiP (shows the game IS reading your face)
+    if(!AUTO){
+      var bw=camW, bx=cxp, byb=cyp+camH+5;
+      cx.fillStyle='rgba(255,255,255,0.12)'; cx.fillRect(bx,byb,bw,5);
+      cx.fillStyle=open?VERM:TEAL; cx.fillRect(bx,byb,bw*Math.min(1,mouthSmoothed*1.3),5);
+    }
+    var fcLabel = AUTO?'DEMO':(FC.statusLabel()|| (FC.sig.mouthOpen>0.15?'OPEN WIDE!':'open your mouth'));
+    cx.fillStyle=(fcLabel.indexOf('http')>=0||fcLabel.indexOf('blocked')>=0)?GOLD:'rgba(255,255,255,0.6)';
+    cx.font='700 9px Menlo,monospace'; cx.textAlign='center';
+    cx.fillText(fcLabel.toUpperCase(),cxp+camW/2,cyp+camH+22);
+
+    // score
+    cx.textAlign='center'; cx.fillStyle='#fff'; cx.font='900 56px -apple-system,Helvetica,Arial';
+    if(st&&(st.phase==='play'||st.phase==='over')) cx.fillText(st.score,W/2,90);
+    cx.fillStyle='rgba(255,255,255,0.4)'; cx.font='600 12px Menlo,monospace'; cx.fillText('BEST '+best,W/2,112);
+
+    if(st&&st.phase==='ready'){ cx.fillStyle=VERM; cx.font='800 18px -apple-system,Helvetica,Arial';
+      cx.globalAlpha=0.6+0.4*Math.sin(now/300); cx.fillText('OPEN·CLOSE·OPEN — EACH GAPE IS A FLAP',W/2,H/2-40); cx.globalAlpha=1; }
+    if(st&&st.phase==='over'){ cx.fillStyle='rgba(11,13,18,0.6)'; cx.fillRect(0,0,W,H);
+      cx.fillStyle=VERM; cx.font='900 42px -apple-system,Helvetica,Arial'; cx.fillText('SPLAT.',W/2,H/2-30);
+      cx.fillStyle='#fff'; cx.font='800 24px -apple-system,Helvetica,Arial'; cx.fillText(st.score+' pipes',W/2,H/2+8);
+      if(!AUTO){ cx.fillStyle=TEAL; cx.font='700 15px -apple-system,Helvetica,Arial';
+        cx.globalAlpha=0.6+0.4*Math.sin(now/280); cx.fillText('tap to fly again',W/2,H/2+50); cx.globalAlpha=1; } }
+    if(st&&st.phase==='cta'){ var t=(now-ctaAt)/1000,e=Math.min(1,t*2.2); cx.fillStyle='rgba(11,13,18,'+(0.82*e)+')'; cx.fillRect(0,0,W,H);
+      cx.globalAlpha=e; cx.fillStyle='#fff'; cx.font='900 40px -apple-system,Helvetica,Arial'; cx.fillText('FLAPPY FACE',W/2,H/2-30);
+      cx.fillStyle=TEAL; cx.font='700 17px -apple-system,Helvetica,Arial'; cx.fillText('flap with your face. record the chaos.',W/2,H/2+6);
+      cx.fillStyle=VERM; cx.font='900 24px -apple-system,Helvetica,Arial'; cx.fillText('▶ PLAY NOW',W/2,H/2+52); cx.globalAlpha=1; }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- recording (shared FaceControl lib) ----
+  var recBtn=document.getElementById('rec');
+  recBtn.addEventListener('click',function(){
+    var started=FC.toggleRecord(cv,'flappy-face.webm',function(){
+      recBtn.textContent='● RECORD'; recBtn.classList.remove('on');
+      if(window.LOOP) LOOP.emit('recording_saved',{score:st?st.score:0});
+    });
+    if(started){ recBtn.textContent='■ STOP & SAVE'; recBtn.classList.add('on'); }
+  });
+
+  // scripted modes auto-start (no camera prompt)
+  if(AUTO){ document.getElementById('perm').style.display='none'; newRun(); requestAnimationFrame(frame); }
+})();
+</script>
+</body>
+</html>

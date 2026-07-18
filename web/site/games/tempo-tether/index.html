@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Tempo Tether — Tilt</title>
+<!--
+  LOOP / attention-architecture — Tempo Tether
+  Circuits: 01-rpe, 07-timing, 05-ease.
+  Modes (query params):
+    ?demo=1&seed=7        scripted calm arc for clip capture,
+                          sets window.__demoDone when finished
+    ?bot=1&runs=3&seed=5  imperfect autoplay for traffic simulation, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'tempo-tether';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                          // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 0.16;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134';
+  var START_INTERVAL = 500;                      // ms between beats at start
+  var INTERVAL_GROWTH = 1.4;                     // each clean tap slows the tempo
+  var MAX_INTERVAL = 4000;                       // cap at a few seconds per beat
+  var WINDOW_FRAC = 0.16;                        // clean window as fraction of interval
+  var MAX_DIM = 0.86;                            // screen nearly black by completion
+  var DIM_STEP = 0.086;                          // dims a notch per clean tap
+  var DEMO_TAPS = 8;                             // length of scripted calm arc
+
+  var state, flashes, runStartTs, endAt, ctaAt, best = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  try { best = +localStorage.getItem('tt_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      score: 0,
+      interval: START_INTERVAL,
+      cycleStart: 0,
+      dim: 0
+    };
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0;
+    if (DEMO) { startRun(); setupDemo(); }
+    else if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.score = 0;
+    state.interval = START_INTERVAL;
+    state.dim = 0;
+    state.cycleStart = performance.now();
+    runStartTs = Date.now();
+    endAt = 0;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // nearest peak time for the current interval ladder
+  function nearestPeak(now) {
+    var t = now - state.cycleStart;
+    var k = Math.round(t / state.interval);
+    return state.cycleStart + k * state.interval;
+  }
+
+  function distToPeakMs(now) {
+    return Math.abs(now - nearestPeak(now));
+  }
+
+  function orbScale(now) {
+    var t = now - state.cycleStart;
+    var phase = (t / state.interval) * 2 * Math.PI;
+    return 1 + 0.45 * Math.cos(phase);           // peak at phase = 0 mod 2π
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 110, y: 500, w: 220, h: 44 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;                     // scripted modes ignore human taps
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { tryTap(); return; }
+    if ((state.phase === 'over' || state.phase === 'settled') && performance.now() - endAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'taps' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  function tryTap() {
+    var now = performance.now();
+    var windowMs = state.interval * WINDOW_FRAC;
+    var dist = distToPeakMs(now);
+    if (dist <= windowMs) {
+      var peak = nearestPeak(now);
+      state.cycleStart = peak;                     // lock to the beat that was tapped
+      state.score++;
+      state.interval = Math.min(MAX_INTERVAL, state.interval * INTERVAL_GROWTH);
+      state.dim = Math.min(MAX_DIM, state.dim + DIM_STEP);
+      if (window.J) J.calm(state.score);
+      hitStop = 3; zoom = 1.035; shakeAmt = 1.2;
+      flash('+' + state.score, TEAL, 30);
+      if (window.LOOP) LOOP.emit('tap_success', { score: state.score, interval: +state.interval.toFixed(0), bpm: Math.round(60000 / state.interval) });
+      if (state.dim >= MAX_DIM - 0.001) settleRun();
+    } else {
+      gameOver(false);
+    }
+  }
+
+  function settleRun() {
+    state.phase = 'settled';
+    endAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (state.score > best) { best = state.score; try { localStorage.setItem('tt_best', String(best)); } catch (_) {} }
+    if (window.J) J.calm(state.score + 2);
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+  }
+
+  function gameOver(completed) {
+    state.phase = 'over';
+    endAt = performance.now();
+    shakeAmt = 3;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (state.score > best) { best = state.score; try { localStorage.setItem('tt_best', String(best)); } catch (_) {} }
+    if (window.J) J.calm(0);                      // soft landing, no percussive death
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 1200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 900);
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.interval = START_INTERVAL; state.dim = 0;
+    state.cycleStart = performance.now();
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- demo / bot autopilots ----
+  var demoTargets = [], demoIdx = 0, demoStart = 0;
+  var botRunsDone = 0, botNextPeak = null;
+
+  function setupDemo() {
+    demoStart = state.cycleStart;                  // lock to the actual first beat
+    demoIdx = 0;
+    demoTargets = [0];
+    var iv = START_INTERVAL;
+    for (var i = 1; i < DEMO_TAPS; i++) {
+      iv = Math.min(MAX_INTERVAL, iv * INTERVAL_GROWTH);
+      demoTargets.push(demoTargets[demoTargets.length - 1] + iv);
+    }
+  }
+
+  function autopilot(now) {
+    if (state.phase !== 'play') return;
+    if (DEMO) {
+      if (demoIdx >= demoTargets.length) return;
+      var target = demoStart + demoTargets[demoIdx];
+      // add tiny human sway to the scripted tap time
+      var sway = Math.sin(demoIdx * 1.7) * 60;
+      if (Math.abs(now - (target + sway)) <= 22) {
+        demoIdx++;
+        tryTap();
+        if (demoIdx >= demoTargets.length) {
+          // let the last slow beat resolve visually, then soft CTA
+          setTimeout(function () {
+            window.__demoScore = state.score;
+            state.phase = 'cta'; ctaAt = performance.now();
+            setTimeout(function () { window.__demoDone = true; }, 3500);
+          }, state.interval * 0.55);
+        }
+      }
+    } else if (BOT) {
+      if (botNextPeak === null) {
+        var p = nearestPeak(now);
+        botNextPeak = p + gauss() * BOT_ERR * state.interval;
+        if (botNextPeak < now) botNextPeak = p + state.interval + gauss() * BOT_ERR * state.interval;
+      }
+      if (Math.abs(now - botNextPeak) <= 20) { botNextPeak = null; tryTap(); }
+    }
+  }
+
+  // ---- render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // sim: freeze during hit-stop, else advance
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') { autopilot(now); }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(242,177,52,0.04)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // orb
+    var ox = W / 2, oy = H / 2 - 24;
+    var s = orbScale(now);
+    var r = 78 * s;
+    var glow = cx.createRadialGradient(ox, oy, r * 0.4, ox, oy, r * 1.8);
+    glow.addColorStop(0, 'rgba(46,197,182,0.22)');
+    glow.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = glow;
+    cx.beginPath(); cx.arc(ox, oy, r * 1.8, 0, Math.PI * 2); cx.fill();
+
+    var core = cx.createRadialGradient(ox, oy, 0, ox, oy, r);
+    core.addColorStop(0, 'rgba(255,255,255,0.92)');
+    core.addColorStop(0.35, 'rgba(46,197,182,0.8)');
+    core.addColorStop(1, 'rgba(46,197,182,0.2)');
+    cx.fillStyle = core;
+    cx.beginPath(); cx.arc(ox, oy, r, 0, Math.PI * 2); cx.fill();
+
+    // faint target ring
+    cx.strokeStyle = 'rgba(46,197,182,0.22)';
+    cx.lineWidth = 1.5;
+    cx.beginPath(); cx.arc(ox, oy, 78 * 1.45, 0, Math.PI * 2); cx.stroke();
+
+    // dim overlay — the screen darkens as the player slows their tempo
+    cx.fillStyle = 'rgba(0,0,0,' + state.dim + ')';
+    cx.fillRect(0, 0, W, H);
+
+    // score / tempo readout
+    if (state.phase === 'play' || state.phase === 'over' || state.phase === 'settled') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '800 56px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      var bpm = Math.round(60000 / state.interval);
+      cx.fillText(bpm + ' BPM · BEST ' + best, W / 2, 122);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 240 - fl.t * 0.55);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('TEMPO TETHER', W / 2, 280);
+      cx.fillStyle = TEAL; cx.font = '700 17px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse; cx.fillText('TAP THE PEAK', W / 2, 330); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('slow your own tempo', W / 2, 360);
+    }
+
+    // game over / settled card
+    if (state.phase === 'over' || state.phase === 'settled') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = state.phase === 'settled' ? TEAL : GOLD;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText(state.phase === 'settled' ? 'SETTLED' : 'DRIFTED', W / 2, 304);
+      cx.fillStyle = '#fff'; cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' taps', W / 2, 350);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      var finalBpm = Math.round(60000 / state.interval);
+      cx.fillText('final tempo ' + finalBpm + ' bpm', W / 2, 378);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 300);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — BREATHE AGAIN', W / 2, 430);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(46,197,182,0.14)';
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 22) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = TEAL; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ SHARE', W / 2, SHARE_R.y + 28);
+      }
+    }
+
+    // demo soft CTA
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('TEMPO TETHER', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('slow your own tempo', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 260);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.6)'; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 444);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

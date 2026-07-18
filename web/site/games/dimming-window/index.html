@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Dimming Window — Tilt</title>
+<!--
+  LOOP / attention-architecture — Dimming Window
+  Engine: calm. Circuits: 07-timing, 05-ease, 02-novelty.
+  Mechanic: hold to advance the sun toward night. Sky darkens, color temperature
+  warms down, ambient daytime sound fades to silence. When full night lands →
+  sleep onset → game_over.
+  Score = sunset_steps completed.
+
+  Modes:
+    ?demo=1&seed=7       scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=M imperfect autopilot N runs → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'dimming-window';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // Deterministic mulberry32 RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  // Calm game: no vermillion
+
+  // ------------------------------------------------------------------
+  // Sky palette — interpolated from day to dusk to night
+  // t = 0 (day noon), t = 1 (full night)
+  // ------------------------------------------------------------------
+  // Day:  sky #4fb3e8 → horizon #b0d8f5
+  // Dusk: sky #e86c30 → horizon #f2b134
+  // Night:sky #0b0d12 → horizon #151929
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function lerpRgb(c1, c2, t) {
+    return [
+      Math.round(lerp(c1[0], c2[0], t)),
+      Math.round(lerp(c1[1], c2[1], t)),
+      Math.round(lerp(c1[2], c2[2], t))
+    ];
+  }
+  function rgb(c) { return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')'; }
+  function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+
+  var DAY_SKY    = [79, 179, 232],   DAY_HORIZ   = [176, 216, 245];
+  var DUSK_SKY   = [232, 108, 48],   DUSK_HORIZ  = [242, 177, 52];
+  var NIGHT_SKY  = [11, 13, 18],     NIGHT_HORIZ = [21, 25, 41];
+  var SUN_DAY    = [255, 245, 190],  SUN_DUSK    = [255, 160, 60];
+
+  function skyColors(t) {
+    // Two-phase: 0→0.5 = day→dusk, 0.5→1 = dusk→night
+    if (t <= 0.5) {
+      var s = t * 2;
+      return {
+        sky:   lerpRgb(DAY_SKY,  DUSK_SKY,  s),
+        horiz: lerpRgb(DAY_HORIZ, DUSK_HORIZ, s),
+        sun:   lerpRgb(SUN_DAY,  SUN_DUSK,  s),
+        stars: 0
+      };
+    } else {
+      var s2 = (t - 0.5) * 2;
+      return {
+        sky:   lerpRgb(DUSK_SKY,  NIGHT_SKY,  s2),
+        horiz: lerpRgb(DUSK_HORIZ, NIGHT_HORIZ, s2),
+        sun:   lerpRgb(SUN_DUSK,  [11, 13, 18], s2),
+        stars: s2
+      };
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Stars (seeded positions, revealed at dusk→night)
+  // ------------------------------------------------------------------
+  var STARS = [];
+  (function () {
+    var sr = mulberry32(SEED + 99);
+    for (var i = 0; i < 60; i++) {
+      STARS.push({ x: sr() * W, y: sr() * (H * 0.55), r: 0.6 + sr() * 1.2, twink: sr() * Math.PI * 2 });
+    }
+  })();
+
+  // ------------------------------------------------------------------
+  // Game state
+  // ------------------------------------------------------------------
+  // sunT: 0 = noon, 1 = full night.
+  // Player holds → sunT advances. Releasing → sunT slowly drifts back toward 0
+  //   BUT ratchet: the "night baseline" increases each step so you always make progress.
+  // NIGHT_STEPS: completing each step gives one score point and advances baseline.
+  // When sunT reaches 1 fully → game_over (sleep onset).
+  var NIGHT_STEPS  = 10;   // steps from day to full night
+  var STEP_SIZE    = 1 / NIGHT_STEPS;
+  var ADVANCE_RATE = 0.018; // sunT units/frame while holding
+  var DRIFT_BACK   = 0.004; // passive drift back toward baseline (not step already locked)
+
+  var state;
+  var flashes = [];
+  var runStartTs = 0;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var ctaAt = 0;
+  var holding = false;
+  var sunT = 0;          // current sky darkness 0→1
+  var baseT = 0;         // ratcheted floor (locked baseline after each step)
+  var stepCount = 0;     // score: steps completed
+  var lastStepFlash = -1;
+
+  // Floating birds/particles
+  var birds = [];
+  function spawnBird() {
+    var side = rng() > 0.5 ? 1 : -1;
+    birds.push({
+      x: side === 1 ? -30 : W + 30,
+      y: 100 + rng() * 200,
+      vx: side * (0.4 + rng() * 0.5),
+      vy: (rng() - 0.5) * 0.15,
+      size: 3 + rng() * 3,
+      life: 0,
+      maxLife: 300 + rng() * 200
+    });
+  }
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ------------------------------------------------------------------
+  // Input (hold mechanic)
+  // ------------------------------------------------------------------
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function startHold() {
+    if (DEMO || BOT) return;
+    if (state.phase === 'title') { beginRun(); return; }
+    if (state.phase === 'play') holding = true;
+  }
+  function endHold(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    holding = false;
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale, py = (e.clientY - r.top) / scale;
+    if (inR(MUTE_R, px, py) && window.J && !DEMO && !BOT) { J.toggleMute(); return; }
+    startHold();
+  });
+  cv.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    endHold((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointercancel', function () { holding = false; });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') startHold(); });
+  window.addEventListener('keyup',   function (e) { if (e.code === 'Space') endHold(); });
+
+  // ------------------------------------------------------------------
+  // Game logic
+  // ------------------------------------------------------------------
+  function newGame() {
+    state = { phase: 'title', overAt: 0 };
+    flashes = []; birds = [];
+    holding = false;
+    sunT = 0; baseT = 0; stepCount = 0; lastStepFlash = -1;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    if (DEMO) { beginRun(); return; }
+    if (BOT)  { beginRun(); return; }
+  }
+
+  function beginRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    // Seed some birds at start
+    for (var i = 0; i < 3; i++) spawnBird();
+  }
+
+  var STEP_LABELS = ['SOFTENING', 'MELLOWING', 'DIMMING', 'COOLING', 'DRIFTING',
+                     'SETTLING', 'DEEPENING', 'QUIETING', 'YIELDING', 'STILL'];
+
+  function checkStep(dt) {
+    // Advance sunT while holding
+    if (holding) {
+      sunT = Math.min(1, sunT + ADVANCE_RATE * dt);
+    } else {
+      // Drift back toward baseT (ratchet floor), not below it
+      sunT = Math.max(baseT, sunT - DRIFT_BACK * dt);
+    }
+
+    // Check for new step crossing
+    var newStep = Math.floor(sunT / STEP_SIZE);
+    if (newStep > stepCount && newStep <= NIGHT_STEPS) {
+      stepCount = newStep;
+      baseT = stepCount * STEP_SIZE; // lock in the step
+      if (window.J) J.calm(stepCount);
+      var label = STEP_LABELS[Math.min(stepCount - 1, STEP_LABELS.length - 1)];
+      flash(label, TEAL, 22);
+      zoom = 1.013;
+      if (window.LOOP) LOOP.emit('step_complete', { step: stepCount, sunT: +sunT.toFixed(3) });
+    }
+
+    // Full night reached → game over
+    if (sunT >= 0.999) {
+      gameOver();
+    }
+  }
+
+  function gameOver() {
+    if (state.phase !== 'play') return;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    holding = false;
+    if (window.J) J.calm(stepCount + 2);
+    if (window.LOOP) LOOP.emit('game_over', { score: stepCount, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = stepCount;
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(resetRun, 700);
+      }
+    }
+  }
+
+  function resetRun() {
+    flashes = []; birds = [];
+    holding = false;
+    sunT = 0; baseT = 0; stepCount = 0; lastStepFlash = -1;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    botHolding = false; botHoldFor = 0; botPauseFor = 0; botStepsDone = 0;
+    demoHolding = false; demoTimer = 0; demoWaiting = false; demoIdx = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    beginRun();
+  }
+
+  // ------------------------------------------------------------------
+  // Bot / Demo autopilot
+  // ------------------------------------------------------------------
+  var botRunsDone = 0;
+  var botHolding = false;
+  var botHoldFor = 0;
+  var botPauseFor = 0;
+  var botStepsDone = 0;
+  // Bot needs to drive sunT to 1.0.
+  // Each step = STEP_SIZE=0.1 / ADVANCE_RATE=0.018 ≈ 5.6 frames hold.
+  // 10 steps × ~6 frames + rng drift = ~80 frames. Bot does 10 hold bursts then holds continuous.
+  var BOT_STEPS_MAX = 11; // trigger game_over naturally by going beyond 10
+
+  // Demo script: [holdFrames, pauseFrames] sequence representing the calm arc.
+  // settle→deepen→resolve. ~16 seconds total at 60fps.
+  // ADVANCE_RATE=0.018, STEP_SIZE=0.1 → need ~5.6 frames per step hold minimum.
+  // We hold longer per step to show gradual sunset.
+  var demoScript = [
+    [40, 50],   // step 1 — settle
+    [40, 45],   // step 2
+    [45, 42],   // step 3 — deepen
+    [45, 40],   // step 4
+    [50, 38],   // step 5
+    [50, 35],   // step 6 — resolve
+    [55, 30],   // step 7
+    [55, 28],   // step 8
+    [60, 22],   // step 9
+    [80, 0],    // step 10 — hold to full night
+  ];
+  var demoIdx = 0, demoHolding = false, demoTimer = 0, demoWaiting = false;
+
+  function autopilot(dt) {
+    if (state.phase !== 'play') return;
+
+    if (DEMO) {
+      if (demoIdx >= demoScript.length) {
+        // Final push: hold continuously until game_over
+        holding = true;
+        return;
+      }
+      var step = demoScript[demoIdx];
+      demoTimer += dt;
+      if (!demoWaiting) {
+        if (!demoHolding) { demoHolding = true; holding = true; }
+        if (demoTimer >= step[0]) {
+          holding = false; demoHolding = false;
+          if (step[1] > 0) { demoWaiting = true; demoTimer = 0; }
+          else { demoIdx++; demoTimer = 0; }
+        }
+      } else {
+        if (demoTimer >= step[1]) {
+          demoWaiting = false; demoTimer = 0; demoIdx++;
+        }
+      }
+      return;
+    }
+
+    if (BOT) {
+      if (botStepsDone >= BOT_STEPS_MAX) {
+        // Hold continuously to push sunT to 1 → game_over
+        holding = true;
+        return;
+      }
+      if (botPauseFor > 0) {
+        botPauseFor -= dt;
+        holding = false; botHolding = false;
+        return;
+      }
+      if (!botHolding) {
+        // Hold burst: enough to advance one step + a bit of variance
+        botHoldFor = 5 + Math.floor(rng() * 15) + (rng() > 0.3 ? Math.floor(rng() * 20) : 0);
+        botHolding = true; holding = true;
+      }
+      botHoldFor -= dt;
+      if (botHoldFor <= 0) {
+        holding = false; botHolding = false;
+        botPauseFor = 10 + Math.floor(rng() * 30);
+        botStepsDone++;
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Draw helpers
+  // ------------------------------------------------------------------
+  // Window frame — draws the scene inside a rounded window shape
+  var WIN_X = 40, WIN_Y = 130, WIN_W = W - 80, WIN_H = 380;
+  var WIN_R = 18; // corner radius
+  var PANE_GAP = 8; // cross divider thickness
+
+  function drawWindow(now, col) {
+    var t = sunT;
+    var sc = skyColors(t);
+
+    // === Sky gradient inside the window ===
+    cx.save();
+    // Clip to window shape
+    cx.beginPath();
+    if (cx.roundRect) {
+      cx.roundRect(WIN_X, WIN_Y, WIN_W, WIN_H, WIN_R);
+    } else {
+      cx.rect(WIN_X, WIN_Y, WIN_W, WIN_H);
+    }
+    cx.clip();
+
+    // Sky gradient
+    var grad = cx.createLinearGradient(WIN_X, WIN_Y, WIN_X, WIN_Y + WIN_H);
+    grad.addColorStop(0, rgb(sc.sky));
+    grad.addColorStop(0.6, rgb(sc.horiz));
+    grad.addColorStop(1, rgb(lerpRgb(sc.horiz, [30, 20, 10], Math.max(0, t - 0.3))));
+    cx.fillStyle = grad;
+    cx.fillRect(WIN_X, WIN_Y, WIN_W, WIN_H);
+
+    // Stars
+    if (sc.stars > 0.05) {
+      for (var si = 0; si < STARS.length; si++) {
+        var s = STARS[si];
+        if (s.y > WIN_Y + WIN_H) continue;
+        var twinkle = 0.5 + 0.5 * Math.sin(now / 900 + s.twink);
+        var sa = sc.stars * twinkle * 0.85;
+        cx.beginPath();
+        cx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+        cx.fillStyle = 'rgba(255,255,255,' + sa + ')';
+        cx.fill();
+      }
+    }
+
+    // Sun/moon disc
+    // Sun travels from upper-right (day) to lower-left (dusk) to below horizon (night)
+    var sunAngle = t * Math.PI * 0.85; // arc from top-right to bottom
+    var sunCX = WIN_X + WIN_W * (0.72 - t * 0.38);
+    var sunCY = WIN_Y + 60 + t * (WIN_H - 50);
+    var sunR = lerp(36, 22, t);
+    var sunAlpha = t < 0.85 ? 1 : 1 - (t - 0.85) / 0.15; // fade below horizon
+
+    if (sunAlpha > 0.02) {
+      // Glow
+      var glowR = sunR + lerp(30, 12, t);
+      var glow = cx.createRadialGradient(sunCX, sunCY, sunR * 0.3, sunCX, sunCY, glowR);
+      glow.addColorStop(0, rgba(sc.sun, 0.55 * sunAlpha));
+      glow.addColorStop(1, rgba(sc.sun, 0));
+      cx.fillStyle = glow;
+      cx.beginPath();
+      cx.arc(sunCX, sunCY, glowR, 0, Math.PI * 2);
+      cx.fill();
+      // Core
+      cx.beginPath();
+      cx.arc(sunCX, sunCY, sunR, 0, Math.PI * 2);
+      cx.fillStyle = rgba(sc.sun, sunAlpha);
+      cx.fill();
+    }
+
+    // Horizon line (thin warm layer)
+    if (t < 0.8) {
+      var horizH = lerp(6, 18, Math.min(1, t * 2));
+      var horizGrad = cx.createLinearGradient(WIN_X, WIN_Y + WIN_H - horizH, WIN_X, WIN_Y + WIN_H);
+      horizGrad.addColorStop(0, rgba(sc.horiz, 0));
+      horizGrad.addColorStop(1, rgba(sc.horiz, 0.45));
+      cx.fillStyle = horizGrad;
+      cx.fillRect(WIN_X, WIN_Y + WIN_H - horizH, WIN_W, horizH);
+    }
+
+    // Silhouette buildings/landscape at bottom edge
+    drawSilhouette(sc, t);
+
+    // Birds (only at day/dusk, fade as night comes)
+    var birdAlpha = Math.max(0, 1 - t * 2.5);
+    if (birdAlpha > 0.02) {
+      for (var bi = 0; bi < birds.length; bi++) {
+        var b = birds[bi];
+        var blife = b.life / b.maxLife;
+        var ba = birdAlpha * (blife < 0.15 ? blife / 0.15 : blife > 0.75 ? (1 - blife) / 0.25 : 1) * 0.7;
+        if (ba > 0.01) {
+          cx.save();
+          cx.translate(b.x, b.y);
+          cx.strokeStyle = 'rgba(30,20,10,' + ba + ')';
+          cx.lineWidth = 1;
+          cx.beginPath();
+          cx.moveTo(-b.size, 0);
+          cx.quadraticCurveTo(0, -b.size * 0.6, b.size, 0);
+          cx.stroke();
+          cx.restore();
+        }
+      }
+    }
+
+    cx.restore(); // un-clip
+
+    // Window frame
+    cx.save();
+    cx.strokeStyle = 'rgba(200,190,175,0.9)';
+    cx.lineWidth = 3;
+    cx.beginPath();
+    if (cx.roundRect) {
+      cx.roundRect(WIN_X, WIN_Y, WIN_W, WIN_H, WIN_R);
+    } else {
+      cx.rect(WIN_X, WIN_Y, WIN_W, WIN_H);
+    }
+    cx.stroke();
+
+    // Pane dividers (cross)
+    var midX = WIN_X + WIN_W / 2;
+    var midY = WIN_Y + WIN_H / 2;
+    cx.strokeStyle = 'rgba(200,190,175,0.85)';
+    cx.lineWidth = PANE_GAP;
+    cx.lineCap = 'round';
+    cx.beginPath();
+    cx.moveTo(midX, WIN_Y + 2); cx.lineTo(midX, WIN_Y + WIN_H - 2);
+    cx.stroke();
+    cx.beginPath();
+    cx.moveTo(WIN_X + 2, midY); cx.lineTo(WIN_X + WIN_W - 2, midY);
+    cx.stroke();
+
+    // Sill and frame top
+    cx.fillStyle = 'rgba(210,200,185,0.9)';
+    // top bar
+    cx.fillRect(WIN_X - 6, WIN_Y - 8, WIN_W + 12, 10);
+    // sill
+    cx.fillRect(WIN_X - 10, WIN_Y + WIN_H, WIN_W + 20, 14);
+    cx.restore();
+  }
+
+  function drawSilhouette(sc, t) {
+    // Simple building silhouette at bottom of window
+    var siloY = WIN_Y + WIN_H - 45;
+    var siloAlpha = Math.max(0.08, 0.85 - t * 0.3);
+    var siloColor = t < 0.5
+      ? rgba(lerpRgb([60, 40, 20], [15, 10, 5], t * 2), siloAlpha)
+      : rgba([8, 6, 4], siloAlpha);
+
+    cx.fillStyle = siloColor;
+    // Left building cluster
+    cx.fillRect(WIN_X, siloY, 30, 45);
+    cx.fillRect(WIN_X + 28, siloY - 20, 18, 65);
+    cx.fillRect(WIN_X + 44, siloY + 5, 22, 40);
+    // Right building cluster
+    cx.fillRect(WIN_X + WIN_W - 38, siloY - 15, 20, 60);
+    cx.fillRect(WIN_X + WIN_W - 22, siloY + 5, 22, 40);
+
+    // Window lights in buildings (appear at night)
+    if (t > 0.55) {
+      var lightAlpha = Math.min(0.9, (t - 0.55) / 0.3);
+      var lights = [
+        { bx: WIN_X + 6,  by: siloY + 8,  w: 4, h: 5 },
+        { bx: WIN_X + 6,  by: siloY + 18, w: 4, h: 5 },
+        { bx: WIN_X + 32, by: siloY - 14, w: 4, h: 5 },
+        { bx: WIN_X + 32, by: siloY - 2,  w: 4, h: 5 },
+        { bx: WIN_X + WIN_W - 34, by: siloY - 9, w: 4, h: 5 },
+        { bx: WIN_X + WIN_W - 18, by: siloY + 8, w: 4, h: 5 },
+      ];
+      for (var li = 0; li < lights.length; li++) {
+        var l = lights[li];
+        cx.fillStyle = 'rgba(255,210,100,' + lightAlpha + ')';
+        cx.fillRect(l.bx, l.by, l.w, l.h);
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Render
+  // ------------------------------------------------------------------
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Autopilot
+    if (DEMO || BOT) autopilot(dt);
+
+    // Game logic
+    if (state.phase === 'play') checkStep(dt);
+
+    // Hit-stop: decay and gate sim
+    if (hitStop > 0) hitStop -= dt;
+
+    // Bird spawning
+    if (state.phase === 'play' && sunT < 0.75 && rng() < 0.003 * dt) spawnBird();
+    // Update birds
+    for (var bi = birds.length - 1; bi >= 0; bi--) {
+      var b = birds[bi];
+      b.life += dt;
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      if (b.life >= b.maxLife || b.x < -60 || b.x > W + 60) birds.splice(bi, 1);
+    }
+
+    // Juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx2 = (Math.random() - 0.5) * shakeAmt, sy2 = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx2, H / 2 + sy2);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // Background — room interior (warms slightly at dusk)
+    var roomAlpha = lerp(0.05, 0.18, Math.min(1, sunT * 2));
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    // Warm interior glow
+    var roomGrad = cx.createLinearGradient(0, H * 0.4, 0, H);
+    roomGrad.addColorStop(0, 'rgba(80,55,30,' + (roomAlpha * 0.5) + ')');
+    roomGrad.addColorStop(1, 'rgba(40,28,14,' + roomAlpha + ')');
+    cx.fillStyle = roomGrad; cx.fillRect(0, 0, W, H);
+
+    if (state.phase === 'title') {
+      drawTitle(now);
+    } else if (state.phase === 'play') {
+      drawPlay(now);
+    } else if (state.phase === 'over') {
+      drawPlay(now);
+      drawOver(now);
+    } else if (state.phase === 'cta') {
+      drawPlay(now);
+      drawCta(now);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.42;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    // Warm title with a preview window glowing behind
+    // Draw window with static day scene
+    sunT = 0;
+    drawWindow(now, null);
+    sunT = 0;
+
+    // Dark overlay for readability
+    cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '300 34px -apple-system, Helvetica, Arial';
+    cx.fillText('DIMMING WINDOW', W / 2, 72);
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '400 15px -apple-system, Helvetica, Arial';
+    cx.fillText('hold to bring the night', W / 2, 100);
+
+    var pulse = 0.5 + 0.45 * Math.sin(now / 750);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = TEAL;
+    cx.font = '600 15px -apple-system, Helvetica, Arial';
+    cx.fillText('HOLD TO BEGIN', W / 2, H - 90);
+    cx.globalAlpha = 1;
+    cx.fillStyle = 'rgba(255,255,255,0.22)';
+    cx.font = '400 12px -apple-system, Helvetica, Arial';
+    cx.fillText('dim the light · find the night', W / 2, H - 65);
+  }
+
+  function drawPlay(now) {
+    drawWindow(now, null);
+
+    // Progress arc at bottom
+    var pct = sunT;
+    var arcY = WIN_Y + WIN_H + 44;
+    var arcR = 22;
+    var arcX = W / 2;
+    // Track (full circle dim)
+    cx.beginPath();
+    cx.arc(arcX, arcY, arcR, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2);
+    cx.strokeStyle = 'rgba(255,255,255,0.1)';
+    cx.lineWidth = 3;
+    cx.stroke();
+    // Fill arc
+    if (pct > 0.005) {
+      cx.beginPath();
+      cx.arc(arcX, arcY, arcR, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * pct);
+      cx.strokeStyle = sunT < 0.5 ? TEAL : GOLD;
+      cx.lineWidth = 3;
+      cx.stroke();
+    }
+    // Step count in center
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText(stepCount, arcX, arcY + 6);
+
+    // Label above arc
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '400 10px -apple-system, Helvetica, Arial';
+    cx.fillText('steps', arcX, arcY + 20);
+
+    // Hold instruction (fades after first step)
+    if (stepCount === 0 && state.phase === 'play') {
+      var instA = holding ? 0.15 : 0.45;
+      cx.fillStyle = 'rgba(255,255,255,' + instA + ')';
+      cx.font = '400 13px -apple-system, Helvetica, Arial';
+      cx.fillText(holding ? 'keep holding…' : 'hold to dim', W / 2, WIN_Y + WIN_H + 92);
+    } else if (state.phase === 'play') {
+      cx.fillStyle = 'rgba(255,255,255,' + (holding ? 0.1 : 0.3) + ')';
+      cx.font = '400 12px -apple-system, Helvetica, Arial';
+      cx.fillText(holding ? 'dimming…' : 'hold to continue', W / 2, WIN_Y + WIN_H + 92);
+    }
+
+    // Score (large, top)
+    cx.fillStyle = 'rgba(255,255,255,0.75)';
+    cx.font = '300 44px -apple-system, Helvetica, Arial';
+    cx.fillText(stepCount, W / 2, 90);
+    cx.fillStyle = 'rgba(255,255,255,0.28)';
+    cx.font = '400 11px -apple-system, Helvetica, Arial';
+    cx.fillText('of 10', W / 2, 110);
+
+    // Dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+      cx.fillStyle = GOLD;
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('REACH ' + SHARE.dare + ' STEPS' + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 128);
+    }
+
+    // Flashes
+    for (var fi = flashes.length - 1; fi >= 0; fi--) {
+      var fl = flashes[fi]; fl.t += 1;
+      var fa = Math.max(0, 1 - fl.t / 42);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '600 ' + (fl.size + fl.t * 0.25) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, WIN_Y - 22 - fl.t * 0.35);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(fi, 1);
+    }
+  }
+
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.78)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.88)';
+    cx.font = '300 28px -apple-system, Helvetica, Arial';
+    cx.fillText('the night is here', W / 2, 278);
+    cx.fillStyle = TEAL;
+    cx.font = '700 60px -apple-system, Helvetica, Arial';
+    cx.fillText(stepCount, W / 2, 350);
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '400 14px -apple-system, Helvetica, Arial';
+    cx.fillText('steps into night', W / 2, 375);
+    if (!DEMO && !BOT) {
+      var pulse2 = 0.5 + 0.4 * Math.sin(now / 800);
+      cx.globalAlpha = pulse2;
+      cx.fillStyle = TEAL;
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to dim again', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawCta(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 1.6);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.88 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.88)';
+    cx.font = '300 30px -apple-system, Helvetica, Arial';
+    cx.fillText('DIMMING WINDOW', W / 2, 280);
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '400 16px -apple-system, Helvetica, Arial';
+    cx.fillText('dim the light. find the night.', W / 2, 315);
+    var p2 = 0.7 + 0.3 * Math.sin(now / 700);
+    cx.fillStyle = TEAL; cx.globalAlpha = ease * p2;
+    cx.font = '700 20px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 386);
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(255,255,255,0.3)';
+    cx.font = '400 13px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 415);
+    cx.globalAlpha = 1;
+  }
+
+  // Tap-to-restart (human)
+  window.addEventListener('pointerdown', function () {
+    if (state && state.phase === 'over' && !DEMO && !BOT) {
+      if (performance.now() - state.overAt > 350) resetRun();
+    }
+  });
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Viral Dare — Tilt</title>
+<!--
+  LOOP / attention-architecture — Viral Dare
+  Engine: viral. Circuits: 03-social, 01-rpe, 02-novelty.
+  Conditioned path: watching a view count explode (Instagram/TikTok thumb memory).
+  Mechanic: post a dare → tap friends to send → views accumulate → link dies at day end.
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip → __demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot → __botDone
+    ?dare=<n>        incoming dare from a friend (score to beat)
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'viral-dare';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  var ROUND_DURATION = 18;   // seconds the link stays "live"
+  var MAX_FRIENDS = 12;      // friend slots visible
+  var VIEW_BASE = 3;         // base views per friend tapped
+  var COMBO_BONUS = 8;       // extra views per chain step
+
+  // ---- state ----
+  var phase;    // 'title' | 'challenge' | 'play' | 'over' | 'cta'
+  var views, combo, timeLeft, runStartTs, overAt, ctaAt, challengeAt;
+  var friends;          // array of friend circles
+  var particles;        // floating +views text
+  var ripples;          // tap ripple effects
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var dareBeaten = false;
+  var botRunsDone = 0, botTimer = 0, botTapsLeft = 0, botPassive = false;
+  var demoBeat = 0, demoTimer = 0, demoHesitate = 0;
+  // demo script: [hesitate_frames, tap_target_idx, ...] pairs
+  var DEMO_TAPS = [
+    { wait: 38, idx: 0 },
+    { wait: 22, idx: 3 },
+    { wait: 28, idx: 1 },
+    { wait: 18, idx: 5 },
+    { wait: 44, idx: 2 },   // near-fail beat — long pause
+    { wait: 16, idx: 4 },   // recovery burst
+    { wait: 12, idx: 0 },
+    { wait: 14, idx: 3 },
+    // then goes passive — let timer kill
+  ];
+  var demoTapIdx = 0;
+  var DEMO_SCORE = 0;
+
+  function newGame() {
+    views = 0; combo = 0; timeLeft = ROUND_DURATION;
+    runStartTs = null; overAt = 0; ctaAt = 0; challengeAt = 0;
+    hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    particles = []; ripples = [];
+    friends = buildFriends();
+    botRunsDone = 0; botTimer = 0; botTapsLeft = 0; botPassive = false;
+    demoBeat = 0; demoTimer = 0; demoHesitate = 0; demoTapIdx = 0;
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) {
+      startRun();
+      return;
+    }
+    phase = 'title';
+  }
+
+  function buildFriends() {
+    var list = [];
+    var count = MAX_FRIENDS;
+    // lay friends in a 3-column grid in the lower 2/3 of screen
+    var cols = 3, rows = Math.ceil(count / cols);
+    var startX = 60, gapX = (W - 120) / (cols - 1);
+    var startY = 310, gapY = 80;
+    for (var i = 0; i < count; i++) {
+      var col = i % cols, row = Math.floor(i / cols);
+      list.push({
+        x: startX + col * gapX,
+        y: startY + row * gapY,
+        r: 28,
+        sent: false,       // link has been sent to this friend
+        viewBoost: 0,      // animated view-burst scale on tap
+        cooldown: 0,       // can re-tap after cooldown (viral spreads)
+        color: ['#e8502e','#2ec5b6','#f2b134','#a855f7','#3b82f6'][i % 5],
+        label: 'F' + (i + 1),
+        pulse: rng() * Math.PI * 2,   // idle animation offset
+        sends: 0,          // how many times tapped
+      });
+    }
+    return list;
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    // bot: tap K friends then go passive so timer fires naturally
+    if (BOT) {
+      botTapsLeft = 4 + Math.floor(rng() * 4);   // 4-7 taps then passive
+      botTimer = 0;
+      botPassive = false;
+    }
+  }
+
+  function tapFriend(idx) {
+    var f = friends[idx];
+    if (f.cooldown > 0) return;   // still cooling
+    f.sent = true;
+    f.sends++;
+    f.cooldown = 45;        // ~0.75s cooldown before re-tap (viral re-send)
+    f.viewBoost = 1.5;
+
+    var gain = VIEW_BASE + combo * COMBO_BONUS;
+    gain = Math.max(1, gain);
+    combo++;
+
+    views += gain;
+    hitStop = combo >= 4 ? 3 : 0;
+    if (combo >= 4) zoom = 1.03;
+
+    // ripple at friend position
+    ripples.push({ x: f.x, y: f.y, r: 0, maxR: 60, t: 0, color: f.color });
+
+    // floating text
+    particles.push({ x: f.x, y: f.y - 20, txt: '+' + gain, t: 0, color: GOLD, size: 22 + Math.min(combo * 2, 18) });
+
+    // sounds
+    if (window.J) {
+      if (combo >= 8) J.gold();
+      else if (combo >= 4) J.perfect(combo);
+      else J.hit(combo);
+      J.tension(Math.min(views / 120, 1));
+    }
+
+    // dare beaten?
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && views > SHARE.dare) {
+      dareBeaten = true;
+      particles.push({ x: W / 2, y: H / 2, txt: 'DARE BEATEN', t: 0, color: TEAL, size: 36 });
+      if (window.J) J.fanfare();
+      SHARE.beaten(views);
+    }
+
+    if (window.LOOP) LOOP.emit('friend_sent', { idx: idx, views: views, combo: combo });
+
+    // near-miss detection: if time is very low and combo just broke (gain was tiny)
+    if (timeLeft < 3 && combo === 1) {
+      if (window.LOOP) LOOP.emit('near_miss', { views: views, timeLeft: +timeLeft.toFixed(1) });
+      if (window.J) J.near();
+    }
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 8;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) {
+      J.death(Math.min(0.3 + views / 200, 1));
+      if (views > 80) setTimeout(function () { J.fanfare(); }, 500);
+    }
+    if (DEMO) window.__demoScore = views;
+    if (window.LOOP) LOOP.emit('game_over', { score: views, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+      return;
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    views = 0; combo = 0; timeLeft = ROUND_DURATION;
+    hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    particles = []; ripples = [];
+    friends = buildFriends();
+    botTimer = 0; botTapsLeft = 0; botPassive = false;
+    demoBeat = 0; demoTimer = 0; demoHesitate = 0; demoTapIdx = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function pctTop(v) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-v / 55))));
+  }
+
+  // ---- input regions ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 550, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(cx_coord, cy_coord) {
+    if (DEMO || BOT) return;
+    // mute button
+    if (cx_coord !== undefined && inR(MUTE_R, cx_coord, cy_coord) && window.J) {
+      J.toggleMute(); return;
+    }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') {
+      // check friend circles
+      if (cx_coord !== undefined) {
+        for (var i = 0; i < friends.length; i++) {
+          var f = friends[i];
+          var dx = cx_coord - f.x, dy = cy_coord - f.y;
+          if (dx * dx + dy * dy <= (f.r + 10) * (f.r + 10)) {
+            tapFriend(i); return;
+          }
+        }
+      }
+      // tap anywhere else resets combo
+      combo = 0;
+      return;
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (cx_coord !== undefined && inR(SHARE_R, cx_coord, cy_coord) && window.SHARE) {
+        SHARE.send({ score: views, unit: 'views' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') tap();
+    // number keys 1-9 tap friend shortcuts (human fun)
+    var n = parseInt(e.key, 10);
+    if (!isNaN(n) && n >= 1 && n <= friends.length) tapFriend(n - 1);
+  });
+
+  // ---- autopilots ----
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      // demo: scripted human-feeling taps with hesitation
+      demoTimer += dt;
+      if (demoTapIdx < DEMO_TAPS.length) {
+        var beat = DEMO_TAPS[demoTapIdx];
+        if (demoTimer >= beat.wait) {
+          tapFriend(beat.idx % friends.length);
+          demoTapIdx++;
+          demoTimer = 0;
+        }
+      }
+      // after all scripted taps, go passive — let timer run to 0
+      return;
+    }
+
+    if (BOT) {
+      botTimer += dt;
+      if (!botPassive && botTapsLeft > 0 && botTimer > 18 + rng() * 20) {
+        var idx = Math.floor(rng() * friends.length);
+        tapFriend(idx);
+        botTapsLeft--;
+        botTimer = 0;
+        if (botTapsLeft === 0) botPassive = true;
+      }
+      // passive: do nothing, let timer expire naturally → gameOver fires
+    }
+  }
+
+  // ---- render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // tick game timer
+    if (phase === 'play') {
+      if (hitStop > 0) {
+        hitStop -= dt;
+      } else {
+        timeLeft -= dt * 16.667 / 1000;
+        autopilot(dt);
+        // decay combo if no tap for ~1s (30 frames)
+        // (handled per-friend cooldown)
+        // tick friend cooldowns
+        for (var i = 0; i < friends.length; i++) {
+          if (friends[i].cooldown > 0) friends[i].cooldown -= dt;
+          if (friends[i].viewBoost > 1) friends[i].viewBoost -= 0.04 * dt;
+          friends[i].pulse += 0.04 * dt;
+        }
+        // combo decay: if no tap for ~1.2s (72 frames at 60fps), reset
+        // We track via a noTapFrames counter
+      }
+      if (timeLeft <= 0 && phase === 'play') {
+        timeLeft = 0;
+        gameOver();
+      }
+    }
+
+    // tick particles
+    for (var p = particles.length - 1; p >= 0; p--) {
+      particles[p].t += dt;
+      if (particles[p].t > 50) particles.splice(p, 1);
+    }
+    for (var rr = ripples.length - 1; rr >= 0; rr--) {
+      ripples[rr].t += dt;
+      ripples[rr].r = ripples[rr].maxR * (ripples[rr].t / 30);
+      if (ripples[rr].t > 30) ripples.splice(rr, 1);
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.84, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(232,80,46,0.05)'); bg.addColorStop(1, 'rgba(46,197,182,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- phase-specific draw ----
+    if (phase === 'title') {
+      drawTitle(now);
+    } else if (phase === 'challenge') {
+      drawChallenge(now);
+    } else if (phase === 'play') {
+      drawPlay(now);
+    } else if (phase === 'over') {
+      drawOver(now);
+    } else if (phase === 'cta') {
+      drawCta(now);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    // icon — pulsing circle with play arrow
+    cx.fillStyle = VERM;
+    cx.globalAlpha = 0.15;
+    cx.beginPath(); cx.arc(W / 2, 260, 70, 0, Math.PI * 2); cx.fill();
+    cx.globalAlpha = 1;
+    cx.fillStyle = VERM;
+    cx.font = '900 54px -apple-system, Helvetica, Arial';
+    cx.fillText('VIRAL', W / 2, 265);
+    cx.fillStyle = '#fff';
+    cx.font = '900 54px -apple-system, Helvetica, Arial';
+    cx.fillText('DARE', W / 2, 320);
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '500 15px -apple-system, Helvetica, Arial';
+    cx.fillText('post your dare. make it spread.', W / 2, 356);
+    var p = 0.6 + 0.4 * Math.sin(now / 320);
+    cx.globalAlpha = p; cx.fillStyle = VERM;
+    cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO START', W / 2, 410);
+    cx.globalAlpha = 1;
+  }
+
+  function drawChallenge(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '800 16px Menlo, monospace';
+    cx.fillText('SCORE TO BEAT', W / 2, 300);
+    cx.fillStyle = GOLD;
+    cx.font = '900 100px -apple-system, Helvetica, Arial';
+    cx.fillText('73', W / 2, 410);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText("today's viral record", W / 2, 440);
+  }
+
+  function drawPlay(now) {
+    // top HUD: view count + timer bar
+    var timerFrac = Math.max(0, timeLeft / ROUND_DURATION);
+    // timer bar background
+    cx.fillStyle = 'rgba(255,255,255,0.08)';
+    cx.fillRect(20, 20, W - 40, 6);
+    // timer bar fill — goes from teal to vermillion as time runs out
+    var barColor = timeLeft > 6 ? TEAL : VERM;
+    cx.fillStyle = barColor;
+    cx.fillRect(20, 20, (W - 40) * timerFrac, 6);
+
+    // blinking urgency when <4s
+    if (timeLeft < 4 && Math.floor(now / 250) % 2 === 0) {
+      cx.fillStyle = 'rgba(232,80,46,0.18)';
+      cx.fillRect(0, 0, W, H);
+    }
+
+    // view count — the ego number
+    cx.textAlign = 'center';
+    var countScale = 1 + (zoom > 1.001 ? (zoom - 1) * 3 : 0);
+    cx.save();
+    cx.translate(W / 2, 100);
+    cx.scale(countScale, countScale);
+    cx.fillStyle = '#fff';
+    cx.font = '900 76px -apple-system, Helvetica, Arial';
+    cx.fillText(views, 0, 0);
+    cx.restore();
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('VIEWS', W / 2, 122);
+
+    // combo badge
+    if (combo >= 2) {
+      var cbColor = combo >= 8 ? GOLD : combo >= 4 ? VERM : TEAL;
+      cx.fillStyle = cbColor;
+      var cbSize = 14 + Math.min(combo * 1.5, 22);
+      cx.font = '900 ' + cbSize + 'px -apple-system, Helvetica, Arial';
+      cx.fillText('×' + combo + ' CHAIN', W / 2, 150);
+    }
+
+    // timer seconds
+    cx.fillStyle = timeLeft < 5 ? VERM : 'rgba(255,255,255,0.5)';
+    cx.font = '700 16px Menlo, monospace';
+    cx.textAlign = 'right';
+    cx.fillText(Math.ceil(timeLeft) + 's', W - 22, 15);
+    cx.textAlign = 'center';
+
+    // dare banner (incoming)
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — by ' + SHARE.by : ''), W / 2, 172);
+    }
+
+    // ripples
+    for (var rr = 0; rr < ripples.length; rr++) {
+      var rip = ripples[rr];
+      cx.strokeStyle = rip.color;
+      cx.globalAlpha = Math.max(0, 1 - rip.t / 30) * 0.6;
+      cx.lineWidth = 2;
+      cx.beginPath(); cx.arc(rip.x, rip.y, rip.r, 0, Math.PI * 2); cx.stroke();
+      cx.globalAlpha = 1;
+    }
+
+    // friend circles
+    for (var i = 0; i < friends.length; i++) {
+      var f = friends[i];
+      var fr = f.r * (f.sent ? (f.cooldown > 0 ? Math.max(1, f.viewBoost) : 1.05) : 1);
+      fr += Math.sin(f.pulse + now * 0.002) * (f.sent ? 2 : 1);
+
+      // outer ring for sent friends
+      if (f.sent && f.cooldown <= 0) {
+        cx.strokeStyle = f.color;
+        cx.lineWidth = 2;
+        cx.globalAlpha = 0.5;
+        cx.beginPath(); cx.arc(f.x, f.y, fr + 6, 0, Math.PI * 2); cx.stroke();
+        cx.globalAlpha = 1;
+      }
+
+      // glow for available friends
+      if (!f.sent || f.cooldown <= 0) {
+        cx.fillStyle = f.color;
+        cx.globalAlpha = 0.12;
+        cx.beginPath(); cx.arc(f.x, f.y, fr + 10, 0, Math.PI * 2); cx.fill();
+        cx.globalAlpha = 1;
+      }
+
+      // main circle
+      cx.fillStyle = f.sent ? f.color : 'rgba(255,255,255,0.12)';
+      cx.globalAlpha = f.cooldown > 0 ? 0.5 : 1;
+      cx.beginPath(); cx.arc(f.x, f.y, fr, 0, Math.PI * 2); cx.fill();
+      cx.globalAlpha = 1;
+
+      // label
+      cx.fillStyle = f.sent ? '#fff' : 'rgba(255,255,255,0.4)';
+      cx.font = '700 12px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText(f.label, f.x, f.y + 4);
+
+      // sends count badge
+      if (f.sends > 0) {
+        cx.fillStyle = GOLD;
+        cx.font = '800 10px -apple-system, Helvetica, Arial';
+        cx.fillText('×' + f.sends, f.x, f.y + fr + 14);
+      }
+    }
+
+    // instruction (first few seconds)
+    if (timeLeft > ROUND_DURATION - 3 && !BOT) {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('tap your friends to spread the dare', W / 2, H - 30);
+    }
+
+    // floating reward text
+    for (var pp = 0; pp < particles.length; pp++) {
+      var pt = particles[pp];
+      var palpha = Math.max(0, 1 - pt.t / 50);
+      cx.globalAlpha = palpha;
+      cx.fillStyle = pt.color;
+      cx.font = '900 ' + pt.size + 'px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText(pt.txt, pt.x, pt.y - pt.t * 0.8);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawOver(now) {
+    // draw dimmed play bg first
+    cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+
+    cx.fillStyle = VERM;
+    cx.font = '900 36px -apple-system, Helvetica, Arial';
+    cx.fillText('LINK EXPIRED.', W / 2, 280);
+
+    cx.fillStyle = '#fff';
+    cx.font = '800 72px -apple-system, Helvetica, Arial';
+    cx.fillText(views, W / 2, 365);
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '600 16px -apple-system, Helvetica, Arial';
+    cx.fillText('views in 18 seconds', W / 2, 390);
+
+    var pt = pctTop(views);
+    cx.fillStyle = GOLD;
+    cx.font = '900 22px -apple-system, Helvetica, Arial';
+    cx.fillText('TOP ' + pt + '% TODAY', W / 2, 428);
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('more viral than ' + (100 - pt) + '% of posts', W / 2, 450);
+
+    if (!DEMO && !BOT) {
+      var p = 0.6 + 0.4 * Math.sin(now / 280);
+      cx.globalAlpha = p;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — DARE AGAIN', W / 2, 502);
+      cx.globalAlpha = 1;
+
+      // share pill
+      cx.fillStyle = 'rgba(242,177,52,0.14)';
+      cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+      else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = GOLD;
+      cx.font = '800 16px -apple-system, Helvetica, Arial';
+      var shareLabel = (window.SHARE && SHARE.dare !== null && dareBeaten) ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND';
+      cx.fillText(shareLabel, W / 2, SHARE_R.y + 30);
+    }
+  }
+
+  function drawCta(now) {
+    var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.4);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease; cx.textAlign = 'center';
+
+    cx.fillStyle = '#fff';
+    cx.font = '900 46px -apple-system, Helvetica, Arial';
+    cx.fillText('VIRAL DARE', W / 2, 290);
+
+    cx.fillStyle = 'rgba(255,255,255,0.7)';
+    cx.font = '700 19px -apple-system, Helvetica, Arial';
+    cx.fillText('they got ' + (window.__demoScore || 73) + ' views.', W / 2, 332);
+
+    var p = 0.7 + 0.3 * Math.sin(now / 240);
+    cx.fillStyle = VERM; cx.globalAlpha = ease * p;
+    cx.font = '900 34px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ BEAT ' + (window.__demoScore || 73), W / 2, 402);
+
+    cx.globalAlpha = ease;
+    cx.fillStyle = TEAL;
+    cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 434);
+    cx.globalAlpha = 1;
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

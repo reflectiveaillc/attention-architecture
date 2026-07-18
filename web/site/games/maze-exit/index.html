@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Maze Exit — Tilt</title>
+<!--
+  LOOP / attention-architecture — Maze Exit
+  Circuits: 06-zeigarnik, 01-rpe, 05-ease
+  Hook: satisfying maze-solve drag — the thumb already knows this move from IG/TikTok
+  Modes:
+    ?demo=1&seed=7    mirror-neuron clip — challenge card → human play → near-fail → fail → CTA
+    ?bot=1&runs=N&seed=5  imperfect bot, N runs, sets __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:none; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'maze-exit';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  // canvas / dpr
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ── MAZE GENERATION ──────────────────────────────────────────────────────────
+  // Grid-based maze using recursive backtracker. Each cell has 4 walls (N,E,S,W).
+  var COLS = 7, ROWS = 11;   // odd so exit at center is clean
+  var CELL = 44;             // px per cell
+  var MAZE_X = (W - COLS * CELL) / 2;  // left offset
+  var MAZE_Y = 100;                      // top offset
+
+  // Wall bits
+  var N = 1, E = 2, S = 4, _W = 8;
+
+  function generateMaze(seed) {
+    var r = mulberry32(seed);
+    // walls[row][col] — bit mask of OPEN passages (no wall in that direction)
+    var walls = [];
+    for (var row = 0; row < ROWS; row++) {
+      walls[row] = [];
+      for (var col = 0; col < COLS; col++) walls[row][col] = 0;
+    }
+    var visited = [];
+    for (var row = 0; row < ROWS; row++) { visited[row] = []; for (var col = 0; col < COLS; col++) visited[row][col] = false; }
+
+    var dirs = [
+      { dr: -1, dc: 0, bit: N, opp: S },
+      { dr:  0, dc: 1, bit: E, opp: _W },
+      { dr:  1, dc: 0, bit: S, opp: N  },
+      { dr:  0, dc:-1, bit: _W, opp: E }
+    ];
+    function shuffle(arr) {
+      for (var i = arr.length - 1; i > 0; i--) {
+        var j = Math.floor(r() * (i + 1));
+        var tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+      }
+      return arr;
+    }
+    function carve(row, col) {
+      visited[row][col] = true;
+      var shuffled = shuffle(dirs.slice());
+      for (var i = 0; i < shuffled.length; i++) {
+        var d = shuffled[i];
+        var nr = row + d.dr, nc = col + d.dc;
+        if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS && !visited[nr][nc]) {
+          walls[row][col] |= d.bit;
+          walls[nr][nc]   |= d.opp;
+          carve(nr, nc);
+        }
+      }
+    }
+    carve(0, 0);
+    return walls;
+  }
+
+  // Convert maze walls into a path from start (top-left) to exit (bottom-right)
+  // BFS to find a solution path
+  function solveMaze(walls) {
+    var start = { r: 0, c: 0 };
+    var end   = { r: ROWS - 1, c: COLS - 1 };
+    var queue = [start];
+    var prev  = {};
+    prev['0,0'] = null;
+    var dirsMap = [
+      { dr: -1, dc: 0, bit: N },
+      { dr:  0, dc: 1, bit: E },
+      { dr:  1, dc: 0, bit: S },
+      { dr:  0, dc:-1, bit: _W }
+    ];
+    while (queue.length) {
+      var cur = queue.shift();
+      if (cur.r === end.r && cur.c === end.c) break;
+      for (var i = 0; i < 4; i++) {
+        var d = dirsMap[i];
+        var nr = cur.r + d.dr, nc = cur.c + d.dc;
+        var key = nr + ',' + nc;
+        if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS
+            && !(key in prev) && (walls[cur.r][cur.c] & d.bit)) {
+          prev[key] = { r: cur.r, c: cur.c };
+          queue.push({ r: nr, c: nc });
+        }
+      }
+    }
+    // reconstruct path as array of cell {r,c}
+    var path = [], cur = end;
+    while (cur) {
+      path.unshift(cur);
+      var k = cur.r + ',' + cur.c;
+      cur = prev[k];
+    }
+    return path;
+  }
+
+  // Cell center in canvas coords
+  function cellCenter(r, c) {
+    return { x: MAZE_X + c * CELL + CELL / 2, y: MAZE_Y + r * CELL + CELL / 2 };
+  }
+
+  // ── STATE ─────────────────────────────────────────────────────────────────────
+  var walls, solPath, solPts; // solution path as {x,y} pixel points
+  var state, flashes, hitStop, shakeAmt, zoom, dareBeaten, runStartTs;
+  var best = 0, mazesCompleted = 0;
+  try { best = +localStorage.getItem('me_best') || 0; } catch (_) {}
+
+  // player draw path: array of {x,y} the finger has passed through
+  var playerPts, playerSeg, isDown; // playerSeg = index of next solution node to reach
+  var REACH = CELL * 0.45;          // how close finger must be to count as hitting a waypoint
+
+  // juice
+  var ctaAt = 0;
+
+  function newMaze() {
+    walls   = generateMaze(Math.floor(rng() * 999999));
+    solPath = solveMaze(walls);
+    solPts  = solPath.map(function (c) { return cellCenter(c.r, c.c); });
+  }
+
+  function newGame() {
+    newMaze();
+    flashes   = [];
+    hitStop   = 0;
+    shakeAmt  = 0;
+    zoom      = 1;
+    dareBeaten = false;
+    isDown    = false;
+    playerPts = [];
+    playerSeg = 0;
+    mazesCompleted = 0;
+
+    state = { phase: 'title', score: 0, overAt: 0 };
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { startRun(); }
+  }
+
+  var challengeAt = 0;
+
+  function startRun() {
+    state.phase = 'play';
+    state.score = 0;
+    playerPts   = [];
+    playerSeg   = 0;
+    isDown      = false;
+    runStartTs  = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ── FINGER / BOT PATH LOGIC ──────────────────────────────────────────────────
+  // Called each time the finger moves or bot advances.
+  // cx/cy = canvas coordinates.
+  function movePlayer(cx2, cy2) {
+    if (state.phase !== 'play') return;
+    playerPts.push({ x: cx2, y: cy2 });
+    // check if we've reached the next waypoint on the solution
+    while (playerSeg < solPts.length) {
+      var target = solPts[playerSeg];
+      var dx = cx2 - target.x, dy = cy2 - target.y;
+      if (Math.sqrt(dx * dx + dy * dy) < REACH) {
+        playerSeg++;
+        // sound
+        if (window.J) {
+          J.hit(playerSeg);
+          J.tension(Math.min(playerSeg / solPts.length, 1));
+        }
+        // juice flash for mid-progress
+        if (playerSeg === Math.floor(solPts.length * 0.5)) {
+          flash('HALFWAY!', TEAL, 32);
+          if (window.J) J.near();
+        }
+        if (playerSeg >= solPts.length) {
+          // REACHED EXIT
+          mazeComplete();
+        }
+      } else {
+        break;
+      }
+    }
+  }
+
+  function mazeComplete() {
+    state.score++;
+    mazesCompleted++;
+    hitStop = 5;
+    zoom = 1.04;
+    shakeAmt = 3;
+    if (window.J) { J.perfect(state.score); if (state.score % 3 === 0) J.gold(); }
+    flash('EXIT!', GOLD, 46);
+
+    // dare beat check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 38);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+
+    if (window.LOOP) LOOP.emit('maze_complete', { n: state.score });
+
+    // short celebration then new maze
+    setTimeout(function () {
+      if (state.phase !== 'play') return;
+      newMaze();
+      playerPts  = [];
+      playerSeg  = 0;
+      isDown     = false;
+    }, 420);
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 8;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) { J.death(0.5 + state.score * 0.04); if (newBest) setTimeout(function () { J.fanfare(); }, 450); }
+    if (newBest) { best = state.score; try { localStorage.setItem('me_best', String(best)); } catch (_) {} }
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2500);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 800);
+    }
+  }
+
+  function resetRun() {
+    newMaze();
+    state.score = 0;
+    playerPts   = [];
+    playerSeg   = 0;
+    isDown      = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 4))));
+  }
+
+  // ── INPUT ─────────────────────────────────────────────────────────────────────
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 510, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function onDown(x, y) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { isDown = true; movePlayer(x, y); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'mazes' }); return;
+      }
+      resetRun();
+    }
+  }
+  function onMove(x, y) {
+    if (DEMO || BOT) return;
+    if (state.phase === 'play' && isDown) movePlayer(x, y);
+  }
+  function onUp() { if (!DEMO && !BOT) isDown = false; }
+
+  cv.addEventListener('pointerdown', function (e) {
+    e.preventDefault();
+    var r = cv.getBoundingClientRect();
+    onDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointermove', function (e) {
+    e.preventDefault();
+    var r = cv.getBoundingClientRect();
+    onMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup',   function () { onUp(); });
+  cv.addEventListener('pointerleave', function () { onUp(); });
+
+  // ── BOT / DEMO AUTOPILOT ──────────────────────────────────────────────────────
+  // Bot follows the solution path with small Gaussian jitter + hesitation
+  var botPtIdx   = 0;   // current target index in solPts
+  var botProgress = 0;  // interpolation 0→1 between consecutive points
+  var botRunsDone = 0;
+  var botWait     = 0;  // frames to pause (simulate hesitation)
+  var botSpeed    = 0;
+  var botMaxMazes = 4;  // bot quits to trigger game_over after this many mazes
+  var botMazeDone = 0;
+  var botFailing  = false; // when true, bot moves AWAY from path to trigger timeout death
+
+  // Demo-specific state
+  var demoPhase   = 0;  // 0=normal, 1=near-fail-recovery, 2=real-fail
+  var demoMazeDone = 0;
+
+  function initBotForMaze() {
+    botPtIdx    = 0;
+    botProgress = 0;
+    botWait     = 10 + Math.floor(rng() * 12);
+    botSpeed    = 0.028 + rng() * 0.015;
+    if (DEMO) botSpeed = 0.018 + rng() * 0.008; // slower for human feel
+  }
+  initBotForMaze();
+
+  // Virtual finger position for bot
+  var botX = 0, botY = 0;
+
+  function botFrame() {
+    if (state.phase !== 'play') return;
+
+    // Wait (hesitation)
+    if (botWait > 0) { botWait--; return; }
+
+    if (botFailing) {
+      // Move bot in a random direction away from path to waste time → eventually timeout → gameOver
+      botX += (rng() - 0.5) * 8;
+      botY += (rng() - 0.5) * 8;
+      botX = Math.max(MAZE_X, Math.min(MAZE_X + COLS * CELL, botX));
+      botY = Math.max(MAZE_Y, Math.min(MAZE_Y + ROWS * CELL, botY));
+      return;
+    }
+
+    if (botPtIdx >= solPts.length) return;
+
+    var speed = botSpeed;
+    botProgress += speed;
+    if (botProgress >= 1) {
+      botProgress = 0;
+      botPtIdx++;
+      if (botPtIdx >= solPts.length) {
+        // completed maze
+        botMazeDone++;
+        demoMazeDone++;
+        botWait = 18 + Math.floor(rng() * 20);
+        // after maze completes, mazeComplete() already triggered by movePlayer
+        // wait for new maze to load, then reinit
+        setTimeout(function () { initBotForMaze(); }, 480);
+        return;
+      }
+      // occasional pause mid-path for human feel
+      if (rng() < 0.18) botWait = 4 + Math.floor(rng() * 8);
+    }
+
+    if (botPtIdx >= solPts.length) return;
+
+    // Interpolate between current and next point
+    var fromIdx = Math.max(0, botPtIdx - 1);
+    var from = botPtIdx === 0 ? solPts[0] : solPts[fromIdx];
+    var to   = solPts[Math.min(botPtIdx, solPts.length - 1)];
+    var jx = (rng() - 0.5) * 5, jy = (rng() - 0.5) * 5;
+    botX = from.x + (to.x - from.x) * botProgress + jx;
+    botY = from.y + (to.y - from.y) * botProgress + jy;
+    movePlayer(botX, botY);
+
+    // Demo near-fail at ~60%: slow way down, wobble, then recover
+    if (DEMO && demoPhase === 0 && demoMazeDone >= 1 && botPtIdx >= Math.floor(solPts.length * 0.55)) {
+      demoPhase = 1;
+      botSpeed *= 0.4; // crawl
+    }
+    if (DEMO && demoPhase === 1 && botPtIdx >= Math.floor(solPts.length * 0.80)) {
+      demoPhase = 2;
+      botSpeed = 0.022; // recover
+    }
+    // After second maze complete, trigger real fail
+    if (DEMO && demoMazeDone >= 2 && !botFailing) {
+      botFailing = true;
+    }
+    // Bot mode: after botMaxMazes complete, stop so the natural timeout fires
+    if (BOT && botMazeDone >= botMaxMazes && !botFailing) {
+      botFailing = true;
+    }
+  }
+
+  // ── TIMEOUT LOSS CONDITION ────────────────────────────────────────────────────
+  // If the player hasn't moved their finger for 5 seconds (time limit per segment),
+  // they lose. This creates the fail path for bot/demo.
+  var lastProgressTime = 0;
+  var SEGMENT_TIMEOUT_MS = 5000; // 5s max per maze before fail
+
+  // ── DRAW MAZE ─────────────────────────────────────────────────────────────────
+  function drawMaze() {
+    if (!walls) return;
+    var lineW = 3;
+    cx.strokeStyle = 'rgba(255,255,255,0.82)';
+    cx.lineWidth   = lineW;
+    cx.lineCap     = 'round';
+
+    for (var row = 0; row < ROWS; row++) {
+      for (var col = 0; col < COLS; col++) {
+        var x = MAZE_X + col * CELL, y = MAZE_Y + row * CELL;
+        var w = walls[row][col];
+        if (!(w & N)) { cx.beginPath(); cx.moveTo(x, y); cx.lineTo(x + CELL, y); cx.stroke(); }
+        if (!(w & E)) { cx.beginPath(); cx.moveTo(x + CELL, y); cx.lineTo(x + CELL, y + CELL); cx.stroke(); }
+        if (!(w & S)) { cx.beginPath(); cx.moveTo(x, y + CELL); cx.lineTo(x + CELL, y + CELL); cx.stroke(); }
+        if (!(w & _W)) { cx.beginPath(); cx.moveTo(x, y); cx.lineTo(x, y + CELL); cx.stroke(); }
+      }
+    }
+
+    // draw outer border
+    cx.strokeStyle = 'rgba(255,255,255,0.95)';
+    cx.lineWidth = lineW + 1;
+    cx.strokeRect(MAZE_X, MAZE_Y, COLS * CELL, ROWS * CELL);
+
+    // Start marker (top-left cell)
+    var sc = cellCenter(0, 0);
+    cx.fillStyle = TEAL;
+    cx.beginPath(); cx.arc(sc.x, sc.y, 9, 0, Math.PI * 2); cx.fill();
+    cx.fillStyle = INK; cx.textAlign = 'center'; cx.textBaseline = 'middle';
+    cx.font = '700 9px -apple-system, Helvetica, Arial';
+    cx.fillText('GO', sc.x, sc.y + 1);
+    cx.textBaseline = 'alphabetic';
+
+    // Exit marker (bottom-right cell) — pulsing GOLD
+    var ec = cellCenter(ROWS - 1, COLS - 1);
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 220);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = GOLD;
+    cx.beginPath(); cx.arc(ec.x, ec.y, 10, 0, Math.PI * 2); cx.fill();
+    cx.globalAlpha = 1;
+    cx.fillStyle = INK; cx.textAlign = 'center'; cx.textBaseline = 'middle';
+    cx.font = '700 8px -apple-system, Helvetica, Arial';
+    cx.fillText('EXIT', ec.x, ec.y + 1);
+    cx.textBaseline = 'alphabetic';
+  }
+
+  function drawPlayerTrail() {
+    if (playerPts.length < 2) return;
+    // revealed corridors: segments up to playerSeg, drawn as thick teal trail
+    cx.save();
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 7;
+    cx.lineCap = 'round';
+    cx.lineJoin = 'round';
+    cx.globalAlpha = 0.72;
+    cx.beginPath();
+    cx.moveTo(playerPts[0].x, playerPts[0].y);
+    for (var i = 1; i < playerPts.length; i++) cx.lineTo(playerPts[i].x, playerPts[i].y);
+    cx.stroke();
+    cx.restore();
+
+    // highlight tip
+    if (playerPts.length > 0) {
+      var tip = playerPts[playerPts.length - 1];
+      cx.save();
+      cx.fillStyle = '#fff';
+      cx.globalAlpha = 0.9;
+      cx.beginPath(); cx.arc(tip.x, tip.y, 6, 0, Math.PI * 2); cx.fill();
+      cx.restore();
+    }
+  }
+
+  // ── TIMER BAR ──────────────────────────────────────────────────────────────────
+  var TIMER_MAX_MS = SEGMENT_TIMEOUT_MS;
+  var timerStart = 0;
+
+  function getTimerFrac() {
+    var elapsed = performance.now() - timerStart;
+    return Math.max(0, 1 - elapsed / TIMER_MAX_MS);
+  }
+
+  // ── MAIN LOOP ──────────────────────────────────────────────────────────────────
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // hit-stop decay
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      // autopilot runs when NOT in hitStop
+      if ((DEMO || BOT) && state.phase === 'play') botFrame();
+
+      // timeout check (only in play, non-DEMO-non-BOT for human; also for bot after bot sets botFailing)
+      if (state.phase === 'play') {
+        var elapsed = now - timerStart;
+        if (elapsed > SEGMENT_TIMEOUT_MS) {
+          // time ran out → game over
+          if (DEMO || BOT) {
+            // only fail if bot is "failing" or demo has passed second maze
+            if (botFailing) gameOver();
+          } else {
+            gameOver();
+          }
+        }
+      }
+    }
+
+    // Track timer: reset when playerSeg advances
+    if (state.phase === 'play' && !isDown && !DEMO && !BOT) {
+      // human: timer starts fresh after each waypoint
+    }
+
+    // juice: decaying shake + zoom pulse
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ── TITLE ────────────────────────────────────────────────────────────────────
+    if (state.phase === 'title') {
+      // draw the maze faded in background
+      cx.save(); cx.globalAlpha = 0.22; drawMaze(); cx.restore();
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('MAZE EXIT', W / 2, 272);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse; cx.fillText('DRAG TO SOLVE', W / 2, 318); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('find the exit. don\'t lift too soon.', W / 2, 348);
+    }
+
+    // ── CHALLENGE CARD (demo) ─────────────────────────────────────────────────
+    if (state.phase === 'challenge') {
+      cx.save(); cx.globalAlpha = 0.18; drawMaze(); cx.restore();
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 298);
+      cx.fillStyle = GOLD; cx.font = '900 104px -apple-system, Helvetica, Arial';
+      cx.fillText('7', W / 2, 412);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top solve", W / 2, 442);
+    }
+
+    // ── PLAY ─────────────────────────────────────────────────────────────────────
+    if (state.phase === 'play' || (state.phase === 'over')) {
+      drawMaze();
+      drawPlayerTrail();
+
+      // timer bar (only in play)
+      if (state.phase === 'play') {
+        var frac = getTimerFrac();
+        var barW = W - 60, barX = 30, barY = H - 60;
+        cx.fillStyle = 'rgba(255,255,255,0.12)';
+        cx.beginPath(); cx.roundRect ? cx.roundRect(barX, barY, barW, 6, 3) : cx.rect(barX, barY, barW, 6);
+        cx.fill();
+        var barColor = frac > 0.5 ? TEAL : frac > 0.25 ? GOLD : VERM;
+        cx.fillStyle = barColor;
+        cx.beginPath(); cx.roundRect ? cx.roundRect(barX, barY, barW * frac, 6, 3) : cx.rect(barX, barY, barW * frac, 6);
+        cx.fill();
+        if (frac < 0.3 && window.J) J.tension(1 - frac);
+      }
+
+      // score
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '800 56px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 72);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 94);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare, W / 2, 112);
+      }
+    }
+
+    // ── GAME OVER OVERLAY ─────────────────────────────────────────────────────
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('TIME\'S UP.', W / 2, 290);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' maze' + (state.score !== 1 ? 's' : '') + ' solved', W / 2, 336);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 378);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of solvers', W / 2, 400);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — TRY AGAIN', W / 2, 446);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ── CTA CARD (demo) ───────────────────────────────────────────────────────
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('MAZE EXIT', W / 2, 296);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('he solved ' + (window.__demoScore || 2) + '. your turn.', W / 2, 336);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 2), W / 2, 406);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 438);
+      cx.globalAlpha = 1;
+    }
+
+    // ── FLASHES ───────────────────────────────────────────────────────────────
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 230 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // ── MUTE TOGGLE (human only) ──────────────────────────────────────────────
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ── TIMER RESET HOOK ──────────────────────────────────────────────────────────
+  // Reset timer each time a waypoint is hit — done by overriding movePlayer timing
+  var origMovePlayer = movePlayer;
+  var lastSeg = 0;
+  function movePt(x, y) {
+    var prevSeg = playerSeg;
+    origMovePlayer(x, y);
+    if (playerSeg > prevSeg) timerStart = performance.now(); // progress: reset timer
+  }
+  // Replace for human input
+  cv.removeEventListener('pointermove', cv._moveHandler);
+  cv.addEventListener('pointermove', function (e) {
+    e.preventDefault();
+    if (DEMO || BOT) return;
+    if (state.phase === 'play' && isDown) {
+      var r = cv.getBoundingClientRect();
+      movePt((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+    }
+  });
+
+  // initialise timer when play starts
+  var _origStartRun = startRun;
+  startRun = function () {
+    _origStartRun();
+    timerStart = performance.now();
+    lastSeg = 0;
+    botMazeDone = 0;
+    demoMazeDone = 0;
+    demoPhase = 0;
+    botFailing = false;
+    initBotForMaze();
+    // position bot at start cell
+    var sc = cellCenter(0, 0);
+    botX = sc.x; botY = sc.y;
+  };
+
+  // re-init timer after maze complete
+  var _origMazeComplete = mazeComplete;
+  mazeComplete = function () {
+    _origMazeComplete();
+    timerStart = performance.now();
+  };
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

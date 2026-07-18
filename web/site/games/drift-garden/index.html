@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Drift Garden — Tilt</title>
+<!--
+  LOOP / attention-architecture — Drift Garden (CALM engine, contract v2)
+  Circuits: 03 completion-satisfaction, 07 variable reward, 09 persistence/investment.
+  Modes (query params):
+    ?demo=1&seed=7        scripted garden-filling clip, sets window.__demoDone + __demoScore
+    ?bot=1&runs=N&seed=5  autoplay traffic simulation, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'drift-garden';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so gardens are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  // canvas + fit
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', TEAL = '#2ec5b6', LAV = '#9d8cff', ROSE = '#e8a0b4';
+
+  // ---- persistence ----
+  var savedGarden = null, titleSeen = false;
+  try {
+    var raw = localStorage.getItem('dg_garden');
+    if (raw) savedGarden = JSON.parse(raw);
+    titleSeen = localStorage.getItem('dg_title_seen') === '1';
+  } catch (_) {}
+
+  // state
+  var flowers = [];        // completed blooms
+  var growing = [];        // blooms currently animating
+  var queue = [];          // breath-queued taps
+  var motes = [];
+  var titleOpacity = titleSeen ? 0 : 1;
+  var totalBlooms = 0;
+  var sessionBlooms = 0;
+  var startedAt = 0;
+  var lastBloomStart = 0;
+  var fullMessageShown = false;
+  var ctaAt = 0, ctaPhase = false;
+  var demoDone = false;
+  var botRunsDone = 0, botRunBlooms = 0;
+
+  // v2 juice state
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var flashes = [];
+
+  function now() { return performance.now(); }
+
+  function saveGarden() {
+    if (DEMO || BOT) return;
+    try {
+      localStorage.setItem('dg_garden', JSON.stringify({
+        seed: SEED,
+        total: totalBlooms,
+        flowers: flowers.map(function (f) {
+          return { x: f.x, y: f.y, n: f.n, size: f.size, hue: f.hue, round: f.round, sway: f.sway, phase: f.phase };
+        })
+      }));
+    } catch (_) {}
+  }
+
+  function loadGarden() {
+    if (!savedGarden || !savedGarden.flowers) return;
+    totalBlooms = savedGarden.total || savedGarden.flowers.length;
+    if (totalBlooms >= 30) fullMessageShown = true;
+    sessionBlooms = 0;
+    flowers = savedGarden.flowers.map(function (f) {
+      return makeFlower(f.x, f.y, f.n, f.size, f.hue, f.round, f.sway, f.phase, true);
+    });
+  }
+
+  // ---- flower factory ----
+  function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+  function easeOutBack(t) { var c = 1.70158; var r = t - 1; return r * r * ((c + 1) * r + c) + 1; }
+
+  function makeFlower(x, y, n, size, hue, round, sway, phase, completed) {
+    return {
+      x: x, y: y,
+      n: n, size: size, hue: hue, round: round,
+      sway: sway == null ? rng() * Math.PI * 2 : sway,
+      phase: phase == null ? rng() * Math.PI * 2 : phase,
+      t: 0,
+      stemDur: 42,           // ~0.7s
+      petalStagger: 10,      // frames between petal reveals
+      completed: !!completed,
+      glow: 0,
+      born: now()
+    };
+  }
+
+  function randFlowerAt(x, y) {
+    var n = 5 + Math.floor(rng() * 4);          // 5–8 petals
+    var size = 18 + Math.floor(rng() * 17);     // 18–34px
+    var hueBase = rng();
+    var hue;
+    if (hueBase < 0.38) hue = 168 + rng() * 16;        // teal family
+    else if (hueBase < 0.72) hue = 250 + rng() * 22;   // lavender family
+    else hue = 330 + rng() * 18;                       // rose family
+    var round = 0.35 + rng() * 0.55;              // shape roundness
+    return makeFlower(x, y, n, size, hue, round, rng() * Math.PI * 2, rng() * Math.PI * 2, false);
+  }
+
+  function startFlower(x, y) {
+    if (flowers.length + growing.length >= 120) return; // soft cap
+    var f = randFlowerAt(x, y);
+    growing.push(f);
+    lastBloomStart = now();
+  }
+
+  function completeFlower(f, idx) {
+    f.completed = true;
+    f.t = 0;
+    f.glow = 1;
+    flowers.push(f);
+    growing.splice(idx, 1);
+    totalBlooms++;
+    sessionBlooms++;
+    if (BOT) botRunBlooms++;
+    if (window.LOOP) LOOP.emit('bloom', { n: totalBlooms });
+
+    // calm-engine sound only
+    if (window.J) J.calm(totalBlooms);
+
+    // gentle bloom pulse; milestone breath gets a bigger moment
+    var milestone = totalBlooms % 10 === 0;
+    hitStop = milestone ? 6 : 2;
+    zoom = milestone ? 1.045 : 1.015;
+    if (milestone) {
+      shakeAmt = 1.5;
+      flash(totalBlooms + ' BLOOMS', LAV, 32);
+    } else {
+      flash('bloom', TEAL, 18);
+    }
+
+    if (!BOT && totalBlooms % 10 === 0 && window.LOOP) {
+      var dur = (Date.now() - startedAt) / 1000;
+      LOOP.emit('game_over', { score: totalBlooms, dur_s: +dur.toFixed(1) });
+    }
+    if (totalBlooms === 30) fullMessageShown = true;
+    saveGarden();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- motes ----
+  function spawnMote() {
+    var x = rng() * W;
+    var y = H + 10 + rng() * 40;
+    var size = 2 + rng() * 4;
+    var hue = rng() < 0.5 ? 168 + rng() * 16 : 250 + rng() * 22;
+    motes.push({ x: x, y: y, size: size, hue: hue, vy: 0.3 + rng() * 0.5, phase: rng() * Math.PI * 2 });
+  }
+
+  // ---- input / breath pacing ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 110, y: 76, w: 220, h: 36 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (fullMessageShown && x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+      SHARE.send({ score: totalBlooms, unit: 'blooms' }); return;
+    }
+    if (startedAt === 0) {
+      startedAt = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+    if (titleOpacity > 0) {
+      titleOpacity = 0;
+      try { localStorage.setItem('dg_title_seen', '1'); } catch (_) {}
+    }
+    var tn = now();
+    if (tn - lastBloomStart < 1200) {
+      queue.push({ x: x, y: y });
+    } else {
+      startFlower(x, y);
+    }
+  }
+
+  function screenToGame(ex, ey) {
+    var rect = cv.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(W, (ex - rect.left) / scale)),
+      y: Math.max(0, Math.min(H, (ey - rect.top) / scale))
+    };
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var p = screenToGame(e.clientX, e.clientY);
+    tap(p.x, p.y);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (DEMO || BOT) return;
+    if (e.code === 'Space') tap(W / 2 + (rng() - 0.5) * 80, H - 160 - rng() * 120);
+  });
+
+  // ---- demo / bot autopilots ----
+  var demoTargets = [];
+  function buildDemoTargets() {
+    var cx0 = W / 2, cy0 = H / 2 + 30;
+    var golden = Math.PI * (3 - Math.sqrt(5));
+    // settle → deepen → resolve, with human hesitation
+    var waits = [1600, 1500, 1400, 1200, 1000, 950, 900, 850, 750, 700, 650, 600, 550, 500, 450, 400];
+    var t = 0;
+    for (var i = 0; i < waits.length; i++) {
+      t += waits[i] + Math.round((rng() - 0.5) * 140);
+      var r = 12 + Math.sqrt(i + 1) * 38;
+      var a = i * golden + (rng() - 0.5) * 0.15;
+      demoTargets.push({
+        x: cx0 + Math.cos(a) * r,
+        y: cy0 + Math.sin(a) * r * 0.62 + 40 + (rng() - 0.5) * 20,
+        time: t
+      });
+    }
+  }
+
+  var demoStart = 0, demoHoldStart = 0, demoStartsDone = 0;
+  var botRunStart = 0, botPositions = [], botIdx = 0;
+
+  function initAutopilot() {
+    if (DEMO) { buildDemoTargets(); demoStart = now(); }
+    if (BOT) {
+      botRunStart = now();
+      botRunBlooms = 0;
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      botPositions = [];
+      for (var i = 0; i < 8; i++) {
+        botPositions.push({ x: 40 + rng() * (W - 80), y: 140 + rng() * (H - 260) });
+      }
+      botIdx = 0;
+    }
+  }
+
+  function autopilot() {
+    if (DEMO && !ctaPhase && !demoDone) {
+      if (titleOpacity > 0) titleOpacity = 0;
+      var t = now() - demoStart;
+      if (demoStartsDone < demoTargets.length && t >= demoTargets[demoStartsDone].time) {
+        var d = demoTargets[demoStartsDone++];
+        startFlower(d.x, d.y);
+      }
+      if (demoStartsDone >= demoTargets.length && flowers.length >= demoTargets.length && growing.length === 0 && demoHoldStart === 0) {
+        demoHoldStart = now();
+      }
+      if (demoHoldStart && now() - demoHoldStart > 2200 && !ctaPhase) {
+        ctaPhase = true;
+        ctaAt = now();
+        window.__demoScore = totalBlooms;
+        setTimeout(function () { window.__demoDone = true; demoDone = true; }, 3500);
+      }
+    }
+    if (BOT && !window.__botDone) {
+      var tb = now() - botRunStart;
+      if (tb >= botIdx * 400 && botIdx < 8) {
+        startFlower(botPositions[botIdx].x, botPositions[botIdx].y);
+        botIdx++;
+      }
+      if (botIdx >= 8 && botRunBlooms >= 8 && growing.length === 0) {
+        var dur = (Date.now() - startedAt) / 1000 || 0;
+        if (window.LOOP) LOOP.emit('game_over', { score: botRunBlooms, dur_s: +dur.toFixed(1) });
+        botRunsDone++;
+        if (botRunsDone >= BOT_RUNS) {
+          window.__botDone = true;
+        } else {
+          // clear garden for next run, do not persist
+          flowers = [];
+          growing = [];
+          queue = [];
+          botRunBlooms = 0;
+          botIdx = 0;
+          if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+          botRunStart = now();
+          botPositions = [];
+          for (var i = 0; i < 8; i++) {
+            botPositions.push({ x: 40 + rng() * (W - 80), y: 140 + rng() * (H - 260) });
+          }
+        }
+      }
+    }
+  }
+
+  // ---- visibility game_over ----
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden && window.LOOP) {
+      var dur = startedAt ? (Date.now() - startedAt) / 1000 : 0;
+      LOOP.emit('game_over', { score: totalBlooms, dur_s: +dur.toFixed(1) });
+    }
+  });
+
+  // ---- render helpers ----
+  function petalGradient(hue) {
+    var g = cx.createLinearGradient(-20, -30, 20, 30);
+    g.addColorStop(0, 'hsl(' + hue + ',70%,76%)');
+    g.addColorStop(1, 'hsl(' + hue + ',55%,58%)');
+    return g;
+  }
+
+  function drawFlower(f) {
+    var age = now() - f.born;
+    var swayX = Math.sin(age / 900 + f.sway) * 2.5;
+    var swayY = Math.cos(age / 1100 + f.phase) * 2;
+    var x = f.x + swayX, y = f.y + swayY;
+
+    var stemProgress, petalProgress;
+    if (f.completed) {
+      stemProgress = 1;
+      petalProgress = 1;
+    } else {
+      stemProgress = Math.min(1, f.t / f.stemDur);
+      petalProgress = Math.max(0, Math.min(1, (f.t - f.stemDur) / (f.petalStagger * f.n)));
+    }
+
+    // stem
+    if (stemProgress > 0) {
+      var stemLen = 45 * easeOutCubic(stemProgress);
+      var groundY = Math.min(H, f.y + 80 + rngOffset(f.x, f.y) * 20);
+      cx.beginPath();
+      cx.moveTo(x, groundY);
+      cx.quadraticCurveTo(x + Math.sin(age / 800) * 4, groundY - stemLen / 2, x, y);
+      cx.strokeStyle = 'hsl(' + f.hue + ',45%,45%)';
+      cx.lineWidth = 2.5;
+      cx.globalAlpha = 0.85;
+      cx.stroke();
+      cx.globalAlpha = 1;
+    }
+
+    // petals
+    if (petalProgress > 0) {
+      var petalsToShow = f.completed ? f.n : Math.floor(petalProgress * f.n);
+      var currentPetalT = f.completed ? 1 : (petalProgress * f.n) % 1;
+      cx.save();
+      cx.translate(x, y);
+      for (var i = 0; i < f.n; i++) {
+        if (i > petalsToShow) break;
+        var t = (i === petalsToShow && !f.completed) ? easeOutBack(currentPetalT) : 1;
+        var a = (i / f.n) * Math.PI * 2 + age / 2400;
+        var px = Math.cos(a) * (f.size * 0.55 * t);
+        var py = Math.sin(a) * (f.size * 0.55 * t);
+        var w = f.size * (0.55 + 0.25 * f.round) * t;
+        var h = f.size * (0.9 + 0.2 * f.round) * t;
+        cx.save();
+        cx.translate(px, py);
+        cx.rotate(a + Math.PI / 2);
+        cx.beginPath();
+        if (cx.roundRect) {
+          cx.roundRect(-w / 2, -h / 2, w, h, [w * f.round, h * f.round, w * f.round, h * f.round]);
+        } else {
+          cx.ellipse(0, 0, w / 2, h / 2, 0, 0, Math.PI * 2);
+        }
+        cx.fillStyle = petalGradient(f.hue + i * 2);
+        cx.fill();
+        cx.restore();
+      }
+      // center
+      cx.beginPath();
+      cx.arc(0, 0, f.size * 0.18, 0, Math.PI * 2);
+      cx.fillStyle = 'hsl(' + f.hue + ',30%,88%)';
+      cx.fill();
+      cx.restore();
+    }
+
+    // glow pulse on completion
+    if (f.completed && f.glow > 0) {
+      var g = cx.createRadialGradient(x, y, 0, x, y, f.size * 2.2);
+      g.addColorStop(0, 'hsla(' + f.hue + ',70%,70%,' + (0.22 * f.glow) + ')');
+      g.addColorStop(1, 'hsla(' + f.hue + ',70%,70%,0)');
+      cx.fillStyle = g;
+      cx.beginPath();
+      cx.arc(x, y, f.size * 2.2, 0, Math.PI * 2);
+      cx.fill();
+      f.glow *= 0.96;
+      if (f.glow < 0.01) f.glow = 0;
+    }
+  }
+
+  function rngOffset(x, y) { return Math.sin(x * 0.01 + y * 0.02) * 0.5 + 0.5; }
+
+  function drawMote(m) {
+    cx.save();
+    cx.translate(m.x + Math.sin(m.phase + m.y * 0.02) * 6, m.y);
+    cx.rotate(m.phase);
+    cx.beginPath();
+    cx.ellipse(0, 0, m.size, m.size * 0.55, 0, 0, Math.PI * 2);
+    cx.fillStyle = 'hsla(' + m.hue + ',60%,70%,0.35)';
+    cx.fill();
+    cx.restore();
+  }
+
+  // ---- main loop ----
+  var last = now(), moteTimer = 0;
+  function frame(t) {
+    var dt = Math.min((t - last) / 16.667, 3); last = t;
+    if (hitStop > 0) { hitStop -= dt; }
+    var effDt = hitStop > 0 ? 0 : dt;
+
+    // process breath queue
+    if (queue.length && !DEMO && !BOT && hitStop <= 0) {
+      if (t - lastBloomStart >= 1200) {
+        var next = queue.shift();
+        startFlower(next.x, next.y);
+      }
+    }
+
+    // update growing flowers
+    for (var i = growing.length - 1; i >= 0; i--) {
+      var g = growing[i];
+      g.t += effDt;
+      if (!g.completed && g.t >= g.stemDur + g.petalStagger * g.n) {
+        completeFlower(g, i);
+      }
+    }
+
+    // update motes
+    moteTimer += effDt;
+    if (moteTimer > 80 + rng() * 120) { spawnMote(); moteTimer = 0; }
+    for (var m = motes.length - 1; m >= 0; m--) {
+      var p = motes[m];
+      p.y -= p.vy * effDt;
+      p.phase += 0.02 * effDt;
+      if (p.y < -20) motes.splice(m, 1);
+    }
+
+    autopilot();
+
+    // juice transforms: gentle zoom + micro shake
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(0.55, 'rgba(157,140,255,0.04)');
+    bg.addColorStop(1, 'rgba(232,160,180,0.05)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // subtle ground line
+    cx.beginPath();
+    cx.moveTo(0, H - 30);
+    cx.bezierCurveTo(W * 0.3, H - 42, W * 0.7, H - 22, W, H - 34);
+    cx.strokeStyle = 'rgba(46,197,182,0.08)';
+    cx.lineWidth = 2;
+    cx.stroke();
+
+    // motes behind flowers
+    for (var mi = 0; mi < motes.length; mi++) drawMote(motes[mi]);
+
+    // completed flowers
+    for (var fi = 0; fi < flowers.length; fi++) drawFlower(flowers[fi]);
+    // growing flowers
+    for (var gi = 0; gi < growing.length; gi++) drawFlower(growing[gi]);
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 35);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.25) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, H / 2 - 40 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 35) flashes.splice(k, 1);
+    }
+
+    // title hint
+    if (titleOpacity > 0) {
+      titleOpacity = Math.max(0, titleOpacity - 0.01 * dt);
+      cx.globalAlpha = Math.min(1, titleOpacity);
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 34px -apple-system, Helvetica, Arial';
+      cx.fillText('DRIFT GARDEN', W / 2, 280);
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to bloom', W / 2, 314);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('no score. no timer. just yours.', W / 2, 342);
+      cx.globalAlpha = 1;
+    }
+
+    // bloom counter
+    cx.textAlign = 'right';
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText(totalBlooms + ' bloom' + (totalBlooms === 1 ? '' : 's'), W - 18, H - 22);
+
+    // full garden whisper + share pill (human only)
+    if (fullMessageShown) {
+      var wh = 0.5 + 0.5 * Math.sin(t / 600);
+      cx.globalAlpha = wh;
+      cx.textAlign = 'center';
+      cx.fillStyle = LAV;
+      cx.font = '700 14px -apple-system, Helvetica, Arial';
+      cx.fillText('your garden is full — it will keep drifting', W / 2, 60);
+      cx.globalAlpha = 1;
+      if (!DEMO && !BOT) {
+        cx.fillStyle = 'rgba(157,140,255,0.12)';
+        cx.strokeStyle = LAV; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) {
+          cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 18);
+        } else {
+          cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        }
+        cx.fill(); cx.stroke();
+        cx.fillStyle = LAV; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 24);
+      }
+    }
+
+    // demo CTA card — soft invitation, no dare
+    if (ctaPhase) {
+      var elapsed = (t - ctaAt) / 1000, ease = Math.min(1, elapsed * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('DRIFT GARDEN', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.78)';
+      cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText((window.__demoScore || totalBlooms) + ' blooms settled', W / 2, 332);
+      var p3 = 0.7 + 0.3 * Math.sin(t / 260);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 25px -apple-system, Helvetica, Arial';
+      cx.fillText('▶  GROW YOURS', W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = LAV;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  // init
+  loadGarden();
+  if (DEMO || BOT) {
+    startedAt = Date.now();
+    initAutopilot();
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

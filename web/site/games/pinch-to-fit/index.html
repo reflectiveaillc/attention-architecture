@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Pinch to Fit — Tilt</title>
+<!--
+  LOOP / attention-architecture — Pinch to Fit
+  Circuits: 01 RPE (variable fit reward), 03 social (dares), 06 Zeigarnik.
+  Modes:
+    ?demo=1&seed=7        scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay for traffic sim, sets window.__botDone
+    ?dare=<n>[&by=<name>] incoming challenge
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'pinch-to-fit';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 0.16;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var BASE = 180;                 // base square size
+  var MIN_SCALE = 0.32, MAX_SCALE = 1.85;
+  var PERFECT = 0.97, NEAR = 0.80, PASS = 0.70;
+  var PULSE_AMP = 0.025, PULSE_SPEED = 2.6;
+
+  var state, flashes, runStartTs, best = 0, dareBeaten = false;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, challengeAt = 0, ctaAt = 0;
+  try { best = +localStorage.getItem('p2f_best') || 0; } catch (_) {}
+
+  // demo script: target scale, release offset, hold frames (hesitation)
+  var DEMO_TARGETS = [
+    { t: 1.00, rel: -0.02, wait: 70 },
+    { t: 1.35, rel: +0.06, wait: 75 },
+    { t: 0.80, rel: -0.09, wait: 68 },
+    { t: 0.55, rel: -0.22, wait: 120 },
+    { t: 1.15, rel: +0.02, wait: 90 },
+    { t: 0.65, rel: -0.08, wait: 70 },
+    { t: 1.05, rel: -0.36, wait: 55 }
+  ];
+  var DEMO_CHALLENGE = 88;        // scripted final avg is 87, so the dare is just out of reach
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  function pctTop(s) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 30)))); }
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  function newGame() {
+    state = {
+      phase: DEMO ? 'challenge' : 'title',
+      round: 0, fits: [], combo: 0,
+      targetScale: 1, baseScale: 1, pulse: 0,
+      pinching: false, pinchStartDist: 0, pinchStartScale: 1,
+      releaseLock: false, ghostFlash: 0,
+      overAt: 0, botTarget: null, demoWait: 0
+    };
+    flashes = []; dareBeaten = false; hitStop = 0; zoom = 1; shakeAmt = 0;
+    if (DEMO) {
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.round = -1;
+    state.fits = [];
+    state.combo = 0;
+    state.releaseLock = false;
+    state.ghostFlash = 0;
+    state.pulse = 0;
+    state.botTarget = null;
+    runStartTs = Date.now();
+    nextRound();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function nextRound() {
+    state.round++;
+    state.releaseLock = false;
+    state.ghostFlash = 0;
+    state.pulse = 0;
+    state.roundAge = 0;
+    if (DEMO) {
+      var s = DEMO_TARGETS[Math.min(state.round, DEMO_TARGETS.length - 1)];
+      state.targetScale = s.t;
+      state.baseScale = 1.0 + (rng() - 0.5) * 0.5;
+      state.demoWait = s.wait;
+    } else if (BOT) {
+      state.targetScale = 0.5 + rng() * 1.0;
+      state.baseScale = 0.7 + rng() * 0.6;
+      state.botTarget = clamp(state.targetScale * (1 + gauss() * BOT_ERR), MIN_SCALE, MAX_SCALE);
+    } else {
+      state.targetScale = 0.5 + rng() * 1.0;
+      state.baseScale = 1.0;
+    }
+  }
+
+  function score() {
+    if (!state.fits.length) return 0;
+    var total = 0;
+    for (var i = 0; i < state.fits.length; i++) total += state.fits[i].pct;
+    return Math.floor(total / state.fits.length);
+  }
+
+  function commit() {
+    if (state.releaseLock || state.phase !== 'play') return;
+    state.releaseLock = true;
+    var match = 1 - Math.abs(state.baseScale - state.targetScale) / state.targetScale;
+    match = clamp(match, 0, 1);
+    var pct = Math.floor(match * 100);
+    state.fits.push({ target: state.targetScale, match: match, pct: pct });
+
+    var perfect = match >= PERFECT;
+    var near = match >= NEAR && !perfect;
+    var pass = match >= PASS;
+
+    if (window.J) {
+      if (perfect) J.perfect(state.combo + 1);
+      else if (near) J.near();
+      else if (pass) J.hit(state.round + 1);
+      else J.death(Math.min(0.35 + state.round * 0.08, 1));
+      J.tension(Math.min(state.round / 8, 1));
+    }
+
+    if (perfect) {
+      hitStop = 5; zoom = 1.04; state.combo++;
+      flash('PERFECT', TEAL, 44);
+    } else if (near) {
+      shakeAmt = 4; state.combo = 0;
+      flash('SO CLOSE', VERM, 40);
+      if (window.LOOP) LOOP.emit('near_miss', { round: state.round, pct: pct });
+    } else if (pass) {
+      state.combo = 0;
+      flash('+' + pct + '%', GOLD, 36);
+    } else {
+      shakeAmt = 9; state.combo = 0;
+      flash('MISFIT', VERM, 52);
+    }
+
+    if (window.LOOP) {
+      LOOP.emit('fit_released', { round: state.round, pct: pct, perfect: perfect, near: near, pass: pass });
+    }
+
+    if (pass) {
+      // keep the run going until it fails (endless pressure)
+      setTimeout(nextRound, 380);
+    } else {
+      setTimeout(gameOver, 700);
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 7;
+    var sc = score();
+    var newBest = sc > best;
+    if (newBest) {
+      best = sc;
+      try { localStorage.setItem('p2f_best', String(best)); } catch (_) {}
+    }
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) {
+      if (newBest) J.fanfare();
+      else J.death(Math.min(0.3 + state.round * 0.06, 1));
+      J.tension(0);
+    }
+    if (DEMO) window.__demoScore = sc;
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && sc > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 46);
+      if (window.J) J.fanfare();
+      SHARE.beaten(sc);
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: sc, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2500);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else { setTimeout(resetRun, 900); }
+    }
+  }
+
+  var botRunsDone = 0;
+  function resetRun() {
+    state.fits = []; state.round = -1; state.combo = 0;
+    state.releaseLock = false; state.ghostFlash = 0; state.pulse = 0; state.botTarget = null;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  var pointers = {};
+  function getXY(e) {
+    var r = cv.getBoundingClientRect();
+    return { x: (e.clientX - r.left) / scale, y: (e.clientY - r.top) / scale };
+  }
+  function pointerList() {
+    var arr = [];
+    for (var k in pointers) arr.push(pointers[k]);
+    return arr;
+  }
+  function updatePinch() {
+    var pts = pointerList();
+    if (pts.length === 2) {
+      var dx = pts[0].x - pts[1].x, dy = pts[0].y - pts[1].y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      if (!state.pinching) {
+        state.pinching = true;
+        state.pinchStartDist = dist;
+        state.pinchStartScale = state.baseScale;
+      }
+      state.baseScale = clamp(state.pinchStartScale * (dist / state.pinchStartDist), MIN_SCALE, MAX_SCALE);
+    } else {
+      state.pinching = false;
+    }
+  }
+
+  function tap(x, y) {
+    if (x !== undefined && y !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && y !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score(), unit: '%' });
+        return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var p = getXY(e);
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over') { tap(p.x, p.y); return; }
+    if (state.phase !== 'play') return;
+    if (Object.keys(pointers).length === 0 && inR(MUTE_R, p.x, p.y) && window.J) { J.toggleMute(); return; }
+    pointers[e.pointerId] = p;
+    updatePinch();
+  }, { passive: false });
+  window.addEventListener('pointermove', function (e) {
+    if (DEMO || BOT) return;
+    if (!pointers[e.pointerId]) return;
+    pointers[e.pointerId] = getXY(e);
+    updatePinch();
+  }, { passive: false });
+  function lift(e) {
+    if (DEMO || BOT) return;
+    delete pointers[e.pointerId];
+    updatePinch();
+    if (state.phase === 'play' && Object.keys(pointers).length === 0 && !state.releaseLock) commit();
+  }
+  window.addEventListener('pointerup', lift);
+  window.addEventListener('pointercancel', lift);
+
+  window.addEventListener('wheel', function (e) {
+    if (DEMO || BOT || state.phase !== 'play') return;
+    e.preventDefault();
+    var f = e.deltaY > 0 ? 0.96 : 1.04;
+    state.baseScale = clamp(state.baseScale * f, MIN_SCALE, MAX_SCALE);
+  }, { passive: false });
+
+  window.addEventListener('keydown', function (e) {
+    if (DEMO || BOT) return;
+    if (state.phase === 'title' && e.code === 'Space') { startRun(); return; }
+    if (state.phase !== 'play') return;
+    if (e.code === 'Space') { commit(); return; }
+    if (e.code === 'ArrowUp' || e.code === 'ArrowRight') {
+      state.baseScale = clamp(state.baseScale * 1.03, MIN_SCALE, MAX_SCALE);
+    } else if (e.code === 'ArrowDown' || e.code === 'ArrowLeft') {
+      state.baseScale = clamp(state.baseScale * 0.97, MIN_SCALE, MAX_SCALE);
+    }
+  });
+
+  // ---- autopilots ----
+  function autopilot(dt) {
+    if (state.phase !== 'play' || state.releaseLock) return;
+    state.roundAge = (state.roundAge || 0) + dt;
+    if (DEMO) {
+      var s = DEMO_TARGETS[Math.min(state.round, DEMO_TARGETS.length - 1)];
+      var release = s.t * (1 + s.rel);
+      state.baseScale += (release - state.baseScale) * 0.08 * dt;
+      if (Math.abs(state.baseScale - release) < 0.02 && state.demoWait > 0) state.demoWait -= dt;
+      // commit when settled+waited OR after a per-round timeout (never hang)
+      if (state.demoWait <= 0 || state.roundAge > 150) { state.baseScale = release; commit(); }
+    } else if (BOT) {
+      state.baseScale += (state.botTarget - state.baseScale) * 0.08 * dt;
+      state.baseScale = clamp(state.baseScale, MIN_SCALE, MAX_SCALE);
+      if (Math.abs(state.baseScale - state.botTarget) < 0.015 || state.roundAge > 150) { state.baseScale = state.botTarget; commit(); }
+    }
+  }
+
+  // ---- render ----
+  function drawShape(x, y, sc, fill, stroke, sw, alpha) {
+    cx.save();
+    cx.globalAlpha = alpha || 1;
+    cx.translate(x, y);
+    cx.scale(sc, sc);
+    if (fill) {
+      var g = cx.createLinearGradient(-BASE / 2, -BASE / 2, BASE / 2, BASE / 2);
+      g.addColorStop(0, fill);
+      g.addColorStop(1, 'rgba(11,13,18,0.55)');
+      cx.fillStyle = g;
+      cx.fillRect(-BASE / 2, -BASE / 2, BASE, BASE);
+    }
+    if (stroke) {
+      cx.strokeStyle = stroke;
+      cx.lineWidth = sw || 2;
+      cx.strokeRect(-BASE / 2, -BASE / 2, BASE, BASE);
+    }
+    cx.restore();
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play' && !state.releaseLock) {
+      state.pulse += PULSE_SPEED * 0.016667 * dt;
+      autopilot(dt);
+      var live = 1 - Math.abs(state.baseScale - state.targetScale) / state.targetScale;
+      if (live >= 0.96 && state.ghostFlash <= 0.001) state.ghostFlash = 1;
+      state.ghostFlash *= Math.pow(0.82, dt);
+    }
+
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)'); bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    var cxMid = W / 2, cyMid = H / 2 + 16;
+
+    // ghost outline (the frame to hit)
+    if (state.phase === 'play' || state.phase === 'over') {
+      var ghostAlpha = 0.25 + state.ghostFlash * 0.75;
+      var ghostWidth = 2 + state.ghostFlash * 3;
+      drawShape(cxMid, cyMid, state.targetScale, null, '#fff', ghostWidth, ghostAlpha);
+    }
+
+    // player shape
+    if (state.phase === 'play' || state.phase === 'over') {
+      var renderScale = state.baseScale * (1 + PULSE_AMP * Math.sin(state.pulse));
+      var col = (state.phase === 'over' && !state.fits.length) ? VERM : TEAL;
+      if (state.phase === 'over' && state.fits.length) {
+        var lastFit = state.fits[state.fits.length - 1];
+        col = lastFit.pct >= PASS ? TEAL : VERM;
+      }
+      drawShape(cxMid, cyMid, renderScale, col, null, 0, 1);
+    }
+
+    // fail spectacle: split/offset overlay on death
+    if (state.phase === 'over' && state.fits.length && state.fits[state.fits.length - 1].pct < PASS) {
+      cx.save();
+      cx.translate(cxMid + (Math.random() - 0.5) * 8, cyMid + (Math.random() - 0.5) * 8);
+      cx.fillStyle = VERM; cx.globalAlpha = 0.18;
+      var rs = state.baseScale * (1 + PULSE_AMP * Math.sin(state.pulse));
+      cx.fillRect(-BASE * rs / 2, -BASE * rs / 2, BASE * rs, BASE * rs);
+      cx.restore(); cx.globalAlpha = 1;
+    }
+
+    // HUD
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 56px -apple-system, Helvetica, Arial';
+      cx.fillText(state.fits.length ? score() + '%' : '0%', W / 2, 86);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best + '%', W / 2, 110);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '700 15px Menlo, monospace';
+      cx.fillText('FIT ' + (state.round + 1), W / 2, 136);
+
+      // combo / status line
+      if (state.combo > 1) {
+        cx.fillStyle = GOLD;
+        cx.font = '900 ' + (18 + state.combo * 1.2) + 'px -apple-system, Helvetica, Arial';
+        cx.fillText('×' + state.combo, W / 2, 162);
+      }
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 186);
+      }
+    }
+
+    // challenge card (demo only)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText(String(DEMO_CHALLENGE), W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // floating text
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 260 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('PINCH TO FIT', W / 2, 260);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('PINCH / SPREAD / RELEASE', W / 2, 314); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('frame the ghost square. don\'t blink.', W / 2, 344);
+    }
+
+    // game over card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      var sc = score();
+      var last = state.fits[state.fits.length - 1];
+      cx.fillStyle = last && last.pct < PASS ? VERM : TEAL;
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText(last && last.pct < PASS ? 'MISFIT.' : 'LOCKED IN.', W / 2, 292);
+      cx.fillStyle = '#fff'; cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(sc + '% average', W / 2, 338);
+      var pt = pctTop(sc);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 384);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 408);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 454);
+        cx.globalAlpha = 1;
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('PINCH TO FIT', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they hit ' + (window.__demoScore || DEMO_CHALLENGE - 1) + '%. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + DEMO_CHALLENGE, W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

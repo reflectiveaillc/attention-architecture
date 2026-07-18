@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Online Dot — Tilt</title>
+<!--
+  LOOP / attention-architecture — Online Dot
+  Circuits: 03-social (conditioned green-dot reflex), 01-rpe (variable reward),
+            02-novelty (flicker fakes).
+  Mechanic: tap the dot that stays solid for 1s. Fakes flicker to exploit the
+            green-dot impulse (the Instagram/TikTok trained move).
+  Engine: viral.
+  Modes:
+    ?demo=1&seed=7        mirror-neuron clip, window.__demoDone when finished
+    ?bot=1&runs=N&seed=5  imperfect autoplay, window.__botDone when finished
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'online-dot';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ── Grid layout ──────────────────────────────────────────────────────────
+  var COLS = 3, ROWS = 4;
+  var CELL_W = 116, CELL_H = 130;
+  var GRID_X = (W - COLS * CELL_W) / 2;   // ~36.5
+  var GRID_Y = 180;
+  // Avatar circle radius
+  var AV_R = 32;
+  // Online dot radius
+  var DOT_R = 9;
+
+  // ── Palette for avatar backgrounds ───────────────────────────────────────
+  var AV_COLORS = ['#2a3240','#1e2d3a','#2d2a3e','#3a2a2d','#2a3a2d','#2a2d3a',
+                   '#3d2f1e','#1e3d3a','#3a1e2d','#2a3a3a','#3a2a3a','#2f3d2a'];
+
+  // ── State ─────────────────────────────────────────────────────────────────
+  var phase, score, combo, runStartTs, overAt, ctaAt;
+  var cells, flashes, dareBeaten;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var best = 0;
+  try { best = +localStorage.getItem('od_best') || 0; } catch (_) {}
+
+  // Each cell: { av (avatar index), dotState, dotTimer, flickerTimer, isReal, missed }
+  // dotState: 'none' | 'rising' | 'solid' | 'flicker' | 'fading'
+  // Only one real dot per wave; rest are fakes that flicker
+
+  var SOLID_NEED = 1000;   // ms to hold solid before it counts as "hittable"
+  var SOLID_SHOW = 1500;   // ms the dot stays hittable (then fades)
+  var FLICKER_DUR = 600;
+  var NEAR_MISS_RATIO = 0.25;   // flash "SO CLOSE" if tapped flicker
+
+  function newGame() {
+    phase = 'title';
+    score = 0; combo = 0; dareBeaten = false;
+    flashes = [];
+    cells = buildCells();
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startPlay, 1250);
+      return;
+    }
+    if (BOT) startPlay();
+  }
+
+  function buildCells() {
+    var arr = [];
+    for (var i = 0; i < COLS * ROWS; i++) {
+      arr.push({
+        av: i % AV_COLORS.length,
+        dotState: 'none',
+        dotTimer: 0,
+        flickerTimer: 0,
+        isReal: false,
+        missed: false,
+        lit: false   // flicker on-frame flag
+      });
+    }
+    return arr;
+  }
+
+  // ── Wave logic ─────────────────────────────────────────────────────────
+  var waveTimer = 0;
+  var WAVE_INTERVAL = 1400;  // ms between waves (gets faster)
+  var activeWave = false;
+  var realCell = -1;
+  var waveDone = false;
+  var waveTimeout = null;
+
+  function launchWave() {
+    if (activeWave) return;
+    activeWave = true;
+    waveDone = false;
+
+    // Pick one real cell
+    realCell = Math.floor(rng() * cells.length);
+    cells[realCell].dotState = 'rising';
+    cells[realCell].dotTimer = 0;
+    cells[realCell].isReal = true;
+    cells[realCell].missed = false;
+
+    // Pick 1-3 fake cells (not the real one)
+    var numFakes = 1 + Math.floor(rng() * 3);
+    var fakePool = [];
+    for (var i = 0; i < cells.length; i++) {
+      if (i !== realCell) fakePool.push(i);
+    }
+    // shuffle
+    for (var j = fakePool.length - 1; j > 0; j--) {
+      var k = Math.floor(rng() * (j + 1));
+      var tmp = fakePool[j]; fakePool[j] = fakePool[k]; fakePool[k] = tmp;
+    }
+    var fakes = fakePool.slice(0, Math.min(numFakes, fakePool.length));
+    for (var f = 0; f < fakes.length; f++) {
+      cells[fakes[f]].dotState = 'flicker';
+      cells[fakes[f]].dotTimer = 0;
+      cells[fakes[f]].flickerTimer = 0;
+      cells[fakes[f]].isReal = false;
+      cells[fakes[f]].missed = false;
+    }
+
+    // Wave timeout: if player doesn't tap the real dot in time, wave ends with miss
+    if (waveTimeout) clearTimeout(waveTimeout);
+    waveTimeout = setTimeout(function () {
+      if (activeWave && !waveDone) {
+        // missed the real dot
+        cells[realCell].missed = true;
+        endWaveGameOver();
+      }
+    }, SOLID_NEED + SOLID_SHOW);
+  }
+
+  function clearWaveCells() {
+    for (var i = 0; i < cells.length; i++) {
+      if (cells[i].dotState !== 'none') {
+        cells[i].dotState = 'fading';
+        cells[i].dotTimer = 0;
+        cells[i].isReal = false;
+      }
+    }
+    activeWave = false;
+  }
+
+  function endWaveGameOver() {
+    waveDone = true;
+    clearWaveCells();
+    gameOver();
+  }
+
+  function advanceCells(dt) {
+    for (var i = 0; i < cells.length; i++) {
+      var c = cells[i];
+      if (c.dotState === 'none') continue;
+
+      if (c.dotState === 'rising') {
+        c.dotTimer += dt;
+        if (c.dotTimer >= SOLID_NEED) {
+          c.dotState = 'solid';
+          c.dotTimer = 0;
+          if (window.J) J.tension(Math.min(score / 20, 1));
+        }
+      } else if (c.dotState === 'solid') {
+        c.dotTimer += dt;
+        if (c.dotTimer >= SOLID_SHOW) {
+          c.dotState = 'fading';
+          c.dotTimer = 0;
+        }
+      } else if (c.dotState === 'flicker') {
+        c.dotTimer += dt;
+        c.flickerTimer += dt;
+        // flicker on/off every ~80ms
+        c.lit = (Math.floor(c.flickerTimer / 80) % 2 === 0);
+        if (c.dotTimer >= FLICKER_DUR) {
+          c.dotState = 'fading';
+          c.dotTimer = 0;
+        }
+      } else if (c.dotState === 'fading') {
+        c.dotTimer += dt;
+        if (c.dotTimer >= 300) {
+          c.dotState = 'none';
+          c.dotTimer = 0;
+          c.isReal = false;
+        }
+      }
+    }
+  }
+
+  // ── Tap / hit handling ────────────────────────────────────────────────
+  function tapCell(idx) {
+    if (phase !== 'play') return;
+    var c = cells[idx];
+    if (!c || c.dotState === 'none' || c.dotState === 'fading') return;
+
+    if (c.isReal && c.dotState === 'solid') {
+      // HIT
+      if (waveTimeout) { clearTimeout(waveTimeout); waveTimeout = null; }
+      waveDone = true;
+      score++;
+      combo++;
+      var isGold = (combo % 5 === 0);
+      if (window.J) {
+        if (isGold) { J.gold(); hitStop = 5; zoom = 1.03; }
+        else if (combo > 1) { J.perfect(combo); hitStop = 3; zoom = 1.02; }
+        else J.hit(combo);
+      }
+      shakeAmt = isGold ? 4 : 0;
+      flash(isGold ? 'GOLD ×' + combo : combo > 1 ? '×' + combo : '+1',
+            isGold ? GOLD : combo > 1 ? TEAL : '#fff',
+            isGold ? 46 : 38);
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(score);
+      }
+      if (window.LOOP) LOOP.emit('dot_tapped', { n: score, combo: combo, gold: isGold });
+      clearWaveCells();
+      // schedule next wave
+      var interval = Math.max(700, WAVE_INTERVAL - score * 30);
+      waveTimer = -interval * 0.3;   // slight pause then launch
+      activeWave = false;
+    } else if (!c.isReal && (c.dotState === 'flicker' || c.dotState === 'rising')) {
+      // Tapped a fake — near miss, lose combo but don't die
+      combo = 0;
+      shakeAmt = 6;
+      if (window.J) J.near();
+      flash('FAKE!', VERM, 42);
+      if (window.LOOP) LOOP.emit('near_miss', { n: score, fake: true });
+      // Punish: force wave to end without credit
+      if (waveTimeout) { clearTimeout(waveTimeout); waveTimeout = null; }
+      waveDone = true;
+      clearWaveCells();
+      // small pause before next wave
+      waveTimer = -600;
+      activeWave = false;
+    } else if (c.isReal && c.dotState === 'rising') {
+      // Tapped too early
+      combo = 0;
+      shakeAmt = 4;
+      if (window.J) J.near();
+      flash('TOO SOON', VERM, 36);
+      if (window.LOOP) LOOP.emit('near_miss', { n: score, early: true });
+      if (waveTimeout) { clearTimeout(waveTimeout); waveTimeout = null; }
+      waveDone = true;
+      clearWaveCells();
+      waveTimer = -500;
+      activeWave = false;
+    }
+  }
+
+  // ── Game lifecycle ─────────────────────────────────────────────────────
+  var challengeAt = 0;
+
+  function startPlay() {
+    phase = 'play';
+    score = 0; combo = 0;
+    flashes = [];
+    cells = buildCells();
+    activeWave = false;
+    waveTimer = -500;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + score / 20, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = score;
+    if (newBest) { best = score; try { localStorage.setItem('od_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 900);
+      }
+    }
+  }
+
+  function resetRun() {
+    score = 0; combo = 0; dareBeaten = false; flashes = [];
+    cells = buildCells();
+    activeWave = false; waveTimer = -500;
+    if (waveTimeout) { clearTimeout(waveTimeout); waveTimeout = null; }
+    if (window.LOOP) LOOP.emit('restart', {});
+    startPlay();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function pctTop(s) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 10))));
+  }
+
+  // ── Input ─────────────────────────────────────────────────────────────
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(cx_, cy_) {
+    if (DEMO || BOT) return;
+    if (cx_ !== undefined && inR(MUTE_R, cx_, cy_) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startPlay(); return; }
+    if (phase === 'play') {
+      // check share button tap? no — share is on 'over' phase
+      // find which cell was tapped
+      var col = Math.floor((cx_ - GRID_X) / CELL_W);
+      var row = Math.floor((cy_ - GRID_Y) / CELL_H);
+      if (col >= 0 && col < COLS && row >= 0 && row < ROWS) {
+        tapCell(row * COLS + col);
+        return;
+      }
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (cx_ !== undefined && inR(SHARE_R, cx_, cy_) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'dots' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') tap(W / 2, H / 2);
+  });
+
+  // ── Bot / Demo autopilots ─────────────────────────────────────────────
+  var botRunsDone = 0;
+  // Demo script: how many good hits before the scripted near-fail then miss
+  // Arc: 5 solid hits (hesitated) → near-fail (tap fake) → 3 more hits → miss timeout
+  var demoPhaseIdx = 0;
+  var demoHits = 0;
+  var DEMO_GOOD_HITS = 5;    // hits before the near-fail
+  var DEMO_RECOVERY  = 3;    // hits after near-fail before death
+  var demoDidNearFail = false;
+  var demoWaitFrames = 0;
+  // Track which wave the demo is on
+  var demoWavesSeen = 0;
+
+  // Bot: play K waves correctly then go passive so timeout fires = game_over
+  var BOT_GOOD_WAVES = 5;
+  var botWavesDone = 0;
+  var botPassive = false;
+
+  function autopilot(now) {
+    if (phase !== 'play') return;
+    if (!activeWave) return;
+
+    if (DEMO) {
+      demoBotTick(now);
+    } else if (BOT) {
+      botTick(now);
+    }
+  }
+
+  // Demo bot: human-feeling, hesitation
+  var demoHesitate = 0;
+  var demoPending = false;
+  var demoPendingCell = -1;
+  var demoScheduled = false;
+
+  function demoBotTick(now) {
+    // Only act when real dot is solid (or in near-fail phase, tap a fake)
+    if (demoScheduled) return;
+
+    var rc = cells[realCell];
+    if (!rc) return;
+
+    // Determine current demo arc position
+    var totalHits = demoHits;
+    var shouldNearFail = (totalHits === DEMO_GOOD_HITS && !demoDidNearFail);
+    var shouldDie      = demoDidNearFail && (totalHits >= DEMO_GOOD_HITS + DEMO_RECOVERY);
+
+    if (shouldDie) {
+      // Let the timeout kill us — just don't tap
+      return;
+    }
+
+    if (shouldNearFail) {
+      // Tap a fake dot after a pause
+      if (rc.dotState === 'solid' || rc.dotState === 'rising') {
+        // find a flicker cell to mis-tap
+        var fakeIdx = -1;
+        for (var i = 0; i < cells.length; i++) {
+          if (!cells[i].isReal && cells[i].dotState === 'flicker') { fakeIdx = i; break; }
+        }
+        if (fakeIdx >= 0) {
+          demoScheduled = true;
+          var delay = 300 + Math.floor(rng() * 200);
+          setTimeout(function () {
+            demoScheduled = false;
+            tapCellDemo(fakeIdx);
+            demoDidNearFail = true;
+          }, delay);
+        } else {
+          // no fake available — just hit the real one and skip near-fail
+          demoDidNearFail = true;
+        }
+      }
+      return;
+    }
+
+    // Normal hit: wait for solid, then hesitate humanly
+    if (rc.dotState === 'solid') {
+      demoScheduled = true;
+      var hesitation = 80 + Math.floor(rng() * 340);
+      setTimeout(function () {
+        demoScheduled = false;
+        tapCellDemo(realCell);
+        demoHits++;
+      }, hesitation);
+    }
+  }
+
+  function tapCellDemo(idx) {
+    // Simulate the tap logic directly (demo bypasses human gate)
+    var c = cells[idx];
+    if (!c || c.dotState === 'none' || c.dotState === 'fading') return;
+
+    if (c.isReal && c.dotState === 'solid') {
+      if (waveTimeout) { clearTimeout(waveTimeout); waveTimeout = null; }
+      waveDone = true;
+      score++;
+      combo++;
+      var isGold = (combo % 5 === 0);
+      if (window.J) {
+        if (isGold) { J.gold(); hitStop = 5; zoom = 1.03; }
+        else if (combo > 1) { J.perfect(combo); hitStop = 3; }
+        else J.hit(combo);
+      }
+      flash(isGold ? 'GOLD ×' + combo : combo > 1 ? '×' + combo : '+1',
+            isGold ? GOLD : combo > 1 ? TEAL : '#fff', isGold ? 46 : 38);
+      if (window.LOOP) LOOP.emit('dot_tapped', { n: score, combo: combo, demo: true });
+      clearWaveCells();
+      var interval = Math.max(700, WAVE_INTERVAL - score * 30);
+      waveTimer = -interval * 0.3;
+      activeWave = false;
+    } else if (!c.isReal && (c.dotState === 'flicker' || c.dotState === 'rising')) {
+      combo = 0;
+      shakeAmt = 6;
+      if (window.J) J.near();
+      flash('SO CLOSE!', VERM, 42);
+      if (window.LOOP) LOOP.emit('near_miss', { n: score, demo: true });
+      if (waveTimeout) { clearTimeout(waveTimeout); waveTimeout = null; }
+      waveDone = true;
+      clearWaveCells();
+      waveTimer = -600;
+      activeWave = false;
+    }
+  }
+
+  // Bot tick: hit correctly for BOT_GOOD_WAVES waves, then go passive
+  var botScheduled = false;
+  function botTick(now) {
+    if (botPassive) return;  // let timeout kill us
+    if (botScheduled) return;
+    var rc = cells[realCell];
+    if (!rc || rc.dotState !== 'solid') return;
+
+    botScheduled = true;
+    var delay = 120 + Math.floor(rng() * 300);
+    setTimeout(function () {
+      botScheduled = false;
+      if (phase !== 'play' || !activeWave || waveDone) return;
+      botWavesDone++;
+      if (botWavesDone >= BOT_GOOD_WAVES) {
+        botPassive = true;
+        // Don't tap — let timeout fire game_over
+        return;
+      }
+      // hit it
+      if (waveTimeout) { clearTimeout(waveTimeout); waveTimeout = null; }
+      waveDone = true;
+      score++;
+      combo++;
+      if (window.J) J.hit(combo);
+      if (window.LOOP) LOOP.emit('dot_tapped', { n: score, combo: combo, bot: true });
+      clearWaveCells();
+      var interval = Math.max(700, WAVE_INTERVAL - score * 30);
+      waveTimer = -interval * 0.3;
+      activeWave = false;
+    }, delay);
+  }
+
+  // ── Render helpers ────────────────────────────────────────────────────
+  function cellCenter(idx) {
+    var col = idx % COLS, row = Math.floor(idx / COLS);
+    return {
+      x: GRID_X + col * CELL_W + CELL_W / 2,
+      y: GRID_Y + row * CELL_H + CELL_H * 0.45
+    };
+  }
+
+  function drawAvatar(cx2, idx, c, now) {
+    var pos = cellCenter(idx);
+    var x = pos.x, y = pos.y;
+
+    // Avatar background circle
+    cx2.save();
+    cx2.beginPath();
+    cx2.arc(x, y, AV_R, 0, Math.PI * 2);
+    cx2.fillStyle = AV_COLORS[c.av];
+    cx2.fill();
+
+    // Silhouette lines (person shape)
+    cx2.fillStyle = 'rgba(255,255,255,0.18)';
+    // Head
+    cx2.beginPath(); cx2.arc(x, y - 8, 9, 0, Math.PI * 2); cx2.fill();
+    // Body
+    cx2.beginPath();
+    cx2.ellipse(x, y + 14, 11, 9, 0, 0, Math.PI * 2);
+    cx2.fill();
+    cx2.restore();
+
+    // Name line placeholder
+    cx2.save();
+    cx2.fillStyle = 'rgba(255,255,255,0.22)';
+    cx2.fillRect(x - 22, y + AV_R + 6, 44, 5);
+    cx2.fillStyle = 'rgba(255,255,255,0.12)';
+    cx2.fillRect(x - 14, y + AV_R + 14, 28, 4);
+    cx2.restore();
+
+    // Online dot
+    if (c.dotState === 'none') return;
+
+    var dotX = x + AV_R - DOT_R * 0.7;
+    var dotY = y + AV_R - DOT_R * 0.7;
+    var alpha = 0;
+    var dotColor = '#22c55e';
+
+    if (c.dotState === 'rising') {
+      var p = Math.min(c.dotTimer / SOLID_NEED, 1);
+      alpha = p;
+      // pulsing ring to show it's loading
+      cx2.save();
+      cx2.globalAlpha = p * 0.35;
+      cx2.strokeStyle = dotColor;
+      cx2.lineWidth = 2;
+      cx2.beginPath();
+      cx2.arc(dotX, dotY, DOT_R + 4 + (1 - p) * 6, 0, Math.PI * 2);
+      cx2.stroke();
+      cx2.restore();
+    } else if (c.dotState === 'solid') {
+      alpha = 1;
+      // Glow
+      cx2.save();
+      var glow = cx2.createRadialGradient(dotX, dotY, 0, dotX, dotY, DOT_R * 2.5);
+      glow.addColorStop(0, 'rgba(34,197,94,0.5)');
+      glow.addColorStop(1, 'rgba(34,197,94,0)');
+      cx2.fillStyle = glow;
+      cx2.beginPath(); cx2.arc(dotX, dotY, DOT_R * 2.5, 0, Math.PI * 2); cx2.fill();
+      // pulse ring
+      var pulse = 0.5 + 0.5 * Math.sin(now / 200);
+      cx2.globalAlpha = pulse * 0.5;
+      cx2.strokeStyle = dotColor; cx2.lineWidth = 2;
+      cx2.beginPath(); cx2.arc(dotX, dotY, DOT_R + 5, 0, Math.PI * 2); cx2.stroke();
+      cx2.restore();
+    } else if (c.dotState === 'flicker') {
+      alpha = c.lit ? 0.9 : 0.1;
+    } else if (c.dotState === 'fading') {
+      var fp = Math.max(0, 1 - c.dotTimer / 300);
+      alpha = fp;
+    }
+
+    if (alpha <= 0) return;
+    cx2.save();
+    cx2.globalAlpha = alpha;
+    // Dot
+    cx2.beginPath(); cx2.arc(dotX, dotY, DOT_R, 0, Math.PI * 2);
+    cx2.fillStyle = dotColor; cx2.fill();
+    // White border
+    cx2.strokeStyle = INK; cx2.lineWidth = 2;
+    cx2.stroke();
+    cx2.restore();
+  }
+
+  // ── Main loop ─────────────────────────────────────────────────────────
+  var last = performance.now(), ctaAtReal = 0;
+
+  function frame(now) {
+    var dtMs = Math.min(now - last, 100); last = now;
+    var dt = dtMs / 16.667;
+
+    // juice decay
+    if (hitStop > 0) { hitStop -= dt; }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // wave timer
+    if (phase === 'play') {
+      if (!activeWave) {
+        waveTimer += dtMs;
+        var interval = Math.max(700, WAVE_INTERVAL - score * 30);
+        if (waveTimer >= 0) {
+          launchWave();
+          waveTimer = -interval;
+        }
+      }
+      // advance cell states (only when not hit-stopped)
+      if (hitStop <= 0) {
+        advanceCells(dtMs);
+        autopilot(now);
+      }
+    }
+
+    // ── Draw ──────────────────────────────────────────────────────────
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // Grid avatars
+    if (phase === 'play' || phase === 'over') {
+      for (var i = 0; i < cells.length; i++) {
+        drawAvatar(cx, i, cells[i], now);
+      }
+    }
+
+    // Score
+    if (phase === 'play' || phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 90);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 112);
+
+      // Combo display
+      if (combo > 1) {
+        var comboGlow = Math.min(combo / 8, 1);
+        cx.fillStyle = combo >= 5 ? GOLD : TEAL;
+        cx.font = '900 ' + (20 + Math.min(combo, 10) * 2) + 'px -apple-system, Helvetica, Arial';
+        cx.globalAlpha = 0.9 + comboGlow * 0.1;
+        cx.fillText('×' + combo, W / 2, 135);
+        cx.globalAlpha = 1;
+      }
+
+      // Dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 162);
+      }
+    }
+
+    // Title
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('ONLINE DOT', W / 2, 300);
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('tap the dot that stays solid', W / 2, 340);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('fakes flicker. one is real.', W / 2, 365);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillStyle = VERM;
+      cx.font = '800 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO PLAY', W / 2, 410);
+      cx.globalAlpha = 1;
+    }
+
+    // Challenge card (demo beat 1)
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('12', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // Flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 42);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 160 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(k, 1);
+    }
+
+    // Game over
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('MISSED IT.', W / 2, 310);
+      cx.fillStyle = '#fff'; cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' dots', W / 2, 356);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 402);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('faster than ' + (100 - pt) + '% of players', W / 2, 425);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 468);
+        cx.globalAlpha = 1;
+        // Share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) { cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23); }
+        else { cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h); }
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // Demo CTA card
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('ONLINE DOT', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('they got ' + (window.__demoScore || 8) + '. your reflexes?', W / 2, 342);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 8), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 444);
+      cx.globalAlpha = 1;
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

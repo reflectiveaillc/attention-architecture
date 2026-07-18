@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Story Viewers — Tilt</title>
+<!--
+  LOOP / attention-architecture — Story Viewers
+  Conditioned path: the story viewer-list check (did they watch?). The thumb
+  already knows this move from Instagram/TikTok — the game IS that move.
+  Mechanic: post → viewer handles stream into the list; a target handle is
+  hinted at the top. Tap ONLY when your target appears in the flood. Tap wrong
+  or miss and they slip away. Circuits: 03 social, 02 novelty, 06 zeigarnik.
+  Modes (query params):
+    ?demo=1&seed=7        scripted run for clip capture (catches → sliver save →
+                          cascade fail → CTA), sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay for traffic simulation, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'story-viewers';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 40;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- geometry ----
+  var ROW_H = 46, AV_R = 15;
+  var LIST_TOP = 120;            // list area top
+  var CATCH_Y = 326;            // catch band top
+  var CATCH_H = 64;             // band height → 326..390, mid 358
+  var BAND_MID = CATCH_Y + CATCH_H / 2;
+  var SPAWN_Y = 700;            // rows spawn near bottom edge, scroll up
+
+  // ---- handles (IG-like) ----
+  var SYL = ['maya','kai','noa','leo','zoe','ravi','cleo','jay','mia','fin','tess','owen',
+             'lula','reza','ida','sol','nova','dex','pax','wren','jun','ari','bos','kira',
+             'tao','vee','remi','nyx','coco','eli','lux','ami','reo','sky','ben','jude'];
+  var SUF = ['','.k','_22','.codes','_.x','x','_o','_real','.art','._','b','q','_dk','s','_m','.j'];
+  function makeHandle(r) {
+    for (var tries = 0; tries < 4; tries++) {
+      var a = SYL[Math.floor(r() * SYL.length)];
+      var s = SUF[Math.floor(r() * SUF.length)];
+      var h = (r() < 0.55) ? ('@' + a + s) : ('@' + a + '_' + SYL[Math.floor(r() * SYL.length)]);
+      if (h.length <= 14) return h;
+    }
+    return '@' + a;
+  }
+  function hueOf(h) { var x = 0; for (var i = 0; i < h.length; i++) x = (x * 31 + h.charCodeAt(i)) | 0; return ((x % 360) + 360) % 360; }
+
+  // ---- state ----
+  var state, flashes, shakeAmt = 0, zoom = 1, hitStop = 0;
+  var runStartTs, dareBeaten = false, challengeAt = 0, ctaAt = 0, best = 0;
+  try { best = +localStorage.getItem('sv_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',              // title | challenge | play | over | cta
+      score: 0, combo: 0, lives: 3, overAt: 0,
+      pendingTarget: '@maya.k',    // shown in hint bar
+      targetRow: null,             // active target row on screen
+      targetSpawnIn: 0,            // frames until target spawns
+      rows: [],                    // streaming viewer rows
+      spawnTimer: 0,              // decoy spawn accumulator
+      speed: 1.6,
+      viewed: 2341                // cosmetic viewer counter
+    };
+    flashes = []; shakeAmt = 0; zoom = 1; hitStop = 0; dareBeaten = false;
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 22))));
+  }
+  function fmt(n) { return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    scheduleNextTarget();
+    if (DEMO) state.targetSpawnIn = demoWaits[0];
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function scheduleNextTarget() {
+    state.pendingTarget = makeHandle(rng);
+    if (!DEMO) state.targetSpawnIn = BOT ? 40 + Math.floor(rng() * 30) : 55 + Math.floor(rng() * 60);
+  }
+
+  function spawnDecoy() {
+    var h;
+    do { h = makeHandle(rng); } while (h === state.pendingTarget);
+    state.rows.push({ handle: h, hue: hueOf(h), y: SPAWN_Y, isTarget: false, caught: false, slipping: false, vy: 0, alpha: 1, stampT: 0 });
+    state.viewed++;
+  }
+  function spawnTarget() {
+    var h = state.pendingTarget;
+    state.rows.push({ handle: h, hue: hueOf(h), y: SPAWN_Y, isTarget: true, caught: false, slipping: false, vy: 0, alpha: 1, stampT: 0 });
+    state.targetRow = state.rows[state.rows.length - 1];
+  }
+
+  function inBand(r) { return r.y < CATCH_Y + CATCH_H && r.y + ROW_H > CATCH_Y; }
+
+  // ---- core actions ----
+  function attemptCatch() {
+    var tr = state.targetRow;
+    if (!tr || tr.caught || tr.slipping) { tooEarly(); return; }
+    if (inBand(tr)) catchTarget(tr);
+    else slipTarget(tr, 'SLIPPED');
+  }
+
+  function catchTarget(r) {
+    r.caught = true;
+    var pts = state.combo + 1;
+    state.score += pts;
+    state.combo++;
+    var centered = Math.abs((r.y + ROW_H / 2) - BAND_MID) < 14;
+    hitStop = 4; zoom = 1.03; shakeAmt = centered ? 4 : 2;
+    flash('+' + pts, GOLD, 30);
+    if (state.combo >= 3 && state.combo % 3 === 0) flash('×' + state.combo + ' COMBO', TEAL, 26);
+    if (window.J) {
+      if (centered && state.combo >= 2) J.perfect(state.combo);
+      else if (state.combo >= 5 && state.combo % 5 === 0) J.gold();
+      else J.hit(state.combo);
+      J.tension(Math.min(state.score / 70, 1));
+    }
+    state.viewed++;
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 30);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+    if (window.LOOP) LOOP.emit('target_caught', { n: state.score, combo: state.combo });
+    state.targetRow = null;
+    scheduleNextTarget();
+  }
+
+  function slipTarget(r, label) {
+    r.slipping = true; r.vy = -7;
+    state.combo = 0;
+    state.lives--;
+    shakeAmt = 7;
+    flash(label, VERM, 28);
+    if (window.J) { J.near(); }
+    if (window.LOOP) LOOP.emit('target_slipped', { lives: state.lives });
+    state.targetRow = null;
+    scheduleNextTarget();
+    if (state.lives <= 0) gameOver();
+  }
+
+  function targetGotAway(r) {
+    state.combo = 0;
+    state.lives--;
+    shakeAmt = 6;
+    flash('GOT AWAY', VERM, 26);
+    if (window.J) J.near();
+    if (window.LOOP) LOOP.emit('near_miss', { n: state.score, lives: state.lives });
+    state.targetRow = null;
+    scheduleNextTarget();
+    if (state.lives <= 0) gameOver();
+  }
+
+  function tooEarly() {
+    state.combo = 0;
+    shakeAmt = 2;
+    flash('TOO EARLY', 'rgba(255,255,255,0.55)', 22);
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 11;
+    if (window.J) J.death(Math.min(0.3 + state.score / 80, 1));
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (newBest) { best = state.score; try { localStorage.setItem('sv_best', String(best)); } catch (_) {} setTimeout(function () { if (window.J) J.fanfare(); }, 450); }
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+      setTimeout(function () { window.__demoDone = true; }, 3600); }, 2800);
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) window.__botDone = true;
+      else setTimeout(resetRun, 900);
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.combo = 0; state.lives = 3; state.rows = [];
+    state.targetRow = null; state.spawnTimer = 0; state.speed = 1.6;
+    flashes = []; shakeAmt = 0; zoom = 1; hitStop = 0; dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 44, y: 10, w: 36, h: 36 };
+  var SHARE_R = { x: W / 2 - 130, y: 470, w: 260, h: 48 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;                 // scripted modes ignore human taps
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { attemptCatch(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'targets caught' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  // mirror-neuron arc: tense catches building combo → 'sliver' near-fail saved at
+  // the last instant → one more catch → 'wrong' fumble cascade (the real death).
+  // Hesitation lives BETWEEN targets (demoWait delays the next spawn) so the
+  // rhythm reads human, never robotic.
+  var demoScript = ['catch','catch','catch','catch','catch','catch','sliver','catch','wrong','wrong','wrong'];
+  var demoWaits  = [26, 32, 24, 38, 28, 34, 48, 26, 22, 18, 16];
+  var demoIdx = 0, botRunsDone = 0, botTarget = null;
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    var tr = state.targetRow;
+    if (DEMO) {
+      if (!tr || tr.caught || tr.slipping) return;
+      var want = demoScript[demoIdx];
+      if (want === undefined) return;
+      var center = tr.y + ROW_H / 2, bottom = tr.y + ROW_H, fire = false;
+      if (want === 'catch' && Math.abs(center - BAND_MID) < 26) fire = true;
+      else if (want === 'sliver' && bottom > CATCH_Y && bottom < CATCH_Y + 24) fire = true;
+      else if (want === 'wrong' && tr.y > CATCH_Y + CATCH_H + 6 && tr.y < CATCH_Y + CATCH_H + 60) fire = true;
+      if (fire) {
+        attemptCatch();
+        demoIdx++;
+        state.targetSpawnIn = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 22;
+      }
+    } else if (BOT) {
+      if (!tr || tr.caught || tr.slipping) return;
+      if (botTarget === null) botTarget = gauss() * BOT_ERR;
+      var c = tr.y + ROW_H / 2;
+      if (Math.abs(c - (BAND_MID + botTarget)) < 10) { attemptCatch(); botTarget = null; }
+    }
+  }
+
+  // ---- render ----
+  function rr(x, y, w, h, r) {
+    if (cx.roundRect) cx.roundRect(x, y, w, h, r); else cx.rect(x, y, w, h);
+  }
+  function rowGradient(hue, y) {
+    var g = cx.createLinearGradient(0, y, 0, y + ROW_H);
+    g.addColorStop(0, 'hsl(' + hue + ',62%,58%)');
+    g.addColorStop(1, 'hsl(' + hue + ',66%,44%)');
+    return g;
+  }
+  function drawRow(r, now) {
+    if (r.y > 720 || r.y < LIST_TOP - ROW_H) return;
+    cx.globalAlpha = r.alpha;
+    // avatar
+    var ax = 30, ay = r.y + ROW_H / 2;
+    cx.fillStyle = rowGradient(r.hue, r.y);
+    cx.beginPath(); cx.arc(ax, ay, AV_R, 0, 7); cx.fill();
+    cx.fillStyle = 'rgba(255,255,255,0.92)';
+    cx.textAlign = 'center'; cx.textBaseline = 'middle';
+    cx.font = '800 15px -apple-system, Helvetica, Arial';
+    cx.fillText(r.handle[1] ? r.handle[1].toUpperCase() : '?', ax, ay + 1);
+    cx.textBaseline = 'alphabetic';
+    // handle + subtitle
+    cx.textAlign = 'left';
+    if (r.caught) {
+      cx.fillStyle = TEAL; cx.font = '800 16px -apple-system, Helvetica, Arial';
+      cx.fillText(r.handle, 58, r.y + 21);
+      cx.fillStyle = TEAL; cx.font = '700 11px -apple-system, Helvetica, Arial';
+      cx.fillText('✓ caught', 58, r.y + 36);
+    } else {
+      cx.fillStyle = '#fff'; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText(r.handle, 58, r.y + 21);
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '500 11px -apple-system, Helvetica, Arial';
+      cx.fillText('viewed · just now', 58, r.y + 36);
+    }
+    // divider
+    cx.strokeStyle = 'rgba(255,255,255,0.05)'; cx.lineWidth = 1;
+    cx.beginPath(); cx.moveTo(14, r.y + ROW_H); cx.lineTo(W - 14, r.y + ROW_H); cx.stroke();
+    // caught pop glow
+    if (r.caught && r.stampT < 14) {
+      cx.globalAlpha = r.alpha * (1 - r.stampT / 14) * 0.6;
+      cx.fillStyle = TEAL; cx.beginPath(); cx.arc(ax, ay, AV_R + 8, 0, 7); cx.fill();
+    }
+    cx.globalAlpha = 1;
+  }
+
+  function drawHeader(now) {
+    // story thumb
+    cx.lineWidth = 2.5; cx.strokeStyle = VERM;
+    cx.beginPath(); cx.arc(20, 28, AV_R + 3, 0, 7); cx.stroke();
+    cx.fillStyle = rowGradient(28, 14); cx.beginPath(); cx.arc(20, 28, AV_R, 0, 7); cx.fill();
+    cx.fillStyle = '#fff'; cx.textAlign = 'center'; cx.textBaseline = 'middle';
+    cx.font = '800 13px -apple-system, Helvetica, Arial';
+    cx.fillText('M', 20, 29); cx.textBaseline = 'alphabetic';
+    cx.textAlign = 'left';
+    cx.fillStyle = '#fff'; cx.font = '700 13px -apple-system, Helvetica, Arial';
+    cx.fillText('Your story', 40, 24);
+    cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '500 10px -apple-system, Helvetica, Arial';
+    cx.fillText(fmt(state.viewed) + ' viewers', 40, 37);
+    // lives (hearts) — left column, below thumb text
+    for (var i = 0; i < 3; i++) {
+      var hx = 40 + i * 16, hy = 52;
+      cx.fillStyle = i < state.lives ? VERM : 'rgba(255,255,255,0.14)';
+      cx.font = '700 14px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'left';
+      cx.fillText('♥', hx, hy);
+    }
+    // score center
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.92)'; cx.font = '800 38px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score, W / 2, 40);
+    cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 10px -apple-system, Helvetica, Arial';
+    var meta = state.combo > 0 ? ('×' + state.combo + ' combo · best ' + best) : ('best ' + best);
+    cx.fillText(meta, W / 2, 56);
+    // dare banner (human only)
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 13px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 74);
+    }
+    cx.textAlign = 'left';
+  }
+
+  function drawHintBar(now) {
+    var y = 86, h = 42;
+    var pulse = 0.5 + 0.5 * Math.sin(now / 280);
+    cx.fillStyle = 'rgba(232,80,46,0.12)';
+    cx.strokeStyle = VERM; cx.lineWidth = 1.5;
+    cx.globalAlpha = 0.7 + 0.3 * pulse;
+    cx.beginPath(); rr(14, y, W - 28, h, 10); cx.fill(); cx.stroke();
+    cx.globalAlpha = 1;
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '700 10px -apple-system, Helvetica, Arial';
+    cx.fillText('WATCH FOR', 70, y + 17);
+    cx.fillStyle = '#fff'; cx.font = '800 18px -apple-system, Helvetica, Arial';
+    cx.fillText(state.pendingTarget, W / 2 + 18, y + 28);
+    // eye glyph
+    cx.fillStyle = VERM; cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('👁', W - 38, y + 28);
+    cx.textAlign = 'left';
+  }
+
+  function drawCatchBand(now) {
+    var tr = state.targetRow;
+    var lit = tr && !tr.caught && !tr.slipping && inBand(tr);
+    cx.fillStyle = lit ? 'rgba(46,197,182,0.10)' : 'rgba(232,80,46,0.05)';
+    cx.strokeStyle = lit ? TEAL : 'rgba(232,80,46,0.45)';
+    cx.lineWidth = lit ? 2 : 1.5;
+    cx.beginPath(); rr(14, CATCH_Y, W - 28, CATCH_H, 12); cx.fill(); cx.stroke();
+    cx.textAlign = 'right';
+    cx.fillStyle = lit ? TEAL : 'rgba(232,80,46,0.5)';
+    cx.font = '700 9px Menlo, monospace';
+    cx.fillText(lit ? 'TAP NOW' : 'CATCH ZONE', W - 22, CATCH_Y + 14);
+    cx.textAlign = 'left';
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // ---- sim (frozen during hit-stop; decay hitStop every frame) ----
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else if (state.phase === 'play') {
+      // scroll rows
+      for (var i = 0; i < state.rows.length; i++) {
+        var r = state.rows[i];
+        if (r.slipping) { r.y += r.vy * dt; r.vy -= 0.6 * dt; r.alpha = Math.max(0, r.alpha - 0.05 * dt); }
+        else r.y -= state.speed * dt;
+        if (r.caught) r.stampT += dt;
+      }
+      // target got away?
+      var tr = state.targetRow;
+      if (tr && !tr.caught && !tr.slipping && tr.y + ROW_H < CATCH_Y) targetGotAway(tr);
+      // cull
+      state.rows = state.rows.filter(function (r) { return r.y > LIST_TOP - ROW_H - 30 && r.alpha > 0.02; });
+      // decoy spawn
+      state.spawnTimer += dt;
+      var interval = Math.max(16, 42 - state.score * 0.5);
+      if (state.spawnTimer >= interval) { state.spawnTimer = 0; spawnDecoy(); }
+      // target spawn
+      if (!state.targetRow && state.targetSpawnIn > 0) {
+        state.targetSpawnIn -= dt;
+        if (state.targetSpawnIn <= 0) spawnTarget();
+      }
+      // ramp speed with score
+      state.speed = Math.min(3.4, 1.6 + state.score * 0.05);
+      autopilot();
+    }
+
+    // ---- juice transforms ----
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // list + header during play / over
+    if (state.phase === 'play' || state.phase === 'over') {
+      drawCatchBand(now);
+      for (var k = 0; k < state.rows.length; k++) drawRow(state.rows[k], now);
+      drawHeader(now);
+      drawHintBar(now);
+    }
+
+    // flashes (floating reward text)
+    for (var f = flashes.length - 1; f >= 0; f--) {
+      var fl = flashes[f]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 42);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 250 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(f, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('STORY VIEWERS', W / 2, 290);
+      cx.fillStyle = VERM; cx.font = '700 17px -apple-system, Helvetica, Arial';
+      var p = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = p; cx.fillText('TAP TO CATCH', W / 2, 332); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('spot the handle in the flood.', W / 2, 360);
+      cx.fillText("tap when yours hits the band — or they slip.", W / 2, 378);
+    }
+
+    // challenge card (demo beat 1)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('36', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // game over / score card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('THEY SLIPPED.', W / 2, 298);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' caught', W / 2, 344);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 414);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 544);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath(); rr(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 24); cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('STORY VIEWERS', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('they caught ' + (window.__demoScore || 36) + '. your move.', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 36), W / 2, 408);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 25);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

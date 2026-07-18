@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Mirror Line — Tilt</title>
+<!--
+  LOOP / attention-architecture — Mirror Line
+  Engine: calm. Circuits: 06-zeigarnik, 05-ease, 01-rpe.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'mirror-line';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL2 = '#1a9e92', SOFT = '#a8e6e1';
+
+  // ── PALETTE for shapes ──
+  var SHAPE_COLORS = ['#2ec5b6','#f2b134','#7ec8c8','#b8e0d4','#5bb8d4','#d4a8c8'];
+
+  // ── SHAPE TYPES ──
+  // Each shape: { type, x, y, r, color, size }  (r = rotation in radians)
+  // types: 'circle', 'square', 'triangle', 'diamond'
+
+  function drawShape(type, x, y, size, color, alpha, r) {
+    cx.save();
+    cx.globalAlpha = alpha !== undefined ? alpha : 1;
+    cx.translate(x, y);
+    if (r) cx.rotate(r);
+    cx.fillStyle = color;
+    cx.beginPath();
+    if (type === 'circle') {
+      cx.arc(0, 0, size * 0.5, 0, Math.PI * 2);
+    } else if (type === 'square') {
+      var h = size * 0.45;
+      cx.rect(-h, -h, h * 2, h * 2);
+    } else if (type === 'triangle') {
+      var s = size * 0.55;
+      cx.moveTo(0, -s);
+      cx.lineTo(s * 0.87, s * 0.5);
+      cx.lineTo(-s * 0.87, s * 0.5);
+      cx.closePath();
+    } else if (type === 'diamond') {
+      var d = size * 0.52;
+      cx.moveTo(0, -d);
+      cx.lineTo(d * 0.7, 0);
+      cx.lineTo(0, d);
+      cx.lineTo(-d * 0.7, 0);
+      cx.closePath();
+    }
+    cx.fill();
+    cx.restore();
+  }
+
+  function drawShapeOutline(type, x, y, size, color, alpha, r) {
+    cx.save();
+    cx.globalAlpha = alpha !== undefined ? alpha : 1;
+    cx.translate(x, y);
+    if (r) cx.rotate(r);
+    cx.strokeStyle = color;
+    cx.lineWidth = 1.5;
+    cx.setLineDash([4, 4]);
+    cx.beginPath();
+    if (type === 'circle') {
+      cx.arc(0, 0, size * 0.5, 0, Math.PI * 2);
+    } else if (type === 'square') {
+      var h = size * 0.45;
+      cx.rect(-h, -h, h * 2, h * 2);
+    } else if (type === 'triangle') {
+      var s = size * 0.55;
+      cx.moveTo(0, -s);
+      cx.lineTo(s * 0.87, s * 0.5);
+      cx.lineTo(-s * 0.87, s * 0.5);
+      cx.closePath();
+    } else if (type === 'diamond') {
+      var d = size * 0.52;
+      cx.moveTo(0, -d);
+      cx.lineTo(d * 0.7, 0);
+      cx.lineTo(0, d);
+      cx.lineTo(-d * 0.7, 0);
+      cx.closePath();
+    }
+    cx.stroke();
+    cx.setLineDash([]);
+    cx.restore();
+  }
+
+  // ── LEVEL GENERATION ──
+  // The canvas is split horizontally at center (W/2).
+  // LEFT half = reference pattern (fixed shapes).
+  // RIGHT half = blank slots where player drags shapes.
+  // PLAY_AREA: top portion of canvas for the puzzle.
+  var AXIS = W / 2;           // center axis x
+  var PUZZLE_TOP = 100;       // y where puzzle area starts
+  var PUZZLE_H   = 480;       // height of puzzle area
+  var TRAY_Y     = 610;       // y of the shape tray (draggable pieces)
+  var TRAY_ITEM_R= 30;        // radius of tray item slots
+
+  var SHAPE_TYPES = ['circle', 'square', 'triangle', 'diamond'];
+
+  function genLevel(n, seed) {
+    var r = mulberry32(seed + n * 997);
+    // How many shapes: 3 + floor(n/2), capped at 7
+    var count = Math.min(3 + Math.floor(n / 2), 7);
+    var shapes = [];
+    // Distribute shapes in left half grid
+    // grid: 2 cols × up to 4 rows within puzzle area
+    var cols = 2, rows = Math.ceil(count / cols);
+    var cellW = (AXIS - 20) / cols;
+    var cellH = PUZZLE_H / (rows + 1);
+    var used = {};
+    for (var i = 0; i < count; i++) {
+      var col = i % cols, row = Math.floor(i / cols);
+      var lx = 14 + col * cellW + cellW * 0.5 + (r() - 0.5) * 12;
+      var ly = PUZZLE_TOP + (row + 1) * cellH + (r() - 0.5) * 10;
+      lx = Math.max(18, Math.min(AXIS - 18, lx));
+      ly = Math.max(PUZZLE_TOP + 20, Math.min(PUZZLE_TOP + PUZZLE_H - 20, ly));
+      var type = SHAPE_TYPES[Math.floor(r() * SHAPE_TYPES.length)];
+      var color = SHAPE_COLORS[Math.floor(r() * SHAPE_COLORS.length)];
+      var sz = 28 + Math.floor(r() * 18); // 28..45
+      var rot = (r() - 0.5) * 0.4;
+      shapes.push({ type: type, lx: lx, ly: ly, color: color, size: sz, rot: rot });
+    }
+    return shapes;
+  }
+
+  // ── GAME STATE ──
+  var phase = 'title'; // title | play | over | cta
+  var level = 0;
+  var shapes = [];     // level shapes (source of truth)
+  var tray = [];       // items in the bottom tray (draggable)
+  var placed = [];     // items placed on right side { shapeIdx, rx, ry, matched }
+  var dragging = null; // { trayIdx, x, y, startX, startY }
+  var score = 0;       // total matched shapes across levels
+  var levelScore = 0;  // matched in current level
+  var totalInLevel = 0;
+  var runStartTs = 0;
+  var overAt = 0;
+  var ctaAt = 0;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  var meterAnim = 0;   // animated symmetry meter 0..1
+  var botRunsDone = 0;
+  var botState = null; // bot internal state
+
+  // demo
+  var demoPhase = 'play'; // 'play' | 'card' | 'done'
+  var demoPlayStart = 0;
+  var demoActIdx = 0;
+  var demoWait = 0;
+  var demoScript = []; // generated in startLevel for demo
+
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ── LEVEL INIT ──
+  function startLevel(lvl) {
+    level = lvl;
+    shapes = genLevel(lvl, SEED);
+    totalInLevel = shapes.length;
+    levelScore = 0;
+
+    // Build tray: shuffled copies of the shape types (with color/size matching)
+    tray = [];
+    var indices = shapes.map(function (_, i) { return i; });
+    // Fisher-Yates shuffle with rng
+    for (var i = indices.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = indices[i]; indices[i] = indices[j]; indices[j] = tmp;
+    }
+    indices.forEach(function (si, pos) {
+      var s = shapes[si];
+      var angle = (pos - (indices.length - 1) / 2) * 0.18;
+      var tx = AXIS + 16 + pos * 62;
+      // Fan them out evenly across right half of tray
+      var count = indices.length;
+      var spacing = Math.min(62, (W - AXIS - 32) / count);
+      tx = AXIS + 16 + pos * spacing + spacing * 0.5;
+      tray.push({
+        shapeIdx: si,
+        x: tx,
+        y: TRAY_Y,
+        placed: false
+      });
+    });
+
+    placed = [];
+
+    // Demo script: one action per shape, in tray order
+    if (DEMO) {
+      demoScript = tray.map(function (t, i) {
+        return { trayIdx: i, delay: 35 + Math.floor(rng() * 30) };
+      });
+      demoActIdx = 0;
+      demoWait = 60; // initial hesitation
+    }
+    if (BOT) {
+      botState = { actIdx: 0, wait: 40, passiveAfter: shapes.length };
+    }
+  }
+
+  function pctTop(s) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 5))));
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 36, t: 0 });
+  }
+
+  // Mirror position: given a left-half shape, compute the target right-half position
+  function mirrorPos(shape) {
+    var rx = AXIS + (AXIS - shape.lx); // reflect across axis
+    return { rx: rx, ry: shape.ly };
+  }
+
+  // Check if a placed position matches the target mirror position (within threshold)
+  var SNAP_DIST = 30; // pixels tolerance
+
+  function tryMatch(trayIdx, dropX, dropY) {
+    var item = tray[trayIdx];
+    if (!item || item.placed) return false;
+    var s = shapes[item.shapeIdx];
+    var mp = mirrorPos(s);
+    var dist = Math.sqrt(Math.pow(dropX - mp.rx, 2) + Math.pow(dropY - mp.ry, 2));
+    if (dist <= SNAP_DIST) {
+      // Correct match
+      item.placed = true;
+      placed.push({ shapeIdx: item.shapeIdx, rx: mp.rx, ry: mp.ry, matched: true, alpha: 0 });
+      levelScore++;
+      score++;
+      hitStop = 4;
+      zoom = 1.02;
+      if (window.J) J.calm(levelScore);
+      flash(levelScore === totalInLevel ? 'PERFECT' : '+1', TEAL, levelScore === totalInLevel ? 48 : 32);
+      if (levelScore === totalInLevel) {
+        // Level complete!
+        setTimeout(function () { levelComplete(); }, 800);
+      }
+      return true;
+    } else {
+      // Wrong position — drop back to tray
+      shakeAmt = 2;
+      return false;
+    }
+  }
+
+  function levelComplete() {
+    if (DEMO) {
+      // In demo mode, just go to next level or CTA
+      if (level >= 1) {
+        // enough for demo arc: show CTA
+        showDemoCTA();
+      } else {
+        startLevel(level + 1);
+      }
+      return;
+    }
+    if (BOT) {
+      // Bot: next run or done
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        // Bot must also eventually trigger game_over
+        gameOver();
+      } else {
+        setTimeout(function () {
+          if (window.LOOP) LOOP.emit('restart', {});
+          score = 0;
+          startLevel(0);
+          startRun();
+        }, 400);
+      }
+      return;
+    }
+    // Human: advance to next level
+    if (window.J) J.calm(score);
+    setTimeout(function () {
+      startLevel(level + 1);
+    }, 600);
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 3;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+    }
+    if (BOT) {
+      window.__botDone = true;
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function showDemoCTA() {
+    phase = 'cta';
+    demoPhase = 'card';
+    ctaAt = performance.now();
+    window.__demoScore = score;
+    // CTA lasts ~3.5s then sets __demoDone
+    setTimeout(function () {
+      window.__demoDone = true;
+    }, 3500);
+  }
+
+  // ── BOT LOGIC ──
+  // Bot places shapes one by one with imperfect aim (small miss chance),
+  // then after placing all shapes, triggers game_over via miss-and-timeout
+  function botTick() {
+    if (!botState || phase !== 'play') return;
+    if (botState.wait > 0) { botState.wait--; return; }
+
+    // Find next unplaced tray item
+    var nextIdx = -1;
+    for (var i = 0; i < tray.length; i++) {
+      if (!tray[i].placed) { nextIdx = i; break; }
+    }
+
+    if (nextIdx === -1) {
+      // All placed (or we ran out) — trigger game_over
+      gameOver();
+      return;
+    }
+
+    var item = tray[nextIdx];
+    var s = shapes[item.shapeIdx];
+    var mp = mirrorPos(s);
+
+    // Imperfect aim: sometimes miss (20% chance) to simulate human error
+    var miss = rng() < 0.2;
+    var dropX = mp.rx + (miss ? (SNAP_DIST + 10 + rng() * 20) * (rng() > 0.5 ? 1 : -1) : (rng() - 0.5) * 15);
+    var dropY = mp.ry + (miss ? (SNAP_DIST + 10 + rng() * 20) * (rng() > 0.5 ? 1 : -1) : (rng() - 0.5) * 15);
+
+    var matched = tryMatch(nextIdx, dropX, dropY);
+    if (!matched) {
+      // Missed — bot tries again next tick after delay
+      botState.wait = 25 + Math.floor(rng() * 20);
+    } else {
+      botState.wait = 30 + Math.floor(rng() * 25);
+    }
+
+    // If all shapes exhausted and not complete (shouldn't happen but safety)
+    var allPlaced = tray.every(function (t) { return t.placed; });
+    if (allPlaced && levelScore < totalInLevel) {
+      gameOver();
+    }
+  }
+
+  // ── DEMO AUTOPILOT ──
+  function demoTick() {
+    if (phase !== 'play' || demoPhase !== 'play') return;
+    if (demoWait > 0) { demoWait--; return; }
+    if (demoActIdx >= demoScript.length) return;
+
+    var act = demoScript[demoActIdx];
+    var item = tray[act.trayIdx];
+    if (!item || item.placed) { demoActIdx++; demoWait = 20; return; }
+
+    var s = shapes[item.shapeIdx];
+    var mp = mirrorPos(s);
+
+    // Demo places with slight imperfection for human feel
+    var offX = (rng() - 0.5) * 10;
+    var offY = (rng() - 0.5) * 10;
+    tryMatch(act.trayIdx, mp.rx + offX, mp.ry + offY);
+    demoActIdx++;
+    demoWait = act.delay;
+  }
+
+  // ── INPUT ──
+  function pointerDown(px, py) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') {
+      score = 0;
+      startLevel(0);
+      startRun();
+      return;
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      // Restart
+      score = 0;
+      startLevel(0);
+      flashes = [];
+      if (window.LOOP) LOOP.emit('restart', {});
+      startRun();
+      return;
+    }
+    if (phase !== 'play') return;
+
+    // Check tray items
+    for (var i = 0; i < tray.length; i++) {
+      var item = tray[i];
+      if (item.placed) continue;
+      var dx = px - item.x, dy = py - item.y;
+      if (Math.sqrt(dx * dx + dy * dy) < TRAY_ITEM_R) {
+        dragging = { trayIdx: i, x: px, y: py, origX: item.x, origY: item.y };
+        return;
+      }
+    }
+  }
+
+  function pointerMove(px, py) {
+    if (dragging) {
+      dragging.x = px;
+      dragging.y = py;
+    }
+  }
+
+  function pointerUp(px, py) {
+    if (!dragging) return;
+    var matched = tryMatch(dragging.trayIdx, px, py);
+    if (!matched) {
+      // Snap back (just leave in tray)
+    }
+    dragging = null;
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointermove', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+
+  // ── RENDER ──
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Decay hitStop and run autopilots
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      if (DEMO) demoTick();
+      if (BOT) botTick();
+    }
+
+    // Animate placed shape alphas
+    placed.forEach(function (p) {
+      if (p.alpha < 1) p.alpha = Math.min(1, p.alpha + 0.05 * dt);
+    });
+
+    // Animate meter
+    var targetMeter = totalInLevel > 0 ? levelScore / totalInLevel : 0;
+    meterAnim += (targetMeter - meterAnim) * 0.06 * dt;
+
+    // juice decay
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    cx.save();
+    // juice transforms
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt * 2;
+      var sy = (Math.random() - 0.5) * shakeAmt * 2;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // Background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // Subtle gradient bg
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    if (phase === 'title') {
+      drawTitle(now);
+    } else if (phase === 'play') {
+      drawPlay(now);
+    } else if (phase === 'over') {
+      drawPlay(now);
+      drawOver(now);
+    } else if (phase === 'cta') {
+      drawPlay(now);
+      drawCTA(now);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 82 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    // Title
+    cx.fillStyle = '#fff';
+    cx.font = '800 46px -apple-system, Helvetica, Arial';
+    cx.fillText('MIRROR LINE', W / 2, 280);
+
+    // Subtle divider illustration
+    cx.strokeStyle = 'rgba(46,197,182,0.3)';
+    cx.lineWidth = 1;
+    cx.setLineDash([4, 6]);
+    cx.beginPath(); cx.moveTo(W / 2, 300); cx.lineTo(W / 2, 380); cx.stroke();
+    cx.setLineDash([]);
+
+    // Two placeholder shapes (one left, one right) to show the concept
+    drawShape('circle', 140, 340, 32, 'rgba(46,197,182,0.6)');
+    drawShapeOutline('circle', 265, 340, 32, 'rgba(46,197,182,0.4)');
+
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText('drag shapes to mirror the pattern', W / 2, 400);
+
+    var pulse = 0.6 + 0.4 * Math.sin(now / 400);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = TEAL;
+    cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO BEGIN', W / 2, 450);
+    cx.globalAlpha = 1;
+  }
+
+  function drawPlay(now) {
+    // ── Score / level header ──
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.font = '700 13px Menlo, monospace';
+    cx.fillText('LEVEL ' + (level + 1), W / 2, 30);
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '500 11px Menlo, monospace';
+    cx.fillText('score ' + score, W / 2, 48);
+
+    // ── Center axis (dashed mirror line) ──
+    cx.strokeStyle = 'rgba(46,197,182,0.25)';
+    cx.lineWidth = 1;
+    cx.setLineDash([6, 8]);
+    cx.beginPath();
+    cx.moveTo(AXIS, PUZZLE_TOP - 10);
+    cx.lineTo(AXIS, PUZZLE_TOP + PUZZLE_H + 10);
+    cx.stroke();
+    cx.setLineDash([]);
+
+    // ── Left panel label ──
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.28)';
+    cx.font = '500 10px Menlo, monospace';
+    cx.fillText('ORIGINAL', AXIS / 2, PUZZLE_TOP - 4);
+    cx.fillText('MIRROR', AXIS + (W - AXIS) / 2, PUZZLE_TOP - 4);
+
+    // ── Draw reference shapes on LEFT ──
+    shapes.forEach(function (s) {
+      drawShape(s.type, s.lx, s.ly, s.size, s.color, 0.9, s.rot);
+    });
+
+    // ── Draw target outlines on RIGHT (ghost slots) ──
+    shapes.forEach(function (s, si) {
+      var mp = mirrorPos(s);
+      // Check if already filled
+      var isPlaced = placed.some(function (p) { return p.shapeIdx === si; });
+      if (!isPlaced) {
+        drawShapeOutline(s.type, mp.rx, mp.ry, s.size, 'rgba(46,197,182,0.35)', 0.7, -s.rot);
+      }
+    });
+
+    // ── Draw placed shapes on RIGHT ──
+    placed.forEach(function (p) {
+      var s = shapes[p.shapeIdx];
+      drawShape(s.type, p.rx, p.ry, s.size, s.color, p.alpha, -s.rot);
+      // Soft glow on placed
+      if (p.alpha > 0.8) {
+        cx.save();
+        cx.globalAlpha = (p.alpha - 0.8) * 2 * 0.3;
+        cx.shadowColor = s.color;
+        cx.shadowBlur = 16;
+        drawShape(s.type, p.rx, p.ry, s.size, s.color, 1, -s.rot);
+        cx.restore();
+      }
+    });
+
+    // ── Symmetry meter ──
+    var meterX = 20, meterY = PUZZLE_TOP + PUZZLE_H + 18, meterW = W - 40, meterH = 7;
+    cx.fillStyle = 'rgba(255,255,255,0.08)';
+    cx.beginPath();
+    cx.roundRect ? cx.roundRect(meterX, meterY, meterW, meterH, 4) : cx.rect(meterX, meterY, meterW, meterH);
+    cx.fill();
+    if (meterAnim > 0) {
+      var grad = cx.createLinearGradient(meterX, 0, meterX + meterW, 0);
+      grad.addColorStop(0, SOFT);
+      grad.addColorStop(1, TEAL);
+      cx.fillStyle = grad;
+      cx.beginPath();
+      var fw = meterW * Math.min(meterAnim, 1);
+      cx.roundRect ? cx.roundRect(meterX, meterY, fw, meterH, 4) : cx.rect(meterX, meterY, fw, meterH);
+      cx.fill();
+    }
+    // Meter label
+    cx.textAlign = 'right';
+    cx.fillStyle = 'rgba(46,197,182,0.7)';
+    cx.font = '600 10px Menlo, monospace';
+    cx.fillText(Math.round(meterAnim * 100) + '%', W - 20, meterY - 3);
+    cx.textAlign = 'left';
+    cx.fillStyle = 'rgba(255,255,255,0.25)';
+    cx.font = '500 10px Menlo, monospace';
+    cx.fillText('SYMMETRY', meterX, meterY - 3);
+
+    // ── Tray divider ──
+    cx.strokeStyle = 'rgba(255,255,255,0.07)';
+    cx.lineWidth = 1;
+    cx.beginPath();
+    cx.moveTo(20, TRAY_Y - 30); cx.lineTo(W - 20, TRAY_Y - 30);
+    cx.stroke();
+
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.2)';
+    cx.font = '500 10px Menlo, monospace';
+    cx.fillText('DRAG TO PLACE', W / 2, TRAY_Y - 16);
+
+    // ── Draw tray items ──
+    tray.forEach(function (item, i) {
+      if (item.placed) return;
+      if (dragging && dragging.trayIdx === i) return; // draw dragging piece separately
+      var s = shapes[item.shapeIdx];
+      drawShape(s.type, item.x, item.y, s.size, s.color, 0.9, s.rot);
+    });
+
+    // ── Draw dragging piece ──
+    if (dragging) {
+      var ds = shapes[tray[dragging.trayIdx].shapeIdx];
+      // Glow while dragging
+      cx.save();
+      cx.shadowColor = ds.color;
+      cx.shadowBlur = 18;
+      drawShape(ds.type, dragging.x, dragging.y, ds.size, ds.color, 1, ds.rot);
+      cx.restore();
+
+      // Show target ghost highlight near snap zone
+      var mp = mirrorPos(ds);
+      var dist = Math.sqrt(Math.pow(dragging.x - mp.rx, 2) + Math.pow(dragging.y - mp.ry, 2));
+      if (dist < SNAP_DIST * 2.5) {
+        var pulse = 0.4 + 0.3 * Math.sin(last / 150);
+        drawShape(ds.type, mp.rx, mp.ry, ds.size, TEAL, pulse * 0.5, -ds.rot);
+      }
+    }
+  }
+
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.68)';
+    cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+
+    cx.fillStyle = TEAL;
+    cx.font = '900 36px -apple-system, Helvetica, Arial';
+    cx.fillText('BALANCED', W / 2, 290);
+
+    cx.fillStyle = '#fff';
+    cx.font = '700 22px -apple-system, Helvetica, Arial';
+    cx.fillText(score + ' shapes mirrored', W / 2, 334);
+
+    var pt = pctTop(score);
+    cx.fillStyle = GOLD;
+    cx.font = '800 20px -apple-system, Helvetica, Arial';
+    cx.fillText('TOP ' + pt + '% TODAY', W / 2, 374);
+
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '500 12px -apple-system, Helvetica, Arial';
+    cx.fillText('more balanced than ' + (100 - pt) + '% of players', W / 2, 398);
+
+    if (!DEMO && !BOT) {
+      var pulse = 0.6 + 0.4 * Math.sin(now / 350);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO TRY AGAIN', W / 2, 450);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawCTA(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+
+    cx.fillStyle = TEAL;
+    cx.font = '900 40px -apple-system, Helvetica, Arial';
+    cx.fillText('MIRROR LINE', W / 2, 290);
+
+    cx.fillStyle = 'rgba(255,255,255,0.75)';
+    cx.font = '500 16px -apple-system, Helvetica, Arial';
+    cx.fillText('can you find the balance?', W / 2, 328);
+
+    var pulse = 0.72 + 0.28 * Math.sin(now / 260);
+    cx.globalAlpha = ease * pulse;
+    cx.fillStyle = TEAL;
+    cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 400);
+
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 434);
+
+    cx.globalAlpha = 1;
+  }
+
+  // ── INIT ──
+  function init() {
+    if (DEMO) {
+      // Demo: start straight into play, calm arc
+      demoPhase = 'play';
+      score = 0;
+      startLevel(0);
+      startRun();
+    } else if (BOT) {
+      score = 0;
+      startLevel(0);
+      startRun();
+    }
+    // Human starts at title
+  }
+
+  init();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

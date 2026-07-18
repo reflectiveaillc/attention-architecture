@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>One Cut — Tilt</title>
+<!--
+  LOOP / attention-architecture — One Cut
+  Circuits: 01-rpe (variable reward per cut precision), 06-zeigarnik (one more try),
+            04-loss (PB is always at risk).
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N    imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'one-cut';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  /* ── constants ── */
+  var W = 405, H = 720;
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TOTAL_CUTS = 10;
+  var BAR_Y = H / 2 + 20;        // center of bar
+  var BAR_H = 44;
+  var BAR_TRACK_X = 40;          // left edge start
+  var BAR_TRACK_W = W - 80;      // total track width
+  var TARGET_ZONE = 0.5;         // target fraction of track (0–1)
+  var TARGET_W = 32;             // pixel width of target zone rendered
+  var SPEED_BASE = 2.8;          // px/frame at 60fps
+
+  /* ── query params ── */
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  /* ── seeded RNG ── */
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  /* ── canvas setup ── */
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  /* ── juice state ── */
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size || 36, t: 0 }); }
+
+  /* ── persistent best ── */
+  var pb = Infinity;  // PB = lowest total error (px) over a full 10-cut round
+  try { var stored = +localStorage.getItem('oc_pb'); if (!isNaN(stored) && stored > 0) pb = stored; } catch (_) {}
+
+  /* ── game state ── */
+  var phase;     // 'title' | 'challenge' | 'play' | 'over' | 'cta'
+  var cuts;      // array of {target, length, error} for current round
+  var cutIdx;    // which cut we're on (0–9)
+  var bar;       // current moving bar state { x, dir, speed }
+  var totalErr;  // accumulated |error| in px this round
+  var runStartTs;
+  var overAt = 0, ctaAt = 0, challengeAt = 0;
+  var dareBeaten = false;
+  var botRunsDone = 0;
+
+  /* ── target positions per cut (seeded, fixed per seed) ── */
+  var targets = [];
+  function genTargets() {
+    targets = [];
+    for (var i = 0; i < TOTAL_CUTS; i++) {
+      // target fraction: 0.25–0.75 range so it's not too extreme
+      targets.push(0.25 + rng() * 0.50);
+    }
+  }
+
+  /* ── MUTE / SHARE hit-regions ── */
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 510, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  /* ── percent rank ── */
+  function pctTop(err) {
+    // lower error → better rank. err in px, typical range 0–100+
+    return Math.max(1, Math.min(99, Math.round(100 * (1 - Math.exp(-err / 18)))));
+  }
+
+  /* ── init / new game ── */
+  function newGame() {
+    rng = mulberry32(SEED);
+    genTargets();
+    cuts = [];
+    cutIdx = 0;
+    totalErr = 0;
+    flashes = [];
+    dareBeaten = false;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRound, 1250);
+      return;
+    }
+    if (BOT) { phase = 'play'; startRound(); return; }
+    phase = 'title';
+  }
+
+  function startRound() {
+    phase = 'play';
+    runStartTs = Date.now();
+    spawnBar();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function spawnBar() {
+    var spd = SPEED_BASE + cutIdx * 0.18 + rng() * 0.4;
+    // bar starts from left edge, moving right
+    bar = { x: 0, dir: 1, speed: spd };
+  }
+
+  /* ── cut logic ── */
+  function doCut() {
+    if (phase !== 'play' || !bar) return;
+    var target = targets[cutIdx];
+    var targetPx = BAR_TRACK_X + target * BAR_TRACK_W;  // target stop in absolute px
+    var currentPx = BAR_TRACK_X + bar.x;                 // current bar head in absolute px
+    var err = Math.abs(currentPx - targetPx);
+    var errMm = Math.round(err);  // 1px ≈ 1mm in the metaphor
+
+    cuts.push({ target: target, length: bar.x / BAR_TRACK_W, error: errMm });
+    totalErr += errMm;
+
+    var perfect = errMm <= 4;
+    var near    = errMm <= 14 && !perfect;
+
+    // sound
+    if (window.J) {
+      if (perfect) J.perfect(cutIdx + 1);
+      else if (near) J.near();
+      else J.hit(cutIdx + 1);
+      J.tension(Math.min(cutIdx / TOTAL_CUTS, 1));
+    }
+
+    // juice
+    if (perfect) { hitStop = 4; zoom = 1.025; flash('PERFECT', TEAL, 44); }
+    else if (near) { shakeAmt = 3; flash('SO CLOSE', GOLD, 38); }
+    else { shakeAmt = 1.5; }
+
+    if (window.LOOP) LOOP.emit('cut_placed', { cut: cutIdx + 1, error_mm: errMm, perfect: perfect });
+    if (near && window.LOOP) LOOP.emit('near_miss', { cut: cutIdx + 1, error_mm: errMm });
+
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten) {
+      // dare score = total error. lower is better. beat dare if our totalErr < dare score
+      if (totalErr < SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 40);
+        if (window.J) J.fanfare();
+        SHARE.beaten(totalErr);
+      }
+    }
+
+    cutIdx++;
+    if (cutIdx >= TOTAL_CUTS) {
+      endRound();
+    } else {
+      bar = null;
+      // tiny pause between cuts
+      setTimeout(function () { if (phase === 'play') spawnBar(); }, 280);
+    }
+  }
+
+  function endRound() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 6;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newPB = totalErr < pb;
+
+    if (window.J) {
+      J.death(Math.min(0.3 + totalErr / 200, 1));
+      if (newPB) setTimeout(function () { J.fanfare(); }, 450);
+    }
+
+    if (newPB && !BOT) { pb = totalErr; try { localStorage.setItem('oc_pb', String(pb)); } catch (_) {} }
+    if (DEMO) window.__demoScore = totalErr;
+
+    if (window.LOOP) LOOP.emit('game_over', { score: totalErr, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 900);
+      }
+    }
+  }
+
+  function resetRun() {
+    rng = mulberry32(SEED + botRunsDone * 13);
+    genTargets();
+    cuts = [];
+    cutIdx = 0;
+    totalErr = 0;
+    flashes = [];
+    dareBeaten = false;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRound();
+  }
+
+  /* ── input ── */
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title')  { startRound(); return; }
+    if (phase === 'play')   { doCut(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: totalErr, unit: 'mm' }); return;
+      }
+      // restart
+      rng = mulberry32(SEED);
+      genTargets();
+      cuts = [];
+      cutIdx = 0;
+      totalErr = 0;
+      flashes = [];
+      dareBeaten = false;
+      hitStop = 0; shakeAmt = 0; zoom = 1;
+      if (window.LOOP) LOOP.emit('restart', {});
+      startRound();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  /* ── demo / bot autopilots ── */
+  // demo script: desired errors per cut (px from target). negative = overshoot left
+  // Arc: close → tighter → near-fail tension spike → recovery save → wider fail → repeat close → final
+  var demoErrors    = [18, 10, 6, 52, 3, 22, 8, 45, 12, 6];
+  var demoWaits     = [48, 38, 30, 60, 28, 42, 34, 55, 32, 28]; // frames of hesitation
+  var demoWaitLeft  = 0;
+  var demoPhase     = 0;   // index into demoErrors
+
+  function autopilot(dt) {
+    if (!bar || phase !== 'play') return;
+    var targetFrac = targets[cutIdx];
+    var targetX    = targetFrac * BAR_TRACK_W;  // target within bar.x space
+
+    if (DEMO) {
+      if (demoWaitLeft > 0) { demoWaitLeft -= dt; return; }
+      var wantErr = demoErrors[Math.min(demoPhase, demoErrors.length - 1)];
+      // aim to stop at targetX + wantErr (always overshoot slightly for realism)
+      var aim = targetX + wantErr;
+      aim = Math.max(0, Math.min(BAR_TRACK_W, aim));
+      var dist = aim - bar.x;
+      var v = bar.speed * bar.dir;
+      if (Math.abs(dist) <= Math.abs(v) * 1.1 + 1) {
+        demoPhase++;
+        demoWaitLeft = demoWaits[Math.min(demoPhase, demoWaits.length - 1)] || 30;
+        doCut();
+      }
+    } else if (BOT) {
+      // bot aims near target with gaussian error
+      var botErr = gauss() * 18;
+      var aim2 = targetX + botErr;
+      aim2 = Math.max(0, Math.min(BAR_TRACK_W, aim2));
+      var dist2 = aim2 - bar.x;
+      var v2 = bar.speed * bar.dir;
+      if (Math.abs(dist2) <= Math.abs(v2) * 1.1 + 1) {
+        doCut();
+      }
+    }
+  }
+
+  /* ── draw helpers ── */
+  function drawBar(frac, color, alpha) {
+    // frac = 0..1 proportion of track
+    alpha = alpha !== undefined ? alpha : 1;
+    cx.globalAlpha = alpha;
+    var w = frac * BAR_TRACK_W;
+    var rr = 8;
+    cx.fillStyle = color;
+    cx.beginPath();
+    if (cx.roundRect) {
+      cx.roundRect(BAR_TRACK_X, BAR_Y - BAR_H / 2, Math.max(rr * 2, w), BAR_H, rr);
+    } else {
+      cx.rect(BAR_TRACK_X, BAR_Y - BAR_H / 2, Math.max(rr * 2, w), BAR_H);
+    }
+    cx.fill();
+    cx.globalAlpha = 1;
+  }
+
+  function drawTargetLine(frac) {
+    var x = BAR_TRACK_X + frac * BAR_TRACK_W;
+    // dashed vertical line at target
+    cx.save();
+    cx.strokeStyle = GOLD;
+    cx.lineWidth = 2.5;
+    cx.setLineDash([5, 4]);
+    cx.globalAlpha = 0.85;
+    cx.beginPath();
+    cx.moveTo(x, BAR_Y - BAR_H / 2 - 18);
+    cx.lineTo(x, BAR_Y + BAR_H / 2 + 18);
+    cx.stroke();
+    cx.setLineDash([]);
+    cx.globalAlpha = 1;
+    cx.restore();
+
+    // small scissors icon above line
+    cx.fillStyle = GOLD;
+    cx.globalAlpha = 0.9;
+    cx.font = '18px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.fillText('✂', x, BAR_Y - BAR_H / 2 - 22);
+    cx.globalAlpha = 1;
+  }
+
+  function drawTrack() {
+    cx.save();
+    cx.fillStyle = 'rgba(255,255,255,0.07)';
+    cx.beginPath();
+    if (cx.roundRect) {
+      cx.roundRect(BAR_TRACK_X, BAR_Y - BAR_H / 2, BAR_TRACK_W, BAR_H, 8);
+    } else {
+      cx.rect(BAR_TRACK_X, BAR_Y - BAR_H / 2, BAR_TRACK_W, BAR_H);
+    }
+    cx.fill();
+    cx.restore();
+  }
+
+  function drawPreviousCuts() {
+    // show small cut result bars above main bar
+    var startY = BAR_Y - BAR_H / 2 - 30;
+    for (var i = 0; i < cuts.length; i++) {
+      var c = cuts[i];
+      var dotX = BAR_TRACK_X + c.target * BAR_TRACK_W;
+      var hue = c.error <= 4 ? TEAL : c.error <= 14 ? GOLD : VERM;
+      cx.fillStyle = hue;
+      cx.globalAlpha = 0.5;
+      cx.beginPath();
+      cx.arc(dotX, startY - i * 12, 4, 0, Math.PI * 2);
+      cx.fill();
+      cx.globalAlpha = 1;
+    }
+  }
+
+  /* ── main render loop ── */
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // move bar (ping-pong within track)
+    if (phase === 'play' && bar) {
+      if (hitStop > 0) {
+        hitStop -= dt;
+      } else {
+        bar.x += bar.speed * bar.dir * dt;
+        if (bar.x >= BAR_TRACK_W) { bar.x = BAR_TRACK_W; bar.dir = -1; }
+        if (bar.x <= 0)           { bar.x = 0;           bar.dir =  1; }
+        autopilot(dt);
+      }
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    /* ─── title ─── */
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 54px -apple-system, Helvetica, Arial';
+      cx.fillText('ONE CUT', W / 2, 280);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('stop the bar at the mark', W / 2, 318);
+      cx.fillStyle = 'rgba(255,255,255,0.28)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('10 cuts · lowest error wins', W / 2, 344);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, 400);
+      cx.globalAlpha = 1;
+      if (pb !== Infinity) {
+        cx.fillStyle = GOLD; cx.font = '700 13px Menlo, monospace';
+        cx.fillText('PB  ' + pb + ' mm', W / 2, 435);
+      }
+    }
+
+    /* ─── challenge card (demo beat 1) ─── */
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '700 14px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 296);
+      cx.fillStyle = GOLD; cx.font = '900 86px -apple-system, Helvetica, Arial';
+      cx.fillText('24', W / 2, 402);
+      cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('total mm off — lower is better', W / 2, 432);
+    }
+
+    /* ─── play ─── */
+    if (phase === 'play') {
+      // cut counter
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px Menlo, monospace';
+      cx.fillText('CUT ' + (cutIdx + 1) + ' / ' + TOTAL_CUTS, W / 2, 140);
+
+      // running error
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '800 60px -apple-system, Helvetica, Arial';
+      cx.fillText(totalErr, W / 2, 210);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('mm off so far', W / 2, 232);
+
+      if (pb !== Infinity) {
+        cx.fillStyle = GOLD;
+        cx.font = '600 12px Menlo, monospace';
+        cx.fillText('PB ' + pb, W / 2, 260);
+      }
+
+      // draw previous cut dots
+      drawPreviousCuts();
+
+      // track + target
+      drawTrack();
+      if (bar !== null) {
+        drawTargetLine(targets[cutIdx]);
+      }
+
+      // moving bar
+      if (bar !== null) {
+        var barFrac = bar.x / BAR_TRACK_W;
+        // gradient color: green if near target, red if far
+        var targetPx = targets[cutIdx] * BAR_TRACK_W;
+        var dist3 = Math.abs(bar.x - targetPx);
+        var proximity = Math.max(0, 1 - dist3 / 60);
+        var hue = Math.round(proximity * 140);  // 0=red, 140=green
+        cx.fillStyle = 'hsl(' + hue + ',72%,54%)';
+        cx.globalAlpha = 0.92;
+        cx.beginPath();
+        var bw = BAR_TRACK_X + bar.x - BAR_TRACK_X;
+        if (cx.roundRect) {
+          cx.roundRect(BAR_TRACK_X, BAR_Y - BAR_H / 2, Math.max(16, bw), BAR_H, 8);
+        } else {
+          cx.rect(BAR_TRACK_X, BAR_Y - BAR_H / 2, Math.max(16, bw), BAR_H);
+        }
+        cx.fill();
+        cx.globalAlpha = 1;
+
+        // leading edge highlight
+        cx.fillStyle = 'rgba(255,255,255,0.55)';
+        cx.fillRect(BAR_TRACK_X + bar.x - 3, BAR_Y - BAR_H / 2 + 4, 3, BAR_H - 8);
+      }
+
+      // tap hint (first cut only)
+      if (cutIdx === 0 && bar) {
+        var p2 = 0.5 + 0.5 * Math.sin(now / 280);
+        cx.globalAlpha = p2 * 0.65;
+        cx.fillStyle = '#fff';
+        cx.font = '600 14px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP to cut', W / 2, BAR_Y + BAR_H / 2 + 40);
+        cx.globalAlpha = 1;
+      }
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '700 14px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + ' mm' + (SHARE.by ? ' — ' + SHARE.by : ''),
+          W / 2, 290
+        );
+      }
+    }
+
+    /* ─── game over ─── */
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+
+      var newPBOver = totalErr < pb || totalErr === pb;
+      cx.fillStyle = newPBOver ? GOLD : VERM;
+      cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText(newPBOver ? 'NEW BEST' : 'ROUND DONE', W / 2, 270);
+
+      cx.fillStyle = '#fff'; cx.font = '800 72px -apple-system, Helvetica, Arial';
+      cx.fillText(totalErr + ' mm', W / 2, 356);
+
+      var pt = pctTop(totalErr);
+      cx.fillStyle = GOLD; cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 398);
+
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('sharper than ' + (100 - pt) + '% of players', W / 2, 422);
+
+      if (!DEMO && !BOT) {
+        var p3 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p3;
+        cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — TRY AGAIN', W / 2, 472);
+        cx.globalAlpha = 1;
+
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) {
+          cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        } else {
+          cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        }
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W / 2, SHARE_R.y + 30
+        );
+      }
+    }
+
+    /* ─── demo CTA card ─── */
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('ONE CUT', W / 2, 296);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '500 18px -apple-system, Helvetica, Arial';
+      cx.fillText((window.__demoScore || 24) + ' mm total — beat it', W / 2, 336);
+      var p4 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p4;
+      cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 24), W / 2, 412);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 448);
+      cx.globalAlpha = 1;
+    }
+
+    /* ─── floating reward text ─── */
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 44);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, BAR_Y - 80 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 44) flashes.splice(k, 1);
+    }
+
+    /* ─── mute toggle ─── */
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

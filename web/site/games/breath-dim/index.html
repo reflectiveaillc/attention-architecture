@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Breath Dim — Tilt</title>
+<!--
+  LOOP / attention-architecture — Breath Dim
+  Engine: calm. Circuits: 05-ease, 07-timing, 01-rpe.
+  Mechanic: hold to inhale (screen brightens), release to exhale (dims).
+  Each full breath lowers the resting baseline a step → sleep onset arc.
+  Score = breaths completed before baseline reaches near-black (game_over).
+
+  Modes:
+    ?demo=1&seed=7     scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed M  imperfect autopilot N runs → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'breath-dim';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 deterministic RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  // Calm game — no vermillion
+
+  // ------------------------------------------------------------------
+  // Game state
+  // ------------------------------------------------------------------
+  // brightness: 0..1 (rendered as overlay alpha, 1=fully dark/sleep)
+  // baseline: starts ~0.05 (almost no darkness overlay), steps up per breath
+  //           when baseline >= SLEEP_THRESHOLD → game_over (sleep onset)
+  var SLEEP_THRESHOLD = 0.92;   // baseline level that triggers sleep
+  var BASELINE_STEP   = 0.085;  // each exhale completes → baseline rises
+  var MAX_INHALE_S    = 5.0;    // cap inhale brightness boost
+  var SETTLE_RATE     = 0.12;   // how fast brightness eases to target (per frame at 60fps)
+
+  var state;                    // phase: 'title' | 'play' | 'over' | 'cta'
+  var flashes = [];
+  var runStartTs = 0;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var ctaAt = 0;
+  var frameDt = 1;              // current frame dt, updated each frame
+  var holding = false;          // is the player currently holding (inhaling)?
+  var breathPhase = 'idle';     // idle | inhale | exhale
+  var holdTimer = 0;            // seconds held (for inhale timing)
+  var exhaleTimer = 0;          // seconds of exhale (before next breath)
+  var brightness = 0.05;        // current overlay darkness (0=clear 1=black)
+  var baseline   = 0.05;        // resting darkness that decays toward SLEEP_THRESHOLD
+  var breathCount = 0;          // score
+  var particleAngle = 0;
+
+  // floating particles (calm visual)
+  var particles = [];
+  function spawnParticle() {
+    particles.push({
+      x: W * 0.15 + rng() * W * 0.7,
+      y: H * 0.3 + rng() * H * 0.4,
+      r: 1.5 + rng() * 3,
+      a: 0,
+      vy: -0.25 - rng() * 0.3,
+      life: 0,
+      maxLife: 90 + rng() * 60
+    });
+  }
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ------------------------------------------------------------------
+  // Input
+  // ------------------------------------------------------------------
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function startHold() {
+    if (DEMO || BOT) return;
+    if (state.phase === 'title') { beginRun(); return; }
+    if (state.phase === 'play')  { holding = true; }
+  }
+  function endHold(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') return;
+    holding = false;
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale, py = (e.clientY - r.top) / scale;
+    if (inR(MUTE_R, px, py) && window.J && !DEMO && !BOT) { J.toggleMute(); return; }
+    startHold();
+  });
+  cv.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    endHold((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') startHold(); });
+  window.addEventListener('keyup',   function (e) { if (e.code === 'Space') endHold(); });
+
+  // ------------------------------------------------------------------
+  // Game logic
+  // ------------------------------------------------------------------
+  function newGame() {
+    state = { phase: 'title' };
+    flashes = []; particles = [];
+    holding = false; breathPhase = 'idle';
+    holdTimer = 0; exhaleTimer = 0;
+    brightness = 0.05; baseline = 0.05;
+    breathCount = 0; hitStop = 0; shakeAmt = 0; zoom = 1;
+    if (DEMO) { beginRun(); return; }
+    if (BOT)  { beginRun(); return; }
+  }
+
+  function beginRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    breathPhase = 'idle';
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function completeBreathe() {
+    // A full inhale+exhale cycle counted as one breath
+    breathCount++;
+    baseline = Math.min(SLEEP_THRESHOLD, baseline + BASELINE_STEP);
+    if (window.J) J.calm(breathCount);
+    flash(breathCount === 1 ? 'BREATHE' : breathCount < 5 ? 'DEEPER' : 'DRIFTING', TEAL, 28);
+    zoom = 1.015;
+    if (window.LOOP) LOOP.emit('breath_complete', { n: breathCount, baseline: +baseline.toFixed(3) });
+    // Reaching the threshold means sleep onset → game_over
+    if (baseline >= SLEEP_THRESHOLD) {
+      setTimeout(gameOver, 800);
+    }
+  }
+
+  function gameOver() {
+    if (state.phase !== 'play') return;
+    state.phase = 'over';
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.calm(breathCount + 1);
+    if (window.LOOP) LOOP.emit('game_over', { score: breathCount, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = breathCount;
+      setTimeout(function () {
+        state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2000);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(resetRun, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    flashes = []; particles = [];
+    holding = false; breathPhase = 'idle';
+    holdTimer = 0; exhaleTimer = 0;
+    brightness = 0.05; baseline = 0.05;
+    breathCount = 0; hitStop = 0; shakeAmt = 0; zoom = 1;
+    // Reset autopilot state for the next run
+    botHolding = false; botHoldFor = 0; botWaitFor = 0; botBreathsDone = 0;
+    demoIdx = 0; demoHolding = false; demoTimer = 0; demoWaiting = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    beginRun();
+  }
+
+  // ------------------------------------------------------------------
+  // Bot / Demo autopilot
+  // ------------------------------------------------------------------
+  var botRunsDone = 0;
+  var botHolding = false;
+  var botHoldFor = 0;    // frames to hold
+  var botWaitFor = 0;    // frames to wait before next inhale
+  var botBreathsDone = 0;
+  // Bot will do enough breaths to trigger game_over naturally
+  // Each breath needs ~2-4s hold + 1-2s exhale. With BASELINE_STEP=0.085,
+  // need ceil((SLEEP_THRESHOLD - 0.05) / 0.085) = ceil(0.87/0.085) = 11 breaths.
+  // Bot does 12 breaths to be safe.
+  var BOT_BREATHS_MAX = 12;
+
+  // Demo script: [holdFrames, pauseFrames] at ~60fps
+  // SETTLE_RATE=0.12 → eases in ~10 frames, need >0.5s=30 frames pause
+  // BASELINE_STEP=0.085, need 11 completions: 0.05 + 11×0.085 = 0.985 >= 0.92
+  // 11 cycles × ~65 frames avg = 715 frames ≈ 12s play; then gameOver → cta
+  var demoScript = [
+    [30, 35],   // 0.5s hold, 0.58s pause — settle
+    [34, 35],
+    [38, 35],
+    [40, 36],   // deepen
+    [42, 36],
+    [44, 37],
+    [46, 37],   // resolve
+    [48, 38],
+    [50, 38],
+    [52, 39],
+    [54, 40],   // sleep onset
+  ];
+  var demoIdx = 0, demoHolding = false, demoTimer = 0, demoWaiting = false;
+
+  function autopilot(dt) {
+    if (state.phase !== 'play') return;
+
+    if (DEMO) {
+      if (demoIdx >= demoScript.length) return;
+      var step = demoScript[demoIdx];
+      demoTimer += dt; // dt is already ~1 per frame at 60fps
+      if (!demoWaiting) {
+        // inhale phase
+        if (!demoHolding) { demoHolding = true; holding = true; }
+        if (demoTimer >= step[0]) {
+          // end inhale → start exhale pause
+          holding = false; demoHolding = false;
+          demoWaiting = true; demoTimer = 0;
+        }
+      } else {
+        // exhale / pause phase
+        if (demoTimer >= step[1]) {
+          demoWaiting = false; demoTimer = 0; demoIdx++;
+        }
+      }
+      return;
+    }
+
+    if (BOT) {
+      if (botBreathsDone >= BOT_BREATHS_MAX) {
+        // Bot is done breathing — let game_over fire from baseline reaching threshold
+        botHolding = false; holding = false;
+        return;
+      }
+      if (botWaitFor > 0) {
+        botWaitFor -= dt;
+        holding = false; botHolding = false;
+        return;
+      }
+      if (!botHolding) {
+        // Start a new inhale: 80-280 frames (1.3-4.7s)
+        botHoldFor = 80 + Math.floor(rng() * 200);
+        botHolding = true; holding = true;
+      }
+      botHoldFor -= dt;
+      if (botHoldFor <= 0) {
+        // End inhale → pause before next
+        holding = false; botHolding = false;
+        botWaitFor = 40 + Math.floor(rng() * 60);  // 0.7-1.7s pause
+        botBreathsDone++;
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Update breath phases
+  // ------------------------------------------------------------------
+  function updateBreath(dt) {
+    var dtS = dt / 60; // dt is in "frames" normalized (16.667ms chunks)
+
+    if (holding) {
+      // Inhaling: brightness eases toward (baseline + boost based on hold duration)
+      holdTimer += dtS;
+      var boost = Math.min(0.5, holdTimer / MAX_INHALE_S * 0.5);
+      var inhaleTarget = Math.max(0, baseline - boost); // screen gets LIGHTER (less dark) on inhale
+      brightness += (inhaleTarget - brightness) * SETTLE_RATE * dt;
+      breathPhase = 'inhale';
+      exhaleTimer = 0;
+      // Spawn particles on inhale
+      if (Math.random() < 0.15 * dt) spawnParticle();
+    } else {
+      // Exhaling: brightness returns to baseline then slightly below → counts breath
+      holdTimer = 0;
+      exhaleTimer += dtS;
+      var exhaleTarget = baseline; // ease back to baseline darkness
+      brightness += (exhaleTarget - brightness) * SETTLE_RATE * dt;
+      if (breathPhase === 'inhale') {
+        // Just released — this is an exhale completion if we held long enough
+        breathPhase = 'exhale';
+      }
+      // If we've held long enough in exhale, count the breath (time-based, robust to varying framerates)
+      if (breathPhase === 'exhale' && exhaleTimer > 0.4) {
+        breathPhase = 'idle';
+        exhaleTimer = 0;
+        completeBreathe();
+      }
+      if (breathPhase === 'idle') exhaleTimer = 0;
+    }
+    // clamp
+    brightness = Math.max(0, Math.min(1, brightness));
+  }
+
+  // Orbital ring params
+  function ringParams(step) {
+    var t = performance.now() / 1000;
+    var pulse = holding ? 1 + 0.04 * Math.sin(t * 2.5) : 1 + 0.015 * Math.sin(t * 0.8);
+    var baseR = 88 + step * 6;
+    return baseR * pulse;
+  }
+
+  // ------------------------------------------------------------------
+  // Render
+  // ------------------------------------------------------------------
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+    frameDt = dt;
+
+    // Autopilot advance
+    if (DEMO || BOT) autopilot(dt);
+
+    // Breath update
+    if (state.phase === 'play') updateBreath(dt);
+
+    // Hit-stop gating: decay hitStop, but autopilot still runs (calm game uses hitStop for zoom only)
+    if (hitStop > 0) hitStop -= dt;
+
+    // Juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // Background — pure dark canvas
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+
+    if (state.phase === 'title') {
+      drawTitle(now);
+    } else if (state.phase === 'play') {
+      drawPlay(now);
+    } else if (state.phase === 'over') {
+      drawPlay(now);
+      drawOver(now);
+    } else if (state.phase === 'cta') {
+      drawPlay(now);
+      drawCta(now);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.88)';
+    cx.font = '700 38px -apple-system, Helvetica, Arial';
+    cx.fillText('BREATH DIM', W / 2, 280);
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '400 16px -apple-system, Helvetica, Arial';
+    cx.fillText('hold to inhale · release to exhale', W / 2, 320);
+    var pulse = 0.5 + 0.45 * Math.sin(now / 700);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = TEAL;
+    cx.font = '600 15px -apple-system, Helvetica, Arial';
+    cx.fillText('HOLD TO BEGIN', W / 2, 375);
+    cx.globalAlpha = 1;
+    cx.fillStyle = 'rgba(255,255,255,0.22)';
+    cx.font = '400 12px -apple-system, Helvetica, Arial';
+    cx.fillText('each breath dims the light', W / 2, 408);
+  }
+
+  function drawPlay(now) {
+    var t = now / 1000;
+    var cx_ = cx;
+
+    // Brightness overlay: dark layer whose alpha = brightness
+    // When brightness is high → screen is dark → calm/sleepy
+    cx_.fillStyle = INK;
+    cx_.globalAlpha = brightness;
+    cx_.fillRect(0, 0, W, H);
+    cx_.globalAlpha = 1;
+
+    // Center orb — glows on inhale
+    var orbR = 60 + (holding ? 18 : 0) * Math.sin(Math.min(holdTimer, 1) * Math.PI);
+    orbR += 4 * Math.sin(t * 1.2);
+    var inhaleAlpha = holding ? 0.18 + 0.12 * Math.sin(t * 2.2) : 0.08;
+    // Outer glow rings
+    for (var ri = 3; ri >= 0; ri--) {
+      var rr = ringParams(ri);
+      var rAlpha = (0.07 - ri * 0.015) * (1 - brightness * 0.5);
+      cx_.beginPath();
+      cx_.arc(W / 2, H / 2, rr, 0, Math.PI * 2);
+      cx_.strokeStyle = TEAL;
+      cx_.globalAlpha = Math.max(0, rAlpha);
+      cx_.lineWidth = 1;
+      cx_.stroke();
+      cx_.globalAlpha = 1;
+    }
+    // Core orb glow
+    var grad = cx_.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, orbR + 40);
+    grad.addColorStop(0, 'rgba(46,197,182,' + (inhaleAlpha + 0.08) + ')');
+    grad.addColorStop(0.5, 'rgba(46,197,182,' + inhaleAlpha + ')');
+    grad.addColorStop(1, 'rgba(46,197,182,0)');
+    cx_.fillStyle = grad;
+    cx_.beginPath();
+    cx_.arc(W / 2, H / 2, orbR + 40, 0, Math.PI * 2);
+    cx_.fill();
+
+    // Core circle
+    cx_.beginPath();
+    cx_.arc(W / 2, H / 2, orbR, 0, Math.PI * 2);
+    cx_.fillStyle = 'rgba(46,197,182,' + (0.12 + (holding ? 0.12 : 0)) + ')';
+    cx_.fill();
+    cx_.strokeStyle = 'rgba(46,197,182,' + (0.5 + (holding ? 0.3 : 0)) + ')';
+    cx_.lineWidth = 1.5;
+    cx_.stroke();
+
+    // Breath label inside orb
+    cx_.textAlign = 'center';
+    cx_.fillStyle = 'rgba(255,255,255,' + (0.7 - brightness * 0.4) + ')';
+    cx_.font = '400 12px -apple-system, Helvetica, Arial';
+    cx_.fillText(holding ? 'inhale' : (breathPhase === 'exhale' ? 'exhale' : ''), W / 2, H / 2 + 4);
+
+    // Particles floating upward
+    particleAngle += 0.002 * frameDt;
+    for (var pi = particles.length - 1; pi >= 0; pi--) {
+      var p = particles[pi];
+      p.life += frameDt;
+      p.y += p.vy * frameDt;
+      var lifeRatio = p.life / p.maxLife;
+      p.a = lifeRatio < 0.2 ? lifeRatio / 0.2 : lifeRatio > 0.7 ? (1 - lifeRatio) / 0.3 : 1;
+      cx_.beginPath();
+      cx_.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      cx_.fillStyle = TEAL;
+      cx_.globalAlpha = p.a * 0.35 * (1 - brightness * 0.6);
+      cx_.fill();
+      cx_.globalAlpha = 1;
+      if (p.life >= p.maxLife) particles.splice(pi, 1);
+    }
+
+    // Breath count (score)
+    cx_.textAlign = 'center';
+    cx_.fillStyle = 'rgba(255,255,255,' + (0.8 - brightness * 0.5) + ')';
+    cx_.font = '700 52px -apple-system, Helvetica, Arial';
+    cx_.fillText(breathCount, W / 2, 120);
+    cx_.fillStyle = 'rgba(255,255,255,' + (0.3 - brightness * 0.2) + ')';
+    cx_.font = '400 12px -apple-system, Helvetica, Arial';
+    cx_.fillText('breaths', W / 2, 140);
+
+    // Baseline progress dots at bottom
+    var totalSteps = Math.ceil((SLEEP_THRESHOLD - 0.05) / BASELINE_STEP);
+    var filledSteps = Math.round((baseline - 0.05) / BASELINE_STEP);
+    var dotSpacing = 14, dotY = H - 55;
+    var dotsStartX = W / 2 - (totalSteps - 1) * dotSpacing / 2;
+    for (var di = 0; di < totalSteps; di++) {
+      var filled = di < filledSteps;
+      cx_.beginPath();
+      cx_.arc(dotsStartX + di * dotSpacing, dotY, 3, 0, Math.PI * 2);
+      cx_.fillStyle = filled ? TEAL : 'rgba(46,197,182,0.2)';
+      cx_.globalAlpha = 1 - brightness * 0.6;
+      cx_.fill();
+      cx_.globalAlpha = 1;
+    }
+    cx_.fillStyle = 'rgba(255,255,255,' + (0.2 - brightness * 0.15) + ')';
+    cx_.font = '400 10px -apple-system, Helvetica, Arial';
+    cx_.fillText('sleep approaching', W / 2, H - 30);
+
+    // Instruction fade out after first breath
+    if (breathCount === 0 && state.phase === 'play') {
+      var instA = Math.max(0, 0.4 - brightness * 2);
+      cx_.fillStyle = 'rgba(255,255,255,' + instA + ')';
+      cx_.font = '400 13px -apple-system, Helvetica, Arial';
+      cx_.fillText('hold · release · repeat', W / 2, H / 2 + 100);
+    }
+
+    // Flashes
+    for (var fi = flashes.length - 1; fi >= 0; fi--) {
+      var fl = flashes[fi]; fl.t += frameDt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx_.globalAlpha = a; cx_.textAlign = 'center';
+      cx_.fillStyle = fl.color;
+      cx_.font = '600 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx_.fillText(fl.txt, W / 2, H / 2 - 100 - fl.t * 0.4);
+      cx_.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(fi, 1);
+    }
+
+    // Dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+      cx_.fillStyle = GOLD;
+      cx_.font = '700 13px -apple-system, Helvetica, Arial';
+      cx_.textAlign = 'center';
+      cx_.fillText('REACH ' + SHARE.dare + ' BREATHS' + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 162);
+    }
+  }
+
+  function drawOver(now) {
+    var t = now / 1000;
+    var fadeIn = Math.min(1, (Date.now() - (runStartTs + (Date.now() - runStartTs))) / 800);
+    cx.fillStyle = 'rgba(11,13,18,0.7)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    // Calm completion — no harsh colors
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '300 28px -apple-system, Helvetica, Arial';
+    cx.fillText('you fell asleep', W / 2, 285);
+    cx.fillStyle = TEAL;
+    cx.font = '700 64px -apple-system, Helvetica, Arial';
+    cx.fillText(breathCount, W / 2, 360);
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.font = '400 14px -apple-system, Helvetica, Arial';
+    cx.fillText('breaths to sleep', W / 2, 385);
+    if (!DEMO && !BOT) {
+      var pulse = 0.55 + 0.4 * Math.sin(t * 1.1);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to breathe again', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+    // Tap to restart (human)
+    if (!DEMO && !BOT) {
+      cv.addEventListener('pointerdown', handleOverTap, { once: true });
+    }
+  }
+
+  var overTapSetup = false;
+  function handleOverTap() {
+    if (state.phase === 'over') resetRun();
+  }
+
+  function drawCta(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 1.8);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.85 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '300 32px -apple-system, Helvetica, Arial';
+    cx.fillText('BREATH DIM', W / 2, 285);
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.font = '400 16px -apple-system, Helvetica, Arial';
+    cx.fillText('dim the light. find sleep.', W / 2, 320);
+    var p2 = 0.7 + 0.3 * Math.sin(now / 600);
+    cx.fillStyle = TEAL; cx.globalAlpha = ease * p2;
+    cx.font = '700 20px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 390);
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '400 13px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 420);
+    cx.globalAlpha = 1;
+  }
+
+  // Tap-to-restart: use a flag to avoid stacking listeners
+  window.addEventListener('pointerdown', function () {
+    if (state && state.phase === 'over' && !DEMO && !BOT) resetRun();
+  });
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1018 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Train Timetable — Tilt</title>
+<!--
+  LOOP / attention-architecture — Train Timetable
+  Circuits: 06-zeigarnik, 05-ease, 08-investment
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'train-timetable';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL2 = '#1da99c', SOFT = 'rgba(46,197,182,0.18)';
+
+  // ---- GRID LAYOUT ----
+  // 4 platforms (rows), 5 time slots (cols)
+  // Each train occupies 1-2 consecutive time slots on one platform
+  // Constraint: no two trains overlap on the same platform at the same time slot
+  var PLATFORMS = 4;
+  var SLOTS = 5;
+  var GRID_X = 42;       // left edge of grid
+  var GRID_Y = 200;      // top edge of grid
+  var CELL_W = 66;
+  var CELL_H = 56;
+  var GRID_W = SLOTS * CELL_W;
+  var GRID_H = PLATFORMS * CELL_H;
+
+  var PLATFORM_LABELS = ['A', 'B', 'C', 'D'];
+  var TIME_LABELS = ['06:00','07:00','08:00','09:00','10:00'];
+
+  // Train colors (teal palette variants, calm)
+  var TRAIN_COLORS = [
+    { fill: '#2ec5b6', dark: '#1da99c', text: '#0b0d12' },
+    { fill: '#f2b134', dark: '#c8911a', text: '#0b0d12' },
+    { fill: '#6ec6f5', dark: '#3ba8d8', text: '#0b0d12' },
+    { fill: '#a8d8a8', dark: '#6bb56b', text: '#0b0d12' },
+    { fill: '#d4a8e8', dark: '#b07acc', text: '#0b0d12' },
+    { fill: '#f5a8a8', dark: '#d87070', text: '#0b0d12' },
+  ];
+
+  // ---- PUZZLE GENERATION ----
+  function generatePuzzle(rngFn) {
+    // Place N trains on the grid without conflicts
+    // Each train: { id, platform, startSlot, length(1 or 2), color }
+    var trains = [];
+    var occupied = []; // occupied[platform][slot] = trainId or -1
+    for (var p = 0; p < PLATFORMS; p++) {
+      occupied[p] = [];
+      for (var s = 0; s < SLOTS; s++) occupied[p][s] = -1;
+    }
+
+    var id = 0;
+    var attempts = 0;
+    var target = 5 + Math.floor(rngFn() * 3); // 5-7 trains
+    target = Math.min(target, 7);
+
+    while (id < target && attempts < 200) {
+      attempts++;
+      var plat = Math.floor(rngFn() * PLATFORMS);
+      var len = rngFn() < 0.45 ? 2 : 1;
+      var slot = Math.floor(rngFn() * (SLOTS - len + 1));
+      // check conflicts
+      var ok = true;
+      for (var l = 0; l < len; l++) {
+        if (occupied[plat][slot + l] !== -1) { ok = false; break; }
+      }
+      if (!ok) continue;
+      // place
+      for (var l = 0; l < len; l++) occupied[plat][slot + l] = id;
+      var colorIdx = id % TRAIN_COLORS.length;
+      trains.push({ id: id, platform: plat, startSlot: slot, length: len, color: TRAIN_COLORS[colorIdx], label: 'T' + (id + 1) });
+      id++;
+    }
+    return trains;
+  }
+
+  // ---- GAME STATE ----
+  var state, hitStop, zoom, shakeAmt, flashes;
+  var runStartTs, botRunsDone;
+  var ctaAt = 0, last = performance.now();
+
+  // Drag state
+  var dragging = null; // { trainId, offsetX, offsetY, curX, curY }
+  // Token positions: placed in correct cell, or in tray (bottom)
+  // Each token: { id, placed, platform, startSlot } — placed=true means correct grid pos
+  var tokens;  // array of { id, x, y, placed, platform, startSlot, length, color, label }
+  var solvedIds;
+
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // Tray layout: tokens start in a row at the bottom
+  var TRAY_Y = H - 120;
+  var TRAY_TOKEN_H = 44;
+  var TRAY_TOKEN_W = 52;
+
+  function cellX(slot) { return GRID_X + slot * CELL_W; }
+  function cellY(plat) { return GRID_Y + plat * CELL_H; }
+
+  // Snap a position to grid cell, returns {platform, startSlot} or null
+  function snapToCell(x, y, trainLen) {
+    // find which cell the center is closest to
+    var cx2 = x + (trainLen * CELL_W) / 2 - CELL_W / 2;
+    var cy2 = y + CELL_H / 2;
+    var col = Math.round((cx2 - GRID_X) / CELL_W);
+    var row = Math.round((cy2 - GRID_Y) / CELL_H);
+    col = Math.max(0, Math.min(SLOTS - trainLen, col));
+    row = Math.max(0, Math.min(PLATFORMS - 1, row));
+    if (x < GRID_X - CELL_W || x > GRID_X + GRID_W || y < GRID_Y - CELL_H || y > GRID_Y + GRID_H + CELL_H) return null;
+    return { platform: row, startSlot: col };
+  }
+
+  // Check if placing a token at (platform, startSlot, length) conflicts with any other placed token
+  function hasConflict(token, platform, startSlot) {
+    for (var i = 0; i < tokens.length; i++) {
+      var t = tokens[i];
+      if (t.id === token.id) continue;
+      if (!t.placed) continue;
+      if (t.platform !== platform) continue;
+      // overlap check
+      var aStart = startSlot, aEnd = startSlot + token.length - 1;
+      var bStart = t.startSlot, bEnd = t.startSlot + t.length - 1;
+      if (aStart <= bEnd && aEnd >= bStart) return true;
+    }
+    return false;
+  }
+
+  function isCorrect(token, platform, startSlot) {
+    return token.platform === platform && token.startSlot === startSlot;
+  }
+
+  // Get pixel position of a placed token
+  function tokenGridPos(token) {
+    return { x: cellX(token.startSlot), y: cellY(token.platform) };
+  }
+
+  function newGame() {
+    rng = mulberry32(SEED);
+    var trains = generatePuzzle(rng);
+    hitStop = 0; zoom = 1; shakeAmt = 0; flashes = [];
+    solvedIds = [];
+    botRunsDone = 0;
+
+    // Create tokens in tray
+    var traySpacing = Math.min(62, (W - 40) / trains.length);
+    var trayStartX = (W - traySpacing * (trains.length - 1) - TRAY_TOKEN_W) / 2;
+
+    tokens = trains.map(function (tr, i) {
+      return {
+        id: tr.id,
+        // correct answer:
+        platform: tr.platform,
+        startSlot: tr.startSlot,
+        length: tr.length,
+        color: tr.color,
+        label: tr.label,
+        // current visual state:
+        placed: false,    // placed in a (possibly wrong) grid cell
+        placedPlatform: -1,
+        placedSlot: -1,
+        // tray position:
+        trayX: trayStartX + i * traySpacing,
+        trayY: TRAY_Y,
+        // current x,y (for dragging/animation)
+        x: trayStartX + i * traySpacing,
+        y: TRAY_Y,
+        solveGlow: 0,
+      };
+    });
+
+    if (BOT) {
+      state = { phase: 'play', score: 0 };
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      scheduleBotMove();
+    } else if (DEMO) {
+      state = { phase: 'play', score: 0 };
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      scheduleDemoMove();
+    } else {
+      state = { phase: 'title', score: 0 };
+      dragging = null;
+    }
+  }
+
+  function startPlay() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- PLACE TOKEN ----
+  function placeToken(tokenId, platform, startSlot) {
+    var tok = tokens[tokenId];
+    if (!tok) return false;
+
+    // Remove from current grid position if placed
+    if (tok.placed) {
+      tok.placed = false;
+      tok.placedPlatform = -1;
+      tok.placedSlot = -1;
+    }
+
+    var conflict = hasConflict(tok, platform, startSlot);
+    if (conflict) return false; // can't place here
+
+    tok.placed = true;
+    tok.placedPlatform = platform;
+    tok.placedSlot = startSlot;
+    tok.x = cellX(startSlot);
+    tok.y = cellY(platform);
+
+    // check if correct
+    var correct = isCorrect(tok, platform, startSlot);
+    if (correct && solvedIds.indexOf(tokenId) === -1) {
+      solvedIds.push(tokenId);
+      tok.solveGlow = 1;
+      flash('+' + (10 + tok.length * 5), TEAL, 32, W / 2, GRID_Y + cellY(platform) - GRID_Y + CELL_H / 2);
+      if (window.J) J.calm(solvedIds.length);
+      hitStop = 2; zoom = 1.012;
+      state.score += 10 + tok.length * 5;
+      if (window.LOOP) LOOP.emit('token_placed', { id: tokenId, correct: true, n: solvedIds.length });
+
+      // All solved?
+      if (solvedIds.length === tokens.length) {
+        setTimeout(gameOver, 600);
+      }
+    } else if (!correct) {
+      // Wrong position but no conflict — allowed, shows as "placed but dimmed"
+      if (window.LOOP) LOOP.emit('token_placed', { id: tokenId, correct: false });
+    }
+    return true;
+  }
+
+  function returnToTray(tokenId) {
+    var tok = tokens[tokenId];
+    if (!tok) return;
+    // Remove from solved if was solved
+    var sidx = solvedIds.indexOf(tokenId);
+    if (sidx !== -1) {
+      solvedIds.splice(sidx, 1);
+      state.score = Math.max(0, state.score - (10 + tok.length * 5));
+    }
+    tok.placed = false;
+    tok.placedPlatform = -1;
+    tok.placedSlot = -1;
+    tok.x = tok.trayX;
+    tok.y = tok.trayY;
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.calm(tokens.length + 2);
+    zoom = 1.02; shakeAmt = 2;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      window.__demoScore = state.score;
+      state.phase = 'over';
+      // After showing result briefly, show CTA
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () {
+          rng = mulberry32(SEED + botRunsDone);
+          var trains = generatePuzzle(rng);
+          var traySpacing = Math.min(62, (W - 40) / trains.length);
+          var trayStartX = (W - traySpacing * (trains.length - 1) - TRAY_TOKEN_W) / 2;
+          tokens = trains.map(function (tr, i) {
+            return {
+              id: tr.id, platform: tr.platform, startSlot: tr.startSlot,
+              length: tr.length, color: tr.color, label: tr.label,
+              placed: false, placedPlatform: -1, placedSlot: -1,
+              trayX: trayStartX + i * traySpacing, trayY: TRAY_Y,
+              x: trayStartX + i * traySpacing, y: TRAY_Y,
+              solveGlow: 0,
+            };
+          });
+          solvedIds = [];
+          state = { phase: 'play', score: 0 };
+          flashes = [];
+          runStartTs = Date.now();
+          if (window.LOOP) LOOP.emit('restart', {});
+          if (window.LOOP) LOOP.emit('play_start', { seed: SEED + botRunsDone });
+          scheduleBotMove();
+        }, 500);
+      }
+    }
+  }
+
+  // ---- BOT AUTOPILOT ----
+  // Bot places tokens one by one into correct slots; then a few wrong/right moves
+  var botMoveQueue = [];
+  var botMoveTimer = null;
+
+  function scheduleBotMove() {
+    if (botMoveTimer) clearTimeout(botMoveTimer);
+    buildBotQueue();
+    doBotMove();
+  }
+
+  function buildBotQueue() {
+    botMoveQueue = [];
+    var shuffled = tokens.slice().sort(function () { return rng() - 0.5; });
+    // Bot places most tokens correctly but sometimes picks wrong platform first
+    for (var i = 0; i < shuffled.length; i++) {
+      var tok = shuffled[i];
+      var makeError = rng() < 0.3 && PLATFORMS > 1;
+      if (makeError) {
+        // Place in wrong platform first, then correct
+        var wrongPlat = (tok.platform + 1 + Math.floor(rng() * (PLATFORMS - 1))) % PLATFORMS;
+        botMoveQueue.push({ type: 'place', id: tok.id, platform: wrongPlat, startSlot: tok.startSlot });
+        botMoveQueue.push({ type: 'pickup', id: tok.id });
+      }
+      botMoveQueue.push({ type: 'place', id: tok.id, platform: tok.platform, startSlot: tok.startSlot });
+    }
+  }
+
+  function doBotMove() {
+    if (state.phase !== 'play') return;
+    if (botMoveQueue.length === 0) {
+      // Force game over if somehow not triggered
+      setTimeout(gameOver, 300);
+      return;
+    }
+    var move = botMoveQueue.shift();
+    if (move.type === 'pickup') {
+      returnToTray(move.id);
+    } else if (move.type === 'place') {
+      var tok = tokens[move.id];
+      if (!tok) { setTimeout(doBotMove, 200); return; }
+      // Try to place; if conflict pick different slot
+      var placed = placeToken(move.id, move.platform, move.startSlot);
+      if (!placed) {
+        // try other slots
+        for (var s = 0; s < SLOTS - tok.length + 1; s++) {
+          if (placeToken(move.id, move.platform, s)) break;
+        }
+      }
+    }
+    var delay = 380 + Math.floor(rng() * 400);
+    if (botMoveQueue.length === 0) delay = 300;
+    botMoveTimer = setTimeout(doBotMove, delay);
+  }
+
+  // ---- DEMO AUTOPILOT ----
+  // Demo arc: settle (place easy trains slowly) → deepen (fill grid) → resolve (last trains click into place) → soft CTA
+  var demoMoveQueue = [];
+  var demoMoveTimer = null;
+
+  function scheduleDemoMove() {
+    if (demoMoveTimer) clearTimeout(demoMoveTimer);
+    buildDemoQueue();
+    doDemoMove();
+  }
+
+  function buildDemoQueue() {
+    demoMoveQueue = [];
+    // Settle: place first 2 tokens slowly with hesitation
+    var order = tokens.slice();
+    // Sort by startSlot so it looks methodical
+    order.sort(function (a, b) { return a.startSlot - b.startSlot; });
+
+    for (var i = 0; i < order.length; i++) {
+      var tok = order[i];
+      // Hesitation pause before each
+      var waitMs = i < 2 ? 900 : (i < 4 ? 600 : 400);
+      demoMoveQueue.push({ type: 'wait', ms: waitMs });
+      // Occasionally place in slightly wrong slot then correct (human feel)
+      if (i === 1 && tok.startSlot > 0) {
+        demoMoveQueue.push({ type: 'place', id: tok.id, platform: tok.platform, startSlot: tok.startSlot - 1 });
+        demoMoveQueue.push({ type: 'wait', ms: 500 });
+        demoMoveQueue.push({ type: 'pickup', id: tok.id });
+        demoMoveQueue.push({ type: 'wait', ms: 300 });
+      }
+      demoMoveQueue.push({ type: 'place', id: tok.id, platform: tok.platform, startSlot: tok.startSlot });
+    }
+  }
+
+  function doDemoMove() {
+    if (state.phase !== 'play' && state.phase !== 'over') return;
+    if (demoMoveQueue.length === 0) {
+      // All placed — game_over fires via placeToken when last token placed
+      return;
+    }
+    var move = demoMoveQueue.shift();
+    if (move.type === 'wait') {
+      demoMoveTimer = setTimeout(doDemoMove, move.ms);
+      return;
+    }
+    if (move.type === 'pickup') {
+      returnToTray(move.id);
+    } else if (move.type === 'place') {
+      var tok = tokens[move.id];
+      if (!tok) { setTimeout(doDemoMove, 100); return; }
+      var placed = placeToken(move.id, move.platform, move.startSlot);
+      if (!placed) {
+        // try adjacent slot
+        var alt = move.startSlot > 0 ? move.startSlot - 1 : move.startSlot + 1;
+        placeToken(move.id, move.platform, alt);
+      }
+    }
+    if (demoMoveQueue.length > 0) {
+      demoMoveTimer = setTimeout(doDemoMove, 50);
+    }
+  }
+
+  // ---- FLASH ----
+  function flash(txt, color, size, fx, fy) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0, x: fx || W / 2, y: fy || H / 2 - 80 });
+  }
+
+  // ---- INPUT ----
+  function pointerDown(px, py) {
+    if (DEMO || BOT) return;
+    if (state.phase === 'title') { startPlay(); return; }
+    if (state.phase !== 'play') return;
+
+    // Check mute button
+    if (inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+
+    // Check tray tokens first (pick up from tray)
+    for (var i = tokens.length - 1; i >= 0; i--) {
+      var tok = tokens[i];
+      var tx = tok.x, ty = tok.y;
+      var tw = tok.length * CELL_W - 6, th = TRAY_TOKEN_H;
+      if (!tok.placed) {
+        // Tray: token is at tok.trayX, tok.trayY
+        if (px >= tok.trayX && px <= tok.trayX + tw && py >= tok.trayY && py <= tok.trayY + th) {
+          dragging = { tokenId: tok.id, offsetX: px - tok.trayX, offsetY: py - tok.trayY };
+          return;
+        }
+      } else {
+        // Grid: token is at cellX, cellY
+        var gx = cellX(tok.placedSlot), gy = cellY(tok.placedPlatform);
+        if (px >= gx && px <= gx + tok.length * CELL_W - 4 && py >= gy && py <= gy + CELL_H - 4) {
+          returnToTray(tok.id);
+          dragging = { tokenId: tok.id, offsetX: TRAY_TOKEN_W / 2, offsetY: TRAY_TOKEN_H / 2 };
+          return;
+        }
+      }
+    }
+  }
+
+  function pointerMove(px, py) {
+    if (DEMO || BOT || !dragging) return;
+    var tok = tokens[dragging.tokenId];
+    if (!tok) return;
+    tok.x = px - dragging.offsetX;
+    tok.y = py - dragging.offsetY;
+  }
+
+  function pointerUp(px, py) {
+    if (DEMO || BOT || !dragging) return;
+    var tok = tokens[dragging.tokenId];
+    dragging = null;
+    if (!tok) return;
+
+    // Try to snap to grid
+    var snap = snapToCell(tok.x, tok.y, tok.length);
+    if (snap) {
+      var placed = placeToken(tok.id, snap.platform, snap.startSlot);
+      if (!placed) {
+        // conflict — return to tray
+        tok.x = tok.trayX; tok.y = tok.trayY;
+        if (window.J) J.calm(0);
+        shakeAmt = 3;
+      }
+    } else {
+      // Out of grid — return to tray
+      tok.x = tok.trayX; tok.y = tok.trayY;
+    }
+  }
+
+  function resetGame() {
+    rng = mulberry32(SEED);
+    var trains = generatePuzzle(rng);
+    var traySpacing = Math.min(62, (W - 40) / trains.length);
+    var trayStartX = (W - traySpacing * (trains.length - 1) - TRAY_TOKEN_W) / 2;
+    tokens = trains.map(function (tr, i) {
+      return {
+        id: tr.id, platform: tr.platform, startSlot: tr.startSlot,
+        length: tr.length, color: tr.color, label: tr.label,
+        placed: false, placedPlatform: -1, placedSlot: -1,
+        trayX: trayStartX + i * traySpacing, trayY: TRAY_Y,
+        x: trayStartX + i * traySpacing, y: TRAY_Y,
+        solveGlow: 0,
+      };
+    });
+    solvedIds = [];
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    state = { phase: 'title', score: 0 };
+    dragging = null;
+    if (window.LOOP) LOOP.emit('restart', {});
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    e.preventDefault();
+    var r = cv.getBoundingClientRect();
+    pointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointermove', function (e) {
+    e.preventDefault();
+    if (!dragging) return;
+    var r = cv.getBoundingClientRect();
+    pointerMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', function (e) {
+    e.preventDefault();
+    var r = cv.getBoundingClientRect();
+    pointerUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointercancel', function () {
+    if (dragging) {
+      var tok = tokens[dragging.tokenId];
+      if (tok) { tok.x = tok.trayX; tok.y = tok.trayY; }
+      dragging = null;
+    }
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' && state.phase === 'title') startPlay();
+  });
+
+  // ---- RENDER ----
+  function drawRoundRect(x, y, w, h, r) {
+    if (cx.roundRect) {
+      cx.roundRect(x, y, w, h, r);
+    } else {
+      cx.rect(x, y, w, h);
+    }
+  }
+
+  function drawGrid(now) {
+    // Background grid area
+    cx.fillStyle = 'rgba(255,255,255,0.03)';
+    cx.beginPath();
+    drawRoundRect(GRID_X - 2, GRID_Y - 2, GRID_W + 4, GRID_H + 4, 6);
+    cx.fill();
+
+    // Grid lines
+    cx.strokeStyle = 'rgba(255,255,255,0.08)';
+    cx.lineWidth = 1;
+    for (var col = 0; col <= SLOTS; col++) {
+      cx.beginPath();
+      cx.moveTo(GRID_X + col * CELL_W, GRID_Y);
+      cx.lineTo(GRID_X + col * CELL_W, GRID_Y + GRID_H);
+      cx.stroke();
+    }
+    for (var row = 0; row <= PLATFORMS; row++) {
+      cx.beginPath();
+      cx.moveTo(GRID_X, GRID_Y + row * CELL_H);
+      cx.lineTo(GRID_X + GRID_W, GRID_Y + row * CELL_H);
+      cx.stroke();
+    }
+
+    // Platform labels (left)
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '700 14px Menlo, monospace';
+    for (var p = 0; p < PLATFORMS; p++) {
+      cx.fillText(PLATFORM_LABELS[p], GRID_X - 18, GRID_Y + p * CELL_H + CELL_H / 2 + 5);
+    }
+
+    // Time labels (top)
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 10px Menlo, monospace';
+    for (var s = 0; s < SLOTS; s++) {
+      cx.fillText(TIME_LABELS[s], GRID_X + s * CELL_W + CELL_W / 2, GRID_Y - 8);
+    }
+
+    // Highlight cells where dragged token could snap (hover hint)
+    if (dragging) {
+      var dtok = tokens[dragging.tokenId];
+      if (dtok) {
+        var snap = snapToCell(dtok.x, dtok.y, dtok.length);
+        if (snap) {
+          var conflict = hasConflict(dtok, snap.platform, snap.startSlot);
+          cx.fillStyle = conflict ? 'rgba(232,80,46,0.15)' : 'rgba(46,197,182,0.15)';
+          cx.beginPath();
+          drawRoundRect(
+            cellX(snap.startSlot) + 2, cellY(snap.platform) + 2,
+            dtok.length * CELL_W - 4, CELL_H - 4, 5
+          );
+          cx.fill();
+        }
+      }
+    }
+  }
+
+  function drawToken(tok, isDragging, now) {
+    var x, y, w, h;
+    if (tok.placed) {
+      x = cellX(tok.placedSlot) + 3;
+      y = cellY(tok.placedPlatform) + 5;
+    } else {
+      x = tok.trayX + 3;
+      y = tok.trayY + 3;
+    }
+    if (isDragging) {
+      x = tok.x + 3;
+      y = tok.y + 3;
+    }
+    w = tok.length * CELL_W - 8;
+    h = CELL_H - 10;
+
+    var isCorrectlyPlaced = tok.placed && isCorrect(tok, tok.placedPlatform, tok.placedSlot);
+    var glow = tok.solveGlow;
+    if (glow > 0) tok.solveGlow = Math.max(0, tok.solveGlow - 0.02);
+
+    cx.save();
+    if (glow > 0.01) {
+      cx.shadowColor = TEAL;
+      cx.shadowBlur = 18 * glow;
+    }
+
+    // Token body
+    var alpha = isDragging ? 0.92 : (isCorrectlyPlaced ? 1 : (tok.placed ? 0.8 : 0.95));
+    cx.globalAlpha = alpha;
+    cx.fillStyle = tok.color.fill;
+    cx.beginPath();
+    drawRoundRect(x, y, w, h, 6);
+    cx.fill();
+
+    if (isCorrectlyPlaced) {
+      cx.strokeStyle = TEAL;
+      cx.lineWidth = 2;
+      cx.stroke();
+    }
+
+    // Label
+    cx.fillStyle = tok.color.text;
+    cx.globalAlpha = alpha;
+    cx.textAlign = 'center';
+    cx.font = '700 12px -apple-system, Helvetica, Arial';
+    cx.fillText(tok.label, x + w / 2, y + h / 2 + 4);
+
+    // Train icon — small horizontal lines
+    if (w > 30) {
+      cx.fillStyle = 'rgba(0,0,0,0.25)';
+      for (var li = 0; li < 3; li++) {
+        cx.fillRect(x + 6 + li * (w - 12) / 3, y + h - 9, (w - 12) / 3 - 2, 2);
+      }
+    }
+
+    cx.restore();
+  }
+
+  function drawTray(now) {
+    // Tray background
+    cx.fillStyle = 'rgba(255,255,255,0.04)';
+    cx.beginPath();
+    drawRoundRect(16, TRAY_Y - 8, W - 32, TRAY_TOKEN_H + 24, 10);
+    cx.fill();
+    cx.strokeStyle = 'rgba(255,255,255,0.07)';
+    cx.lineWidth = 1;
+    cx.stroke();
+
+    // Label
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.25)';
+    cx.font = '600 10px Menlo, monospace';
+    cx.fillText('DEPARTURES', W / 2, TRAY_Y + TRAY_TOKEN_H + 20);
+  }
+
+  function drawProgressBar() {
+    var n = tokens.length;
+    var done = solvedIds.length;
+    var barW = GRID_W;
+    var barX = GRID_X;
+    var barY = GRID_Y + GRID_H + 14;
+    cx.fillStyle = 'rgba(255,255,255,0.07)';
+    cx.beginPath();
+    drawRoundRect(barX, barY, barW, 6, 3);
+    cx.fill();
+    if (done > 0) {
+      cx.fillStyle = TEAL;
+      cx.beginPath();
+      drawRoundRect(barX, barY, barW * done / n, 6, 3);
+      cx.fill();
+    }
+  }
+
+  function drawFlashes(dt) {
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.save();
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.8);
+      cx.restore();
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+  }
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Hit-stop decay
+    if (hitStop > 0) hitStop -= dt;
+
+    cx.save();
+    // Juice transforms
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // Background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.02)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    if (state.phase === 'title') {
+      drawTitleScreen(now);
+    } else if (state.phase === 'play' || state.phase === 'over') {
+      drawPlayScreen(now, dt);
+      if (state.phase === 'over') drawOverlay(now);
+    } else if (state.phase === 'cta') {
+      drawPlayScreen(now, dt);
+      drawCTAScreen(now);
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitleScreen(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL;
+    cx.font = '800 11px Menlo, monospace';
+    cx.fillText('TILT', W / 2, 120);
+
+    cx.fillStyle = '#fff';
+    cx.font = '800 36px -apple-system, Helvetica, Arial';
+    cx.fillText('TRAIN', W / 2, 240);
+    cx.fillText('TIMETABLE', W / 2, 285);
+
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText('place every train in its slot.', W / 2, 330);
+    cx.fillText('no two trains on the same platform', W / 2, 352);
+    cx.fillText('at the same time.', W / 2, 374);
+
+    // Animated instruction arrows
+    var pulse = 0.55 + 0.45 * Math.sin(now / 500);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = TEAL;
+    cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO BEGIN', W / 2, 450);
+    cx.globalAlpha = 1;
+
+    // Draw a tiny grid preview
+    var px = W / 2 - 60, py = 500, pw = 24, ph = 16;
+    cx.strokeStyle = 'rgba(255,255,255,0.1)'; cx.lineWidth = 1;
+    for (var r = 0; r <= 3; r++) {
+      cx.beginPath(); cx.moveTo(px, py + r * ph); cx.lineTo(px + 5 * pw, py + r * ph); cx.stroke();
+    }
+    for (var c = 0; c <= 5; c++) {
+      cx.beginPath(); cx.moveTo(px + c * pw, py); cx.lineTo(px + c * pw, py + 3 * ph); cx.stroke();
+    }
+    // A couple of colored token hints
+    cx.fillStyle = TRAIN_COLORS[0].fill; cx.globalAlpha = 0.7;
+    cx.beginPath(); drawRoundRect(px + pw + 2, py + ph + 2, pw * 2 - 4, ph - 4, 3); cx.fill();
+    cx.fillStyle = TRAIN_COLORS[1].fill;
+    cx.beginPath(); drawRoundRect(px + 3 * pw + 2, py + 2, pw - 4, ph - 4, 3); cx.fill();
+    cx.globalAlpha = 1;
+  }
+
+  function drawPlayScreen(now, dt) {
+    // Header
+    cx.textAlign = 'left';
+    cx.fillStyle = TEAL;
+    cx.font = '700 10px Menlo, monospace';
+    cx.fillText('TRAIN TIMETABLE', 20, 30);
+
+    cx.textAlign = 'right';
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.font = '600 11px Menlo, monospace';
+    cx.fillText(solvedIds.length + '/' + (tokens ? tokens.length : 0) + ' on track', W - 20, 30);
+
+    // Score
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '800 52px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score, W / 2, 100);
+
+    cx.fillStyle = 'rgba(255,255,255,0.3)';
+    cx.font = '500 11px Menlo, monospace';
+    cx.fillText('SCORE', W / 2, 118);
+
+    // PLATFORM label (vertical, left of grid)
+    cx.save();
+    cx.translate(14, GRID_Y + GRID_H / 2);
+    cx.rotate(-Math.PI / 2);
+    cx.fillStyle = 'rgba(255,255,255,0.2)';
+    cx.font = '600 9px Menlo, monospace';
+    cx.textAlign = 'center';
+    cx.fillText('PLATFORM', 0, 0);
+    cx.restore();
+
+    // TIME label (above grid)
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.2)';
+    cx.font = '600 9px Menlo, monospace';
+    cx.fillText('DEPARTURE TIME', GRID_X + GRID_W / 2, GRID_Y - 20);
+
+    drawGrid(now);
+    drawProgressBar();
+
+    // Draw placed tokens (not dragging)
+    if (tokens) {
+      for (var i = 0; i < tokens.length; i++) {
+        var tok = tokens[i];
+        if (dragging && dragging.tokenId === tok.id) continue;
+        if (!tok.placed) continue;
+        drawToken(tok, false, now);
+      }
+    }
+
+    // Tray
+    drawTray(now);
+
+    // Draw tray tokens
+    if (tokens) {
+      for (var i = 0; i < tokens.length; i++) {
+        var tok = tokens[i];
+        if (dragging && dragging.tokenId === tok.id) continue;
+        if (tok.placed) continue;
+        drawToken(tok, false, now);
+      }
+    }
+
+    // Draw dragging token last (on top)
+    if (dragging && tokens) {
+      var dtok = tokens[dragging.tokenId];
+      if (dtok) drawToken(dtok, true, now);
+    }
+
+    drawFlashes(dt);
+
+    // Mute (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawOverlay(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.72)';
+    cx.fillRect(0, 0, W, H);
+
+    // All solved glow
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL;
+    cx.font = '800 34px -apple-system, Helvetica, Arial';
+    cx.fillText('SCHEDULE', W / 2, 310);
+    cx.fillText('COMPLETE', W / 2, 350);
+
+    cx.fillStyle = 'rgba(255,255,255,0.8)';
+    cx.font = '700 20px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score + ' pts', W / 2, 394);
+
+    cx.fillStyle = GOLD;
+    cx.font = '700 14px Menlo, monospace';
+    cx.fillText('every train departed on time', W / 2, 424);
+
+    if (!DEMO && !BOT) {
+      var pulse = 0.55 + 0.45 * Math.sin(now / 400);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO RUN AGAIN', W / 2, 474);
+      cx.globalAlpha = 1;
+
+      // Share pill
+      var sr = { x: W / 2 - 120, y: 500, w: 240, h: 44 };
+      cx.fillStyle = 'rgba(46,197,182,0.12)';
+      cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+      cx.beginPath(); drawRoundRect(sr.x, sr.y, sr.w, sr.h, 22); cx.fill(); cx.stroke();
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('⚡ SHARE YOUR TIME', W / 2, sr.y + 28);
+    }
+  }
+
+  function drawCTAScreen(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2.4);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+
+    cx.fillStyle = TEAL;
+    cx.font = '700 11px Menlo, monospace';
+    cx.fillText('TILT', W / 2, 260);
+
+    cx.fillStyle = '#fff';
+    cx.font = '800 38px -apple-system, Helvetica, Arial';
+    cx.fillText('TRAIN', W / 2, 310);
+    cx.fillText('TIMETABLE', W / 2, 355);
+
+    cx.fillStyle = 'rgba(255,255,255,0.65)';
+    cx.font = '500 15px -apple-system, Helvetica, Arial';
+    cx.fillText('every slot filled. system running smooth.', W / 2, 388);
+
+    var p = 0.65 + 0.35 * Math.sin(now / 350);
+    cx.fillStyle = TEAL;
+    cx.globalAlpha = ease * p;
+    cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 438);
+
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 468);
+    cx.globalAlpha = 1;
+  }
+
+  // Tap on over screen
+  cv.addEventListener('click', function (e) {
+    if (DEMO || BOT) return;
+    if (state.phase === 'over') {
+      var r = cv.getBoundingClientRect();
+      var px = (e.clientX - r.left) / scale;
+      var py = (e.clientY - r.top) / scale;
+      // Check share
+      var sr = { x: W / 2 - 120, y: 500, w: 240, h: 44 };
+      if (inR(sr, px, py) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'on track' }); return;
+      }
+      resetGame();
+    }
+  });
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

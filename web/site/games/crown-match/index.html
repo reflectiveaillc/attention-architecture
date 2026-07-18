@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Crown Match — Tilt</title>
+<!--
+  LOOP / attention-architecture — Crown Match
+  Circuits: 01-rpe (variable tap timing), 03-social (crown = social status),
+            04-loss (lose the crown), viral engine.
+  Mechanic: tap rapidly to push a crown into the opponent's half;
+            after 30s whoever holds it wins. Score = seconds held.
+  Modes:
+    ?demo=1&seed=7     mirror-neuron clip: challenge card → play → near-fail → fail → CTA
+    ?bot=1&runs=N&seed=M  imperfect autopilot, N runs, sets window.__botDone
+    ?dare=<n>          incoming dare banner; SHARE.beaten() when passed
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'crown-match';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO     = qs.get('demo') === '1';
+  var BOT      = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED     = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  var GAME_DUR   = 30;       // seconds per round
+  var CROWN_SIZE = 56;       // px radius of the crown circle
+  var MID        = H / 2;    // dividing line y
+  // Crown starts at center; each tap by the bottom player nudges it UP (toward top)
+  // Top is the "opponent" (AI in single-player); player is bottom half.
+  // Crown y: 0 = top edge, H = bottom edge. Player wants crown in TOP half (y < MID).
+  // Tap pushes crown UP (decreases y) by TAP_PUSH; natural drift pulls back CENTER.
+  var TAP_PUSH   = 28;       // px per tap
+  var DRIFT_SPD  = 18;       // px/s natural return toward center
+  var MAX_HOLD   = 3.0;      // s of continuous holding before tension fires
+  var BOUNCE_TOP = 80;       // hard boundary at top
+  var BOUNCE_BOT = H - 80;   // hard boundary at bottom
+
+  // ---- state ----
+  var phase, crownY, heldSide, holdTime, score, gameStartTs, overAt, ctaAt;
+  var flashes, shakeAmt, zoom, hitStop, dareBeaten;
+  var last = performance.now();
+  var botRunsDone = 0;
+
+  // ---- demo ----
+  // demoScript: list of actions {t: seconds-into-run, act: 'tap'|'pause'}
+  // We'll drive it by elapsed time checkpoints, with randomised slight hesitations.
+  var demoActions, demoIdx, demoNearFail, demoRecovered, demoDone;
+  var challengeAt = 0;
+
+  function newGame() {
+    phase      = DEMO ? 'challenge' : (BOT ? 'play' : 'title');
+    crownY     = MID;
+    heldSide   = 'center'; // 'player' | 'opponent' | 'center'
+    holdTime   = 0;
+    score      = 0;
+    flashes    = [];
+    shakeAmt   = 0;
+    zoom       = 1;
+    hitStop    = 0;
+    dareBeaten = false;
+    gameStartTs = null;
+    overAt     = 0;
+    ctaAt      = 0;
+
+    if (DEMO) {
+      buildDemoActions();
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+    } else if (BOT) {
+      startRun();
+    }
+  }
+
+  function buildDemoActions() {
+    // Script for a ~18s run: rapid taps early, then a near-fail around t=12,
+    // recover at t=14, then fail (stop tapping) at t=17.
+    demoActions  = [];
+    demoIdx      = 0;
+    demoNearFail = false;
+    demoRecovered= false;
+    demoDone     = false;
+
+    // Phase 1: early rapid taps 0-8s (~16 taps, ~500ms apart)
+    for (var i = 0; i < 16; i++) {
+      demoActions.push({ t: 0.3 + i * 0.55 + (rng() - 0.5) * 0.18 });
+    }
+    // Phase 2: hesitation / near-fail — stop tapping 8-12s so crown drifts back
+    // (this reads as "it's over"), then a burst of 6 rapid taps to recover
+    for (var j = 0; j < 6; j++) {
+      demoActions.push({ t: 12.2 + j * 0.22 + (rng() - 0.5) * 0.06 });
+    }
+    // Phase 3: a few more taps, then stop — the real fail (let drift carry it to opponent)
+    demoActions.push({ t: 13.8 + (rng() - 0.5) * 0.1 });
+    demoActions.push({ t: 14.4 + (rng() - 0.5) * 0.1 });
+    // No more taps after 14.6s → crown drifts to opponent zone → time runs out or
+    // we force game over at t≈17s via the demo controller.
+    demoActions.sort(function(a,b){ return a.t - b.t; });
+  }
+
+  function startRun() {
+    phase       = 'play';
+    gameStartTs = Date.now();
+    crownY      = MID;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function elapsed() {
+    if (!gameStartTs) return 0;
+    return (Date.now() - gameStartTs) / 1000;
+  }
+
+  function pctTop(sc) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-sc / 18))));
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- tap: push crown up (toward top / opponent side) ----
+  function playerTap() {
+    if (phase !== 'play') return;
+    crownY -= TAP_PUSH;
+    if (crownY < BOUNCE_TOP) crownY = BOUNCE_TOP;
+    if (window.J) J.hit(Math.max(1, Math.round((MID - crownY) / 20)));
+    shakeAmt = 3;
+    if (crownY < MID - 60) {
+      zoom = 1.02;
+      if (window.J) J.tension(Math.min(1, (MID - crownY) / (MID - BOUNCE_TOP)));
+    }
+  }
+
+  function opponentTap() {
+    // opponent pushes crown down
+    crownY += TAP_PUSH * (0.72 + rng() * 0.28);
+    if (crownY > BOUNCE_BOT) crownY = BOUNCE_BOT;
+  }
+
+  function gameOver(reason) {
+    phase  = 'over';
+    overAt = performance.now();
+
+    // score = seconds the player held the crown in opponent's half
+    var dur = elapsed();
+    if (window.J) J.death(Math.min(1, 0.3 + score / 20));
+    if (DEMO) window.__demoScore = score;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (window.J) J.fanfare();
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 900);
+      }
+    }
+  }
+
+  function resetRun() {
+    crownY    = MID;
+    score     = 0;
+    flashes   = [];
+    shakeAmt  = 0;
+    zoom      = 1;
+    hitStop   = 0;
+    dareBeaten= false;
+    gameStartTs = null;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') { playerTap(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'crowns' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.code === 'ArrowUp') tap();
+  });
+
+  // ---- autopilots ----
+  var botTapTimer = 0;
+  var botPassive  = false;
+  var botActCount = 0;
+
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+    var t = elapsed();
+
+    if (DEMO) {
+      // Check if we should fire the next scripted tap
+      if (demoIdx < demoActions.length) {
+        var next = demoActions[demoIdx];
+        if (t >= next.t) {
+          playerTap();
+          demoIdx++;
+          // near-fail recovery annotation
+          if (t > 12.0 && t < 13.0 && !demoNearFail && crownY > MID + 30) {
+            demoNearFail = true;
+            flash('SO CLOSE!', VERM, 36);
+            if (window.J) J.near();
+            if (window.LOOP) LOOP.emit('near_miss', { n: score });
+          }
+          if (t > 13.0 && demoNearFail && !demoRecovered) {
+            demoRecovered = true;
+            flash('SAVED!', TEAL, 40);
+          }
+        }
+      }
+      // Opponent taps periodically (natural resistance)
+      botTapTimer -= dt;
+      if (botTapTimer <= 0) {
+        opponentTap();
+        botTapTimer = (0.55 + rng() * 0.45) * 60; // ~0.55-1s at 60fps
+      }
+      // Force demo game over after ~17s
+      if (t > 17 && !demoDone) {
+        demoDone = true;
+        gameOver('demo-end');
+      }
+    } else if (BOT) {
+      // Bot taps to push crown up but plays imperfectly
+      botActCount++;
+      if (botActCount > 180 + Math.floor(rng() * 120)) {
+        // After K actions, go passive so crown drifts to opponent zone → time runs out
+        botPassive = true;
+      }
+      if (!botPassive) {
+        botTapTimer -= dt;
+        if (botTapTimer <= 0) {
+          playerTap();
+          botTapTimer = (0.4 + rng() * 0.6) * 60;
+        }
+      }
+      // Opponent taps
+      var oppTimer2 = (0.4 + rng() * 0.5) * 60;
+      if (Math.floor(botTapTimer) % Math.max(1, Math.floor(oppTimer2)) === 0) {
+        opponentTap();
+      }
+    }
+  }
+
+  // ---- draw helpers ----
+  function drawCrown(cx, x, y, sz, color) {
+    // Simple crown: rectangle base + 3 points
+    cx.save();
+    cx.translate(x, y);
+    var bw = sz * 1.1, bh = sz * 0.45;
+    var pw = sz * 0.22, ph = sz * 0.7;
+    cx.fillStyle = color;
+    // Base bar
+    cx.fillRect(-bw / 2, -bh / 2, bw, bh);
+    // Left point
+    cx.beginPath();
+    cx.moveTo(-bw / 2, -bh / 2);
+    cx.lineTo(-bw / 2 - pw * 0.1, -bh / 2 - ph);
+    cx.lineTo(-bw / 2 + pw * 0.9, -bh / 2 - ph * 0.3);
+    cx.closePath();
+    cx.fill();
+    // Center point
+    cx.beginPath();
+    cx.moveTo(-pw / 2, -bh / 2);
+    cx.lineTo(0, -bh / 2 - ph * 1.2);
+    cx.lineTo(pw / 2, -bh / 2);
+    cx.closePath();
+    cx.fill();
+    // Right point
+    cx.beginPath();
+    cx.moveTo(bw / 2, -bh / 2);
+    cx.lineTo(bw / 2 + pw * 0.1, -bh / 2 - ph);
+    cx.lineTo(bw / 2 - pw * 0.9, -bh / 2 - ph * 0.3);
+    cx.closePath();
+    cx.fill();
+    // Gems
+    cx.fillStyle = INK;
+    cx.beginPath(); cx.arc(0, -bh * 0.1, sz * 0.09, 0, Math.PI * 2); cx.fill();
+    cx.beginPath(); cx.arc(-bw * 0.28, -bh * 0.1, sz * 0.06, 0, Math.PI * 2); cx.fill();
+    cx.beginPath(); cx.arc(bw * 0.28, -bh * 0.1, sz * 0.06, 0, Math.PI * 2); cx.fill();
+    cx.restore();
+  }
+
+  function drawHalfLabel(cx, txt, y, color, alpha) {
+    cx.globalAlpha = alpha;
+    cx.textAlign = 'center';
+    cx.fillStyle = color;
+    cx.font = '700 13px Menlo, monospace';
+    cx.fillText(txt, W / 2, y);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- main loop ----
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3);
+    last = now;
+
+    // ---- physics update ----
+    if (phase === 'play') {
+      var t = elapsed();
+
+      // Natural drift: crown slowly returns toward center
+      var driftDir = crownY < MID ? 1 : (crownY > MID ? -1 : 0);
+      if (hitStop <= 0) crownY += driftDir * DRIFT_SPD * (dt / 60) * 60 * 0.016;
+
+      // Clamp
+      if (crownY < BOUNCE_TOP) crownY = BOUNCE_TOP;
+      if (crownY > BOUNCE_BOT) crownY = BOUNCE_BOT;
+
+      // Determine which side holds the crown
+      var prevSide = heldSide;
+      if (crownY < MID - 10) {
+        heldSide = 'player';   // player is winning (crown in top half)
+      } else if (crownY > MID + 10) {
+        heldSide = 'opponent';
+      } else {
+        heldSide = 'center';
+      }
+
+      // Score: accumulate seconds player holds crown in opponent's half
+      if (heldSide === 'player') {
+        score += dt / 60;
+        holdTime += dt / 60;
+        if (holdTime > MAX_HOLD && window.J) J.tension(Math.min(1, holdTime / 8));
+        // Check dare beaten
+        if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+          dareBeaten = true;
+          flash('DARE BEATEN', TEAL, 44);
+          if (window.J) J.fanfare();
+          SHARE.beaten(score);
+        }
+      } else {
+        holdTime = 0;
+      }
+
+      // Side-change sparkle
+      if (prevSide !== heldSide && heldSide === 'player') {
+        flash('+CROWN', GOLD, 32);
+        if (window.J) J.hit(Math.round(score + 1));
+        shakeAmt = 4;
+      }
+      if (prevSide !== heldSide && heldSide === 'opponent') {
+        flash('LOSING!', VERM, 30);
+        if (window.J) J.near();
+        if (window.LOOP) LOOP.emit('near_miss', { n: Math.round(score) });
+        shakeAmt = 5;
+      }
+
+      // Tension sound when crown is exactly at center zone
+      if (heldSide === 'center' && window.J) {
+        J.tension(0.5);
+      }
+
+      // Game timer
+      if (t >= GAME_DUR && !DEMO) {
+        gameOver('time');
+      }
+
+      // run autopilots
+      autopilot(dt);
+    }
+
+    // hit-stop decay
+    if (hitStop > 0) hitStop -= dt;
+
+    // ---- draw ----
+    cx.save();
+
+    // juice transforms
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (rng() - 0.5) * shakeAmt * 2;
+      var sy = (rng() - 0.5) * shakeAmt * 2;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // gradient BG
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.07)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.08)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    if (phase === 'challenge') {
+      // Demo beat 1: challenge card
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('18', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("seconds held today's top", W / 2, 432);
+    }
+
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('CROWN MATCH', W / 2, 280);
+      drawCrown(cx, W / 2, 340, 44, GOLD);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillText('TAP TO HOLD THE CROWN', W / 2, 420);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('30 seconds. keep it in their half.', W / 2, 448);
+    }
+
+    if (phase === 'play' || phase === 'over') {
+      // Dividing line
+      var lineAlpha = 0.22 + 0.08 * Math.sin(now / 600);
+      cx.globalAlpha = lineAlpha;
+      cx.strokeStyle = '#fff';
+      cx.lineWidth = 1.5;
+      cx.setLineDash([8, 6]);
+      cx.beginPath(); cx.moveTo(30, MID); cx.lineTo(W - 30, MID); cx.stroke();
+      cx.setLineDash([]);
+      cx.globalAlpha = 1;
+
+      // Half labels
+      drawHalfLabel(cx, 'OPPONENT', MID - 40, VERM, 0.4);
+      drawHalfLabel(cx, 'YOU', MID + 55, TEAL, 0.4);
+
+      // Crown glow when player is holding
+      var crownColor = heldSide === 'player' ? GOLD :
+                       heldSide === 'opponent' ? VERM : '#fff';
+      var glowR = CROWN_SIZE * 0.85 + (heldSide === 'player' ? 8 * Math.sin(now / 200) : 0);
+      if (heldSide === 'player' || heldSide === 'opponent') {
+        var grad = cx.createRadialGradient(W / 2, crownY, 0, W / 2, crownY, glowR * 2.5);
+        grad.addColorStop(0, heldSide === 'player' ? 'rgba(242,177,52,0.28)' : 'rgba(232,80,46,0.22)');
+        grad.addColorStop(1, 'rgba(0,0,0,0)');
+        cx.fillStyle = grad; cx.fillRect(0, 0, W, H);
+      }
+
+      // Crown
+      drawCrown(cx, W / 2, crownY, CROWN_SIZE * 0.75, crownColor);
+
+      // Timer bar at top
+      var tElapsed = elapsed();
+      var tLeft = Math.max(0, GAME_DUR - tElapsed);
+      var barW = W - 60;
+      var barX = 30;
+      var barY = 32;
+      cx.fillStyle = 'rgba(255,255,255,0.1)';
+      cx.fillRect(barX, barY, barW, 7);
+      var pct = tLeft / GAME_DUR;
+      var barColor = pct > 0.4 ? TEAL : GOLD;
+      if (pct < 0.2) barColor = VERM;
+      cx.fillStyle = barColor;
+      cx.fillRect(barX, barY, barW * pct, 7);
+
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(Math.ceil(tLeft), W / 2, barY + 34);
+
+      // Score (seconds held)
+      cx.fillStyle = GOLD;
+      cx.font = '900 56px -apple-system, Helvetica, Arial';
+      cx.fillText(Math.floor(score), W / 2, 110);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 11px Menlo, monospace';
+      cx.fillText('SECONDS HELD', W / 2, 128);
+
+      // Dare banner during play
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + 's' + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 150);
+      }
+
+      // Opponent tap indicator (subtle)
+      if (phase === 'play') {
+        var tapPulse = (Math.sin(now / 180) + 1) / 2;
+        cx.globalAlpha = 0.18 + tapPulse * 0.12;
+        cx.textAlign = 'center';
+        cx.fillStyle = VERM;
+        cx.font = '600 11px Menlo, monospace';
+        cx.fillText('▼ pushing back ▼', W / 2, MID - 18);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+
+      var won = score >= GAME_DUR * 0.5; // held >50% of time = win framing
+      cx.fillStyle = won ? GOLD : VERM;
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText(won ? 'CROWNED.' : 'DETHRONED.', W / 2, 295);
+
+      cx.fillStyle = '#fff'; cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText(Math.floor(score) + 's held', W / 2, 338);
+
+      var pt = pctTop(Math.floor(score));
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 382);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of challengers', W / 2, 404);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — CLAIM IT BACK', W / 2, 450);
+        cx.globalAlpha = 1;
+
+        // Share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) {
+          cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        } else {
+          cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        }
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        var shareLabel = (window.SHARE && SHARE.dare !== null && dareBeaten) ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND';
+        cx.fillText(shareLabel, W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    if (phase === 'cta') {
+      var t2 = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t2 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('CROWN MATCH', W / 2, 290);
+      drawCrown(cx, W / 2, 350, 36, GOLD);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('held ' + Math.floor(window.__demoScore || 0) + 's. your move.', W / 2, 412);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + Math.floor(window.__demoScore || 0), W / 2, 468);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 498);
+      cx.globalAlpha = 1;
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

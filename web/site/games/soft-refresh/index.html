@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Soft Refresh — Tilt</title>
+<!--
+  LOOP / attention-architecture — Soft Refresh (CALM engine, contract v2)
+  Conditioned path: the pull-to-refresh gesture. The thumb already knows this
+  move from Instagram/TikTok — the game IS that move. Pull down = breathe in;
+  release inside the calm ring = plant a seed. No competitive score; the feedback
+  is a garden tile that appears once per day (one tile per calm breath in a run).
+  Circuits: 01-soft-rpe, 05-ease, 07-timing, 08-garden.
+  Modes (query params):
+    ?demo=1&seed=7        scripted calm arc (settle → deepen → resolve → soft CTA),
+                          sets window.__demoDone + __demoScore
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'soft-refresh';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 38;        // px of pull-target wobble
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  // canvas + dpr-aware fit (from reference)
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // palette — CALM: ink, teal, soft tones; vermillion avoided
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134', CREAM = '#e9e6dc';
+  var SAGE = '#7fb069';
+
+  // breath geometry
+  var CX = W / 2, CY = 300;
+  var MAXPULL = 360;
+  var ZONE_LO = 166, ZONE_HI = 259;          // calm release band (pullY units)
+  var ZONE_MID = (ZONE_LO + ZONE_HI) / 2;
+  var CYCLES = 3;                             // breaths per run (= tiles per day)
+  function radius(pullY) { return 26 + pullY * 0.4; }      // 26 .. 170
+  var R_LO = radius(ZONE_LO), R_HI = radius(ZONE_HI);
+
+  // state
+  var state, tiles, flashes, petals, runStartTs, hitStop = 0, zoom = 1;
+  var botRunsDone = 0;
+
+  function newGame() {
+    state = {
+      phase: 'title',          // title | play | over | cta
+      pullY: 0,                // current pull 0..MAXPULL
+      target: null,            // autopilot target pullY (demo/bot)
+      breath: 'idle',          // idle | inhale | exhale
+      cycle: 0,                // breaths completed
+      seeds: 0,                // score (seeds planted this run)
+      holdT: 0,                // hold-at-top timer (autopilot)
+      exhaleT: 0,              // exhale progress (0..1)
+      preT: 0,                 // pre-pull hesitation timer (autopilot)
+      overAt: 0
+    };
+    tiles = []; flashes = []; petals = makePetals();
+    if (DEMO) { startRun(); state.preT = 36; return; }   // a soft settle beat before the first breath
+    if (BOT) startRun();
+  }
+
+  // soft drifting petals — ambience for the calm vibe
+  function makePetals() {
+    var arr = [];
+    for (var i = 0; i < 14; i++) arr.push({
+      x: rng() * W, y: rng() * H, r: 1 + rng() * 2.2,
+      vy: 0.12 + rng() * 0.22, vx: (rng() - 0.5) * 0.18,
+      a: 0.05 + rng() * 0.12, hue: rng() < 0.5 ? TEAL : GOLD
+    });
+    return arr;
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.cycle = 0; state.seeds = 0;
+    state.breath = 'idle'; state.pullY = 0; state.target = null; state.preT = 0;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- release: evaluate seed plant ----
+  function release() {
+    if (state.breath !== 'inhale') return;
+    var inZone = state.pullY >= ZONE_LO && state.pullY <= ZONE_HI;
+    state._releasePullY = state.pullY;                 // capture for the exhale shrink
+    state.breath = 'exhale'; state.exhaleT = 0; state.target = null;
+    if (inZone) {
+      state.seeds++;
+      tiles.push({ bloom: 0, jitter: (rng() - 0.5) * 6 });
+      hitStop = 1.6; zoom = 1.025;                       // gentle calm pulse (decays each frame)
+      flash('seed', SAGE, 30);
+      if (window.J) J.calm(state.seeds);                 // calm bell ONLY — no percussion/tension
+      if (window.LOOP) LOOP.emit('seed_planted', { cycle: state.cycle, seeds: state.seeds });
+    } else {
+      flash('softer', CREAM, 22);                        // no punishment, no tension sound
+      if (window.LOOP) LOOP.emit('breath_missed', { cycle: state.cycle, pull: +state.pullY.toFixed(1) });
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (DEMO) window.__demoScore = state.seeds;
+    // calm completion: a soft bloom, the most beautiful frame (peak-end)
+    zoom = 1.03;
+    for (var i = 0; i < tiles.length; i++) tiles[i].bloom = Math.max(tiles[i].bloom, 0.001);
+    if (window.J) { J.calm(state.seeds + 2); }            // resolve bell
+    if (window.LOOP) LOOP.emit('game_over', { score: state.seeds, dur_s: +dur.toFixed(1) });
+    if (DEMO) setTimeout(function () {
+      state.phase = 'cta'; ctaAt = performance.now();
+      setTimeout(function () { window.__demoDone = true; }, 3600);
+    }, 2600);
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 1100);
+    }
+  }
+
+  function resetRun() {
+    state.cycle = 0; state.seeds = 0; tiles = [];
+    state.breath = 'idle'; state.pullY = 0; state.target = null; state.preT = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input (human only; autopilots ignore human, human ignores autopilots) ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  var pointerActive = false, startY = 0, startPull = 0;
+
+  function down(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 600) { resetRun(); return; }
+    if (state.phase === 'play' && state.breath === 'idle') {
+      pointerActive = true; startY = y; startPull = state.pullY;
+      state.breath = 'inhale';
+    }
+  }
+  function move(x, y) {
+    if (!pointerActive || DEMO || BOT) return;
+    state.pullY = Math.max(0, Math.min(MAXPULL, startPull + (y - startY)));
+  }
+  function up() {
+    if (!pointerActive || DEMO || BOT) return;
+    pointerActive = false;
+    if (state.breath === 'inhale') release();
+  }
+  function toLocal(e) {
+    var r = cv.getBoundingClientRect();
+    return { x: (e.clientX - r.left) / scale, y: (e.clientY - r.top) / scale };
+  }
+  window.addEventListener('pointerdown', function (e) { var p = toLocal(e); down(p.x, p.y); });
+  window.addEventListener('pointermove', function (e) { var p = toLocal(e); move(p.x, p.y); });
+  window.addEventListener('pointerup', up);
+  window.addEventListener('pointercancel', up);
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' && !DEMO && !BOT) {
+      if (state.phase === 'title') { startRun(); return; }
+      if (state.phase === 'play' && state.breath === 'idle') {
+        pointerActive = true; startY = 0; startPull = state.pullY; state.breath = 'inhale';
+        // simulate a clean pull-then-release on space for desktop
+        state.pullY = ZONE_MID; release();
+      } else if (state.phase === 'over' && performance.now() - state.overAt > 600) { resetRun(); }
+    }
+  });
+
+  // ---- autopilots (demo / bot) ----
+  // demo: scripted calm arc — settle, deepen, resolve. Targets all land in the
+  // calm ring with slight human wobble + pre-pull hesitation (demoWaits). Never
+  // a robotic run, but never tense (calm demos skip the near-fail beat).
+  var demoTargets = [ZONE_MID - 6, ZONE_MID + 22, ZONE_MID - 3];   // gentle deepening
+  var demoWaits   = [42, 30, 26];                                   // hesitation beats before each pull
+  var demoHoldDur = [22, 26, 30];                                   // hold at top, breath lengthens (deepen)
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    if (state.breath === 'idle') {
+      if (hitStop > 0) return;                            // tiny calm freeze after a seed
+      if (state.preT > 0) { state.preT -= 1; return; }    // human hesitation before pulling
+      // start a new breath
+      var i = Math.min(state.cycle, CYCLES - 1);
+      if (DEMO) {
+        state.target = demoTargets[i];
+        state.holdT = 0;
+      } else if (BOT) {
+        // imperfect autopilot: wobble the target; ~1 in 4 releases misses the ring
+        var miss = rng() < 0.25;
+        var base = ZONE_MID + gauss() * BOT_ERR;
+        state.target = miss ? (rng() < 0.5 ? ZONE_LO - 30 - rng() * 30 : ZONE_HI + 30 + rng() * 30) : base;
+        state.holdT = 0;
+      }
+      state.breath = 'inhale';
+    } else if (state.breath === 'inhale') {
+      // ease the pull toward the target — a slow, calm inhale (bot eases a touch faster)
+      state.pullY += (state.target - state.pullY) * (BOT ? 0.08 : 0.05);
+      if (Math.abs(state.pullY - state.target) < 1.2) {
+        state.pullY = state.target;
+        state.holdT += 1;                                // gentle hold at the top of the breath
+        var holdDur = DEMO ? demoHoldDur[Math.min(state.cycle, 2)] : 18;
+        if (state.holdT >= holdDur) release();
+      }
+    }
+  }
+
+  // ---- render ----
+  function drawPetals(dt) {
+    for (var i = 0; i < petals.length; i++) {
+      var p = petals[i];
+      p.y += p.vy * dt; p.x += p.vx * dt;
+      if (p.y > H + 6) { p.y = -6; p.x = rng() * W; }
+      if (p.x < -6) p.x = W + 6; if (p.x > W + 6) p.x = -6;
+      cx.globalAlpha = p.a; cx.fillStyle = p.hue;
+      cx.beginPath(); cx.arc(p.x, p.y, p.r, 0, 7); cx.fill();
+    }
+    cx.globalAlpha = 1;
+  }
+
+  var ctaAt = 0, last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // breath sim — exhale returns the circle to rest; a completed exhale ends a cycle
+    if (state.breath === 'exhale') {
+      state.exhaleT += dt / (BOT ? 75 : 150);             // ~2.5s exhale (bot ~1.25s to keep runs short)
+      var e = Math.min(1, state.exhaleT);
+      state.pullY = (1 - easeOut(e)) * (state._releasePullY || 0);
+      if (e >= 1) {
+        state.breath = 'idle'; state.pullY = 0; state._releasePullY = 0;
+        state.cycle++;
+        if (window.LOOP) LOOP.emit('breath_complete', { cycle: state.cycle, seeds: state.seeds });
+        if (state.cycle >= CYCLES) { gameOver(); }
+        else if (DEMO || BOT) { state.preT = DEMO ? demoWaits[Math.min(state.cycle, 2)] : 22; }
+      }
+    }
+
+    // autopilot drives the pull for demo/bot (frozen during the tiny calm hit-stop)
+    if (hitStop > 0) hitStop -= dt; else if (DEMO || BOT) autopilot();
+
+    // juice transforms: decaying zoom-pulse (no shake on calm)
+    cx.save();
+    if (zoom > 1.001) {
+      cx.translate(W / 2, H / 2); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background — soft teal/ink gradient
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.10)');
+    bg.addColorStop(0.5, 'rgba(46,197,182,0.03)');
+    bg.addColorStop(1, 'rgba(127,176,105,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+    drawPetals(dt);
+
+    // ---- breath circle (play only — title shows its own preview orb) ----
+    if (state.phase === 'play') {
+    var r = radius(state.pullY);
+    var inZone = state.pullY >= ZONE_LO && state.pullY <= ZONE_HI;
+    // calm ring (the target annulus)
+    cx.lineWidth = 2;
+    cx.strokeStyle = inZone ? 'rgba(46,197,182,0.85)' : 'rgba(46,197,182,0.30)';
+    cx.beginPath(); cx.arc(CX, CY, R_HI, 0, 7); cx.stroke();
+    cx.beginPath(); cx.arc(CX, CY, R_LO, 0, 7); cx.stroke();
+    if (inZone) {
+      var glow = cx.createRadialGradient(CX, CY, R_LO, CX, CY, R_HI);
+      glow.addColorStop(0, 'rgba(46,197,182,0.0)');
+      glow.addColorStop(0.5, 'rgba(46,197,182,0.18)');
+      glow.addColorStop(1, 'rgba(46,197,182,0.0)');
+      cx.fillStyle = glow;
+      cx.beginPath(); cx.arc(CX, CY, R_HI, 0, 7); cx.arc(CX, CY, R_LO, 0, 7, true); cx.fill();
+    }
+    // the breath orb — grows as you pull (inhale), shrinks on exhale
+    var og = cx.createRadialGradient(CX - r * 0.3, CY - r * 0.3, r * 0.1, CX, CY, r);
+    og.addColorStop(0, 'rgba(233,230,220,0.95)');
+    og.addColorStop(0.55, inZone ? 'rgba(46,197,182,0.55)' : 'rgba(46,197,182,0.32)');
+    og.addColorStop(1, 'rgba(46,197,182,0.05)');
+    cx.fillStyle = og;
+    cx.beginPath(); cx.arc(CX, CY, Math.max(6, r), 0, 7); cx.fill();
+    } // end breath circle
+
+    // breath guidance text
+    if (state.phase === 'play') {
+      cx.textAlign = 'center';
+      var label = state.breath === 'exhale' ? 'breathe out'
+                : state.breath === 'inhale' ? 'breathe in' : 'pull down slowly';
+      cx.fillStyle = 'rgba(233,230,220,0.8)';
+      cx.font = '600 17px -apple-system, Helvetica, Arial';
+      cx.fillText(label, CX, CY + 4);
+      // idle cue: a soft downward chevron pulse
+      if (state.breath === 'idle') {
+        var pulse = 0.5 + 0.5 * Math.sin(now / 360);
+        cx.globalAlpha = 0.35 + pulse * 0.4;
+        cx.fillStyle = TEAL; cx.font = '900 22px -apple-system, Helvetica, Arial';
+        cx.fillText('↓', CX, CY + 200);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // ---- garden tiles (the once-per-day feedback) ----
+    var tileSize = 52, gap = 12, n = CYCLES;
+    var rowW = n * tileSize + (n - 1) * gap, rowX = (W - rowW) / 2, rowY = 632;
+    for (var i = 0; i < n; i++) {
+      var tx = rowX + i * (tileSize + gap);
+      cx.strokeStyle = 'rgba(233,230,220,0.14)'; cx.lineWidth = 1.5;
+      cx.beginPath();
+      cx.roundRect ? cx.roundRect(tx, rowY, tileSize, tileSize, 10) : cx.rect(tx, rowY, tileSize, tileSize);
+      cx.stroke();
+      if (i < tiles.length) {
+        var t = tiles[i]; t.bloom = Math.min(1, t.bloom + dt / 22);
+        var b = easeOut(t.bloom);
+        cx.save();
+        cx.translate(tx + tileSize / 2 + t.jitter * (1 - b), rowY + tileSize / 2);
+        cx.scale(b, b); cx.globalAlpha = b;
+        var tg = cx.createLinearGradient(0, -tileSize / 2, 0, tileSize / 2);
+        tg.addColorStop(0, 'rgba(127,176,105,0.55)');
+        tg.addColorStop(1, 'rgba(46,197,182,0.30)');
+        cx.fillStyle = tg;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(-tileSize / 2, -tileSize / 2, tileSize, tileSize, 10) : cx.rect(-tileSize / 2, -tileSize / 2, tileSize, tileSize);
+        cx.fill();
+        // little sprout
+        cx.strokeStyle = SAGE; cx.lineWidth = 2.4;
+        cx.beginPath(); cx.moveTo(0, tileSize / 2 - 6); cx.lineTo(0, -2); cx.stroke();
+        cx.fillStyle = SAGE;
+        cx.beginPath(); cx.ellipse(-5, -2, 6, 3, -0.6, 0, 7); cx.fill();
+        cx.beginPath(); cx.ellipse(5, -6, 6, 3, 0.6, 0, 7); cx.fill();
+        cx.restore(); cx.globalAlpha = 1;
+      }
+    }
+
+    // ---- header (soft, non-competitive) ----
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(233,230,220,0.5)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('SOFT REFRESH', W / 2, 40);
+      cx.fillStyle = 'rgba(233,230,220,0.35)';
+      cx.font = '500 11px -apple-system, Helvetica, Arial';
+      cx.fillText('seeds ' + state.seeds + ' / ' + CYCLES, W / 2, 60);
+    }
+
+    // ---- flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 42);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, CX, CY - R_HI - 30 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(k, 1);
+    }
+
+    // ---- title ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = CREAM; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('SOFT REFRESH', W / 2, 250);
+      cx.fillStyle = TEAL; cx.font = '700 17px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse; cx.fillText('pull down to breathe', W / 2, 286); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(233,230,220,0.4)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('a garden tile a day. no score, just breath.', W / 2, 312);
+      // idle preview orb
+      cx.fillStyle = 'rgba(46,197,182,0.18)';
+      cx.beginPath(); cx.arc(CX, 430, 30, 0, 7); cx.fill();
+    }
+
+    // ---- game over (calm completion) ----
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.5)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '900 34px -apple-system, Helvetica, Arial';
+      cx.fillText("today's garden", W / 2, 200);
+      cx.fillStyle = CREAM; cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText(state.seeds + ' seed' + (state.seeds === 1 ? '' : 's') + ' planted', W / 2, 232);
+      cx.fillStyle = 'rgba(233,230,220,0.45)'; cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('come back tomorrow to grow another.', W / 2, 258);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 300);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('tap — breathe again', W / 2, 552);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // ---- demo CTA (soft invitation) ----
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = CREAM; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('SOFT REFRESH', W / 2, 300);
+      cx.fillStyle = 'rgba(233,230,220,0.75)'; cx.font = '600 19px -apple-system, Helvetica, Arial';
+      cx.fillText('pull down. plant a seed.', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ GROW YOURS', W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function easeOut(x) { return 1 - Math.pow(1 - x, 3); }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

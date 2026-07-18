@@ -1,0 +1,1050 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Mini Boss Rush — Tilt</title>
+<!--
+  LOOP / attention-architecture — Mini Boss Rush
+  Circuits: 02-novelty (new mechanic every 10s), 01-rpe (variable challenge per boss),
+            04-loss (the run that ends at boss 7).
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N    imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'mini-boss-rush';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = Math.max(1, +qs.get('runs') || 3);
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- juice state ----
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size || 36, t: 0 }); }
+
+  // ---- game state ----
+  var phase; // 'title' | 'challenge' | 'play' | 'transition' | 'over' | 'fin' | 'cta'
+  var bossIdx = 0;          // 0-7
+  var bossesBeaten = 0;
+  var bossTimer = 0;        // countdown seconds remaining for current boss
+  var bossResult = null;    // 'win' | 'lose' during transition/over
+  var overAt = 0, challengeAt = 0, transAt = 0, ctaAt = 0, finAt = 0;
+  var runStartTs = 0;
+  var dareBeaten = false;
+  var totalScore = 0;       // bosses beaten (meaningful number)
+
+  // ---- bot tracking ----
+  var botRunsDone = 0;
+
+  // ---- 8 boss definitions ----
+  // Each boss: { name, color, draw(dt), update(dt) → 'alive'|'win'|'lose', onTap(x,y), onPointer(x,y), reset() }
+  // Kept inside closure so they share juice helpers
+  var boss = null;
+
+  // ---------- BOSS 1: DODGE THE SPIRAL ----------
+  function makeBoss1() {
+    var px = W / 2, py = H / 2;   // player dot
+    var bullets = [];
+    var angle = 0;
+    var PLAYER_R = 18, BULLET_R = 8;
+    var t = 0;
+    var pointerX = px, pointerY = py;
+    function spawnSpiral() {
+      var cx2 = W / 2, cy2 = H / 2 + 30;
+      var a = angle;
+      for (var i = 0; i < 3; i++) {
+        var ai = a + (i * Math.PI * 2 / 3);
+        bullets.push({ x: cx2, y: cy2, vx: Math.cos(ai) * 2.8, vy: Math.sin(ai) * 2.8 });
+      }
+      angle += 0.35;
+    }
+    return {
+      name: 'DODGE', color: VERM,
+      reset: function () { bullets = []; angle = 0; t = 0; px = W / 2; py = H * 0.6; pointerX = px; pointerY = py; },
+      onPointer: function (x, y) { pointerX = x; pointerY = y; },
+      update: function (dt) {
+        t += dt;
+        if (t % 30 < dt * 1.01) spawnSpiral();
+        // move player toward pointer (human drag; bot sets pointer)
+        px += (pointerX - px) * 0.18 * dt;
+        py += (pointerY - py) * 0.18 * dt;
+        px = Math.max(PLAYER_R, Math.min(W - PLAYER_R, px));
+        py = Math.max(PLAYER_R + 80, Math.min(H - PLAYER_R - 80, py));
+        for (var i = bullets.length - 1; i >= 0; i--) {
+          var b = bullets[i];
+          b.x += b.vx * dt; b.y += b.vy * dt;
+          if (b.x < -20 || b.x > W + 20 || b.y < -20 || b.y > H + 20) { bullets.splice(i, 1); continue; }
+          var dx = b.x - px, dy = b.y - py;
+          if (dx * dx + dy * dy < (PLAYER_R + BULLET_R) * (PLAYER_R + BULLET_R)) return 'lose';
+        }
+        return 'alive';
+      },
+      draw: function () {
+        // center emitter
+        cx.beginPath(); cx.arc(W / 2, H / 2 + 30, 14, 0, Math.PI * 2);
+        cx.fillStyle = VERM; cx.fill();
+        // bullets
+        for (var i = 0; i < bullets.length; i++) {
+          var b = bullets[i];
+          cx.beginPath(); cx.arc(b.x, b.y, BULLET_R, 0, Math.PI * 2);
+          cx.fillStyle = '#ff7a5a'; cx.fill();
+        }
+        // player
+        cx.beginPath(); cx.arc(px, py, PLAYER_R, 0, Math.PI * 2);
+        cx.fillStyle = TEAL; cx.fill();
+        cx.strokeStyle = '#fff'; cx.lineWidth = 2; cx.stroke();
+        // aim guide (subtle)
+        cx.beginPath(); cx.arc(px, py, PLAYER_R + 6, 0, Math.PI * 2);
+        cx.strokeStyle = 'rgba(46,197,182,0.3)'; cx.lineWidth = 1; cx.stroke();
+      },
+      autopilot: function (dt) {
+        // bot dodges: move away from nearest bullet
+        if (!bullets.length) { pointerX = W / 2; pointerY = H * 0.6; return; }
+        var nb = bullets[0], nd = Infinity;
+        for (var i = 0; i < bullets.length; i++) {
+          var dx = bullets[i].x - px, dy = bullets[i].y - py, d = dx * dx + dy * dy;
+          if (d < nd) { nd = d; nb = bullets[i]; }
+        }
+        var dx = nb.x - px, dy = nb.y - py;
+        pointerX = px - dx * 3 + (rng() - 0.5) * 60;
+        pointerY = py - dy * 3 + (rng() - 0.5) * 60;
+      }
+    };
+  }
+
+  // ---------- BOSS 2: TAP THE SHRINKING ZONE ----------
+  function makeBoss2() {
+    var zones = [], t = 0, tapsNeeded = 5, tapped = 0;
+    function spawnZone() {
+      var r = 48 + rng() * 30;
+      zones.push({ x: 60 + rng() * (W - 120), y: 200 + rng() * (H - 400), r: r, maxR: r, born: t });
+    }
+    return {
+      name: 'ZONE TAP', color: TEAL,
+      reset: function () { zones = []; t = 0; tapped = 0; spawnZone(); },
+      onTap: function (x, y) {
+        for (var i = zones.length - 1; i >= 0; i--) {
+          var z = zones[i];
+          var dx = x - z.x, dy = y - z.y;
+          if (dx * dx + dy * dy < z.r * z.r) {
+            tapped++;
+            if (window.J) J.hit(tapped);
+            flash('+1', TEAL, 32);
+            zones.splice(i, 1);
+            if (tapped >= tapsNeeded) return 'win';
+            spawnZone();
+            return 'alive';
+          }
+        }
+        return 'alive';
+      },
+      update: function (dt) {
+        t += dt;
+        for (var i = zones.length - 1; i >= 0; i--) {
+          zones[i].r = zones[i].maxR * Math.max(0, 1 - (t - zones[i].born) / 90);
+          if (zones[i].r < 4) return 'lose';
+        }
+        return 'alive';
+      },
+      draw: function () {
+        for (var i = 0; i < zones.length; i++) {
+          var z = zones[i];
+          var ratio = z.r / z.maxR;
+          cx.beginPath(); cx.arc(z.x, z.y, z.r, 0, Math.PI * 2);
+          cx.fillStyle = 'rgba(46,197,182,' + (0.15 + ratio * 0.15) + ')'; cx.fill();
+          cx.strokeStyle = ratio < 0.25 ? VERM : TEAL; cx.lineWidth = 3; cx.stroke();
+          cx.textAlign = 'center'; cx.fillStyle = '#fff';
+          cx.font = '700 18px -apple-system, Helvetica, Arial';
+          cx.fillText('TAP', z.x, z.y + 7);
+        }
+        cx.textAlign = 'center'; cx.fillStyle = 'rgba(255,255,255,0.5)';
+        cx.font = '600 14px -apple-system, Helvetica, Arial';
+        cx.fillText(tapped + '/' + tapsNeeded + ' zones', W / 2, 170);
+      },
+      autopilot: function () {
+        // bot taps the zone center after a short delay (imperfect timing)
+        if (zones.length && rng() < 0.06) {
+          var z = zones[0];
+          var jitter = (rng() - 0.5) * z.r * 1.4;
+          return this.onTap(z.x + jitter, z.y + jitter);
+        }
+        return 'alive';
+      }
+    };
+  }
+
+  // ---------- BOSS 3: HOLD THROUGH STATIC ----------
+  function makeBoss3() {
+    var held = false, holdDur = 0, NEED = 90, staticNoise = [];
+    function genNoise() {
+      staticNoise = [];
+      for (var i = 0; i < 80; i++) staticNoise.push({ x: rng() * W, y: 100 + rng() * (H - 200), s: 2 + rng() * 4 });
+    }
+    genNoise();
+    return {
+      name: 'HOLD', color: GOLD,
+      reset: function () { held = false; holdDur = 0; genNoise(); },
+      onPointerDown: function () { held = true; },
+      onPointerUp:   function () { held = false; holdDur = 0; },
+      update: function (dt) {
+        // regenerate noise occasionally
+        if (Math.random() < 0.04) genNoise();
+        if (held) { holdDur += dt; if (holdDur >= NEED) return 'win'; }
+        else if (holdDur > 0) { holdDur = Math.max(0, holdDur - dt * 1.5); }
+        return 'alive';
+      },
+      draw: function () {
+        var prog = holdDur / NEED;
+        // static overlay
+        cx.fillStyle = 'rgba(255,255,255,0.03)';
+        for (var i = 0; i < staticNoise.length; i++) {
+          var n = staticNoise[i];
+          cx.fillRect(n.x, n.y, n.s, n.s);
+        }
+        // hold arc
+        cx.beginPath();
+        cx.arc(W / 2, H / 2, 80, -Math.PI / 2, -Math.PI / 2 + prog * Math.PI * 2);
+        cx.strokeStyle = GOLD; cx.lineWidth = 10; cx.lineCap = 'round'; cx.stroke();
+        cx.beginPath(); cx.arc(W / 2, H / 2, 80, 0, Math.PI * 2);
+        cx.strokeStyle = 'rgba(242,177,52,0.15)'; cx.lineWidth = 10; cx.stroke();
+        // center label
+        cx.textAlign = 'center';
+        cx.fillStyle = held ? GOLD : 'rgba(255,255,255,0.5)';
+        cx.font = '900 ' + (held ? '22' : '20') + 'px -apple-system, Helvetica, Arial';
+        cx.fillText(held ? 'HOLDING' : 'HOLD', W / 2, H / 2 + 8);
+        if (!held && holdDur > 0) {
+          cx.fillStyle = VERM; cx.font = '700 14px -apple-system, Helvetica, Arial';
+          cx.fillText('RELEASED — KEEP HOLDING', W / 2, H / 2 + 40);
+        }
+      },
+      autopilot: function () {
+        // bot holds imperfectly — sometimes releases
+        if (!held && rng() < 0.08) { held = true; }
+        if (held && rng() < 0.005) { held = false; holdDur = Math.max(0, holdDur - 10); }
+        return 'alive';
+      }
+    };
+  }
+
+  // ---------- BOSS 4: STEER A FALLING SHARD ----------
+  function makeBoss4() {
+    var sx = W / 2, vy = 1.8, vx = 0;
+    var gates = [], t = 0, survived = 0, NEED = 4;
+    var pointerX = W / 2;
+    function spawnGate() {
+      var gw = 70 + rng() * 50;
+      gates.push({ x: 40 + rng() * (W - 80 - gw), y: -40, w: gw, speed: 2 + rng() * 1.5 });
+    }
+    spawnGate();
+    return {
+      name: 'STEER', color: '#a78bfa',
+      reset: function () { sx = W / 2; vx = 0; gates = []; t = 0; survived = 0; pointerX = W / 2; spawnGate(); },
+      onPointer: function (x) { pointerX = x; },
+      update: function (dt) {
+        t += dt;
+        // horizontal steering
+        var dx = pointerX - sx;
+        vx += dx * 0.012 * dt;
+        vx *= Math.pow(0.92, dt);
+        sx += vx * dt;
+        sx = Math.max(12, Math.min(W - 12, sx));
+        // gates fall
+        var hit = false;
+        for (var i = gates.length - 1; i >= 0; i--) {
+          gates[i].y += gates[i].speed * dt;
+          if (gates[i].y > H + 40) {
+            gates.splice(i, 1);
+            survived++;
+            if (survived >= NEED) return 'win';
+            spawnGate();
+            if (window.J) J.hit(survived);
+            flash('THROUGH!', TEAL, 30);
+            continue;
+          }
+          // collision: shard must pass THROUGH the gate gap, not hit the walls
+          var gy = gates[i].y, gx = gates[i].x, gw = gates[i].w;
+          if (gy > H * 0.4 && gy < H * 0.4 + 60) { // check at player zone
+            var shardInGate = sx >= gx && sx <= gx + gw;
+            // Actually: gate falls toward shard. check overlap
+          }
+          // simpler: gate is a horizontal bar with a gap; shard is falling from top
+          // Gate y moves downward. Shard is at ~H*0.7 fixed (we draw it falling visually)
+          var shard_y = H * 0.68;
+          if (gates[i].y >= shard_y - 30 && gates[i].y <= shard_y + 30) {
+            if (sx < gates[i].x || sx > gates[i].x + gates[i].w) { hit = true; }
+          }
+        }
+        if (hit) return 'lose';
+        return 'alive';
+      },
+      draw: function () {
+        // shard (player) — diamond shape
+        var sy2 = H * 0.68;
+        cx.save(); cx.translate(sx, sy2);
+        cx.beginPath(); cx.moveTo(0, -18); cx.lineTo(10, 0); cx.lineTo(0, 18); cx.lineTo(-10, 0); cx.closePath();
+        cx.fillStyle = '#a78bfa'; cx.fill();
+        cx.strokeStyle = '#fff'; cx.lineWidth = 1.5; cx.stroke();
+        cx.restore();
+        // gates (horizontal bars with gap)
+        for (var i = 0; i < gates.length; i++) {
+          var g = gates[i];
+          cx.fillStyle = VERM;
+          cx.fillRect(0, g.y, g.x, 14);
+          cx.fillRect(g.x + g.w, g.y, W - g.x - g.w, 14);
+        }
+        cx.textAlign = 'center'; cx.fillStyle = 'rgba(255,255,255,0.5)';
+        cx.font = '600 14px -apple-system, Helvetica, Arial';
+        cx.fillText(survived + '/' + NEED + ' gates', W / 2, 170);
+      },
+      autopilot: function () {
+        if (gates.length) {
+          var g = gates[0];
+          var midGap = g.x + g.w / 2;
+          pointerX = midGap + (rng() - 0.5) * 30;
+        }
+        return 'alive';
+      }
+    };
+  }
+
+  // ---------- BOSS 5: RHYTHM TAP (tap on the beat) ----------
+  function makeBoss5() {
+    var t = 0, beat = 0, tapped = 0, NEED = 5, WINDOW = 18, nextBeat = 30, missed = 0;
+    var pulseT = 0;
+    return {
+      name: 'RHYTHM', color: GOLD,
+      reset: function () { t = 0; beat = 0; tapped = 0; missed = 0; nextBeat = 30; pulseT = 0; },
+      onTap: function () {
+        var diff = Math.abs(t - nextBeat);
+        if (diff < WINDOW) {
+          tapped++;
+          if (window.J) J.hit(tapped);
+          if (diff < WINDOW * 0.4) { if (window.J) J.perfect(tapped); flash('PERFECT', TEAL, 36); }
+          else flash('GOOD', GOLD, 30);
+          nextBeat += 40;
+          if (tapped >= NEED) return 'win';
+        } else if (diff < WINDOW * 2.5) {
+          missed++;
+          if (window.J) J.near();
+          flash('EARLY', VERM, 26);
+          if (missed >= 3) return 'lose';
+        }
+        return 'alive';
+      },
+      update: function (dt) {
+        t += dt;
+        pulseT += dt;
+        if (t > nextBeat + WINDOW * 2) {
+          missed++;
+          if (window.J) J.near();
+          flash('MISS', VERM, 28);
+          nextBeat += 40;
+          if (missed >= 3) return 'lose';
+        }
+        return 'alive';
+      },
+      draw: function () {
+        var timeToNext = nextBeat - t;
+        var prog = Math.max(0, Math.min(1, 1 - timeToNext / 40));
+        var inWindow = Math.abs(t - nextBeat) < WINDOW;
+        var r = 60 + (inWindow ? 10 * Math.sin(t * 0.4) : 0);
+        cx.beginPath(); cx.arc(W / 2, H / 2, r, 0, Math.PI * 2);
+        cx.fillStyle = inWindow ? 'rgba(242,177,52,0.2)' : 'rgba(242,177,52,0.08)'; cx.fill();
+        cx.strokeStyle = inWindow ? GOLD : 'rgba(242,177,52,0.4)';
+        cx.lineWidth = inWindow ? 5 : 3; cx.stroke();
+        // progress ring
+        cx.beginPath(); cx.arc(W / 2, H / 2, 80, -Math.PI / 2, -Math.PI / 2 + prog * Math.PI * 2);
+        cx.strokeStyle = GOLD; cx.lineWidth = 6; cx.lineCap = 'round'; cx.stroke();
+        cx.textAlign = 'center';
+        cx.fillStyle = inWindow ? GOLD : 'rgba(255,255,255,0.5)';
+        cx.font = '900 ' + (inWindow ? '24' : '20') + 'px -apple-system, Helvetica, Arial';
+        cx.fillText(inWindow ? 'NOW' : 'TAP', W / 2, H / 2 + 8);
+        cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+        cx.fillText(tapped + '/' + NEED + ' hits  ' + missed + '/3 misses', W / 2, 170);
+      },
+      autopilot: function () {
+        var diff = t - nextBeat;
+        if (Math.abs(diff) < WINDOW * 0.8 && rng() < 0.35) {
+          return this.onTap();
+        }
+        return 'alive';
+      }
+    };
+  }
+
+  // ---------- BOSS 6: AVOID THE WALLS (shrinking corridor) ----------
+  function makeBoss6() {
+    var py = H * 0.6, px = W / 2;
+    var wallLeft = 0, wallRight = W, t = 0;
+    var PLAYER_R = 16;
+    var pointerX = px;
+    return {
+      name: 'WALLS', color: TEAL,
+      reset: function () { py = H * 0.6; px = W / 2; wallLeft = 0; wallRight = W; t = 0; pointerX = px; },
+      onPointer: function (x) { pointerX = x; },
+      update: function (dt) {
+        t += dt;
+        wallLeft  = Math.min(W / 2 - 40, wallLeft  + 0.35 * dt);
+        wallRight = Math.max(W / 2 + 40, wallRight - 0.35 * dt);
+        if (wallRight - wallLeft < 80) { wallLeft = W / 2 - 40; wallRight = W / 2 + 40; }
+        px += (pointerX - px) * 0.15 * dt;
+        px = Math.max(wallLeft + PLAYER_R, Math.min(wallRight - PLAYER_R, px));
+        if (px - PLAYER_R <= wallLeft || px + PLAYER_R >= wallRight) return 'lose';
+        if (t >= 120) return 'win'; // 8s survival = win
+        if (window.J && t % 30 < dt) J.tension(Math.min(t / 120, 1));
+        return 'alive';
+      },
+      draw: function () {
+        var prog = Math.min(1, t / 120);
+        // walls
+        cx.fillStyle = VERM;
+        cx.fillRect(0, 0, wallLeft, H);
+        cx.fillRect(wallRight, 0, W - wallRight, H);
+        // corridor edge glow
+        var gL = cx.createLinearGradient(wallLeft, 0, wallLeft + 30, 0);
+        gL.addColorStop(0, 'rgba(232,80,46,0.6)'); gL.addColorStop(1, 'rgba(232,80,46,0)');
+        cx.fillStyle = gL; cx.fillRect(wallLeft, 0, 30, H);
+        var gR = cx.createLinearGradient(wallRight - 30, 0, wallRight, 0);
+        gR.addColorStop(0, 'rgba(232,80,46,0)'); gR.addColorStop(1, 'rgba(232,80,46,0.6)');
+        cx.fillStyle = gR; cx.fillRect(wallRight - 30, 0, 30, H);
+        // player
+        cx.beginPath(); cx.arc(px, py, PLAYER_R, 0, Math.PI * 2);
+        cx.fillStyle = TEAL; cx.fill();
+        cx.strokeStyle = '#fff'; cx.lineWidth = 2; cx.stroke();
+        // timer arc
+        cx.beginPath(); cx.arc(W / 2, 600, 40, -Math.PI / 2, -Math.PI / 2 + prog * Math.PI * 2);
+        cx.strokeStyle = TEAL; cx.lineWidth = 5; cx.lineCap = 'round'; cx.stroke();
+        cx.textAlign = 'center'; cx.fillStyle = 'rgba(255,255,255,0.5)';
+        cx.font = '600 14px -apple-system, Helvetica, Arial';
+        cx.fillText('SURVIVE', W / 2, 608);
+      },
+      autopilot: function () {
+        pointerX = W / 2 + (rng() - 0.5) * (wallRight - wallLeft) * 0.5;
+        return 'alive';
+      }
+    };
+  }
+
+  // ---------- BOSS 7: SWIPE STREAK (swipe left/right alternating) ----------
+  function makeBoss7() {
+    var t = 0, streak = 0, NEED = 6, lastDir = null, nextDir = 'right', prompt = 0, PROMPT_DUR = 30;
+    var swipeStartX = null;
+    function nextPrompt() { nextDir = (rng() < 0.5) ? 'left' : 'right'; prompt = PROMPT_DUR; }
+    nextPrompt();
+    return {
+      name: 'SWIPE', color: VERM,
+      reset: function () { t = 0; streak = 0; lastDir = null; nextPrompt(); swipeStartX = null; },
+      onSwipe: function (dir) {
+        if (dir === nextDir) {
+          streak++;
+          if (window.J) J.hit(streak);
+          flash(dir === 'right' ? '→ YES' : '← YES', TEAL, 32);
+          if (streak >= NEED) return 'win';
+          nextPrompt();
+        } else {
+          streak = Math.max(0, streak - 1);
+          if (window.J) J.near();
+          flash('WRONG WAY', VERM, 28);
+          if (streak === 0 && t > 60) return 'lose';
+        }
+        return 'alive';
+      },
+      onPointerDown: function (x) { swipeStartX = x; },
+      onPointerUp:   function (x) {
+        if (swipeStartX === null) return 'alive';
+        var dx = x - swipeStartX;
+        swipeStartX = null;
+        if (Math.abs(dx) > 40) return this.onSwipe(dx > 0 ? 'right' : 'left');
+        return 'alive';
+      },
+      update: function (dt) {
+        t += dt;
+        prompt -= dt;
+        if (prompt <= 0) {
+          streak = Math.max(0, streak - 1);
+          if (window.J) J.near();
+          flash('TOO SLOW', VERM, 26);
+          if (streak === 0 && t > 60) return 'lose';
+          nextPrompt();
+        }
+        return 'alive';
+      },
+      draw: function () {
+        var ratio = Math.max(0, prompt / PROMPT_DUR);
+        var arrow = nextDir === 'right' ? '→' : '←';
+        cx.textAlign = 'center';
+        var pulse = 0.6 + 0.4 * Math.sin(t * 0.2);
+        cx.fillStyle = 'rgba(232,80,46,' + pulse + ')';
+        cx.font = '900 100px -apple-system, Helvetica, Arial';
+        cx.fillText(arrow, W / 2, H / 2 + 30);
+        // urgency bar
+        cx.fillStyle = ratio < 0.25 ? VERM : GOLD;
+        cx.fillRect(60, H / 2 + 70, (W - 120) * ratio, 10);
+        cx.strokeStyle = 'rgba(255,255,255,0.2)'; cx.lineWidth = 1;
+        cx.strokeRect(60, H / 2 + 70, W - 120, 10);
+        cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+        cx.fillText(streak + '/' + NEED + ' streak', W / 2, 170);
+      },
+      autopilot: function () {
+        if (prompt < PROMPT_DUR * 0.6 && rng() < 0.12) {
+          return this.onSwipe(nextDir);
+        }
+        return 'alive';
+      }
+    };
+  }
+
+  // ---------- BOSS 8: THE FINAL CIRCLE (tap inside shrinking circle 3 times) ----------
+  function makeBoss8() {
+    var cx2 = W / 2, cy2 = H / 2 + 20, r = 140, taps = 0, NEED = 3;
+    var t = 0;
+    return {
+      name: 'FIN', color: GOLD,
+      reset: function () { r = 140; taps = 0; t = 0; },
+      onTap: function (x, y) {
+        var dx = x - cx2, dy = y - cy2;
+        if (dx * dx + dy * dy < r * r) {
+          taps++;
+          r = Math.max(30, r - 35);
+          if (window.J) { if (taps >= NEED) J.fanfare(); else J.perfect(taps); }
+          flash(taps >= NEED ? 'FIN!' : 'HIT ' + taps, taps >= NEED ? GOLD : TEAL, 40);
+          if (taps >= NEED) return 'win';
+        } else {
+          if (window.J) J.near();
+          flash('OUTSIDE', VERM, 26);
+          return 'lose';
+        }
+        return 'alive';
+      },
+      update: function (dt) {
+        t += dt;
+        r = Math.max(25, r - 0.08 * dt);
+        if (r <= 25 && taps < NEED) return 'lose';
+        return 'alive';
+      },
+      draw: function () {
+        // outer glow rings
+        for (var ring = 3; ring > 0; ring--) {
+          cx.beginPath(); cx.arc(cx2, cy2, r + ring * 14, 0, Math.PI * 2);
+          cx.strokeStyle = 'rgba(242,177,52,' + (0.06 * ring) + ')';
+          cx.lineWidth = 2; cx.stroke();
+        }
+        cx.beginPath(); cx.arc(cx2, cy2, r, 0, Math.PI * 2);
+        cx.fillStyle = 'rgba(242,177,52,0.1)'; cx.fill();
+        cx.strokeStyle = GOLD; cx.lineWidth = 4; cx.stroke();
+        cx.textAlign = 'center';
+        cx.fillStyle = GOLD; cx.font = '900 28px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP ' + (NEED - taps) + 'x', cx2, cy2 + 10);
+        cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+        cx.fillText('FINAL BOSS', W / 2, 170);
+      },
+      autopilot: function () {
+        if (r > 30 && rng() < 0.03) {
+          var jitter = (rng() - 0.5) * r * 1.5;
+          return this.onTap(cx2 + jitter, cy2 + jitter);
+        }
+        return 'alive';
+      }
+    };
+  }
+
+  var BOSS_FACTORIES = [
+    makeBoss1, makeBoss2, makeBoss3, makeBoss4,
+    makeBoss5, makeBoss6, makeBoss7, makeBoss8
+  ];
+
+  // ---- game lifecycle ----
+  function initGame() {
+    bossIdx = 0; bossesBeaten = 0; totalScore = 0;
+    dareBeaten = false;
+    flashes = []; hitStop = 0; shakeAmt = 0; zoom = 1;
+    boss = null; phase = 'title';
+  }
+
+  function startBoss() {
+    boss = BOSS_FACTORIES[bossIdx]();
+    boss.reset();
+    bossTimer = 10.0; // 10 seconds
+    phase = 'play';
+    if (window.LOOP) LOOP.emit('boss_start', { boss: bossIdx + 1, name: boss.name });
+    if (window.J) J.tension(bossIdx / 7);
+  }
+
+  function bossWin() {
+    bossesBeaten++;
+    totalScore = bossesBeaten;
+    shakeAmt = 3; zoom = 1.03; hitStop = 6;
+    if (window.J) { J.gold(); }
+    flash('BOSS ' + bossIdx + ' DOWN!', TEAL, 40);
+    if (window.LOOP) LOOP.emit('boss_beaten', { boss: bossIdx + 1 });
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && bossesBeaten > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(bossesBeaten);
+    }
+    bossResult = 'win';
+    transAt = performance.now();
+    phase = 'transition';
+    if (bossIdx >= 7) {
+      // beat all 8 — FIN!
+      setTimeout(function () {
+        phase = 'fin'; finAt = performance.now();
+        if (window.J) J.fanfare();
+        if (window.LOOP) LOOP.emit('game_over', { score: totalScore, dur_s: +((Date.now() - runStartTs) / 1000).toFixed(1) });
+        if (DEMO) {
+          window.__demoScore = totalScore;
+          setTimeout(function () { phase = 'cta'; ctaAt = performance.now();
+            setTimeout(function () { window.__demoDone = true; }, 3600);
+          }, 2200);
+        }
+        if (BOT) endBotRun();
+      }, 1400);
+    } else {
+      setTimeout(function () {
+        bossIdx++;
+        startBoss();
+      }, 1400);
+    }
+  }
+
+  function bossLose() {
+    shakeAmt = 9;
+    var mag = Math.min(0.3 + bossIdx * 0.1, 1);
+    if (window.J) J.death(mag);
+    flash('OUT AT BOSS ' + (bossIdx + 1), VERM, 36);
+    bossResult = 'lose';
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: totalScore, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = totalScore;
+      setTimeout(function () { phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) endBotRun();
+  }
+
+  function endBotRun() {
+    botRunsDone++;
+    if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+    else setTimeout(function () { startNewRun(); }, 800);
+  }
+
+  function startNewRun() {
+    bossIdx = 0; bossesBeaten = 0; totalScore = 0;
+    flashes = []; hitStop = 0; shakeAmt = 0; zoom = 1;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startBoss();
+  }
+
+  function startFirstRun() {
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(function () { startBoss(); }, 1300);
+    } else {
+      startBoss();
+    }
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  var pointerDownX = null;
+
+  function handlePointerDown(x, y) {
+    if (DEMO || BOT) return;
+    pointerDownX = x;
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startFirstRun(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (inR(SHARE_R, x, y) && window.SHARE) { SHARE.send({ score: totalScore, unit: 'bosses' }); return; }
+      startNewRun(); return;
+    }
+    if (phase === 'fin' && performance.now() - finAt > 350) {
+      if (inR(SHARE_R, x, y) && window.SHARE) { SHARE.send({ score: totalScore, unit: 'bosses' }); return; }
+      startNewRun(); return;
+    }
+    if (phase === 'play' && boss) {
+      var res = 'alive';
+      if (boss.onPointerDown) boss.onPointerDown(x, y);
+      if (boss.onTap) res = boss.onTap(x, y) || 'alive';
+      if (res === 'win') bossWin();
+      else if (res === 'lose') bossLose();
+    }
+  }
+
+  function handlePointerMove(x, y) {
+    if (DEMO || BOT) return;
+    if (phase !== 'play' || !boss) return;
+    if (boss.onPointer) boss.onPointer(x, y);
+  }
+
+  function handlePointerUp(x, y) {
+    if (DEMO || BOT) return;
+    if (phase !== 'play' || !boss) return;
+    if (boss.onPointerUp) {
+      var res = boss.onPointerUp(x, y) || 'alive';
+      if (res === 'win') bossWin();
+      else if (res === 'lose') bossLose();
+    }
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    handlePointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointermove', function (e) {
+    var r = cv.getBoundingClientRect();
+    handlePointerMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    handlePointerUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') handlePointerDown(W / 2, H / 2);
+    if (e.code === 'ArrowLeft') { if (phase === 'play' && boss && boss.onSwipe) { var res = boss.onSwipe('left') || 'alive'; if (res === 'win') bossWin(); else if (res === 'lose') bossLose(); } }
+    if (e.code === 'ArrowRight') { if (phase === 'play' && boss && boss.onSwipe) { var res = boss.onSwipe('right') || 'alive'; if (res === 'win') bossWin(); else if (res === 'lose') bossLose(); } }
+  });
+
+  // ---- demo autopilot script ----
+  // arc: challenge card → boss1 dodge (dies heroically at ~60%) → transition shows boss # → CTA
+  var demoPhase = 0, demoTimer = 0;
+  // demo will go through bosses 1-5 then die on boss 6 (walls)
+  var DEMO_BOSS_OUTCOMES = ['win','win','win','win','win','lose']; // die at boss 6 index 5
+
+  function demoAutopilot(dt) {
+    if (!boss || phase !== 'play') return;
+    var res = boss.autopilot ? (boss.autopilot(dt) || 'alive') : 'alive';
+    // demo outcome override: on certain bosses, force a loss at the right time
+    var currentOutcome = DEMO_BOSS_OUTCOMES[Math.min(bossIdx, DEMO_BOSS_OUTCOMES.length - 1)];
+    if (currentOutcome === 'lose' && bossTimer < 3.5) {
+      // force death by not dodging
+      if (boss.onPointer) boss.onPointer(W / 2, H / 2); // move to center (may collide)
+      // manually trigger lose after a dramatic moment
+      if (bossTimer < 1.2 && rng() < 0.06) { bossLose(); return; }
+    }
+    if (res === 'win') bossWin();
+    else if (res === 'lose') bossLose();
+  }
+
+  // ---- bot autopilot ----
+  // Bot plays imperfectly; guaranteed to lose within each run (boss limit or time)
+  // Bot fails harder on later bosses
+  var botFailThreshold = [0, 0, 0, 0, 1, 1, 1, 1]; // which bosses bot always fails (0=try, 1=fail after short time)
+  var botHardFail = false;
+  function botAutopilot(dt) {
+    if (!boss || phase !== 'play') return;
+    // after boss 4, bot starts failing more
+    if (bossIdx >= 4 && !botHardFail && bossTimer < 4 + rng() * 3) {
+      botHardFail = true;
+    }
+    if (botHardFail && bossTimer < 2 && rng() < 0.08) { bossLose(); return; }
+    var res = boss.autopilot ? (boss.autopilot(dt) || 'alive') : 'alive';
+    if (res === 'win') { botHardFail = false; bossWin(); }
+    else if (res === 'lose') bossLose();
+  }
+
+  // ---- boss timer ----
+  function tickBossTimer(dt) {
+    if (phase !== 'play' || hitStop > 0) return;
+    bossTimer -= dt / 60; // dt is in frames (60fps), convert to seconds
+    if (bossTimer <= 0) {
+      bossTimer = 0;
+      // time's up = lose (failed to complete boss in time)
+      bossLose();
+    }
+    if (bossTimer < 3 && window.J) J.tension(1 - bossTimer / 3);
+  }
+
+  // ---- pctTop helper ----
+  function pctTop(score) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 4)))); }
+
+  // ---- render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // boss timer tick
+    if (phase === 'play') {
+      tickBossTimer(dt);
+      // autopilots
+      if (DEMO) demoAutopilot(dt);
+      else if (BOT) botAutopilot(dt);
+      // boss update (for non-tap bosses that self-update)
+      if (boss && phase === 'play') {
+        var res = 'alive';
+        if (hitStop <= 0) res = boss.update(dt) || 'alive';
+        if (res === 'win' && phase === 'play') bossWin();
+        else if (res === 'lose' && phase === 'play') bossLose();
+      }
+    }
+
+    // hit-stop decay
+    if (hitStop > 0) hitStop -= dt;
+
+    cx.save();
+    // juice transforms
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.86, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- phases ----
+    if (phase === 'title') {
+      drawTitle(now);
+    } else if (phase === 'challenge') {
+      drawChallenge(now);
+    } else if (phase === 'play') {
+      drawPlay(now);
+    } else if (phase === 'transition') {
+      drawTransition(now);
+    } else if (phase === 'over') {
+      drawOver(now);
+    } else if (phase === 'fin') {
+      drawFin(now);
+    } else if (phase === 'cta') {
+      drawCta(now);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      cx.globalAlpha = Math.max(0, 1 - fl.t / 38);
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+    cx.fillText('MINI BOSS', W / 2, 280);
+    cx.fillStyle = VERM; cx.font = '900 42px -apple-system, Helvetica, Arial';
+    cx.fillText('RUSH', W / 2, 330);
+    cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('8 bosses · 10s each', W / 2, 370);
+    var pulse = 0.55 + 0.45 * Math.sin(now / 320);
+    cx.globalAlpha = pulse; cx.fillStyle = TEAL;
+    cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO START', W / 2, 420); cx.globalAlpha = 1;
+  }
+
+  function drawChallenge(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+    cx.fillText('SCORE TO BEAT', W / 2, 290);
+    cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+    cx.fillText('6', W / 2, 400);
+    cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('bosses cleared today', W / 2, 430);
+  }
+
+  function drawPlay(now) {
+    if (!boss) return;
+    // boss draw
+    boss.draw();
+    // boss header
+    cx.textAlign = 'center';
+    cx.fillStyle = boss.color || VERM;
+    cx.font = '800 15px Menlo, monospace';
+    cx.fillText('BOSS ' + (bossIdx + 1) + ' — ' + boss.name, W / 2, 112);
+    // progress dots
+    for (var d = 0; d < 8; d++) {
+      cx.beginPath();
+      cx.arc(W / 2 - 3.5 * 22 + d * 22, 130, 6, 0, Math.PI * 2);
+      if (d < bossesBeaten) { cx.fillStyle = TEAL; cx.fill(); }
+      else if (d === bossIdx) { cx.fillStyle = boss.color || VERM; cx.fill(); }
+      else { cx.strokeStyle = 'rgba(255,255,255,0.2)'; cx.lineWidth = 1.5; cx.stroke(); }
+    }
+    // boss timer bar
+    var timerFrac = Math.max(0, bossTimer / 10);
+    var barW = W - 80;
+    cx.fillStyle = 'rgba(255,255,255,0.08)';
+    cx.fillRect(40, 148, barW, 6);
+    cx.fillStyle = bossTimer < 3 ? VERM : TEAL;
+    cx.fillRect(40, 148, barW * timerFrac, 6);
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '700 13px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + ' bosses', W / 2, 675);
+    }
+  }
+
+  function drawTransition(now) {
+    var elapsed = (now - transAt) / 1000;
+    cx.fillStyle = 'rgba(11,13,18,0.7)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL; cx.font = '900 52px -apple-system, Helvetica, Arial';
+    cx.fillText('BOSS ' + (bossIdx) + ' CLEARED', W / 2, H / 2 - 20);
+    cx.fillStyle = GOLD; cx.font = '700 22px -apple-system, Helvetica, Arial';
+    cx.fillText('NEXT UP: BOSS ' + (bossIdx + 2), W / 2, H / 2 + 30);
+  }
+
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+    cx.fillText('ELIMINATED.', W / 2, 300);
+    cx.fillStyle = '#fff'; cx.font = '800 24px -apple-system, Helvetica, Arial';
+    cx.fillText(bossesBeaten + ' boss' + (bossesBeaten !== 1 ? 'es' : '') + ' cleared', W / 2, 342);
+    var pt = pctTop(bossesBeaten);
+    cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+    cx.fillText('TOP ' + pt + '% TODAY', W / 2, 385);
+    cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 410);
+    if (!DEMO && !BOT) {
+      var p2 = 0.55 + 0.45 * Math.sin(now / 280);
+      cx.globalAlpha = p2; cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — ONE MORE RUN', W / 2, 458); cx.globalAlpha = 1;
+      drawSharePill(now);
+    }
+  }
+
+  function drawFin(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = GOLD; cx.font = '900 72px -apple-system, Helvetica, Arial';
+    cx.fillText('FIN.', W / 2, 320);
+    cx.fillStyle = '#fff'; cx.font = '800 22px -apple-system, Helvetica, Arial';
+    cx.fillText('ALL 8 BOSSES CLEARED', W / 2, 365);
+    cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('you finished the rush', W / 2, 392);
+    if (!DEMO && !BOT) {
+      var p2 = 0.55 + 0.45 * Math.sin(now / 280);
+      cx.globalAlpha = p2; cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — RUN IT AGAIN', W / 2, 440); cx.globalAlpha = 1;
+      drawSharePill(now);
+    }
+  }
+
+  function drawSharePill(now) {
+    cx.fillStyle = 'rgba(242,177,52,0.13)';
+    cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+    else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+    cx.fill(); cx.stroke();
+    cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+    cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+  }
+
+  function drawCta(now) {
+    var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease; cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+    cx.fillText('MINI BOSS RUSH', W / 2, 285);
+    cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('got to boss ' + (window.__demoScore || bossesBeaten) + '. beat that.', W / 2, 328);
+    var p3 = 0.65 + 0.35 * Math.sin(now / 240);
+    cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+    cx.font = '900 32px -apple-system, Helvetica, Arial';
+    cx.fillText('BEAT ' + (window.__demoScore || bossesBeaten), W / 2, 402);
+    cx.globalAlpha = ease;
+    cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 438);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- kick off ----
+  initGame();
+  if (BOT) {
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    startBoss();
+  } else if (DEMO) {
+    // demo starts with challenge card, then auto-runs
+    phase = 'challenge';
+    challengeAt = performance.now();
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    setTimeout(function () { startBoss(); }, 1300);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

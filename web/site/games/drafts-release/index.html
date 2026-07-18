@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Drafts Release — Tilt</title>
+<!--
+  LOOP / attention-architecture — Drafts Release
+  Engine: calm. Circuits: 05-ease, 06-zeigarnik, 04-loss.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N    imperfect autopilot, N complete runs → window.__botDone
+    ?clip=ID&src=... attribution (see js/loop-events.js)
+    ?sink=URL        event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'drafts-release';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var CARD_W = 310, CARD_H = 110, CARD_R = 18;
+  var TOTAL_DRAFTS = 8;
+
+  // draft card text snippets — the "half-written thoughts" feel
+  var SNIPPETS = [
+    'maybe i should just say it',
+    'that thing i keep thinking about',
+    'hey, i wanted to tell you—',
+    'no one talks about this but',
+    'been sitting on this for weeks',
+    'not sure if this makes sense but',
+    'the thing i never post:',
+    'i almost sent this last night',
+    'this is probably too honest',
+    'still not the right time',
+    'i wrote this at 2am',
+    'draft #47, maybe this one'
+  ];
+
+  // game state
+  var phase; // 'title' | 'play' | 'over' | 'cta'
+  var cards, releasedCount, totalDrafts;
+  var runStartTs;
+  var flashes = [];
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var botRunsDone = 0;
+
+  // CTA timing
+  var ctaAt = 0;
+  // Over timing
+  var overAt = 0;
+
+  // Input state (swipe tracking)
+  var drag = null; // { cardIdx, startY, curY }
+
+  // Mute + Share hit areas (same pattern as reference)
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // Per-card state
+  function makeCard(idx) {
+    var snippet = SNIPPETS[Math.floor(rng() * SNIPPETS.length)];
+    var baseY = 340 + idx * 24; // stacked with slight offset
+    return {
+      idx: idx,
+      snippet: snippet,
+      x: W / 2,
+      y: baseY,
+      targetY: baseY,
+      vy: 0,
+      alpha: 1,
+      released: false,
+      flyY: 0,
+      flyAlpha: 0,
+      hue: 185 + Math.floor(rng() * 30) // teal-ish
+    };
+  }
+
+  function newGame() {
+    phase = 'title';
+    cards = [];
+    releasedCount = 0;
+    totalDrafts = TOTAL_DRAFTS;
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    drag = null;
+    for (var i = 0; i < totalDrafts; i++) {
+      cards.push(makeCard(i));
+    }
+    positionCards();
+    if (DEMO) {
+      // Start demo immediately into play
+      startRun();
+      return;
+    }
+    if (BOT) {
+      startRun();
+    }
+  }
+
+  // Position cards as a stack — top card is index 0, stacked above each other
+  function positionCards() {
+    var remaining = cards.filter(function (c) { return !c.released; });
+    var stackBase = 460;
+    for (var i = 0; i < remaining.length; i++) {
+      var depth = remaining.length - 1 - i; // 0 = top card
+      remaining[i].targetY = stackBase - depth * 8;
+      remaining[i].x = W / 2 + (Math.floor(rng() * 7) - 3) * (depth === 0 ? 0 : 1);
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    positionCards();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function releaseTopCard() {
+    var topCard = getTopCard();
+    if (!topCard) return;
+    topCard.released = true;
+    topCard.flyY = topCard.y;
+    topCard.flyAlpha = 1;
+    releasedCount++;
+
+    // Calm sound — soft bell step
+    if (window.J) J.calm(releasedCount);
+
+    // Gentle zoom pulse on each release
+    zoom = 1.015;
+
+    // Small shake on first and last
+    if (releasedCount === 1 || releasedCount === totalDrafts) shakeAmt = 2.5;
+
+    // Floating text
+    var msgs = ['let it go', 'released', 'breathe', 'free', '✓ sent to air'];
+    flash(msgs[Math.floor(rng() * msgs.length)], TEAL, 22);
+
+    if (window.LOOP) LOOP.emit('draft_released', { n: releasedCount, total: totalDrafts });
+
+    // Reposition remaining cards
+    positionCards();
+
+    // Check if all cleared
+    if (releasedCount >= totalDrafts) {
+      setTimeout(function () { gameOver(); }, 900);
+    }
+  }
+
+  function getTopCard() {
+    // The top-most non-released card
+    for (var i = cards.length - 1; i >= 0; i--) {
+      if (!cards[i].released) return cards[i];
+    }
+    return null;
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: releasedCount, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = releasedCount;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2500);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    rng = mulberry32(SEED + botRunsDone);
+    phase = 'title';
+    cards = [];
+    releasedCount = 0;
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    drag = null;
+    for (var i = 0; i < TOTAL_DRAFTS; i++) {
+      cards.push(makeCard(i));
+    }
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 24, t: 0 });
+  }
+
+  // ---- Demo autopilot ----
+  // Calm arc: settle → deepen → resolve → soft invitation
+  // Releases a card every ~2s with slight variance
+  var demoStep = 0;
+  var demoTimer = 0;
+  // Intervals between releases (frames at 60fps ≈ 16ms): ~1.8-2.5s each
+  var demoIntervals = [108, 95, 115, 88, 102, 120, 95, 85]; // 8 cards
+
+  // ---- Bot autopilot ----
+  var botTimer = 0;
+  var BOT_INTERVAL = 45; // release one card every ~0.75s
+
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+    if (hitStop > 0) return; // wait for hit-stop to decay
+
+    if (DEMO) {
+      demoTimer += dt;
+      var wait = demoIntervals[Math.min(demoStep, demoIntervals.length - 1)];
+      if (demoTimer >= wait) {
+        demoTimer = 0;
+        demoStep++;
+        var top = getTopCard();
+        if (top && !top.released) {
+          releaseTopCard();
+        }
+      }
+    } else if (BOT) {
+      botTimer += dt;
+      if (botTimer >= BOT_INTERVAL) {
+        botTimer = 0;
+        var top2 = getTopCard();
+        if (top2 && !top2.released) {
+          releaseTopCard();
+        }
+      }
+    }
+  }
+
+  // ---- Input (human only) ----
+  var swipeStartY = null, swipeCardIdx = null;
+
+  function pointerDown(x, y) {
+    if (DEMO || BOT) return;
+    if (!inR(MUTE_R, x, y)) {
+      // Check mute
+    }
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+
+    if (phase === 'title') { startRun(); return; }
+
+    if (phase === 'play') {
+      var top = getTopCard();
+      if (!top) return;
+      // Check if touch is on the top card
+      var cy = top.targetY, cx2 = top.x;
+      if (x >= cx2 - CARD_W / 2 - 20 && x <= cx2 + CARD_W / 2 + 20 &&
+          y >= cy - CARD_H / 2 - 20 && y <= cy + CARD_H / 2 + 20) {
+        swipeStartY = y;
+        swipeCardIdx = top.idx;
+        drag = { card: top, startY: y, curY: y };
+      }
+    }
+
+    if (phase === 'over' && performance.now() - overAt > 400) {
+      if (inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: releasedCount, unit: 'drafts released' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  function pointerMove(x, y) {
+    if (DEMO || BOT) return;
+    if (drag) {
+      drag.curY = y;
+      drag.card.y = drag.card.targetY + (y - drag.startY);
+    }
+  }
+
+  function pointerUp(x, y) {
+    if (DEMO || BOT) return;
+    if (drag) {
+      var deltaY = drag.startY - drag.curY; // positive = swiped up
+      if (deltaY > 40) {
+        // Released — swipe was upward enough
+        drag.card.y = drag.card.targetY; // snap back before fly
+        drag = null;
+        releaseTopCard();
+      } else {
+        // Snap back
+        drag.card.y = drag.card.targetY;
+        drag = null;
+      }
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointermove', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.code === 'ArrowUp') {
+      if (DEMO || BOT) return;
+      if (phase === 'title') { startRun(); return; }
+      if (phase === 'play') releaseTopCard();
+    }
+  });
+
+  // ---- Drawing helpers ----
+  function roundRect(x, y, w, h, r2) {
+    cx.beginPath();
+    if (cx.roundRect) {
+      cx.roundRect(x, y, w, h, r2);
+    } else {
+      cx.moveTo(x + r2, y);
+      cx.arcTo(x + w, y, x + w, y + h, r2);
+      cx.arcTo(x + w, y + h, x, y + h, r2);
+      cx.arcTo(x, y + h, x, y, r2);
+      cx.arcTo(x, y, x + w, y, r2);
+      cx.closePath();
+    }
+  }
+
+  function drawCard(card, isTop) {
+    if (card.released && card.flyAlpha <= 0.01) return;
+
+    var cx2 = card.released ? card.x : (drag && drag.card === card ? drag.card.x : card.x);
+    var cy2 = card.released ? card.flyY : card.y;
+    var alpha = card.released ? card.flyAlpha : card.alpha;
+    var depth = cards.filter(function (c) { return !c.released && c.idx < card.idx; }).length;
+
+    cx.save();
+    cx.globalAlpha = alpha;
+    cx.translate(cx2, cy2);
+
+    // Slight tilt for non-top cards
+    var tilt = !card.released ? (card.idx % 2 === 0 ? 0.012 : -0.009) * depth : 0;
+    if (drag && drag.card === card) {
+      // Tilt based on drag direction
+      var dragDelta = (drag.curY - drag.startY);
+      tilt = dragDelta * 0.0004;
+    }
+    cx.rotate(tilt);
+
+    // Card shadow
+    cx.shadowColor = 'rgba(0,0,0,0.35)';
+    cx.shadowBlur = isTop ? 18 : 8;
+    cx.shadowOffsetY = isTop ? 6 : 3;
+
+    // Card background
+    var hue = card.hue;
+    var g = cx.createLinearGradient(0, -CARD_H / 2, 0, CARD_H / 2);
+    g.addColorStop(0, 'hsl(' + hue + ',22%,17%)');
+    g.addColorStop(1, 'hsl(' + hue + ',18%,13%)');
+    cx.fillStyle = g;
+    roundRect(-CARD_W / 2, -CARD_H / 2, CARD_W, CARD_H, CARD_R);
+    cx.fill();
+
+    cx.shadowColor = 'transparent'; cx.shadowBlur = 0; cx.shadowOffsetY = 0;
+
+    // Border — glows teal for top card
+    cx.strokeStyle = isTop ? 'rgba(46,197,182,0.45)' : 'rgba(255,255,255,0.06)';
+    cx.lineWidth = isTop ? 1.5 : 0.8;
+    roundRect(-CARD_W / 2, -CARD_H / 2, CARD_W, CARD_H, CARD_R);
+    cx.stroke();
+
+    // "DRAFT" label
+    cx.fillStyle = 'rgba(46,197,182,0.4)';
+    cx.font = '600 10px Menlo, monospace';
+    cx.textAlign = 'left';
+    cx.fillText('DRAFT', -CARD_W / 2 + 18, -CARD_H / 2 + 22);
+
+    // Snippet text
+    cx.fillStyle = isTop ? 'rgba(255,255,255,0.82)' : 'rgba(255,255,255,0.38)';
+    cx.font = (isTop ? '500' : '400') + ' 15px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'left';
+    // Word-wrap to 2 lines
+    var words = card.snippet.split(' ');
+    var line1 = '', line2 = '';
+    var maxW = CARD_W - 36;
+    cx.font = '500 15px -apple-system, Helvetica, Arial';
+    for (var w = 0; w < words.length; w++) {
+      var test = line1 ? line1 + ' ' + words[w] : words[w];
+      if (cx.measureText(test).width < maxW) {
+        line1 = test;
+      } else {
+        line2 = words.slice(w).join(' ');
+        break;
+      }
+    }
+    cx.fillText(line1, -CARD_W / 2 + 18, -CARD_H / 2 + 52);
+    if (line2) cx.fillText(line2, -CARD_W / 2 + 18, -CARD_H / 2 + 72);
+
+    // Swipe hint on top card (pulsing arrow)
+    if (isTop && phase === 'play' && !card.released) {
+      var pulse = 0.3 + 0.25 * Math.sin(performance.now() / 500);
+      cx.globalAlpha = alpha * pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '600 11px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('↑  swipe to release', 0, CARD_H / 2 - 14);
+    }
+
+    cx.restore();
+  }
+
+  // ---- Particles for card dissolution ----
+  var particles = [];
+  function spawnParticles(x, y) {
+    for (var i = 0; i < 12; i++) {
+      particles.push({
+        x: x + (rng() - 0.5) * CARD_W * 0.6,
+        y: y,
+        vx: (rng() - 0.5) * 1.5,
+        vy: -rng() * 2.5 - 0.5,
+        alpha: 0.7 + rng() * 0.3,
+        r: 1.5 + rng() * 3,
+        life: 0
+      });
+    }
+  }
+
+  // Progress dots
+  function drawProgress() {
+    var total = totalDrafts;
+    var spacing = 14;
+    var startX = W / 2 - (total - 1) * spacing / 2;
+    for (var i = 0; i < total; i++) {
+      var released = i < releasedCount;
+      cx.beginPath();
+      cx.arc(startX + i * spacing, 130, released ? 4 : 3, 0, Math.PI * 2);
+      cx.fillStyle = released ? TEAL : 'rgba(255,255,255,0.18)';
+      cx.fill();
+    }
+  }
+
+  // ---- Main loop ----
+  var last = performance.now();
+  var ctaPhaseAt = 0;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Hit-stop decay — CRITICAL: must decay every frame, never gate autopilot
+    if (hitStop > 0) { hitStop -= dt; }
+    else { autopilot(dt); }
+
+    // Animate cards — lerp toward target, fly-out released cards
+    for (var i = 0; i < cards.length; i++) {
+      var card = cards[i];
+      if (!card.released) {
+        if (!drag || drag.card !== card) {
+          card.y += (card.targetY - card.y) * 0.12 * dt;
+        }
+      } else {
+        // Fly upward and fade out
+        card.flyY -= (2 + (1 - card.flyAlpha) * 3) * dt;
+        card.flyAlpha -= 0.018 * dt;
+        if (card.flyAlpha < 0) card.flyAlpha = 0;
+        // Spawn particles as it fades
+        if (card.flyAlpha > 0.5 && card.flyAlpha < 0.7 && Math.random() < 0.3) {
+          spawnParticles(card.x, card.flyY);
+        }
+      }
+    }
+
+    // Animate particles
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pt = particles[p];
+      pt.x += pt.vx * dt;
+      pt.y += pt.vy * dt;
+      pt.vy += 0.04 * dt;
+      pt.life += dt;
+      pt.alpha -= 0.015 * dt;
+      if (pt.alpha <= 0) { particles.splice(p, 1); }
+    }
+
+    // Juice transforms
+    cx.save();
+    if (shakeAmt > 0.1 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // Background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    // Ambient glow at top (where cards fly to)
+    var glow = cx.createRadialGradient(W / 2, 80, 10, W / 2, 80, 220);
+    glow.addColorStop(0, 'rgba(46,197,182,0.07)');
+    glow.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = glow;
+    cx.fillRect(0, 0, W, 300);
+
+    // Title screen
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '700 36px -apple-system, Helvetica, Arial';
+      cx.fillText('DRAFTS RELEASE', W / 2, 280);
+      cx.fillStyle = 'rgba(46,197,182,0.75)';
+      cx.font = '400 16px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 400);
+      cx.globalAlpha = pulse;
+      cx.fillText('tap to begin', W / 2, 330);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.25)';
+      cx.font = '400 13px -apple-system, Helvetica, Arial';
+      cx.fillText('clear the drafts. let them go.', W / 2, 362);
+    }
+
+    // Play / Over — draw the card stack
+    if (phase === 'play' || phase === 'over') {
+      // Draw cards back to front (index 0 = bottom of stack, last = top)
+      var topCard = getTopCard();
+      for (var ci = 0; ci < cards.length; ci++) {
+        var card2 = cards[ci];
+        var isTop = (card2 === topCard);
+        drawCard(card2, isTop);
+      }
+
+      // Particles
+      for (var pp = 0; pp < particles.length; pp++) {
+        var pt2 = particles[pp];
+        cx.save();
+        cx.globalAlpha = Math.max(0, pt2.alpha);
+        cx.fillStyle = TEAL;
+        cx.beginPath();
+        cx.arc(pt2.x, pt2.y, pt2.r, 0, Math.PI * 2);
+        cx.fill();
+        cx.restore();
+      }
+
+      // Progress dots
+      drawProgress();
+
+      // Counter
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '700 52px -apple-system, Helvetica, Arial';
+      cx.fillText(releasedCount, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('of ' + totalDrafts + ' released', W / 2, 118);
+    }
+
+    // Flashes (floating reward text)
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.save();
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '600 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 280 - fl.t * 0.9);
+      cx.restore();
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // Over screen
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.65)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+
+      // Calm completion message
+      cx.fillStyle = TEAL;
+      cx.font = '700 34px -apple-system, Helvetica, Arial';
+      cx.fillText('all clear.', W / 2, 290);
+
+      cx.fillStyle = 'rgba(255,255,255,0.8)';
+      cx.font = '500 18px -apple-system, Helvetica, Arial';
+      cx.fillText(releasedCount + ' drafts released', W / 2, 330);
+
+      cx.fillStyle = 'rgba(46,197,182,0.7)';
+      cx.font = '400 14px -apple-system, Helvetica, Arial';
+      cx.fillText('you didn\'t need to say it', W / 2, 365);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.65 + 0.35 * Math.sin(now / 350);
+        cx.globalAlpha = p2;
+        cx.fillStyle = 'rgba(255,255,255,0.6)';
+        cx.font = '500 15px -apple-system, Helvetica, Arial';
+        cx.fillText('tap to release again', W / 2, 460);
+        cx.globalAlpha = 1;
+
+        // Share pill
+        cx.fillStyle = 'rgba(46,197,182,0.12)';
+        cx.strokeStyle = TEAL;
+        cx.lineWidth = 1.5;
+        roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        cx.fill();
+        roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        cx.stroke();
+        cx.fillStyle = TEAL;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 29);
+      }
+    }
+
+    // Demo CTA card (calm arc: soft invitation)
+    if (phase === 'cta') {
+      var t2 = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t2 * 2.5);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.save();
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+
+      cx.fillStyle = 'rgba(255,255,255,0.95)';
+      cx.font = '700 40px -apple-system, Helvetica, Arial';
+      cx.fillText('DRAFTS RELEASE', W / 2, 290);
+
+      cx.fillStyle = 'rgba(46,197,182,0.85)';
+      cx.font = '400 18px -apple-system, Helvetica, Arial';
+      cx.fillText('let go of what you almost said', W / 2, 334);
+
+      var p3 = 0.75 + 0.25 * Math.sin(now / 320);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL;
+      cx.font = '700 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ GROW YOURS', W / 2, 406);
+      cx.globalAlpha = ease;
+
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '400 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 438);
+      cx.restore();
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.save();
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.restore();
+    }
+
+    cx.restore(); // juice transform restore
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

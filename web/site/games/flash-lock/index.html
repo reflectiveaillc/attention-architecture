@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Flash Lock — Tilt</title>
+<!--
+  LOOP / attention-architecture — Flash Lock
+  Circuits: 01-rpe (variable reward), 02-novelty (decoys), 07-timing (peak brightness tap)
+  Engine: viral
+  Modes:
+    ?demo=1&seed=7   mirror-neuron clip: challenge card → human run w/ hesitation → near-fail → fail → score → CTA
+    ?bot=1&runs=N    imperfect autopilot, N runs, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'flash-lock';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  // Each "round": several dim decoy flashes, then one REAL peak flash.
+  // Player must tap only at the TRUE peak (brightness >= PEAK_THRESH).
+  // Tapping during a decoy = early penalty (score hit, no point).
+  // Missing the real peak (it fades past window) = miss = lose a life.
+  // 3 lives. Score = streak of correct taps across rounds.
+
+  var LIVES_MAX = 3;
+  var PEAK_THRESH = 0.80;   // brightness above which tap counts as "on peak"
+  var EARLY_THRESH = 0.30;  // brightness above which a tap on decoy is a penalty (not ignored)
+  var WINDOW_HOLD = 0.18;   // seconds peak stays above PEAK_THRESH (tap window)
+
+  // ---- state ----
+  var phase;          // title | challenge | play | over | cta
+  var score, lives, streak, combo, best = 0;
+  var dareBeaten = false;
+  try { best = +localStorage.getItem('fl_best') || 0; } catch (_) {}
+
+  // current flash sequence state
+  var flashSeq;       // array of { type:'decoy'|'real', startBeat:number }
+  var seqBeat;        // monotone beat counter (increments each frame in seconds)
+  var brightness;     // 0..1 current screen overlay brightness
+  var currentFlash;   // index into flashSeq
+  var roundOver;      // waiting for next round spawn
+  var roundWait;      // time remaining before next round
+  var runStartTs;
+  var overAt;
+  var ctaAt;
+
+  // juice
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var flashes = [];   // floating text rewards
+
+  // bot / demo
+  var botRunsDone = 0;
+  var demoScript; // array of actions for demo
+  var demoScriptIdx;
+  var demoActionPending;
+
+  function pctTop(sc) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-sc / 8))));
+  }
+
+  function floatText(txt, color, size, x, y) {
+    flashes.push({ txt: txt, color: color, size: size, x: x || W / 2, y: y || H / 2 - 60, t: 0 });
+  }
+
+  // ---- round generation ----
+  function newRound() {
+    // 1-4 decoy flashes before the real one, intensity varies (never exceeds PEAK_THRESH)
+    var nDecoys = 1 + Math.floor(rng() * 3 + score * 0.08);
+    if (nDecoys > 4) nDecoys = 4;
+    var seq = [];
+    var beat = 0;
+    for (var i = 0; i < nDecoys; i++) {
+      seq.push({ type: 'decoy', startBeat: beat, peakBrightness: 0.25 + rng() * 0.38, dur: 0.28 + rng() * 0.12 });
+      beat += seq[seq.length - 1].dur + 0.15 + rng() * 0.18;
+    }
+    // real flash — always peaks above PEAK_THRESH
+    seq.push({ type: 'real', startBeat: beat, peakBrightness: 0.88 + rng() * 0.12, dur: 0.32 + rng() * 0.08 });
+    flashSeq = seq;
+    seqBeat = 0;
+    currentFlash = 0;
+    brightness = 0;
+    roundOver = false;
+    roundWait = 0;
+  }
+
+  // ---- main game init ----
+  function newGame() {
+    phase = 'title';
+    score = 0; lives = LIVES_MAX; streak = 0; combo = 0;
+    dareBeaten = false; hitStop = 0; zoom = 1; shakeAmt = 0;
+    flashes = []; flashSeq = null; seqBeat = 0; brightness = 0;
+    roundOver = true; roundWait = 0;
+    botRunsDone = 0;
+
+    if (DEMO) {
+      phase = 'challenge';
+      setTimeout(function () { startRun(); }, 1250);
+      // build demo script: sequence of { action:'tap'|'miss', scriptIdx:N }
+      // round 0: perfect tap on real flash (good start)
+      // round 1: early tap on decoy (penalty, tension)
+      // round 2: near-miss recovery (tap right at tail of peak window — reads as luck)
+      // round 3: tap on real flash (combo building)
+      // round 4: miss (real flash expires without tap) → lose life
+      // round 5: miss → lose life
+      // round 6: miss → die (all 3 lives gone via lives at start 3, penalty at r1 costs 1, misses r4/r5/r6 = 3 but 3 lives → die at r6)
+      // Actually: start 3 lives; penalty r1 = -1 life (2 left); miss r4 = -1 (1 left); miss r5 = -1 (0) → game over
+      demoScript = [
+        { action: 'tap_real' },   // r0: perfect, score 1
+        { action: 'tap_decoy' },  // r1: early on decoy → penalty life, tension
+        { action: 'tap_real_late' }, // r2: near-miss recovery, tense
+        { action: 'tap_real' },   // r3: back in the groove, score++
+        { action: 'miss' },       // r4: miss → life lost
+        { action: 'miss' },       // r5: miss → dead (0 lives)
+      ];
+      demoScriptIdx = 0;
+      demoActionPending = false;
+      return;
+    }
+    if (BOT) { startRun(); return; }
+  }
+
+  function startRun() {
+    phase = 'play';
+    score = 0; lives = LIVES_MAX; streak = 0; combo = 0;
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0;
+    runStartTs = Date.now();
+    demoScriptIdx = 0; demoActionPending = false;
+    newRound();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function tapAction() {
+    if (phase !== 'play' || roundOver) return;
+    var flashObj = flashSeq[currentFlash];
+    if (!flashObj) return;
+
+    if (flashObj.type === 'real' && brightness >= PEAK_THRESH) {
+      // PERFECT or GOOD tap on real flash
+      score++;
+      streak++;
+      combo++;
+      var timing_bonus = brightness >= 0.92 ? 'perfect' : 'good';
+      if (timing_bonus === 'perfect') {
+        hitStop = 5; zoom = 1.04;
+        floatText('PERFECT', TEAL, 44);
+        if (window.J) J.perfect(combo);
+        if (window.LOOP) LOOP.emit('perfect_tap', { score: score });
+      } else {
+        floatText('+' + score, GOLD, 36);
+        if (window.J) J.hit(combo);
+        if (window.LOOP) LOOP.emit('good_tap', { score: score });
+      }
+      if (window.J) J.tension(Math.min(score / 18, 1));
+      // dare check
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+        dareBeaten = true;
+        floatText('DARE BEATEN', TEAL, 40);
+        if (window.J) J.fanfare();
+        SHARE.beaten(score);
+      }
+      shakeAmt = combo >= 5 ? 3 : 1.5;
+      roundOver = true;
+      roundWait = 0.45 + rng() * 0.25;
+    } else if (flashObj.type === 'decoy' && brightness >= EARLY_THRESH) {
+      // tapped a decoy — EARLY PENALTY
+      lives--;
+      streak = 0; combo = 0;
+      shakeAmt = 6;
+      floatText('TOO EARLY', VERM, 38);
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { score: score, reason: 'decoy_tap' });
+      if (lives <= 0) { gameOver(); return; }
+      roundOver = true;
+      roundWait = 0.5 + rng() * 0.2;
+    } else if (flashObj.type === 'real' && brightness < PEAK_THRESH && brightness > 0.05) {
+      // tapped real flash but not at peak — "WAIT"
+      floatText('WAIT', VERM, 34);
+      shakeAmt = 3;
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { score: score, reason: 'early_on_real' });
+    }
+    // ignore taps below EARLY_THRESH (just noise)
+  }
+
+  function missRealFlash() {
+    // real flash expired without tap
+    lives--;
+    streak = 0; combo = 0;
+    shakeAmt = 8;
+    floatText('MISSED', VERM, 40);
+    if (window.J) J.near();
+    if (window.LOOP) LOOP.emit('near_miss', { score: score, reason: 'miss' });
+    if (lives <= 0) { gameOver(); return; }
+    roundOver = true;
+    roundWait = 0.6 + rng() * 0.2;
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 12;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + score / 20, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (newBest) { best = score; try { localStorage.setItem('fl_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 800);
+    }
+  }
+
+  function resetRun() {
+    score = 0; lives = LIVES_MAX; streak = 0; combo = 0;
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    roundOver = true; roundWait = 0;
+    demoScriptIdx = 0; demoActionPending = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') { tapAction(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'ms' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilots ----
+  // Demo: scripted human-feeling taps with hesitation jitter
+  // Bot: aim for real-flash peak with gaussian error
+  var demoHesitate = 0; // frames to wait before acting
+
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+    if (roundOver) return;
+    if (!flashSeq || currentFlash >= flashSeq.length) return;
+
+    if (DEMO) {
+      var action = demoScript[Math.min(demoScriptIdx, demoScript.length - 1)];
+      if (!action) return;
+      var flashObj = flashSeq[currentFlash];
+      if (!flashObj) return;
+
+      if (demoHesitate > 0) { demoHesitate -= dt; return; }
+      if (demoActionPending) return;
+
+      if (action.action === 'tap_real') {
+        // tap when real flash is near peak (add slight hesitation)
+        if (flashObj.type === 'real' && brightness >= 0.83) {
+          demoActionPending = true;
+          demoHesitate = 0.04 + rng() * 0.06; // slight natural delay
+          setTimeout(function () {
+            demoActionPending = false;
+            tapAction();
+            demoScriptIdx++;
+            demoHesitate = 0.12 + rng() * 0.2;
+          }, (demoHesitate * 1000) | 0);
+        }
+      } else if (action.action === 'tap_real_late') {
+        // tap very close to end of peak window — tension
+        if (flashObj.type === 'real' && brightness >= 0.81 && brightness < 0.85) {
+          demoActionPending = true;
+          setTimeout(function () {
+            demoActionPending = false;
+            tapAction();
+            demoScriptIdx++;
+            demoHesitate = 0.1 + rng() * 0.15;
+          }, (60 + rng() * 40) | 0);
+        }
+      } else if (action.action === 'tap_decoy') {
+        // tap on a decoy flash that's bright-ish
+        if (flashObj.type === 'decoy' && brightness >= EARLY_THRESH + 0.05) {
+          demoActionPending = true;
+          setTimeout(function () {
+            demoActionPending = false;
+            tapAction();
+            demoScriptIdx++;
+            demoHesitate = 0.15 + rng() * 0.25;
+          }, (30 + rng() * 60) | 0);
+        }
+      } else if (action.action === 'miss') {
+        // do nothing — let real flash expire
+        // missRealFlash is called automatically when flash expires
+        demoScriptIdx++;
+      }
+    } else if (BOT) {
+      // imperfect bot: aims to tap real flash near peak with gaussian error
+      var fo = flashSeq[currentFlash];
+      if (!fo) return;
+      if (fo.type === 'real') {
+        // tap when brightness is around PEAK_THRESH + gaussian noise
+        var targetBrightness = PEAK_THRESH + 0.05 + (rng() - 0.5) * 0.25;
+        targetBrightness = Math.max(0.3, Math.min(0.99, targetBrightness));
+        if (brightness >= targetBrightness) {
+          tapAction();
+        }
+      } else if (fo.type === 'decoy') {
+        // bot rarely taps decoys (10% chance when bright enough)
+        if (brightness >= 0.45 && rng() < 0.04) {
+          tapAction();
+        }
+      }
+    }
+  }
+
+  // ---- render helpers ----
+  function drawBg(bright) {
+    // base dark
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    // flash overlay — white burst
+    if (bright > 0.01) {
+      cx.globalAlpha = bright * 0.96;
+      cx.fillStyle = '#ffffff';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = 1;
+    }
+    // subtle gradient always present
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+  }
+
+  // center ring — expands with brightness
+  function drawRing(bright) {
+    var r = 60 + bright * 120;
+    var a = bright;
+    cx.globalAlpha = a * 0.7;
+    cx.strokeStyle = bright >= PEAK_THRESH ? GOLD : TEAL;
+    cx.lineWidth = 3 + bright * 6;
+    cx.beginPath();
+    cx.arc(W / 2, H / 2, r, 0, Math.PI * 2);
+    cx.stroke();
+    cx.globalAlpha = 1;
+
+    // inner glow dot
+    if (bright > 0.3) {
+      cx.globalAlpha = (bright - 0.3) / 0.7 * 0.85;
+      var grd = cx.createRadialGradient(W/2, H/2, 0, W/2, H/2, r * 0.4);
+      grd.addColorStop(0, bright >= PEAK_THRESH ? '#ffffff' : '#2ec5b6');
+      grd.addColorStop(1, 'rgba(11,13,18,0)');
+      cx.fillStyle = grd;
+      cx.beginPath();
+      cx.arc(W / 2, H / 2, r * 0.4, 0, Math.PI * 2);
+      cx.fill();
+      cx.globalAlpha = 1;
+    }
+  }
+
+  // tap zone indicator
+  function drawTapZone(bright) {
+    var isReal = flashSeq && flashSeq[currentFlash] && flashSeq[currentFlash].type === 'real';
+    var pulse = 0.5 + 0.5 * Math.sin(performance.now() / 200);
+    cx.globalAlpha = (0.25 + bright * 0.5) * (isReal && bright >= PEAK_THRESH ? 1 : 0.6);
+    cx.strokeStyle = bright >= PEAK_THRESH ? GOLD : 'rgba(255,255,255,0.3)';
+    cx.lineWidth = bright >= PEAK_THRESH ? 2.5 : 1.5;
+    var rr = 100;
+    cx.beginPath();
+    cx.arc(W / 2, H / 2, rr, 0, Math.PI * 2);
+    cx.stroke();
+    cx.globalAlpha = 1;
+
+    // TAP text inside ring when peak
+    if (bright >= PEAK_THRESH) {
+      cx.globalAlpha = pulse * 0.9;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#000';
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP', W / 2, H / 2 + 10);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawLives() {
+    var dotR = 8, gap = 22, startX = W / 2 - (LIVES_MAX - 1) * gap / 2;
+    for (var i = 0; i < LIVES_MAX; i++) {
+      cx.beginPath();
+      cx.arc(startX + i * gap, H - 70, dotR, 0, Math.PI * 2);
+      cx.fillStyle = i < lives ? VERM : 'rgba(255,255,255,0.12)';
+      cx.fill();
+    }
+  }
+
+  function drawScore() {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '800 64px -apple-system, Helvetica, Arial';
+    cx.fillText(score, W / 2, 96);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + best, W / 2, 118);
+    // streak / combo
+    if (combo >= 3) {
+      var cSize = 18 + Math.min(combo, 12) * 2;
+      cx.fillStyle = GOLD;
+      cx.font = '900 ' + cSize + 'px -apple-system, Helvetica, Arial';
+      cx.fillText('×' + combo + ' STREAK', W / 2, 148);
+    }
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 172);
+    }
+  }
+
+  // decoy meter — shows brief outline so player can see decoy is NOT peak
+  function drawDecoyWarning(bright) {
+    if (!flashSeq || !flashSeq[currentFlash]) return;
+    var fo = flashSeq[currentFlash];
+    if (fo.type !== 'decoy' || bright < 0.1) return;
+    cx.globalAlpha = bright * 0.7;
+    cx.textAlign = 'center';
+    cx.fillStyle = VERM;
+    cx.font = '700 13px Menlo, monospace';
+    cx.fillText('DECOY', W / 2, H / 2 - 130);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- main loop update ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 1000, 0.1); last = now;
+
+    // --- update flash sequence ---
+    if (phase === 'play') {
+      if (roundOver) {
+        roundWait -= dt;
+        if (roundWait <= 0) newRound();
+      } else {
+        seqBeat += dt;
+        // find current flash
+        var fo = flashSeq[currentFlash];
+        if (fo) {
+          var localT = seqBeat - fo.startBeat;
+          // bell-curve brightness: rises and falls over fo.dur
+          var halfDur = fo.dur / 2;
+          var norm = Math.max(0, 1 - Math.pow((localT - halfDur) / halfDur, 2));
+          brightness = fo.peakBrightness * Math.max(0, norm);
+
+          // check if flash is done
+          if (localT > fo.dur + 0.05) {
+            if (fo.type === 'real') {
+              // real flash expired without being tapped → miss
+              missRealFlash();
+            } else {
+              // decoy expired — advance to next
+              currentFlash++;
+              brightness = 0;
+            }
+          }
+        } else {
+          brightness = 0;
+          roundOver = true;
+          roundWait = 0.35;
+        }
+
+        // autopilot (bot / demo)
+        if (hitStop > 0) { hitStop -= dt; }
+        else { autopilot(dt); }
+      }
+    }
+
+    // decay juice
+    shakeAmt *= Math.pow(0.82, dt * 60);
+    zoom += (1 - zoom) * 0.1 * dt * 60;
+
+    // --- draw ---
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    drawBg(brightness);
+
+    if (phase === 'play') {
+      drawRing(brightness);
+      drawDecoyWarning(brightness);
+      drawTapZone(brightness);
+      drawScore();
+      drawLives();
+    }
+
+    // title screen
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('FLASH LOCK', W / 2, 280);
+      cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillText('TAP THE PEAK', W / 2, 330);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('wait for the real flash. ignore the fakes.', W / 2, 362);
+    }
+
+    // challenge card (demo beat 1)
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('9', W / 2, 410);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 440);
+    }
+
+    // game over screen
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('BLINDED.', W / 2, 290);
+      cx.fillStyle = '#fff';
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' locked', W / 2, 336);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 384);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('faster than ' + (100 - pt) + '% of players', W / 2, 408);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — GO AGAIN', W / 2, 454);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD;
+        cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) {
+          cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        } else {
+          cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        }
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // floating reward texts
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 0.7);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 8) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 40);
+      cx.globalAlpha = 1;
+      if (fl.t > 0.7) flashes.splice(k, 1);
+    }
+
+    // demo CTA card
+    if (phase === 'cta') {
+      var ct = (now - ctaAt) / 1000;
+      var ease = Math.min(1, ct * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('FLASH LOCK', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('locked ' + (window.__demoScore || 9) + '. your move.', W / 2, 334);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM;
+      cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 9), W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 434);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Fold Perfect — Tilt</title>
+<!--
+  LOOP / attention-architecture — Fold Perfect
+  Engine: calm. Circuits: 06-zeigarnik, 05-ease, 08-investment.
+  Conditioned path: laundry-folding ASMR that pauses on the messy drawer.
+  Mechanic: swipe along fold-line guides in sequence to fold a shirt into a tight square.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s -> soft CTA -> window.__demoDone=true
+    ?bot=1&runs=N&seed=M  imperfect autopilot, N runs, sets window.__botDone=true
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'fold-perfect';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // --- mulberry32 seeded RNG ---
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  // --- canvas setup ---
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var SOFT_WHITE = '#e8e6e0';
+  var LINEN = '#f5f0e8';   // shirt color (calm, warm)
+  var CREASE = '#c8bfb0';  // imperfect fold crease
+
+  // ---- SHIRT GEOMETRY ----
+  // Shirt sits centered on canvas. We represent it as a simple T shape.
+  // After each fold the visible area shrinks inward — the rectangle telescopes.
+  // Fold lines: horizontal mid, then vertical mid, then top-fold
+  // 3 folds = one perfect square; possible to do 4 folds for a bonus.
+  var SX = W / 2, SY = H / 2 - 20;  // shirt center
+  var SHIRT_W0 = 200, SHIRT_H0 = 180;
+
+  // Fold guides (line segments across the shirt)
+  // Each guide: { axis: 'h'|'v', pos, label }
+  function makeFolds() {
+    return [
+      { axis: 'h', pos: 0,   label: 'fold bottom up',  done: false, acc: 0 },
+      { axis: 'v', pos: 0,   label: 'fold right side',  done: false, acc: 0 },
+      { axis: 'h', pos: -0.5, label: 'fold top down',   done: false, acc: 0 },
+    ];
+  }
+
+  // ---- GAME STATE ----
+  var state, flashes, hitStop, shakeAmt, zoom;
+  var runStartTs;
+  var botRunsDone = 0;
+
+  // Swipe tracking
+  var swipe = null;   // { x0,y0, x1,y1 }
+  var swipeActive = false;
+
+  function newGame() {
+    state = {
+      phase: 'title',   // title | play | fold_done | over | cta
+      folds: makeFolds(),
+      foldIdx: 0,       // which fold we're on
+      score: 0,         // perfect folds * 100 + imperfect * 50
+      creases: 0,       // imperfect folds this run
+      totalFolds: 0,    // total folds done
+      runScore: 0,
+      overAt: 0,
+      ctaAt: 0,
+      stackCount: 0,    // shirts folded this session
+    };
+    flashes = []; hitStop = 0; shakeAmt = 0; zoom = 1;
+    swipe = null; swipeActive = false;
+
+    if (DEMO) { startDemo(); return; }
+    if (BOT)  { startRun(); return; }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.folds = makeFolds();
+    state.foldIdx = 0;
+    state.creases = 0;
+    state.runScore = 0;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function doFold(accuracy) {
+    // accuracy: 0..1, 1=perfect
+    var fold = state.folds[state.foldIdx];
+    if (!fold || fold.done) return;
+    fold.done = true;
+    fold.acc = accuracy;
+
+    var isPerfect = accuracy > 0.82;
+    var isGood    = accuracy > 0.5;
+
+    if (isPerfect) {
+      fold.quality = 'perfect';
+      state.runScore += 100;
+      hitStop = 3;
+      zoom = 1.015;
+      shakeAmt = 0;
+      flash('PERFECT ✦', TEAL, 36);
+      if (window.J) J.calm(state.foldIdx + 1);
+      if (window.LOOP) LOOP.emit('fold_placed', { idx: state.foldIdx, quality: 'perfect', acc: +accuracy.toFixed(2) });
+    } else if (isGood) {
+      fold.quality = 'good';
+      state.runScore += 60;
+      state.creases++;
+      shakeAmt = 1.5;
+      flash('GOOD', SOFT_WHITE, 28);
+      if (window.J) J.calm(Math.max(1, state.foldIdx));
+      if (window.LOOP) LOOP.emit('fold_placed', { idx: state.foldIdx, quality: 'good', acc: +accuracy.toFixed(2) });
+    } else {
+      fold.quality = 'crease';
+      state.runScore += 20;
+      state.creases++;
+      shakeAmt = 3;
+      flash('CREASE', CREASE, 26);
+      if (window.LOOP) LOOP.emit('near_miss', { idx: state.foldIdx, acc: +accuracy.toFixed(2) });
+      if (window.LOOP) LOOP.emit('fold_placed', { idx: state.foldIdx, quality: 'crease', acc: +accuracy.toFixed(2) });
+    }
+
+    state.foldIdx++;
+    state.totalFolds++;
+
+    if (state.foldIdx >= state.folds.length) {
+      // all folds done — shirt complete
+      setTimeout(function () { completeFold(); }, 500);
+    }
+  }
+
+  function completeFold() {
+    state.stackCount++;
+    state.score += state.runScore;
+
+    var allPerfect = state.folds.every(function (f) { return f.quality === 'perfect'; });
+    if (allPerfect) {
+      if (window.J) J.calm(5);
+      flash('FLAWLESS', GOLD, 44);
+      hitStop = 6; zoom = 1.025;
+    } else {
+      if (window.J) J.calm(3);
+    }
+
+    if (window.LOOP) LOOP.emit('shirt_folded', { score: state.runScore, creases: state.creases, stack: state.stackCount });
+
+    // After 4 shirts, game ends (natural lose-path for bot mode too)
+    if (state.stackCount >= 4) {
+      setTimeout(function () { endGame(); }, 700);
+    } else {
+      // Next shirt
+      setTimeout(function () {
+        state.folds = makeFolds();
+        state.foldIdx = 0;
+        state.creases = 0;
+        state.runScore = 0;
+      }, 900);
+    }
+  }
+
+  function endGame() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2000);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () {
+          state.score = 0;
+          state.stackCount = 0;
+          state.totalFolds = 0;
+          if (window.LOOP) LOOP.emit('restart', {});
+          startRun();
+        }, 600);
+      }
+    }
+  }
+
+  // ---- SWIPE INPUT ----
+  // We check if the swipe direction matches the fold guide direction
+  // (h-fold = horizontal swipe; v-fold = vertical swipe)
+  // Accuracy = how close to perfectly aligned the swipe is
+
+  function getSwipeAccuracy(x0, y0, x1, y1) {
+    var fold = state.folds[state.foldIdx];
+    if (!fold) return 0;
+    var dx = x1 - x0, dy = y1 - y0;
+    var len = Math.sqrt(dx * dx + dy * dy);
+    if (len < 30) return 0;   // too short to count
+
+    var angle = Math.abs(Math.atan2(dy, dx));   // 0=right, PI/2=down
+
+    var targetAngle = (fold.axis === 'h') ? 0 : Math.PI / 2;
+    var diff = Math.abs(angle - targetAngle);
+    if (diff > Math.PI / 2) diff = Math.PI - diff;
+
+    // diff=0 → perfect, diff=PI/2 → terrible
+    var acc = 1 - diff / (Math.PI / 2);
+
+    // Also check swipe goes through the guide zone (center of shirt)
+    var cx0 = SX - SHIRT_W0 / 2 * foldShrink();
+    var cx1 = SX + SHIRT_W0 / 2 * foldShrink();
+    var cy0 = SY - SHIRT_H0 / 2 * foldShrink();
+    var cy1 = SY + SHIRT_H0 / 2 * foldShrink();
+    var inZoneX = (x0 > cx0 - 20 && x0 < cx1 + 20) || (x1 > cx0 - 20 && x1 < cx1 + 20);
+    var inZoneY = (y0 > cy0 - 20 && y0 < cy1 + 20) || (y1 > cy0 - 20 && y1 < cy1 + 20);
+    if (!inZoneX || !inZoneY) acc *= 0.4;
+
+    return Math.max(0, Math.min(1, acc));
+  }
+
+  function foldShrink() {
+    // Shirt appears to shrink as folds complete
+    var done = state.folds.filter(function (f) { return f.done; }).length;
+    return Math.pow(0.75, done);
+  }
+
+  function pointerStart(x, y) {
+    if (DEMO || BOT) return;
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') {
+      swipeActive = true;
+      swipe = { x0: x, y0: y, x1: x, y1: y };
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      state.score = 0;
+      state.stackCount = 0;
+      state.totalFolds = 0;
+      if (window.LOOP) LOOP.emit('restart', {});
+      startRun();
+    }
+    if (inR(MUTE_R, x, y) && window.J && !DEMO && !BOT) {
+      J.toggleMute(); return;
+    }
+  }
+  function pointerMove(x, y) {
+    if (!swipeActive || !swipe) return;
+    swipe.x1 = x; swipe.y1 = y;
+  }
+  function pointerEnd(x, y) {
+    if (!swipeActive || !swipe || state.phase !== 'play') { swipeActive = false; swipe = null; return; }
+    swipe.x1 = x; swipe.y1 = y;
+    var acc = getSwipeAccuracy(swipe.x0, swipe.y0, swipe.x1, swipe.y1);
+    if (acc > 0) {
+      doFold(acc);
+    }
+    swipeActive = false; swipe = null;
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale;
+    if (inR(MUTE_R, x, y) && !DEMO && !BOT && window.J) { J.toggleMute(); return; }
+    pointerStart(x, y);
+  });
+  cv.addEventListener('pointermove', function (e) {
+    if (!swipeActive) return;
+    var r = cv.getBoundingClientRect();
+    pointerMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerEnd((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerleave', function (e) {
+    if (swipeActive) {
+      var r = cv.getBoundingClientRect();
+      pointerEnd((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+    }
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') pointerStart(SX, SY);
+  });
+
+  // ---- INPUT ZONES ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- DEMO / BOT AUTOPILOT ----
+  // Demo: calm arc — 3 shirts, first two flawless, third with one crease, soft close
+  // Demo pacing: slow, hesitating, human-feeling
+  var demoFoldTimer = 0;
+  var demoPhase = 0;   // which fold in the demo script
+  // Demo waits (frames) before each fold:
+  var demoWaits = [70, 60, 80, 90, 55, 75, 85, 60, 90, 100, 65, 80];
+  var demoWaitIdx = 0;
+  var demoFoldAccs = [
+    // shirt 1: flawless
+    0.97, 0.95, 0.98,
+    // shirt 2: flawless
+    0.96, 0.99, 0.94,
+    // shirt 3: one crease, then two good
+    0.35, 0.88, 0.91,
+    // shirt 4: all perfect for the close
+    0.98, 0.96, 0.99
+  ];
+  var demoAccIdx = 0;
+
+  var botFoldTimer = 0;
+  var botFoldsThisRun = 0;
+  // Bot goes passive after a certain count to guarantee game_over (endGame fires at 4 shirts)
+  // Bot gives imperfect but mostly valid folds so game completes
+  var BOT_FOLD_WAIT = 55;
+
+  function startDemo() {
+    state.phase = 'play';
+    state.folds = makeFolds();
+    state.foldIdx = 0;
+    state.creases = 0;
+    state.runScore = 0;
+    runStartTs = Date.now();
+    demoFoldTimer = demoWaits[0] || 80;
+    demoWaitIdx = 0;
+    demoAccIdx = 0;
+    demoPhase = 0;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function autopilot(dt) {
+    if (state.phase !== 'play') return;
+
+    if (DEMO) {
+      // Only fold if foldIdx < total available acc entries (limit to 4 shirts = 12 folds)
+      if (state.foldIdx >= state.folds.length) return;  // waiting for completeFold to reset
+      demoFoldTimer -= dt;
+      if (demoFoldTimer <= 0) {
+        var acc = demoFoldAccs[demoAccIdx % demoFoldAccs.length];
+        demoAccIdx++;
+        demoWaitIdx++;
+        demoFoldTimer = demoWaits[demoWaitIdx % demoWaits.length] || 70;
+        doFold(acc);
+      }
+    } else if (BOT) {
+      if (state.foldIdx >= state.folds.length) return;
+      botFoldTimer -= dt;
+      if (botFoldTimer <= 0) {
+        // Bot: mostly good folds with some creases — always completes
+        var botAcc = 0.5 + rng() * 0.5;   // 0.5..1.0 → good or perfect
+        botFoldTimer = BOT_FOLD_WAIT + rng() * 30;
+        doFold(botAcc);
+      }
+    }
+  }
+
+  // ---- FLASH TEXT ----
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- DRAW HELPERS ----
+  function drawShirt(cx, cx2, cy, shrink, folds, foldIdx, swipeProgress) {
+    var w = SHIRT_W0 * shrink, h = SHIRT_H0 * shrink;
+    var x = cx - w / 2, y = cy - h / 2;
+
+    // Shadow
+    cx2.save();
+    cx2.shadowColor = 'rgba(0,0,0,0.3)';
+    cx2.shadowBlur = 18;
+    cx2.shadowOffsetY = 6;
+
+    // Main shirt body
+    cx2.fillStyle = LINEN;
+    cx2.beginPath();
+    cx2.roundRect ? cx2.roundRect(x, y, w, h, 8 * shrink) : cx2.rect(x, y, w, h);
+    cx2.fill();
+    cx2.restore();
+
+    // Fold crease lines on already-done folds
+    for (var i = 0; i < foldIdx && i < folds.length; i++) {
+      var f = folds[i];
+      var alpha = f.quality === 'perfect' ? 0.12 : (f.quality === 'good' ? 0.28 : 0.5);
+      cx2.save();
+      cx2.globalAlpha = alpha;
+      cx2.strokeStyle = CREASE;
+      cx2.lineWidth = 1.5;
+      cx2.setLineDash([4, 3]);
+      if (f.axis === 'h') {
+        cx2.beginPath(); cx2.moveTo(x, cy); cx2.lineTo(x + w, cy); cx2.stroke();
+      } else {
+        cx2.beginPath(); cx2.moveTo(cx, y); cx2.lineTo(cx, y + h); cx2.stroke();
+      }
+      cx2.setLineDash([]);
+      cx2.restore();
+    }
+
+    // Shirt collar detail
+    cx2.save();
+    cx2.strokeStyle = 'rgba(180,170,155,0.4)';
+    cx2.lineWidth = 1;
+    var cw = w * 0.22, ch = h * 0.18;
+    cx2.beginPath();
+    cx2.moveTo(cx - cw, y + 2 * shrink);
+    cx2.lineTo(cx, y + ch);
+    cx2.lineTo(cx + cw, y + 2 * shrink);
+    cx2.stroke();
+    cx2.restore();
+
+    // Active fold guide line (current fold to do)
+    if (foldIdx < folds.length) {
+      var af = folds[foldIdx];
+      cx2.save();
+      cx2.globalAlpha = 0.55 + 0.15 * Math.sin(performance.now() / 300);
+      cx2.strokeStyle = TEAL;
+      cx2.lineWidth = 2;
+      cx2.setLineDash([6, 4]);
+      if (af.axis === 'h') {
+        cx2.beginPath(); cx2.moveTo(x - 10, cy); cx2.lineTo(x + w + 10, cy); cx2.stroke();
+        // Arrow hints
+        cx2.globalAlpha = 0.45;
+        cx2.font = '14px -apple-system, Arial';
+        cx2.fillStyle = TEAL;
+        cx2.textAlign = 'center';
+        cx2.fillText('↔', cx, cy - 14 * shrink);
+      } else {
+        cx2.beginPath(); cx2.moveTo(cx, y - 10); cx2.lineTo(cx, y + h + 10); cx2.stroke();
+        cx2.globalAlpha = 0.45;
+        cx2.font = '14px -apple-system, Arial';
+        cx2.fillStyle = TEAL;
+        cx2.textAlign = 'center';
+        cx2.fillText('↕', cx + 14 * shrink, cy);
+      }
+      cx2.setLineDash([]);
+      cx2.restore();
+    }
+
+    // Live swipe line
+    if (swipeProgress && swipeActive && swipe) {
+      cx2.save();
+      cx2.strokeStyle = 'rgba(46,197,182,0.5)';
+      cx2.lineWidth = 3;
+      cx2.lineCap = 'round';
+      cx2.beginPath();
+      cx2.moveTo(swipe.x0, swipe.y0);
+      cx2.lineTo(swipe.x1, swipe.y1);
+      cx2.stroke();
+      cx2.restore();
+    }
+  }
+
+  function drawStack(cx2, count) {
+    // Stacked shirt stack in lower corner
+    for (var i = 0; i < count; i++) {
+      var sy = H - 100 - i * 14;
+      var sw = 70 - i * 2, sh = 12;
+      cx2.save();
+      cx2.globalAlpha = 0.6 + i * 0.08;
+      cx2.fillStyle = (i % 2 === 0) ? '#d4cfc5' : '#bfb9af';
+      cx2.strokeStyle = 'rgba(180,170,155,0.3)';
+      cx2.lineWidth = 1;
+      var sx2 = 50 - sw / 2;
+      cx2.roundRect ? cx2.roundRect(sx2, sy, sw, sh, 3) : cx2.rect(sx2, sy, sw, sh);
+      cx2.fill(); cx2.stroke();
+      cx2.restore();
+    }
+    if (count > 0) {
+      cx2.fillStyle = 'rgba(255,255,255,0.4)';
+      cx2.font = '500 11px -apple-system, Arial';
+      cx2.textAlign = 'center';
+      cx2.fillText(count + ' folded', 50, H - 90);
+    }
+  }
+
+  // ---- RENDER ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Hit-stop decay (CRITICAL: always decay so autopilot doesn't freeze)
+    if (hitStop > 0) hitStop -= dt;
+    else autopilot(dt);
+
+    // Juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy2 = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy2);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // Background — calm, warm gradient
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(242,177,52,0.04)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // Title screen
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = SOFT_WHITE;
+      cx.font = '700 42px -apple-system, Helvetica, Arial';
+      cx.fillText('FOLD PERFECT', W / 2, 290);
+      cx.fillStyle = 'rgba(46,197,182,0.9)';
+      cx.font = '500 17px -apple-system, Helvetica, Arial';
+      var pulse = 0.65 + 0.35 * Math.sin(now / 500);
+      cx.globalAlpha = pulse;
+      cx.fillText('swipe along the guide', W / 2, 335);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '400 13px -apple-system, Helvetica, Arial';
+      cx.fillText('fold four shirts. keep them crisp.', W / 2, 365);
+
+      // Draw decorative shirt
+      cx.globalAlpha = 0.55;
+      drawShirt(cx, cx, W / 2, SY - 40, 0.9, [], 0, false);
+      cx.globalAlpha = 1;
+    }
+
+    // Play screen
+    if (state.phase === 'play') {
+      var shrink = foldShrink();
+      drawShirt(cx, cx, SX, SY, shrink, state.folds, state.foldIdx, true);
+
+      // Fold progress indicator
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '500 12px Menlo, monospace';
+      var foldLabel = (state.foldIdx < state.folds.length)
+        ? ('fold ' + (state.foldIdx + 1) + ' of ' + state.folds.length)
+        : 'done ✦';
+      cx.fillText(foldLabel, W / 2, 140);
+
+      // Score
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '700 48px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 96);
+
+      // Stack in corner
+      drawStack(cx, state.stackCount);
+
+      // Shirt number indicator
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '400 12px -apple-system, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('shirt ' + (state.stackCount + 1) + ' of 4', W / 2, H - 50);
+    }
+
+    // Over screen
+    if (state.phase === 'over') {
+      // Faded bg overlay
+      cx.fillStyle = 'rgba(11,13,18,0.5)';
+      cx.fillRect(0, 0, W, H);
+
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '700 36px -apple-system, Helvetica, Arial';
+      cx.fillText('DRAWER DONE', W / 2, 290);
+      cx.fillStyle = '#fff';
+      cx.font = '700 24px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' pts', W / 2, 330);
+
+      var noPerfectAll = state.folds.every(function (f) { return f.quality === 'perfect'; });
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '400 14px -apple-system, Arial';
+      cx.fillText(state.totalFolds + ' folds • ' + (state.totalFolds - (state.creases || 0)) + ' crisp', W / 2, 362);
+
+      if (!DEMO && !BOT) {
+        var pulse2 = 0.65 + 0.35 * Math.sin(now / 420);
+        cx.globalAlpha = pulse2;
+        cx.fillStyle = TEAL;
+        cx.font = '600 16px -apple-system, Arial';
+        cx.fillText('tap to fold again', W / 2, 420);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // CTA (demo only) — soft invitation
+    if (state.phase === 'cta') {
+      var elapsed = (now - state.ctaAt) / 1000;
+      var ease = Math.min(1, elapsed * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = SOFT_WHITE;
+      cx.font = '700 40px -apple-system, Helvetica, Arial';
+      cx.fillText('FOLD PERFECT', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.65)';
+      cx.font = '400 17px -apple-system, Arial';
+      cx.fillText('your drawer is waiting.', W / 2, 338);
+      var pulse3 = 0.75 + 0.25 * Math.sin(now / 350);
+      cx.globalAlpha = ease * pulse3;
+      cx.fillStyle = TEAL;
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '400 14px -apple-system, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // Flash text
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 200 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

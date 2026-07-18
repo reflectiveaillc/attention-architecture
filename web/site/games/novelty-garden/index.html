@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Novelty Garden — Tilt</title>
+<!--
+  LOOP / attention-architecture — Novelty Garden
+  Circuits: 01 soft RPE, 02 novelty, 08 garden.
+  Calm engine: one daily deck of 10 tiny sensory micro-toys.
+  Modes:
+    ?demo=1&seed=7        scripted calm arc → soft CTA, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay N runs, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'novelty-garden';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 14;
+  var SEED = +qs.get('seed') || dailySeed();
+
+  function dailySeed() {
+    var d = new Date();
+    return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
+  }
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134', VERM = '#e8502e';
+  var CARD_ANIM_DUR = 56;          // frames @ 60fps
+  var types = ['pop', 'ripple', 'spin', 'tap', 'breathe', 'sparkle', 'drift', 'chime', 'bloom', 'wave'];
+  var prompts = {
+    pop: 'pop the bubble', ripple: 'make a ripple', spin: 'give it a spin',
+    tap: 'tap the bloom', breathe: 'breathe with it', sparkle: 'catch a sparkle',
+    drift: 'nudge the petal', chime: 'chime the bar', bloom: 'open the bud', wave: 'touch the wave'
+  };
+
+  var state, deck, particles, runStartTs, best = 0, tiles = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var currentIdx = 0, cardTriggered = false, cardAnim = 0, cardWait = 0, cardCompleting = false;
+  var dareBeaten = false;
+  try { best = +localStorage.getItem('ng_best') || 0; tiles = +localStorage.getItem('ng_tiles') || 0; } catch (_) {}
+
+  function softHue() {
+    var h = Math.floor(140 + rng() * 200);
+    return h > 360 ? h - 360 : h;
+  }
+
+  function newGame() {
+    state = { phase: 'title', score: 0, overAt: 0 };
+    particles = []; currentIdx = 0; cardTriggered = false; cardAnim = 0; cardWait = 0;
+    cardCompleting = false; dareBeaten = false;
+    if (DEMO) startRun();
+    else if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play'; state.score = 0; state.overAt = 0;
+    runStartTs = Date.now();
+    rng = mulberry32(SEED);
+    deck = buildDeck();
+    currentIdx = 0; cardTriggered = false; cardAnim = 0; cardCompleting = false;
+    particles = [];
+    nextCard();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function buildDeck() {
+    var d = types.map(function (t) { return { type: t, hue: softHue(), prompt: prompts[t] }; });
+    for (var i = d.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = d[i]; d[i] = d[j]; d[j] = tmp;
+    }
+    return d;
+  }
+
+  function nextCard() {
+    if (currentIdx >= deck.length) { finishGame(); return; }
+    cardTriggered = false; cardAnim = 0; cardCompleting = false;
+    if (DEMO) cardWait = demoWaits[Math.min(currentIdx, demoWaits.length - 1)];
+    else if (BOT) cardWait = 34 + Math.abs(gauss() * BOT_ERR);
+    else cardWait = 0;
+    if (window.LOOP) LOOP.emit('card_drawn', { idx: currentIdx, type: deck[currentIdx].type, hue: deck[currentIdx].hue });
+  }
+
+  function triggerToy(x, y) {
+    if (state.phase !== 'play' || cardTriggered) return;
+    var card = deck[currentIdx];
+    cardTriggered = true; cardAnim = 0; cardCompleting = false;
+    spawnParticles(card.type, card.hue);
+    hitStop = 2.8; zoom = 1.022; shakeAmt = 1.2;
+    flash('+1', hsl(card.hue, 70, 60), 32);
+    if (window.J && J.calm) J.calm(state.score + 1);
+  }
+
+  function completeCard() {
+    if (cardCompleting) return;
+    cardCompleting = true;
+    var card = deck[currentIdx];
+    state.score++;
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score >= SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 40);
+      if (window.J && J.calm) J.calm(state.score + 1);
+      SHARE.beaten(state.score);
+    }
+    if (window.LOOP) LOOP.emit('toy_played', { idx: currentIdx, type: card.type, hue: card.hue });
+    currentIdx++;
+    setTimeout(nextCard, 400);
+  }
+
+  function finishGame() {
+    state.phase = 'done'; state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (!DEMO && !BOT) {
+      if (newBest) { best = state.score; try { localStorage.setItem('ng_best', String(best)); } catch (_) {} }
+      tiles++; try { localStorage.setItem('ng_tiles', String(tiles)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('tile_planted', { tiles_total: tiles, score: state.score });
+    flash('garden planted', TEAL, 42);
+    if (window.J && J.calm) J.calm(state.score + 1);
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 1100);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) window.__botDone = true;
+      else setTimeout(resetRun, 900);
+    }
+  }
+
+  function resetRun() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { particlesFlash.push({ txt: txt, color: color, size: size, t: 0 }); }
+  var particlesFlash = [];
+
+  function hsl(h, s, l) { return 'hsl(' + h + ',' + s + '%,' + l + '%)'; }
+
+  function spawnParticles(type, hue) {
+    var x = W / 2, y = H / 2 + 10, n = 11;
+    if (type === 'sparkle') n = 16;
+    for (var i = 0; i < n; i++) {
+      var a = rng() * Math.PI * 2;
+      var sp = 1.2 + rng() * 3.2;
+      if (type === 'ripple' || type === 'wave') sp *= 0.6;
+      particles.push({
+        x: x, y: y,
+        vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+        grav: 0.06, life: 1, maxLife: 1,
+        color: hsl(hue, 70, 55 + Math.floor(rng() * 30)),
+        size: 2 + rng() * 4
+      });
+    }
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 110, y: H - 168, w: 220, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J && J.toggleMute) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { triggerToy(x, y); return; }
+    if (state.phase === 'done') {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'toys' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilots ----
+  var demoWaits = [60, 48, 42, 38, 34, 34, 38, 44, 50, 58];
+  var botRunsDone = 0;
+  function cardTarget() {
+    var x = W / 2, y = H / 2 + 10;
+    if (currentIdx < deck.length && deck[currentIdx].type === 'drift') {
+      var t = performance.now() / 1200;
+      x += Math.cos(t) * 55; y += Math.sin(t * 0.7) * 35;
+    }
+    return { x: x, y: y };
+  }
+  function botTarget() {
+    var c = cardTarget();
+    return { x: c.x + gauss() * BOT_ERR * 0.7, y: c.y + gauss() * BOT_ERR * 0.7 };
+  }
+  function autopilot() {
+    if (state.phase !== 'play' || cardTriggered) return;
+    if (DEMO) {
+      if (cardWait > 0) { cardWait -= dt; return; }
+      var c = cardTarget();
+      triggerToy(c.x, c.y);
+    } else if (BOT) {
+      if (cardWait > 0) { cardWait -= dt; return; }
+      var c = botTarget();
+      triggerToy(c.x, c.y);
+    }
+  }
+
+  // ---- render helpers ----
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    cx.beginPath();
+    cx.moveTo(x + r, y);
+    cx.lineTo(x + w - r, y);
+    cx.quadraticCurveTo(x + w, y, x + w, y + r);
+    cx.lineTo(x + w, y + h - r);
+    cx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    cx.lineTo(x + r, y + h);
+    cx.quadraticCurveTo(x, y + h, x, y + h - r);
+    cx.lineTo(x, y + r);
+    cx.quadraticCurveTo(x, y, x + r, y);
+    cx.closePath();
+  }
+
+  function drawBackground() {
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var g = cx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, 'rgba(46,197,182,0.05)');
+    g.addColorStop(0.55, 'rgba(11,13,18,0)');
+    g.addColorStop(1, 'rgba(242,177,52,0.05)');
+    cx.fillStyle = g; cx.fillRect(0, 0, W, H);
+  }
+
+  function drawProgress() {
+    var r = 6, gap = 18, total = deck.length * gap - gap;
+    var left = W / 2 - total / 2;
+    for (var i = 0; i < deck.length; i++) {
+      var x = left + i * gap, y = 56;
+      var done = i < state.score;
+      var current = i === currentIdx && state.phase === 'play';
+      cx.beginPath(); cx.arc(x, y, r, 0, Math.PI * 2);
+      if (done) { cx.fillStyle = TEAL; cx.globalAlpha = 0.9; }
+      else if (current) { cx.fillStyle = '#fff'; cx.globalAlpha = 0.8 + 0.2 * Math.sin(now / 200); }
+      else { cx.fillStyle = 'rgba(255,255,255,0.18)'; cx.globalAlpha = 1; }
+      cx.fill(); cx.globalAlpha = 1;
+    }
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 11px -apple-system, Helvetica, Arial';
+    cx.fillText('today’s deck', W / 2, 88);
+  }
+
+  function drawCard(card, now) {
+    var x = W / 2, y = H / 2 + 10;
+    var t = cardTriggered ? Math.min(1, cardAnim / CARD_ANIM_DUR) : 0;
+    var pulse = 0.5 + 0.5 * Math.sin(now / 500);
+    var hue = card.hue, c = hsl(hue, 65, 55);
+
+    // prompt
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.65)'; cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText(card.prompt.toUpperCase(), W / 2, 172);
+
+    switch (card.type) {
+      case 'pop':
+        var r = 55 + (cardTriggered ? 90 * easeOutQuad(t) : 4 * Math.sin(now / 600));
+        var a = cardTriggered ? 1 - t : 0.75 + 0.25 * pulse;
+        cx.globalAlpha = a;
+        cx.fillStyle = c; cx.beginPath(); cx.arc(x, y, r, 0, Math.PI * 2); cx.fill();
+        cx.strokeStyle = 'rgba(255,255,255,0.35)'; cx.lineWidth = 2; cx.stroke();
+        cx.globalAlpha = 1;
+        break;
+
+      case 'ripple':
+        for (var i = 0; i < 4; i++) {
+          var phase = (now / 900 + i * 0.25) % 1;
+          var rr = phase * 160;
+          cx.globalAlpha = (1 - phase) * (cardTriggered ? 0.55 : 0.22);
+          cx.strokeStyle = c; cx.lineWidth = 2; cx.beginPath(); cx.arc(x, y, rr, 0, Math.PI * 2); cx.stroke();
+        }
+        cx.globalAlpha = 1;
+        break;
+
+      case 'spin':
+        var ang = now / 900 + (cardTriggered ? 6 * easeOutQuad(t) : 0);
+        cx.save(); cx.translate(x, y); cx.rotate(ang);
+        cx.strokeStyle = c; cx.lineWidth = 4; cx.globalAlpha = 0.8;
+        cx.beginPath(); cx.arc(0, 0, 68, 0, Math.PI * 1.7); cx.stroke();
+        cx.fillStyle = '#fff'; cx.beginPath(); cx.arc(68, 0, 5, 0, Math.PI * 2); cx.fill();
+        cx.restore(); cx.globalAlpha = 1;
+        break;
+
+      case 'tap':
+        var tr = 50 + (cardTriggered ? 40 * Math.sin(t * Math.PI) : 5 * Math.sin(now / 500));
+        cx.globalAlpha = 0.7 + 0.3 * pulse;
+        cx.fillStyle = c; cx.beginPath(); cx.arc(x, y, tr, 0, Math.PI * 2); cx.fill();
+        cx.strokeStyle = 'rgba(255,255,255,0.35)'; cx.lineWidth = 2; cx.stroke();
+        cx.globalAlpha = 1;
+        break;
+
+      case 'breathe':
+        var br = 48 + (cardTriggered ? (t < 0.5 ? 42 * easeOutQuad(t * 2) : 42 * (1 - easeOutQuad((t - 0.5) * 2))) : 10 * Math.sin(now / 900));
+        cx.globalAlpha = 0.5 + 0.35 * pulse;
+        cx.strokeStyle = c; cx.lineWidth = 3; cx.beginPath(); cx.arc(x, y, br, 0, Math.PI * 2); cx.stroke();
+        cx.globalAlpha = 0.12; cx.fillStyle = c; cx.fill();
+        cx.globalAlpha = 1;
+        break;
+
+      case 'sparkle':
+        for (var s = 0; s < 6; s++) {
+          var sx = x + Math.cos(s + now / 700) * 55;
+          var sy = y + Math.sin(s * 1.7 + now / 900) * 38;
+          var tw = 0.5 + 0.5 * Math.sin(now / 250 + s);
+          cx.globalAlpha = 0.4 + 0.5 * tw;
+          cx.fillStyle = '#fff'; cx.beginPath(); cx.arc(sx, sy, 2.5 + tw * 2, 0, Math.PI * 2); cx.fill();
+        }
+        if (cardTriggered) {
+          cx.globalAlpha = 1 - t;
+          var sweep = t * 160;
+          cx.strokeStyle = GOLD; cx.lineWidth = 2; cx.beginPath(); cx.arc(x, y, sweep, -Math.PI / 2, -Math.PI / 2 + Math.PI * 1.5); cx.stroke();
+        }
+        cx.globalAlpha = 1;
+        break;
+
+      case 'drift':
+        var dx = x + Math.cos(now / 1200) * 58, dy = y + Math.sin(now / 1200 * 0.7) * 38;
+        if (cardTriggered) {
+          dx = x + (dx - x) * (1 - easeOutQuad(t));
+          dy = y + (dy - y) * (1 - easeOutQuad(t));
+        }
+        cx.globalAlpha = 0.35; cx.strokeStyle = c; cx.lineWidth = 1; cx.beginPath(); cx.arc(x, y, 40, 0, Math.PI * 2); cx.stroke(); cx.globalAlpha = 1;
+        cx.fillStyle = c; cx.beginPath(); cx.arc(dx, dy, 14, 0, Math.PI * 2); cx.fill();
+        cx.strokeStyle = '#fff'; cx.lineWidth = 1.5; cx.stroke();
+        break;
+
+      case 'chime':
+        var barW = 6, barH = 110;
+        cx.fillStyle = 'rgba(255,255,255,0.12)';
+        for (var b = 0; b < 5; b++) roundRectPath(x - 40 + b * 20, y - barH / 2, barW, barH, 3);
+        cx.fill();
+        var active = Math.floor((now / 600) % 5);
+        if (cardTriggered) active = Math.floor(t * 5);
+        for (b = 0; b < 5; b++) {
+          var lit = (b === active) || (cardTriggered && b <= Math.floor(t * 5));
+          cx.globalAlpha = lit ? 0.9 : 0.25;
+          cx.fillStyle = lit ? hsl(hue, 70, 65) : 'rgba(255,255,255,0.2)';
+          roundRectPath(x - 40 + b * 20, y - barH / 2, barW, barH, 3); cx.fill();
+        }
+        cx.globalAlpha = 1;
+        break;
+
+      case 'bloom':
+        var petals = 5;
+        var open = cardTriggered ? easeOutQuad(t) : 0.12 + 0.08 * pulse;
+        for (var p = 0; p < petals; p++) {
+          var a = (p / petals) * Math.PI * 2 + now / 2000;
+          var pr = 16 + open * 36;
+          var px = x + Math.cos(a) * pr, py = y + Math.sin(a) * pr;
+          cx.fillStyle = hsl(hue, 65, 60 + (open * 15));
+          cx.beginPath(); cx.ellipse(px, py, 10 + open * 8, 6 + open * 5, a, 0, Math.PI * 2); cx.fill();
+        }
+        cx.fillStyle = GOLD; cx.beginPath(); cx.arc(x, y, 9 + open * 4, 0, Math.PI * 2); cx.fill();
+        break;
+
+      case 'wave':
+        cx.strokeStyle = c; cx.lineWidth = 3; cx.beginPath();
+        for (var wx = -80; wx <= 80; wx += 4) {
+          var wy = y + Math.sin((wx + now / 600) / 25) * 24;
+          if (wx === -80) cx.moveTo(x + wx, wy); else cx.lineTo(x + wx, wy);
+        }
+        cx.stroke();
+        if (cardTriggered) {
+          var wx2 = -80 + t * 160;
+          var wy2 = y + Math.sin((wx2 + now / 600) / 25) * 24;
+          cx.fillStyle = '#fff'; cx.beginPath(); cx.arc(x + wx2, wy2, 6, 0, Math.PI * 2); cx.fill();
+        }
+        break;
+    }
+  }
+
+  function easeOutQuad(t) { return t * (2 - t); }
+
+  function drawParticles() {
+    for (var i = particles.length - 1; i >= 0; i--) {
+      var p = particles[i];
+      p.x += p.vx * dt; p.y += p.vy * dt; p.vy += p.grav * dt;
+      p.life -= dt / 55;
+      if (p.life <= 0) { particles.splice(i, 1); continue; }
+      cx.globalAlpha = Math.max(0, p.life);
+      cx.fillStyle = p.color; cx.beginPath(); cx.arc(p.x, p.y, p.size, 0, Math.PI * 2); cx.fill();
+    }
+    cx.globalAlpha = 1;
+  }
+
+  function drawFlashes() {
+    for (var i = particlesFlash.length - 1; i >= 0; i--) {
+      var f = particlesFlash[i]; f.t += dt;
+      var a = Math.max(0, 1 - f.t / 45);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = f.color;
+      cx.font = '900 ' + (f.size + f.t * 0.35) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(f.txt, W / 2, 250 - f.t * 0.7);
+      cx.globalAlpha = 1;
+      if (f.t > 45) particlesFlash.splice(i, 1);
+    }
+  }
+
+  function drawTile(tx, ty, size, hue, now) {
+    roundRectPath(tx - size / 2, ty - size / 2, size, size, 14);
+    cx.fillStyle = '#161a21'; cx.fill();
+    cx.strokeStyle = 'rgba(255,255,255,0.1)'; cx.lineWidth = 1; cx.stroke();
+    var sway = Math.sin(now / 900) * 5;
+    cx.strokeStyle = hsl(hue, 55, 45); cx.lineWidth = 3;
+    cx.beginPath(); cx.moveTo(tx, ty + size / 2 - 10);
+    cx.quadraticCurveTo(tx + sway, ty + size / 2 - 35, tx + sway * 0.4, ty - size / 2 + 26);
+    cx.stroke();
+    cx.fillStyle = hsl(hue, 60, 55);
+    cx.beginPath(); cx.ellipse(tx + sway * 0.3 - 10, ty - 2, 10, 5, -0.6, 0, Math.PI * 2); cx.fill();
+    cx.fillStyle = GOLD; cx.beginPath(); cx.arc(tx + sway * 0.4, ty - size / 2 + 26, 7, 0, Math.PI * 2); cx.fill();
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+    cx.fillText('NOVELTY GARDEN', W / 2, 280);
+    var p = 0.6 + 0.4 * Math.sin(now / 300);
+    cx.fillStyle = TEAL; cx.globalAlpha = p; cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO BEGIN', W / 2, 330); cx.globalAlpha = 1;
+    cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('10 tiny toys. one calm garden tile.', W / 2, 360);
+  }
+
+  function drawDone(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL; cx.font = '900 38px -apple-system, Helvetica, Arial';
+    cx.fillText('GARDEN PLANTED', W / 2, 300);
+    cx.fillStyle = '#fff'; cx.font = '800 24px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score + ' tiny toys', W / 2, 345);
+    var shownTiles = Math.max(1, tiles);
+    cx.fillStyle = GOLD; cx.font = '700 20px -apple-system, Helvetica, Arial';
+    cx.fillText(tiles === 0 ? 'your first tile' : shownTiles + ' tile' + (shownTiles === 1 ? '' : 's') + ' grown', W / 2, 382);
+    drawTile(W / 2, H / 2 + 156, 140, deck[deck.length - 1].hue, now);
+    if (!DEMO && !BOT) {
+      var p = 0.6 + 0.4 * Math.sin(now / 280);
+      cx.globalAlpha = p; cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — TEND AGAIN', W / 2, H - 198); cx.globalAlpha = 1;
+      roundRectPath(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+      cx.fillStyle = 'rgba(242,177,52,0.14)'; cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+      cx.fill(); cx.stroke();
+      cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+      var label = window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ SHARE YOUR GARDEN';
+      cx.fillText(label, W / 2, SHARE_R.y + 30);
+    }
+  }
+
+  function drawCTA(now) {
+    var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease; cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+    cx.fillText('NOVELTY GARDEN', W / 2, 300);
+    cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+    cx.fillText('10 tiny toys. one calm garden.', W / 2, 340);
+    var p = 0.7 + 0.3 * Math.sin(now / 240);
+    cx.fillStyle = TEAL; cx.globalAlpha = ease * p;
+    cx.font = '900 28px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ GROW YOURS', W / 2, 400);
+    cx.globalAlpha = ease;
+    cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 432);
+    cx.globalAlpha = 1;
+  }
+
+  function drawMute() {
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.5; cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  // ---- main loop ----
+  var dt = 1, now = performance.now(), ctaAt = 0, last = performance.now();
+  function frame(t) {
+    now = t;
+    dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    if (hitStop > 0) { hitStop -= dt; }
+    else {
+      if (state.phase === 'play' && !cardTriggered && (DEMO || BOT)) autopilot();
+    }
+
+    if (hitStop <= 0) {
+      // advance current card animation
+      if (cardTriggered && !cardCompleting) {
+        cardAnim += dt;
+        if (cardAnim >= CARD_ANIM_DUR) completeCard();
+      }
+      // drift particles
+      for (var i = particles.length - 1; i >= 0; i--) {
+        var p = particles[i];
+        p.x += p.vx * dt; p.y += p.vy * dt; p.vy += p.grav * dt;
+        p.life -= dt / 55;
+        if (p.life <= 0) particles.splice(i, 1);
+      }
+    }
+
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.88, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    drawBackground();
+
+    if (state.phase === 'title') drawTitle(now);
+    else if (state.phase === 'play') { drawProgress(); if (currentIdx < deck.length) { drawCard(deck[currentIdx], now); } drawParticles(); drawFlashes(); }
+    else if (state.phase === 'done') { drawProgress(); drawDone(now); drawParticles(); drawFlashes(); }
+    else if (state.phase === 'cta') drawCTA(now);
+
+    // dare banner (human only)
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && (state.phase === 'play' || state.phase === 'done')) {
+      cx.textAlign = 'center';
+      cx.fillStyle = dareBeaten ? TEAL : GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 140);
+    }
+
+    drawMute();
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

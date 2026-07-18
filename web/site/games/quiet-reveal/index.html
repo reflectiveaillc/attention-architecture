@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Quiet Reveal — Tilt</title>
+<!--
+  LOOP / attention-architecture — Quiet Reveal
+  Circuits: 05-ease, 06-zeigarnik, 07-timing
+  Engine: calm
+  Mechanic: swipe to peel translucent layers off a soft shape,
+            each layer reveals a warmer tone until the center rests exposed.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → __demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs → __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'quiet-reveal';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- palette for layers (warm progression from muted → vivid) ----
+  // outermost = cool grey, innermost = warm gold/teal
+  var LAYER_COLORS = [
+    'rgba(80,100,110,0.82)',    // 0 outer
+    'rgba(70,120,130,0.80)',
+    'rgba(60,140,145,0.78)',
+    'rgba(46,175,165,0.76)',
+    'rgba(46,197,182,0.74)',    // teal
+    'rgba(80,200,160,0.72)',
+    'rgba(120,200,140,0.70)',
+    'rgba(170,195,110,0.68)',
+    'rgba(210,185,80,0.66)',
+    'rgba(242,177,52,0.70)',    // gold centre-glow
+  ];
+  var TOTAL_LAYERS = LAYER_COLORS.length;
+  var CENTER_RADIUS = 44;
+  var LAYER_STEP = 26;          // px per layer ring
+
+  // ---- game state ----
+  var state, hitStop, zoom, shakeAmt, flashes;
+  var runStartTs, botRunsDone;
+
+  // MUTE control rect (top-right)
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 530, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // Each "layer" is a ring. peeled[i]=true means that ring has been swept away.
+  // Score = how many layers fully peeled.
+  function newGame() {
+    hitStop = 0; zoom = 1; shakeAmt = 0; flashes = [];
+    botRunsDone = 0;
+    state = {
+      phase: 'title',     // title | play | over | cta
+      layers: [],         // [{ peeled, sweepAngle, peeledAt }]
+      score: 0,
+      overAt: 0,
+      ctaAt: 0,
+      // swipe tracking
+      swiping: false,
+      swipeStart: null,
+      swipeTotal: 0,
+      lastSwipeX: 0,
+      lastSwipeY: 0,
+      // center x/y of shape
+      cx: W / 2,
+      cy: H / 2,
+      // particle sparks
+      sparks: []
+    };
+    for (var i = 0; i < TOTAL_LAYERS; i++) {
+      state.layers.push({ peeled: false, sweepAngle: 0, peeledAt: -1 });
+    }
+    if (DEMO || BOT) {
+      startRun();
+    }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function outerRadius(layerIdx) {
+    // outermost layer = TOTAL_LAYERS-1, innermost=0
+    return CENTER_RADIUS + (TOTAL_LAYERS - layerIdx) * LAYER_STEP;
+  }
+
+  // returns the index of the outermost unpeeled layer (-1 if all peeled)
+  function activeLayer() {
+    for (var i = TOTAL_LAYERS - 1; i >= 0; i--) {
+      if (!state.layers[i].peeled) return i;
+    }
+    return -1;
+  }
+
+  // Peel the active layer fully — called when sweep passes threshold
+  function peelLayer(idx) {
+    if (state.layers[idx].peeled) return;
+    state.layers[idx].peeled = true;
+    state.layers[idx].sweepAngle = Math.PI * 2;
+    state.layers[idx].peeledAt = performance.now();
+    state.score++;
+
+    // calm sound step
+    if (window.J) J.calm(state.score);
+
+    // sparks
+    var cx_ = state.cx, cy_ = state.cy, r = outerRadius(idx);
+    for (var s = 0; s < 8; s++) {
+      var angle = rng() * Math.PI * 2;
+      var sp = 0.6 + rng() * 1.2;
+      state.sparks.push({
+        x: cx_ + Math.cos(angle) * r,
+        y: cy_ + Math.sin(angle) * r,
+        vx: Math.cos(angle) * sp,
+        vy: Math.sin(angle) * sp,
+        life: 1.0, color: LAYER_COLORS[idx]
+      });
+    }
+
+    if (idx === 0) {
+      // final reveal — center exposed
+      flash('REVEALED', TEAL, 42);
+      zoom = 1.04;
+      hitStop = 3;
+      if (window.J) J.calm(state.score + 2);
+      // small delay before game over
+      setTimeout(function () { gameOver(); }, 900);
+    } else {
+      // progress flash every 3 layers
+      if ((TOTAL_LAYERS - idx) % 3 === 0) {
+        flash('DEEPER', TEAL, 28);
+      }
+    }
+
+    if (window.LOOP) LOOP.emit('layer_peeled', { layer: idx, score: state.score });
+  }
+
+  function gameOver() {
+    if (state.phase !== 'play') return;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.layers = [];
+    for (var i = 0; i < TOTAL_LAYERS; i++) {
+      state.layers.push({ peeled: false, sweepAngle: 0, peeledAt: -1 });
+    }
+    state.score = 0;
+    state.sparks = [];
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- input handling ----
+  function onSwipeStart(x, y) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'layers' }); return;
+      }
+      resetRun(); return;
+    }
+    if (state.phase !== 'play') return;
+    state.swiping = true;
+    state.swipeStart = { x: x, y: y };
+    state.lastSwipeX = x;
+    state.lastSwipeY = y;
+    state.swipeTotal = 0;
+  }
+
+  function onSwipeMove(x, y) {
+    if (DEMO || BOT || !state.swiping || state.phase !== 'play') return;
+    var dx = x - state.lastSwipeX;
+    var dy = y - state.lastSwipeY;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    state.swipeTotal += dist;
+    state.lastSwipeX = x;
+    state.lastSwipeY = y;
+
+    var li = activeLayer();
+    if (li < 0) return;
+    var layer = state.layers[li];
+    // Each 80px of swipe = 1 radian of peel
+    var delta = dist / 80;
+    layer.sweepAngle = Math.min(Math.PI * 2, (layer.sweepAngle || 0) + delta);
+    if (layer.sweepAngle >= Math.PI * 2) {
+      peelLayer(li);
+    }
+  }
+
+  function onSwipeEnd() {
+    if (DEMO || BOT) return;
+    state.swiping = false;
+  }
+
+  // pointer events
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    onSwipeStart((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointermove', function (e) {
+    if (!e.buttons) return;
+    var r = cv.getBoundingClientRect();
+    onSwipeMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', onSwipeEnd);
+  cv.addEventListener('pointercancel', onSwipeEnd);
+
+  // ---- demo autopilot ----
+  // calm arc: steady peel rhythm with brief pauses between layers
+  var demoPhase = 0;        // which sub-beat we're in
+  var demoSwipeAccum = 0;   // accumulated simulated swipe distance
+  var demoDelay = 0;        // frames to wait before next action
+  // Vary the hesitation per layer for human feel
+  var demoHesitations = [20, 8, 15, 10, 24, 8, 12, 18, 8, 6];
+
+  // bot autopilot vars
+  var botSwipeAccum = 0;
+  var botDelay = 0;
+
+  function demoPeelStep(dt) {
+    if (demoDelay > 0) { demoDelay -= dt; return; }
+    var li = activeLayer();
+    if (li < 0) return;
+    var layer = state.layers[li];
+
+    // simulate swipe: 4-8px per frame with slight variance
+    var swipePx = (4 + rng() * 4) * dt;
+    demoSwipeAccum += swipePx;
+    layer.sweepAngle = Math.min(Math.PI * 2, (layer.sweepAngle || 0) + swipePx / 80);
+
+    if (layer.sweepAngle >= Math.PI * 2) {
+      peelLayer(li);
+      // pause between layers
+      demoDelay = demoHesitations[Math.min(li, demoHesitations.length - 1)] || 12;
+    }
+  }
+
+  function botPeelStep(dt) {
+    if (botDelay > 0) { botDelay -= dt; return; }
+    var li = activeLayer();
+    if (li < 0) return;
+    var layer = state.layers[li];
+    // bot slightly sloppier — varies speed
+    var swipePx = (3 + rng() * 5) * dt;
+    layer.sweepAngle = Math.min(Math.PI * 2, (layer.sweepAngle || 0) + swipePx / 80);
+    if (layer.sweepAngle >= Math.PI * 2) {
+      peelLayer(li);
+      botDelay = 5 + rng() * 10;
+    }
+  }
+
+  // ---- render helpers ----
+  function drawShape(now) {
+    var cx_ = state.cx, cy_ = state.cy;
+
+    // draw center glow (always visible, grows as layers peel)
+    var peelProgress = state.score / TOTAL_LAYERS;
+    var glowR = CENTER_RADIUS * (0.5 + 0.5 * peelProgress);
+    var gGlow = cx.createRadialGradient(cx_, cy_, 0, cx_, cy_, CENTER_RADIUS * 1.6);
+    gGlow.addColorStop(0, 'rgba(242,177,52,' + (0.15 + 0.55 * peelProgress) + ')');
+    gGlow.addColorStop(0.5, 'rgba(46,197,182,' + (0.10 + 0.30 * peelProgress) + ')');
+    gGlow.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = gGlow;
+    cx.beginPath();
+    cx.arc(cx_, cy_, CENTER_RADIUS * 2.5, 0, Math.PI * 2);
+    cx.fill();
+
+    // draw unpeeled rings from outside in (so inner rings paint on top)
+    for (var i = TOTAL_LAYERS - 1; i >= 0; i--) {
+      var layer = state.layers[i];
+      var R = outerRadius(i);
+      var rInner = i > 0 ? outerRadius(i - 1) : CENTER_RADIUS;
+
+      if (layer.peeled) {
+        // draw peel-away animation for recently peeled layers
+        var age = (performance.now() - layer.peeledAt) / 1000;
+        if (age < 0.6) {
+          var alpha = Math.max(0, 1 - age / 0.6);
+          var expandR = R * (1 + age * 0.5);
+          cx.save();
+          cx.globalAlpha = alpha * 0.4;
+          cx.strokeStyle = LAYER_COLORS[i];
+          cx.lineWidth = 3;
+          cx.beginPath();
+          cx.arc(cx_, cy_, expandR, 0, Math.PI * 2);
+          cx.stroke();
+          cx.restore();
+        }
+        continue;
+      }
+
+      // draw the ring with sweep progress
+      var sweep = layer.sweepAngle || 0;
+      var startAngle = -Math.PI / 2;
+
+      // full ring background (slightly muted)
+      cx.save();
+      cx.globalAlpha = 0.35;
+      cx.fillStyle = LAYER_COLORS[i];
+      cx.beginPath();
+      cx.arc(cx_, cy_, R, 0, Math.PI * 2);
+      cx.arc(cx_, cy_, rInner, 0, Math.PI * 2, true);
+      cx.fill();
+      cx.restore();
+
+      // solid part of ring (not yet peeled)
+      if (sweep < Math.PI * 2) {
+        cx.save();
+        cx.fillStyle = LAYER_COLORS[i];
+        cx.beginPath();
+        cx.arc(cx_, cy_, R, startAngle + sweep, startAngle + Math.PI * 2);
+        cx.arc(cx_, cy_, rInner, startAngle + Math.PI * 2, startAngle + sweep, true);
+        cx.closePath();
+        cx.fill();
+        cx.restore();
+      }
+
+      // peel-progress highlight (the "peeling edge")
+      if (sweep > 0 && sweep < Math.PI * 2) {
+        cx.save();
+        var edgeAngle = startAngle + sweep;
+        cx.strokeStyle = 'rgba(255,255,255,0.6)';
+        cx.lineWidth = 2.5;
+        cx.beginPath();
+        cx.moveTo(cx_ + Math.cos(edgeAngle) * rInner, cy_ + Math.sin(edgeAngle) * rInner);
+        cx.lineTo(cx_ + Math.cos(edgeAngle) * R, cy_ + Math.sin(edgeAngle) * R);
+        cx.stroke();
+        cx.restore();
+      }
+    }
+
+    // draw the revealed center circle
+    var cGrad = cx.createRadialGradient(cx_ - 8, cy_ - 8, 2, cx_, cy_, CENTER_RADIUS);
+    cGrad.addColorStop(0, 'rgba(255,240,200,0.95)');
+    cGrad.addColorStop(0.4, 'rgba(242,177,52,0.85)');
+    cGrad.addColorStop(1, 'rgba(46,197,182,0.80)');
+    cx.fillStyle = cGrad;
+    cx.beginPath();
+    cx.arc(cx_, cy_, CENTER_RADIUS, 0, Math.PI * 2);
+    cx.fill();
+
+    // center dot pulse
+    var pulse = 0.85 + 0.15 * Math.sin(now / 600);
+    cx.save();
+    cx.globalAlpha = 0.7 * peelProgress;
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.beginPath();
+    cx.arc(cx_, cy_, 8 * pulse, 0, Math.PI * 2);
+    cx.fill();
+    cx.restore();
+  }
+
+  function drawSparks(dt) {
+    for (var s = state.sparks.length - 1; s >= 0; s--) {
+      var sp = state.sparks[s];
+      sp.x += sp.vx * dt;
+      sp.y += sp.vy * dt;
+      sp.life -= 0.03 * dt;
+      if (sp.life <= 0) { state.sparks.splice(s, 1); continue; }
+      cx.save();
+      cx.globalAlpha = sp.life;
+      cx.fillStyle = sp.color;
+      cx.beginPath();
+      cx.arc(sp.x, sp.y, 3 * sp.life, 0, Math.PI * 2);
+      cx.fill();
+      cx.restore();
+    }
+  }
+
+  function drawProgress() {
+    // subtle arc around center showing peeled count
+    var li = activeLayer();
+    if (li < 0) return;
+    var peeled = state.score;
+    var frac = peeled / TOTAL_LAYERS;
+    if (frac <= 0) return;
+    var R = outerRadius(TOTAL_LAYERS - 1) + 14;
+    cx.save();
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 2;
+    cx.globalAlpha = 0.5;
+    cx.beginPath();
+    cx.arc(state.cx, state.cy, R, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * frac);
+    cx.stroke();
+    cx.restore();
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // autopilots
+    if (state.phase === 'play') {
+      if (hitStop > 0) {
+        hitStop -= dt;
+        // autopilot only runs when hitStop has decayed
+      } else {
+        if (DEMO) demoPeelStep(dt);
+        else if (BOT) botPeelStep(dt);
+      }
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.88, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(242,177,52,0.06)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    if (state.phase === 'title') {
+      // soft title
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 42px -apple-system, Helvetica, Arial';
+      cx.fillText('QUIET REVEAL', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('swipe to uncover', W / 2, 302);
+
+      // draw a teaser shape
+      drawShape(now);
+      drawProgress();
+
+      var pulse2 = 0.55 + 0.45 * Math.sin(now / 500);
+      cx.globalAlpha = pulse2;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('SWIPE TO BEGIN', W / 2, 640);
+      cx.globalAlpha = 1;
+    }
+
+    if (state.phase === 'play' || state.phase === 'over') {
+      drawShape(now);
+      drawProgress();
+      drawSparks(dt);
+
+      // score display — calm, top center
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 20px Menlo, monospace';
+      cx.fillText(state.score + ' / ' + TOTAL_LAYERS, W / 2, 80);
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('LAYERS REVEALED', W / 2, 100);
+
+      // active layer sweep hint
+      var li2 = activeLayer();
+      if (li2 >= 0 && state.phase === 'play') {
+        var sweep2 = state.layers[li2].sweepAngle || 0;
+        var pct = Math.round((sweep2 / (Math.PI * 2)) * 100);
+        if (pct > 5) {
+          cx.fillStyle = 'rgba(46,197,182,0.6)';
+          cx.font = '600 12px Menlo, monospace';
+          cx.fillText(pct + '%', W / 2, 120);
+        }
+      }
+    }
+
+    if (state.phase === 'over') {
+      // soft overlay
+      cx.fillStyle = 'rgba(11,13,18,0.6)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+
+      if (state.score >= TOTAL_LAYERS) {
+        // full reveal — warm celebration
+        cx.fillStyle = GOLD;
+        cx.font = '900 40px -apple-system, Helvetica, Arial';
+        cx.fillText('FULLY REVEALED', W / 2, 310);
+        cx.fillStyle = 'rgba(255,255,255,0.7)';
+        cx.font = '700 18px -apple-system, Helvetica, Arial';
+        cx.fillText('all ' + TOTAL_LAYERS + ' layers peeled', W / 2, 348);
+      } else {
+        cx.fillStyle = TEAL;
+        cx.font = '900 40px -apple-system, Helvetica, Arial';
+        cx.fillText('REVEALED', W / 2, 310);
+        cx.fillStyle = 'rgba(255,255,255,0.7)';
+        cx.font = '700 18px -apple-system, Helvetica, Arial';
+        cx.fillText(state.score + ' of ' + TOTAL_LAYERS + ' layers', W / 2, 348);
+      }
+
+      if (!DEMO && !BOT) {
+        var pulse3 = 0.6 + 0.4 * Math.sin(now / 400);
+        cx.globalAlpha = pulse3;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('SWIPE AGAIN', W / 2, 400);
+        cx.globalAlpha = 1;
+
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD;
+        cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) {
+          cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        } else {
+          cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        }
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card (calm — soft invitation, not dare)
+    if (state.phase === 'cta') {
+      var ct = (now - state.ctaAt) / 1000;
+      var ease = Math.min(1, ct * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.80 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+
+      cx.fillStyle = '#fff';
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('QUIET REVEAL', W / 2, 290);
+
+      cx.fillStyle = 'rgba(255,255,255,0.65)';
+      cx.font = '500 18px -apple-system, Helvetica, Arial';
+      cx.fillText('peel yours away', W / 2, 330);
+
+      var pulse4 = 0.75 + 0.25 * Math.sin(now / 380);
+      cx.globalAlpha = ease * pulse4;
+      cx.fillStyle = TEAL;
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 405);
+
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 438);
+      cx.globalAlpha = 1;
+    }
+
+    // floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a2 = Math.max(0, 1 - fl.t / 44);
+      cx.globalAlpha = a2;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, H / 2 - 60 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 44) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

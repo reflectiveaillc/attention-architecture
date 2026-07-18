@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Color Flip — Tilt</title>
+<!--
+  LOOP / attention-architecture — Color Flip
+  Circuits: 02-novelty, 01-rpe, 07-timing
+  Engine: viral
+  Mechanic: whole screen cycles through colors; tap when bg matches target.
+  Modes:
+    ?demo=1&seed=7    scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N&seed=M  imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'color-flip';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ── palette: 8 vivid colors the cycle churns through ──
+  var PALETTE = [
+    '#e8502e', // vermillion
+    '#2ec5b6', // teal
+    '#f2b134', // gold
+    '#7c3aed', // violet
+    '#10b981', // emerald
+    '#f43f5e', // rose
+    '#3b82f6', // blue
+    '#f97316', // orange
+  ];
+
+  // ── game state ──
+  var state, flashes, runStartTs;
+  var hitStop = 0, shakeAmt = 0, zoom = 1, dareBeaten = false;
+  var ctaAt = 0, challengeAt = 0;
+  var botRunsDone = 0;
+
+  // Cycle parameters
+  var BASE_CYCLE_MS = 1600;  // how long one full color revolution takes at start
+  var MIN_CYCLE_MS  = 500;   // floor speed
+  var MATCH_WINDOW  = 0.13;  // fraction of cycle considered "on target" (±)
+  var TOTAL_ROUNDS  = 12;    // max rounds per run
+
+  // scoring
+  function pctTop(score) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 5)))); }
+
+  function newGame() {
+    state = {
+      phase: 'title',        // title | challenge | play | over | cta
+      round: 0,              // 0-indexed rounds completed
+      score: 0,
+      cyclePos: 0,           // 0..1 progress through palette
+      cycleSpeed: 0,         // fraction/ms
+      targetIdx: 0,          // which palette slot is the target
+      overAt: 0,
+      tapConsumed: false,
+      nearMissFired: false,
+    };
+    flashes = []; dareBeaten = false;
+    rng = mulberry32(SEED);
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { startRun(); return; }
+  }
+
+  function cycleMs(round) {
+    // Each round speeds up; after 6 it's quite fast
+    return Math.max(MIN_CYCLE_MS, BASE_CYCLE_MS - round * 90);
+  }
+
+  function startRound() {
+    // pick next target — not the same as last
+    var last = state.targetIdx;
+    var next;
+    do { next = Math.floor(rng() * PALETTE.length); } while (next === last && PALETTE.length > 1);
+    state.targetIdx = next;
+    // randomize starting position so it's never trivially at the target
+    state.cyclePos = rng();
+    state.cycleSpeed = 1 / cycleMs(state.round);
+    state.tapConsumed = false;
+    state.nearMissFired = false;
+    if (window.J) J.tension(Math.min(state.round / TOTAL_ROUNDS, 1));
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.round = 0;
+    state.score = 0;
+    runStartTs = Date.now();
+    startRound();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ── Check if current bg position is "matching" the target ──
+  // cyclePos 0..1 maps to palette indices 0..PALETTE.length
+  function bgColorIndex() {
+    return state.cyclePos * PALETTE.length % PALETTE.length;
+  }
+
+  function distToTarget() {
+    // circular distance 0..0.5
+    var pos = (state.cyclePos * PALETTE.length) % PALETTE.length;
+    var d = Math.abs(pos - state.targetIdx);
+    if (d > PALETTE.length / 2) d = PALETTE.length - d;
+    return d / PALETTE.length;  // normalised 0..0.5
+  }
+
+  function isOnTarget() {
+    return distToTarget() <= MATCH_WINDOW;
+  }
+
+  function isPerfect() {
+    return distToTarget() <= MATCH_WINDOW * 0.35;
+  }
+
+  function tapAction() {
+    if (state.phase !== 'play' || state.tapConsumed) return;
+    state.tapConsumed = true;
+    var on  = isOnTarget();
+    var perf = on && isPerfect();
+    var dist = distToTarget();
+
+    if (on) {
+      // Hit!
+      state.score++;
+      state.round++;
+      if (window.J) {
+        if (perf) J.perfect(state.score);
+        else J.hit(state.score);
+      }
+      if (perf) { hitStop = 60; zoom = 1.04; flash('PERFECT', TEAL, 50); }
+      else       { hitStop = 30; flash('+1', VERM, 44); }
+      // dare check
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score);
+      }
+      if (window.LOOP) LOOP.emit('color_match', { round: state.round, score: state.score, perfect: perf });
+      if (state.round >= TOTAL_ROUNDS) {
+        // completed all rounds — win exit
+        gameOver(true);
+      } else {
+        // brief pause before next round
+        state.phase = 'roundPause';
+        setTimeout(function () { state.phase = 'play'; startRound(); }, perf ? 180 : 120);
+      }
+    } else {
+      // MISS — near or far?
+      var near = dist <= MATCH_WINDOW * 2.5;
+      if (near) {
+        flash('SO CLOSE', GOLD, 42);
+        if (window.J) J.near();
+        shakeAmt = 5;
+        if (window.LOOP) LOOP.emit('near_miss', { round: state.round, dist: +dist.toFixed(3) });
+      } else {
+        flash('MISS', VERM, 46);
+        if (window.J) J.death(0.4 + dist);
+        shakeAmt = 9;
+      }
+      if (window.LOOP) LOOP.emit('color_miss', { round: state.round, dist: +dist.toFixed(3), near: near });
+      gameOver(false);
+    }
+  }
+
+  function gameOver(win) {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    if (!win) { shakeAmt = Math.max(shakeAmt, 8); }
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J && !win) J.death(0.7);
+    if (window.J && win)  J.fanfare();
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    rng = mulberry32(SEED + botRunsDone * 17);
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ── Input ──
+  var MUTE_R  = { x: W - 46, y: 10,  w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { tapAction(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'matches' }); return;
+      }
+      if (window.LOOP) LOOP.emit('restart', {});
+      rng = mulberry32(SEED);
+      newGame(); startRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ── Demo / Bot autopilots ──
+  // Demo script: [outcome, timing offset in fraction of window]
+  // 'hit' = land cleanly, 'perfect' = dead-center, 'near' = just outside, 'miss' = clearly wrong
+  var demoScript = [
+    { act: 'hit',     delay: 0.05  },
+    { act: 'perfect', delay: 0     },
+    { act: 'hit',     delay: -0.04 },
+    { act: 'hit',     delay: 0.08  },
+    { act: 'near',    delay: 0.14  },   // ← near-fail (reads as almost missed)
+    { act: 'hit',     delay: 0.02  },   // ← recovery save
+    { act: 'hit',     delay: 0.06  },
+    { act: 'miss',    delay: 0.40  },   // ← real fail
+  ];
+  var demoIdx = 0;
+  var demoTarget = null;  // cyclePos to tap at
+  var demoFired  = false;
+
+  // bot: imperfect hits with occasional miss to force game_over
+  var botActionCount = 0;
+  var BOT_PASSIVE_AFTER = 6;  // after N hits, go passive so the miss fires
+
+  function computeDemoTarget(scriptEntry) {
+    // Compute the cyclePos at which we want to tap
+    var tIdx = state.targetIdx;
+    var n = PALETTE.length;
+    var offset = scriptEntry.delay;
+    if (scriptEntry.act === 'miss') {
+      // tap at position clearly away from target (half-cycle off)
+      return ((tIdx / n) + 0.45) % 1;
+    }
+    if (scriptEntry.act === 'near') {
+      // just outside window
+      return ((tIdx / n) + (MATCH_WINDOW * 1.5) / n * n) % 1;
+    }
+    if (scriptEntry.act === 'perfect') {
+      return (tIdx / n + offset) % 1;
+    }
+    // hit: slightly off-center
+    return ((tIdx / n) + offset * MATCH_WINDOW / n * n + MATCH_WINDOW * 0.5 / n * n) % 1;
+  }
+
+  function autopilot() {
+    if (state.phase !== 'play' || state.tapConsumed) return;
+
+    if (DEMO) {
+      var entry = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      if (!demoFired || demoTarget === null) {
+        demoTarget = computeDemoTarget(entry);
+        demoFired = true;
+      }
+      // Wait until cyclePos crosses demoTarget
+      var cur = state.cyclePos;
+      var spd = state.cycleSpeed;
+      // Check: will we cross demoTarget this frame? (crude: within 1 step)
+      var next = (cur + spd * 16.667) % 1;
+      var crosses;
+      if (next > cur) {
+        crosses = demoTarget >= cur && demoTarget <= next;
+      } else {
+        crosses = demoTarget >= cur || demoTarget <= next;
+      }
+      if (crosses) {
+        demoFired = false;
+        demoTarget = null;
+        demoIdx++;
+        tapAction();
+      }
+    } else if (BOT) {
+      // After BOT_PASSIVE_AFTER actions, go passive → cycle runs off target → tap misses
+      if (botActionCount >= BOT_PASSIVE_AFTER) {
+        // tap immediately (will miss since we're not on target)
+        botActionCount = 0;
+        tapAction();
+        return;
+      }
+      // aim near target with some jitter
+      var tIdx = state.targetIdx;
+      var n = PALETTE.length;
+      var jitter = (rng() - 0.5) * MATCH_WINDOW * 1.2;
+      var botTarget = ((tIdx / n) + jitter) % 1;
+      var cur2 = state.cyclePos;
+      var next2 = (cur2 + state.cycleSpeed * 16.667) % 1;
+      var crosses2;
+      if (next2 > cur2) {
+        crosses2 = botTarget >= cur2 && botTarget <= next2;
+      } else {
+        crosses2 = botTarget >= cur2 || botTarget <= next2;
+      }
+      if (crosses2) {
+        botActionCount++;
+        tapAction();
+      }
+    }
+  }
+
+  // ── Color interpolation for smooth cycling ──
+  function hexToRgb(hex) {
+    var r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+    return [r, g, b];
+  }
+  function lerpRgb(a, b, t) {
+    return [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t];
+  }
+  function cycleColor(pos) {
+    var n = PALETTE.length;
+    var total = pos * n;
+    var lo = Math.floor(total) % n;
+    var hi = (lo + 1) % n;
+    var t = total - Math.floor(total);
+    var c = lerpRgb(hexToRgb(PALETTE[lo]), hexToRgb(PALETTE[hi]), t);
+    return 'rgb(' + c[0].toFixed(0) + ',' + c[1].toFixed(0) + ',' + c[2].toFixed(0) + ')';
+  }
+
+  // Progress indicator: how close bg is to target (0..1)
+  function matchProgress() {
+    var d = distToTarget();
+    return Math.max(0, 1 - d / MATCH_WINDOW);
+  }
+
+  // ── Render ──
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Advance cycle
+    if (state.phase === 'play' || state.phase === 'roundPause') {
+      if (hitStop > 0) {
+        hitStop -= dt;
+      } else {
+        state.cyclePos = (state.cyclePos + state.cycleSpeed * 16.667 * dt) % 1;
+        autopilot();
+      }
+    }
+
+    // juice transforms
+    cx.save();
+    var sx = 0, sy = 0;
+    if (shakeAmt > 0.2) {
+      sx = (Math.random() - 0.5) * shakeAmt;
+      sy = (Math.random() - 0.5) * shakeAmt;
+    }
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // background — full canvas color cycle
+    var bgCol = (state.phase === 'play' || state.phase === 'roundPause')
+      ? cycleColor(state.cyclePos)
+      : INK;
+
+    if (state.phase === 'over' || state.phase === 'cta' || state.phase === 'challenge') {
+      cx.fillStyle = INK;
+    } else if (state.phase === 'title') {
+      cx.fillStyle = INK;
+    } else {
+      cx.fillStyle = bgCol;
+    }
+    cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // ── PLAY phase rendering ──
+    if (state.phase === 'play' || state.phase === 'roundPause') {
+      // full-screen bg already drawn above via bgCol
+      // overlay: darken bottom for readability
+      var fade = cx.createLinearGradient(0, H * 0.55, 0, H);
+      fade.addColorStop(0, 'rgba(0,0,0,0)');
+      fade.addColorStop(1, 'rgba(0,0,0,0.45)');
+      cx.fillStyle = fade;
+      cx.fillRect(0, 0, W, H);
+
+      // Target color swatch — top center
+      var swatchY = 80, swatchW = 130, swatchH = 130, swatchR = 65;
+      // glow ring behind swatch
+      var glowAlpha = matchProgress();
+      if (glowAlpha > 0.05) {
+        cx.shadowColor = PALETTE[state.targetIdx];
+        cx.shadowBlur = 28 * glowAlpha;
+      }
+      cx.beginPath();
+      cx.arc(W / 2, swatchY + swatchR, swatchR, 0, Math.PI * 2);
+      cx.fillStyle = PALETTE[state.targetIdx];
+      cx.fill();
+      cx.shadowBlur = 0;
+
+      // "TAP WHEN" label above swatch
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 13px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP WHEN IT MATCHES', W / 2, 60);
+
+      // Match progress arc around swatch
+      var prog = matchProgress();
+      if (prog > 0) {
+        cx.beginPath();
+        cx.arc(W / 2, swatchY + swatchR, swatchR + 7, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * prog);
+        cx.strokeStyle = 'rgba(255,255,255,' + (0.4 + 0.6 * prog) + ')';
+        cx.lineWidth = 3 + prog * 3;
+        cx.stroke();
+      }
+
+      // Round / score display
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.95)';
+      cx.font = '900 72px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 330);
+
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 13px Menlo, monospace';
+      cx.fillText('ROUND ' + (state.round + 1) + ' / ' + TOTAL_ROUNDS, W / 2, 356);
+
+      // speed indicator
+      var speed = (1 - (cycleMs(state.round) - MIN_CYCLE_MS) / (BASE_CYCLE_MS - MIN_CYCLE_MS));
+      cx.fillStyle = 'rgba(255,255,255,0.25)';
+      cx.fillRect(W / 2 - 60, 374, 120, 4);
+      cx.fillStyle = speed > 0.7 ? VERM : GOLD;
+      cx.fillRect(W / 2 - 60, 374, 120 * speed, 4);
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '500 10px Menlo, monospace';
+      cx.fillText('SPEED', W / 2, 390);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 416);
+      }
+    }
+
+    // ── TITLE ──
+    if (state.phase === 'title') {
+      // animated palette preview strip
+      for (var pi = 0; pi < PALETTE.length; pi++) {
+        var px = (W / PALETTE.length) * pi;
+        var pw = W / PALETTE.length;
+        var bright = 0.5 + 0.5 * Math.sin(now / 400 + pi * 0.8);
+        cx.globalAlpha = 0.15 + bright * 0.1;
+        cx.fillStyle = PALETTE[pi];
+        cx.fillRect(px, 0, pw, H);
+      }
+      cx.globalAlpha = 1;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 52px -apple-system, Helvetica, Arial';
+      cx.fillText('COLOR FLIP', W / 2, 296);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap when the screen matches', W / 2, 336);
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('the target color', W / 2, 356);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM;
+      cx.font = '800 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 410);
+      cx.globalAlpha = 1;
+    }
+
+    // ── CHALLENGE card (demo beat 1) ──
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 310);
+      cx.fillStyle = GOLD;
+      cx.font = '900 100px -apple-system, Helvetica, Arial';
+      cx.fillText('8', W / 2, 410);
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 442);
+    }
+
+    // ── OVER card ──
+    if (state.phase === 'over') {
+      // residual bg tint
+      cx.fillStyle = 'rgba(11,13,18,0.7)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('WRONG COLOR.', W / 2, 296);
+      cx.fillStyle = '#fff';
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' matches', W / 2, 342);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 388);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 412);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE', W / 2, 456);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) {
+          cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        } else {
+          cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        }
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W / 2, SHARE_R.y + 30
+        );
+      }
+    }
+
+    // ── CTA (demo beat 6) ──
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('COLOR FLIP', W / 2, 306);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('they got ' + (window.__demoScore || 8) + '. your move.', W / 2, 348);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM;
+      cx.globalAlpha = ease * p3;
+      cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 8), W / 2, 416);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 450);
+      cx.globalAlpha = 1;
+    }
+
+    // ── Floating reward text ──
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 500 - fl.t * 1.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

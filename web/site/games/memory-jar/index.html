@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Memory Jar — Tilt</title>
+<!--
+  LOOP / attention-architecture — Memory Jar
+  Engine: calm. Circuits: 05-ease, 08-garden, 01-soft-rpe.
+  Conditioned path: the 'save a memory' gesture from Instagram/TikTok.
+  Mechanic: hold to fill the jar with glowing memory-motes; release to settle.
+  Modes (query params):
+    ?demo=1&seed=7        ~16s calm arc → soft CTA → window.__demoDone=true
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone=true
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'memory-jar';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // palette
+  var INK  = '#0b0d12';
+  var TEAL = '#2ec5b6';
+  var GOLD = '#f2b134';
+  // calm tones (no vermillion)
+  var MOTE_COLORS = ['#7ecfcc','#9ed8d5','#a8e6e3','#5ab8b4','#d4f5f3','#b3e8e5','#6fcfc9','#e8f7f6'];
+  var SETTLE_COLORS= ['#4eb0ac','#62bab6','#7ec8c4','#52aeaa','#9cdbd8','#3da8a4'];
+
+  // jar geometry
+  var JAR_CX = W / 2;
+  var JAR_TOP = 190;    // top of jar opening
+  var JAR_BOT = 560;    // bottom of jar
+  var JAR_H   = JAR_BOT - JAR_TOP;
+  var JAR_W_TOP = 130;  // half-width at shoulder
+  var JAR_W_BOT = 120;  // half-width at base
+  var JAR_NECK_TOP = JAR_TOP;
+  var JAR_NECK_BOT = JAR_TOP + 40;  // neck region
+  var JAR_NECK_W   = 60;            // half-width at neck
+
+  // state
+  var phase;           // 'title' | 'play' | 'complete' | 'cta'
+  var fill;            // 0..1 fraction of jar filled
+  var holdTs;          // when hold started (null if not holding)
+  var motes;           // rising particles while holding
+  var settled;         // resting particles at bottom
+  var flashes;
+  var score;           // = Math.round(fill * 100), reported at game_over
+  var runStartTs;
+  var shakeAmt, zoom, hitStop;
+  var overAt, ctaAt;
+  var botRunsDone, botHolding, botPhase, botPhaseEnd;
+
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 580, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function newGame() {
+    phase = DEMO || BOT ? 'play' : 'title';
+    fill  = 0;
+    holdTs = null;
+    motes   = [];
+    settled = [];
+    flashes = [];
+    score   = 0;
+    shakeAmt = 0; zoom = 1; hitStop = 0;
+    overAt = 0; ctaAt = 0;
+    botRunsDone = 0; botHolding = false;
+    botPhase = 'idle'; botPhaseEnd = 0;
+    rng = mulberry32(SEED);
+
+    if (DEMO || BOT) {
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+  }
+
+  // fill rates
+  var FILL_RATE  = 0.008;   // per frame (~60fps → ~12s to full)
+  var SETTLE_RATE = 0.002;  // settle slowly drains tiny bit when not holding
+
+  // ---------- mote helpers ----------
+  function spawnMote(now) {
+    // spawn at the bottom of the jar area, rise upward into fill region
+    var fillY = fillTopY();
+    // spawn just below current fill line, rising up to it
+    var spawnY = JAR_BOT - 4 + rng() * 6;
+    var color = MOTE_COLORS[Math.floor(rng() * MOTE_COLORS.length)];
+    var r = 3 + rng() * 5;
+    var x = jarXatY(spawnY) * (0.3 + rng() * 0.7) * (rng() > 0.5 ? 1 : -1) + JAR_CX;
+    motes.push({
+      x: x, y: spawnY,
+      vx: (rng() - 0.5) * 0.8,
+      vy: -(0.8 + rng() * 1.2),
+      r: r, color: color,
+      life: 1.0,
+      born: now
+    });
+  }
+
+  // half-width of jar at a given y (linear interpolation from neck to base)
+  function jarXatY(y) {
+    if (y < JAR_NECK_BOT) {
+      // neck region
+      var t = (y - JAR_NECK_TOP) / (JAR_NECK_BOT - JAR_NECK_TOP);
+      return JAR_NECK_W + t * (JAR_W_TOP - JAR_NECK_W);
+    }
+    var t = (y - JAR_NECK_BOT) / (JAR_BOT - JAR_NECK_BOT);
+    return JAR_W_TOP + t * (JAR_W_BOT - JAR_W_TOP);
+  }
+
+  // Y coordinate of fill top
+  function fillTopY() {
+    return JAR_BOT - fill * JAR_H;
+  }
+
+  function settleNewParticles(count) {
+    for (var i = 0; i < count; i++) {
+      var y = JAR_BOT - rng() * fill * JAR_H * 0.92;
+      var hw = jarXatY(y) * 0.85;
+      settled.push({
+        x: JAR_CX + (rng() - 0.5) * 2 * hw,
+        y: y,
+        r: 2 + rng() * 4,
+        color: SETTLE_COLORS[Math.floor(rng() * SETTLE_COLORS.length)],
+        alpha: 0.55 + rng() * 0.35,
+        pulse: rng() * Math.PI * 2
+      });
+    }
+    // keep settled count reasonable
+    if (settled.length > 220) settled.splice(0, settled.length - 220);
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 36, t: 0 });
+  }
+
+  function gameOver() {
+    phase = 'complete';
+    overAt = performance.now();
+    score = Math.round(fill * 100);
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (window.J) J.calm(4); // final resolution tone
+    zoom = 1.03; // gentle bloom
+
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 1200);
+      }
+    }
+  }
+
+  function resetRun() {
+    fill = 0; motes = []; settled = []; flashes = [];
+    score = 0; holdTs = null;
+    shakeAmt = 0; zoom = 1; hitStop = 0;
+    phase = 'play';
+    botHolding = false; botPhase = 'idle'; botPhaseEnd = 0;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('restart', {});
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---------- input ----------
+  var holding = false;
+  function startHold(x, y) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { phase = 'play'; runStartTs = Date.now(); if (window.LOOP) LOOP.emit('play_start', { seed: SEED }); }
+    if (phase === 'complete') {
+      if (inR(SHARE_R, x, y) && window.SHARE) { SHARE.send({ score: score, unit: 'memories' }); return; }
+      return;
+    }
+    if (phase === 'play') {
+      holding = true;
+      holdTs = Date.now();
+      if (window.J) J.calm(1);
+    }
+  }
+  function endHold() {
+    if (DEMO || BOT) return;
+    if (holding) {
+      holding = false;
+      holdTs = null;
+      settleNewParticles(Math.floor(motes.length * 0.6));
+      motes = [];
+      if (window.J && fill > 0.01) J.calm(2);
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    startHold((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointerup',   endHold);
+  window.addEventListener('pointercancel', endHold);
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') startHold(W / 2, H / 2);
+  });
+  window.addEventListener('keyup', function (e) {
+    if (e.code === 'Space') endHold();
+  });
+
+  // ---------- demo script ----------
+  // Demo arc: settle (hold ~3s) → rest → deepen (longer hold ~4s) → rest →
+  //           resolve (final hold to ~90%) → soft invitation.
+  // Total ~16s play before complete triggers.
+  var demoScript = [
+    // [phaseType, durationMs] — 'hold' or 'rest'
+    { t: 'hold', d: 2800 },   // first breath: fill to ~22%
+    { t: 'rest', d: 900 },    // settle
+    { t: 'hold', d: 1600 },   // deepen: fill to ~35%
+    { t: 'rest', d: 700 },
+    { t: 'hold', d: 2200 },   // deeper: fill to ~52%
+    { t: 'rest', d: 500 },
+    { t: 'hold', d: 1400 },   // fill to ~63%
+    { t: 'rest', d: 800 },
+    { t: 'hold', d: 2500 },   // resolve: push toward ~80%
+    { t: 'rest', d: 600 },
+    { t: 'hold', d: 9999 },   // final hold: fill to 100%
+  ];
+  var demoScriptIdx = 0;
+  var demoPhaseStart = 0;
+  var demoIsHolding = false;
+
+  // ---------- bot autopilot ----------
+  // Bot holds for random-ish durations then rests, repeating until jar fills → game_over
+  var botHoldMin = 1500, botHoldMax = 3500;
+  var botRestMin = 400,  botRestMax = 1200;
+  var botNextSwitch = 0;
+
+  function autopilot(now) {
+    if (phase !== 'play') return;
+    if (DEMO) {
+      var sc = demoScript[demoScriptIdx];
+      if (!sc) return;
+      if (demoPhaseStart === 0) demoPhaseStart = now;
+      var elapsed = now - demoPhaseStart;
+      if (sc.t === 'hold') {
+        demoIsHolding = true;
+      } else {
+        demoIsHolding = false;
+      }
+      if (elapsed >= sc.d && demoScriptIdx < demoScript.length - 1) {
+        demoScriptIdx++;
+        demoPhaseStart = now;
+        // calm tone on each phase transition
+        if (window.J) J.calm(demoScriptIdx % 3 + 1);
+        if (demoIsHolding) {
+          // release: settle motes
+          settleNewParticles(Math.floor(motes.length * 0.6));
+          motes = [];
+        }
+      }
+    } else if (BOT) {
+      if (botNextSwitch === 0) botNextSwitch = now + botHoldMax * rng();
+      if (now >= botNextSwitch) {
+        botHolding = !botHolding;
+        if (!botHolding) {
+          settleNewParticles(Math.floor(motes.length * 0.6));
+          motes = [];
+          botNextSwitch = now + botRestMin + rng() * (botRestMax - botRestMin);
+        } else {
+          botNextSwitch = now + botHoldMin + rng() * (botHoldMax - botHoldMin);
+        }
+      }
+    }
+  }
+
+  function isHolding() {
+    if (DEMO) return demoIsHolding;
+    if (BOT) return botHolding;
+    return holding;
+  }
+
+  // ---------- draw jar ----------
+  function drawJar(now) {
+    var x = JAR_CX, bot = JAR_BOT, top = JAR_TOP;
+    var neckW = JAR_NECK_W, bodyW = JAR_W_TOP, baseW = JAR_W_BOT;
+    var neckBot = JAR_NECK_BOT;
+
+    // outer glow when holding
+    if (isHolding() && fill > 0) {
+      var glow = cx.createRadialGradient(x, (top + bot) / 2, 20, x, (top + bot) / 2, 180);
+      glow.addColorStop(0, 'rgba(46,197,182,0.10)');
+      glow.addColorStop(1, 'rgba(46,197,182,0)');
+      cx.fillStyle = glow;
+      cx.beginPath();
+      cx.ellipse(x, (top + bot) / 2, 200, 220, 0, 0, Math.PI * 2);
+      cx.fill();
+    }
+
+    // clip to jar interior for fill and motes
+    cx.save();
+    cx.beginPath();
+    // jar shape path (inside)
+    cx.moveTo(x - neckW + 2, top + 2);
+    cx.bezierCurveTo(x - neckW + 2, neckBot, x - bodyW + 2, neckBot + 10, x - bodyW + 2, neckBot + 30);
+    cx.lineTo(x - baseW + 2, bot - 2);
+    cx.lineTo(x + baseW - 2, bot - 2);
+    cx.lineTo(x + bodyW - 2, neckBot + 30);
+    cx.bezierCurveTo(x + bodyW - 2, neckBot + 10, x + neckW - 2, neckBot, x + neckW - 2, top + 2);
+    cx.closePath();
+    cx.clip();
+
+    // draw fill
+    if (fill > 0.002) {
+      var fy = fillTopY();
+      var fillGrad = cx.createLinearGradient(0, fy, 0, bot);
+      fillGrad.addColorStop(0, 'rgba(46,197,182,0.18)');
+      fillGrad.addColorStop(0.4, 'rgba(46,197,182,0.22)');
+      fillGrad.addColorStop(1, 'rgba(46,197,182,0.35)');
+      cx.fillStyle = fillGrad;
+      cx.fillRect(x - baseW, fy, baseW * 2, bot - fy);
+
+      // surface shimmer
+      var shimmerT = (Math.sin(now / 800) * 0.5 + 0.5);
+      cx.fillStyle = 'rgba(200,245,244,' + (0.10 + shimmerT * 0.08) + ')';
+      cx.fillRect(x - bodyW + 2, fy, bodyW * 2 - 4, 3);
+    }
+
+    // settled motes glow
+    for (var i = 0; i < settled.length; i++) {
+      var s = settled[i];
+      var pAlpha = s.alpha * (0.7 + 0.3 * Math.sin(now / 1200 + s.pulse));
+      if (s.y < fillTopY() - 2) { s.alpha *= 0.97; continue; } // fade if above fill
+      cx.beginPath();
+      cx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+      cx.fillStyle = s.color;
+      cx.globalAlpha = pAlpha;
+      cx.fill();
+      cx.globalAlpha = 1;
+    }
+
+    // rising motes
+    for (var j = motes.length - 1; j >= 0; j--) {
+      var m = motes[j];
+      var fy2 = fillTopY();
+      m.life -= 0.008;
+      m.x += m.vx;
+      m.y += m.vy;
+      // float within fill, not above it
+      if (m.y < fy2 + m.r) m.vy = Math.abs(m.vy) * 0.4 + 0.1; // bounce gently back down
+      if (m.life <= 0 || m.y > JAR_BOT + 10) { motes.splice(j, 1); continue; }
+      var mAlpha = Math.min(1, m.life * 2.5) * 0.85;
+      // glow
+      var mg = cx.createRadialGradient(m.x, m.y, 0, m.x, m.y, m.r * 2);
+      mg.addColorStop(0, m.color);
+      mg.addColorStop(1, 'rgba(46,197,182,0)');
+      cx.globalAlpha = mAlpha;
+      cx.beginPath(); cx.arc(m.x, m.y, m.r * 2, 0, Math.PI * 2);
+      cx.fillStyle = mg; cx.fill();
+      cx.beginPath(); cx.arc(m.x, m.y, m.r, 0, Math.PI * 2);
+      cx.fillStyle = m.color; cx.fill();
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore(); // end clip
+
+    // jar glass walls (draw on top of fill)
+    cx.strokeStyle = 'rgba(180,240,238,0.45)';
+    cx.lineWidth = 2;
+    cx.beginPath();
+    cx.moveTo(x - neckW, top);
+    cx.bezierCurveTo(x - neckW, neckBot, x - bodyW, neckBot + 10, x - bodyW, neckBot + 30);
+    cx.lineTo(x - baseW, bot);
+    cx.lineTo(x + baseW, bot);
+    cx.lineTo(x + bodyW, neckBot + 30);
+    cx.bezierCurveTo(x + bodyW, neckBot + 10, x + neckW, neckBot, x + neckW, top);
+    cx.stroke();
+
+    // glass highlight
+    cx.strokeStyle = 'rgba(255,255,255,0.15)';
+    cx.lineWidth = 1.5;
+    cx.beginPath();
+    cx.moveTo(x - neckW + 8, top + 6);
+    cx.bezierCurveTo(x - neckW + 8, neckBot - 2, x - bodyW + 14, neckBot + 12, x - bodyW + 14, neckBot + 36);
+    cx.lineTo(x - baseW + 14, bot - 10);
+    cx.stroke();
+
+    // jar lid / rim
+    cx.fillStyle = 'rgba(180,240,238,0.18)';
+    cx.strokeStyle = 'rgba(180,240,238,0.5)';
+    cx.lineWidth = 2;
+    cx.beginPath();
+    cx.roundRect
+      ? cx.roundRect(x - neckW - 8, top - 14, neckW * 2 + 16, 16, 4)
+      : cx.rect(x - neckW - 8, top - 14, neckW * 2 + 16, 16);
+    cx.fill(); cx.stroke();
+  }
+
+  // ---------- fill percent text ----------
+  function fillPct() { return Math.round(fill * 100); }
+
+  // ---------- complete/cta cards ----------
+  function drawComplete(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.5)';
+    cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL;
+    cx.font = '900 38px -apple-system, Helvetica, Arial';
+    cx.fillText('MEMORY SAVED', W / 2, 310);
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.font = '800 22px -apple-system, Helvetica, Arial';
+    cx.fillText(score + ' memories collected', W / 2, 350);
+    cx.fillStyle = GOLD;
+    cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('jar filled', W / 2, 380);
+
+    if (!DEMO && !BOT) {
+      var p = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = p;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('hold again to begin a new jar', W / 2, 530);
+      cx.globalAlpha = 1;
+
+      // share pill
+      cx.fillStyle = 'rgba(46,197,182,0.12)';
+      cx.strokeStyle = TEAL;
+      cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+      else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = TEAL;
+      cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText('✦ SHARE YOUR JAR', W / 2, SHARE_R.y + 30);
+    }
+  }
+
+  function drawCta(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '900 42px -apple-system, Helvetica, Arial';
+    cx.fillText('MEMORY JAR', W / 2, 300);
+    cx.fillStyle = 'rgba(255,255,255,0.72)';
+    cx.font = '700 19px -apple-system, Helvetica, Arial';
+    cx.fillText('hold to fill yours', W / 2, 342);
+    var p = 0.7 + 0.3 * Math.sin(now / 260);
+    cx.fillStyle = TEAL;
+    cx.globalAlpha = ease * p;
+    cx.font = '900 26px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ GROW YOURS', W / 2, 408);
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(46,197,182,0.7)';
+    cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 440);
+    cx.globalAlpha = 1;
+  }
+
+  // ---------- render loop ----------
+  var last = performance.now();
+  var moteTimer = 0;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // autopilot for demo/bot
+    if ((DEMO || BOT) && phase === 'play') {
+      autopilot(now);
+    }
+
+    // fill logic
+    if (phase === 'play') {
+      if (isHolding()) {
+        var prev = fill;
+        fill = Math.min(1, fill + FILL_RATE * dt);
+        // spawn motes while holding
+        moteTimer += dt;
+        if (moteTimer > 2.5) {
+          moteTimer = 0;
+          var count = 1 + Math.floor(rng() * 3);
+          for (var mi = 0; mi < count; mi++) spawnMote(now);
+          if (window.J && Math.random() < 0.15) J.calm(Math.floor(fill * 4) + 1);
+        }
+        // milestone flashes
+        var pct = fillPct();
+        if (pct === 25 && Math.floor(prev * 100) < 25) { flash('¼ full', TEAL, 28); if (window.J) J.calm(2); }
+        if (pct === 50 && Math.floor(prev * 100) < 50) { flash('halfway', TEAL, 30); if (window.J) J.calm(3); zoom = 1.015; }
+        if (pct === 75 && Math.floor(prev * 100) < 75) { flash('almost there', TEAL, 28); if (window.J) J.calm(3); }
+        if (fill >= 1) { fill = 1; gameOver(); }
+      } else {
+        // when not holding, motes that were spawned gently disappear
+        for (var mi2 = motes.length - 1; mi2 >= 0; mi2--) {
+          motes[mi2].life -= 0.025;
+          if (motes[mi2].life <= 0) motes.splice(mi2, 1);
+        }
+      }
+    }
+
+    // juice: hit-stop decay, zoom decay, shake decay
+    if (hitStop > 0) {
+      hitStop -= dt;
+    }
+    shakeAmt *= Math.pow(0.87, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // canvas transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    // title
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('MEMORY JAR', W / 2, 100);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('hold to fill it', W / 2, 132);
+
+      drawJar(now);
+
+      var pulse = 0.55 + 0.45 * Math.sin(now / 400);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('HOLD TO BEGIN', W / 2, 620);
+      cx.globalAlpha = 1;
+    }
+
+    // play
+    if (phase === 'play') {
+      // label
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '800 52px -apple-system, Helvetica, Arial';
+      cx.fillText(fillPct() + '%', W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('hold to fill', W / 2, 118);
+
+      drawJar(now);
+
+      // breathe cue ring (pulsing when not holding)
+      if (!isHolding()) {
+        var cueP = 0.3 + 0.3 * Math.sin(now / 700);
+        cx.strokeStyle = 'rgba(46,197,182,' + cueP + ')';
+        cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.arc(JAR_CX, (JAR_TOP + JAR_BOT) / 2, 130 + Math.sin(now / 700) * 5, 0, Math.PI * 2);
+        cx.stroke();
+      }
+    }
+
+    // complete
+    if (phase === 'complete') {
+      drawJar(now);
+      drawComplete(now);
+    }
+
+    // cta
+    if (phase === 'cta') {
+      drawJar(now);
+      drawCta(now);
+    }
+
+    // floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 160 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // restart on complete (human hold)
+  window.addEventListener('pointerdown', function (e) {
+    if (phase !== 'complete' || DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale;
+    var py = (e.clientY - r.top) / scale;
+    if (!inR(SHARE_R, px, py)) {
+      // reset and start new run
+      fill = 0; motes = []; settled = []; flashes = []; score = 0; holdTs = null;
+      holding = true;
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('restart', {});
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      if (window.J) J.calm(1);
+    }
+  });
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

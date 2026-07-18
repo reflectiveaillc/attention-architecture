@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Repost Chain — Tilt</title>
+<!--
+  LOOP / attention-architecture — Repost Chain
+  Circuits: 04-loss (chain dies on mistimed tap), 01-rpe (variable reward timing),
+            08-investment (each clean repost deepens the streak).
+  Mechanic: a post travels a conveyor; tap the repost button when it crosses
+            the trigger line. Clean hits extend the chain; misses kill it.
+  Modes:
+    ?demo=1&seed=7   mirror-neuron arc for clip capture → __demoDone
+    ?bot=1&runs=N    imperfect autoplay N runs → __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'repost-chain';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c');
+  var cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ── Game constants ──────────────────────────────────────────────────────────
+  var CONVEYOR_Y   = 460;          // vertical position of conveyor belt
+  var POST_W       = 200;          // width of the post card
+  var POST_H       = 110;          // height of the post card
+  var TRIGGER_X    = W / 2;        // center trigger line
+  var WINDOW_HALF  = 38;           // ±px window for a clean hit (shrinks with chain)
+  var BASE_SPEED   = 1.8;          // px/frame at chain=0
+  var SPEED_SCALE  = 0.055;        // speed increase per chain length
+
+  // ── State ───────────────────────────────────────────────────────────────────
+  var phase, chain, lives, postX, postDir, runStartTs, best = 0;
+  var overAt, challengeAt, ctaAt;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [], dareBeaten = false;
+  try { best = +localStorage.getItem('rc_best') || 0; } catch (_) {}
+
+  // ── Derived helpers ──────────────────────────────────────────────────────────
+  function speed()      { return BASE_SPEED + chain * SPEED_SCALE; }
+  function window_half(){ return Math.max(12, WINDOW_HALF - chain * 0.6); }
+  function pctTop(s)    { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 14)))); }
+
+  // ── Init ─────────────────────────────────────────────────────────────────────
+  function newGame() {
+    chain = 0; lives = 3; overAt = 0; dareBeaten = false;
+    flashes = []; hitStop = 0; shakeAmt = 0; zoom = 1;
+    spawnPost();
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { phase = 'play'; startRun(); return; }
+    phase = 'title';
+  }
+
+  function spawnPost() {
+    // post starts off-screen left or right alternately
+    postDir = (rng() > 0.5) ? 1 : -1;
+    postX = postDir > 0 ? -POST_W / 2 : W + POST_W / 2;
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ── Tap / hit logic ─────────────────────────────────────────────────────────
+  function tryRepost() {
+    if (phase !== 'play') return;
+    var offset = postX - TRIGGER_X;
+    var wh = window_half();
+    if (Math.abs(offset) <= wh) {
+      // clean repost
+      var isPerf = Math.abs(offset) <= wh * 0.25;
+      var ratio   = 1 - Math.abs(offset) / wh;   // 0..1, higher = better
+      chain++;
+      hitStop = isPerf ? 5 : 0;
+      if (isPerf) { zoom = 1.03; }
+      if (ratio < 0.22) shakeAmt = 4;          // near-miss feel
+      if (window.J) {
+        if (isPerf) J.perfect(chain);
+        else if (ratio < 0.22) J.near();
+        else J.hit(chain);
+        J.tension(Math.min(chain / 20, 1));
+      }
+      if (chain > best) { best = chain; try { localStorage.setItem('rc_best', String(best)); } catch(_){} }
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && chain > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 46);
+        if (window.J) J.fanfare();
+        SHARE.beaten(chain);
+      }
+      if (isPerf) flash('PERFECT', TEAL, 46);
+      else if (ratio < 0.22) { flash('SO CLOSE!', VERM, 40); if (window.LOOP) LOOP.emit('near_miss', { n: chain, ratio: +ratio.toFixed(3) }); }
+      if (window.LOOP) LOOP.emit('repost', { n: chain, perfect: isPerf, ratio: +ratio.toFixed(3) });
+      spawnPost();
+    } else {
+      // miss — break the chain
+      miss();
+    }
+  }
+
+  function miss() {
+    lives--;
+    shakeAmt = 8;
+    if (window.J) J.death(Math.min(0.3 + chain / 20, 1));
+    flash('CHAIN BROKEN', VERM, 42);
+    if (window.LOOP) LOOP.emit('chain_broken', { n: chain });
+    if (lives <= 0) {
+      gameOver();
+    } else {
+      // reset conveyor, keep chain at 0 but reduce it (keep going with penalty)
+      chain = Math.max(0, chain - 3);
+      spawnPost();
+    }
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 11;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = chain >= best;
+    if (window.J) { J.death(Math.min(0.5 + chain / 20, 1)); if (newBest && chain > 0) setTimeout(function(){ J.fanfare(); }, 450); }
+    if (window.LOOP) LOOP.emit('game_over', { score: chain, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = chain;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2500);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(resetRun, 800);
+    }
+  }
+
+  function resetRun() {
+    chain = 0; lives = 3; flashes = []; dareBeaten = false;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    spawnPost();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ── Input ────────────────────────────────────────────────────────────────────
+  var MUTE_R  = { x: W - 46, y: 10,  w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 492, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') { tryRepost(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: chain, unit: 'chain' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ── Autopilots ───────────────────────────────────────────────────────────────
+  // Demo script: a sequence of target offsets (px from trigger).
+  // Positive = tap slightly late, negative = slightly early, 'miss' = tap very wide.
+  var demoScript = [4, -6, 8, -5, 'near', 3, -8, 'miss'];
+  var demoIdx = 0;
+  var demoWaits = [28, 32, 24, 38, 26, 44, 30, 22];
+  var demoWait = 40;                // initial hesitation before first tap
+  var demoBotRuns = 0;              // how many miss events used (demo only needs 1 life so stops at 1)
+  var botRunsDone = 0;
+  var botPassCount = 0;             // how many good taps bot has done this run
+
+  // Bot params — imperfect: sometimes hits, sometimes misses
+  var BOT_GOOD_TAPS = 8;           // bot hits this many clean reposts, then deliberately misses
+  var botPassDone = false;
+
+  function autopilot() {
+    if (phase !== 'play') return;
+    var offset = postX - TRIGGER_X;
+
+    if (DEMO) {
+      if (demoWait > 0) { demoWait -= 1; return; }
+      var want = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      if (want === 'miss') {
+        // tap when post is far from trigger
+        if (Math.abs(offset) > window_half() + 28) {
+          demoIdx++; demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 30;
+          tryRepost();
+        }
+        return;
+      }
+      var targetOffset = (want === 'near') ? window_half() * 0.8 * Math.sign(offset) : want;
+      // tap when post is close to target offset (within one frame of movement)
+      var spd = speed();
+      if (Math.abs(offset - targetOffset) <= spd * 0.9) {
+        demoIdx++;
+        demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 30;
+        tryRepost();
+      }
+      return;
+    }
+
+    if (BOT) {
+      if (!botPassDone) {
+        // aim for center with small random error
+        var err = (rng() - 0.5) * window_half() * 0.5;
+        var spd2 = speed();
+        if (Math.abs(offset - err) <= spd2 * 0.9) {
+          botPassCount++;
+          if (botPassCount >= BOT_GOOD_TAPS) {
+            botPassDone = true;
+          }
+          tryRepost();
+        }
+      } else {
+        // deliberately miss to trigger game over
+        if (Math.abs(offset) > window_half() + 30) {
+          botPassDone = false;
+          botPassCount = 0;
+          tryRepost();
+        }
+      }
+    }
+  }
+
+  // ── Drawing helpers ──────────────────────────────────────────────────────────
+  function drawPost(x, highlight) {
+    var px = x - POST_W / 2;
+    var py = CONVEYOR_Y - POST_H / 2;
+    // card shadow
+    cx.shadowColor = highlight ? TEAL : 'rgba(0,0,0,0.5)';
+    cx.shadowBlur  = highlight ? 18 : 10;
+    // card bg
+    cx.fillStyle = highlight ? 'rgba(46,197,182,0.12)' : 'rgba(30,34,44,0.95)';
+    cx.strokeStyle = highlight ? TEAL : 'rgba(255,255,255,0.13)';
+    cx.lineWidth = highlight ? 2 : 1;
+    if (cx.roundRect) cx.roundRect(px, py, POST_W, POST_H, 14);
+    else { cx.beginPath(); cx.rect(px, py, POST_W, POST_H); }
+    cx.fill(); cx.stroke();
+    cx.shadowBlur = 0;
+
+    // simulated post content (profile bar + text lines + like bar)
+    var innerX = px + 14, innerY = py + 14;
+    // avatar circle
+    cx.fillStyle = TEAL;
+    cx.beginPath(); cx.arc(innerX + 12, innerY + 12, 12, 0, Math.PI * 2); cx.fill();
+    // username line
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.font = '700 11px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'left';
+    cx.fillText('@someone', innerX + 30, innerY + 10);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '400 10px -apple-system, Helvetica, Arial';
+    cx.fillText('just now', innerX + 30, innerY + 23);
+    // two text lines
+    cx.fillStyle = 'rgba(255,255,255,0.7)';
+    cx.font = '400 11px -apple-system, Helvetica, Arial';
+    cx.fillText('this thing is going viral rn', innerX, innerY + 46);
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.fillText('tap to keep it alive', innerX, innerY + 60);
+    // like + repost row
+    cx.fillStyle = VERM;
+    cx.font = '600 10px -apple-system, Helvetica, Arial';
+    cx.fillText('♥ 2.4k', innerX, innerY + 80);
+    cx.fillStyle = highlight ? TEAL : 'rgba(255,255,255,0.4)';
+    cx.fillText('↻ REPOST', innerX + 65, innerY + 80);
+    cx.textAlign = 'center';
+  }
+
+  function drawConveyor() {
+    // belt lines
+    cx.strokeStyle = 'rgba(255,255,255,0.06)';
+    cx.lineWidth = 1;
+    for (var lx = 0; lx < W; lx += 30) {
+      cx.beginPath();
+      cx.moveTo(lx, CONVEYOR_Y - POST_H / 2 - 8);
+      cx.lineTo(lx, CONVEYOR_Y + POST_H / 2 + 8);
+      cx.stroke();
+    }
+    // belt edges
+    cx.strokeStyle = 'rgba(255,255,255,0.12)';
+    cx.lineWidth = 2;
+    cx.beginPath();
+    cx.moveTo(0, CONVEYOR_Y - POST_H / 2 - 8);
+    cx.lineTo(W, CONVEYOR_Y - POST_H / 2 - 8);
+    cx.stroke();
+    cx.beginPath();
+    cx.moveTo(0, CONVEYOR_Y + POST_H / 2 + 8);
+    cx.lineTo(W, CONVEYOR_Y + POST_H / 2 + 8);
+    cx.stroke();
+  }
+
+  function drawTrigger(wh) {
+    // trigger zone indicator
+    var alpha = 0.25 + 0.2 * Math.sin(performance.now() / 180);
+    cx.strokeStyle = 'rgba(242,177,52,' + alpha + ')';
+    cx.lineWidth = 2;
+    cx.setLineDash([6, 4]);
+    cx.beginPath(); cx.moveTo(TRIGGER_X, CONVEYOR_Y - POST_H / 2 - 14); cx.lineTo(TRIGGER_X, CONVEYOR_Y + POST_H / 2 + 14); cx.stroke();
+    cx.setLineDash([]);
+    // window highlight
+    var inWindow = Math.abs(postX - TRIGGER_X) <= wh;
+    if (inWindow) {
+      cx.strokeStyle = GOLD;
+      cx.lineWidth = 3;
+      cx.shadowColor = GOLD; cx.shadowBlur = 8;
+      cx.beginPath(); cx.moveTo(TRIGGER_X, CONVEYOR_Y - POST_H / 2 - 14); cx.lineTo(TRIGGER_X, CONVEYOR_Y + POST_H / 2 + 14); cx.stroke();
+      cx.shadowBlur = 0;
+    }
+    // window brackets
+    cx.strokeStyle = inWindow ? GOLD : 'rgba(242,177,52,0.3)';
+    cx.lineWidth = 1.5;
+    cx.beginPath();
+    cx.moveTo(TRIGGER_X - wh, CONVEYOR_Y - POST_H / 2 - 8);
+    cx.lineTo(TRIGGER_X - wh, CONVEYOR_Y + POST_H / 2 + 8);
+    cx.stroke();
+    cx.beginPath();
+    cx.moveTo(TRIGGER_X + wh, CONVEYOR_Y - POST_H / 2 - 8);
+    cx.lineTo(TRIGGER_X + wh, CONVEYOR_Y + POST_H / 2 + 8);
+    cx.stroke();
+  }
+
+  function drawChainUI() {
+    // chain length display
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.92)';
+    cx.font = '800 72px -apple-system, Helvetica, Arial';
+    cx.fillText(chain, W / 2, 100);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('CHAIN  ·  BEST ' + best, W / 2, 122);
+
+    // lives
+    var lifeY = 148;
+    for (var li = 0; li < 3; li++) {
+      cx.fillStyle = li < lives ? VERM : 'rgba(255,255,255,0.15)';
+      cx.beginPath(); cx.arc(W / 2 - 20 + li * 20, lifeY, 6, 0, Math.PI * 2); cx.fill();
+    }
+
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 176);
+    }
+
+    // speed indicator below conveyor
+    var spd = speed();
+    cx.fillStyle = 'rgba(255,255,255,0.25)';
+    cx.font = '500 11px Menlo, monospace';
+    cx.fillText('×' + spd.toFixed(1), W / 2, CONVEYOR_Y + POST_H / 2 + 30);
+  }
+
+  function drawRepostButton() {
+    // big tap target below conveyor
+    var bx = W / 2 - 90, by = H - 130, bw = 180, bh = 58;
+    var inWindow = Math.abs(postX - TRIGGER_X) <= window_half();
+    var glowPulse = inWindow ? (0.7 + 0.3 * Math.sin(performance.now() / 120)) : 1;
+    cx.fillStyle = inWindow ? TEAL : 'rgba(46,197,182,0.22)';
+    cx.strokeStyle = inWindow ? 'rgba(46,197,182,' + glowPulse + ')' : 'rgba(46,197,182,0.4)';
+    cx.lineWidth = inWindow ? 2.5 : 1.5;
+    cx.shadowColor = TEAL; cx.shadowBlur = inWindow ? 20 : 0;
+    if (cx.roundRect) cx.roundRect(bx, by, bw, bh, 29);
+    else { cx.beginPath(); cx.rect(bx, by, bw, bh); }
+    cx.fill(); cx.stroke();
+    cx.shadowBlur = 0;
+    cx.fillStyle = inWindow ? INK : TEAL;
+    cx.font = '900 20px -apple-system, Helvetica, Arial';
+    cx.fillText('↻ REPOST', W / 2, by + 36);
+  }
+
+  // ── Render loop ──────────────────────────────────────────────────────────────
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // update post position (pause during hit-stop)
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else if (phase === 'play') {
+      postX += speed() * postDir * dt;
+      // bounce off walls (gives player a second shot from the other side)
+      if (postX > W + POST_W / 2) { postX = W + POST_W / 2; postDir = -1; }
+      if (postX < -POST_W / 2)    { postX = -POST_W / 2;    postDir =  1; }
+      autopilot();
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.83, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ── title screen ──────────────────────────────────────────────────────────
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('REPOST CHAIN', W / 2, 270);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '500 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap when the post hits the line', W / 2, 308);
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '400 12px -apple-system, Helvetica, Arial';
+      cx.fillText('keep the chain alive', W / 2, 330);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM;
+      cx.font = '800 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 390);
+      cx.globalAlpha = 1;
+    }
+
+    // ── challenge card (demo beat 1) ──────────────────────────────────────────
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('CHAIN TO BEAT', W / 2, 295);
+      cx.fillStyle = GOLD; cx.font = '900 104px -apple-system, Helvetica, Arial';
+      cx.fillText('21', W / 2, 405);
+      cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top chain", W / 2, 435);
+    }
+
+    // ── gameplay ──────────────────────────────────────────────────────────────
+    if (phase === 'play' || phase === 'over') {
+      drawConveyor();
+      if (phase === 'play') {
+        var wh = window_half();
+        drawTrigger(wh);
+        var inWin = Math.abs(postX - TRIGGER_X) <= wh;
+        drawPost(postX, inWin);
+      }
+      drawChainUI();
+      if (phase === 'play' && !DEMO && !BOT) drawRepostButton();
+    }
+
+    // ── game over overlay ─────────────────────────────────────────────────────
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.60)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('CHAIN DEAD.', W / 2, 302);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(chain + ' chain', W / 2, 348);
+      var pt = pctTop(chain);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 395);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 420);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 466);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ── demo CTA card ─────────────────────────────────────────────────────────
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('REPOST CHAIN', W / 2, 296);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('they held ' + (window.__demoScore || 21) + '. can you last longer?', W / 2, 336);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 21), W / 2, 408);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 444);
+      cx.globalAlpha = 1;
+    }
+
+    // ── flashes ───────────────────────────────────────────────────────────────
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 236 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // ── mute toggle (human only) ──────────────────────────────────────────────
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial'; cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

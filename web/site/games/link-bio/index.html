@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Link in Bio — Tilt</title>
+<!--
+  LOOP / attention-architecture — Link in Bio
+  Circuits: 05-ease, 06-zeigarnik, 01-rpe.
+  Modes:
+    ?demo=1&seed=7      scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N&seed=M  imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'link-bio';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO     = qs.get('demo') === '1';
+  var BOT      = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED     = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ------- game constants -------
+  // Progress bar: 0→100. Player taps when progress is in SWEET_ZONE (97–100).
+  // If progress overshoots 100, it "redirects" → game over.
+  // Bar stutters: random pauses + backtracks injected at known points.
+  var SWEET_LO = 97, SWEET_HI = 100;
+  var BAR_W = 300, BAR_H = 22, BAR_X = (W - BAR_W) / 2, BAR_Y = 380;
+  // Normal speed: pct/s. Increases each round.
+  var BASE_SPEED = 12; // pct per second at round 1
+
+  // ------- state -------
+  var phase; // 'title' | 'challenge' | 'play' | 'over' | 'cta'
+  var progress, speed, round, score, combo, overAt, runStartTs;
+  var shakeAmt, zoom, hitStop;
+  var stutter;   // current stutter event: {type:'pause'|'back', dur, amount, done}
+  var stutterQueue; // list of stutter events queued for this run
+  var flashes;
+  var dareBeaten, ctaAt, challengeAt;
+  var best = 0;
+  var botRunsDone = 0, botActionDone = false;
+  try { best = +localStorage.getItem('lb_best') || 0; } catch (_) {}
+
+  // ------- stutter generation -------
+  // A "run" is one progress bar from 0 to 100. We generate 2-4 stutter events
+  // at random progress milestones.
+  function makeStutters() {
+    var q = [];
+    var milestones = [25, 45, 65, 82];
+    // shuffle milestones using seeded rng, pick 2-3
+    for (var i = milestones.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = milestones[i]; milestones[i] = milestones[j]; milestones[j] = tmp;
+    }
+    var count = 2 + Math.floor(rng() * 2); // 2 or 3
+    for (var k = 0; k < count; k++) {
+      var at = milestones[k];
+      var type = rng() < 0.55 ? 'pause' : 'back';
+      q.push({
+        at: at,
+        type: type,
+        dur: type === 'pause' ? 400 + rng() * 600 : 0,      // ms
+        amount: type === 'back' ? 6 + rng() * 12 : 0,       // pct to slide back
+        triggered: false,
+        done: false
+      });
+    }
+    // sort by at ascending
+    q.sort(function(a, b) { return a.at - b.at; });
+    return q;
+  }
+
+  function pctTop(s) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 6))));
+  }
+
+  function newGame() {
+    phase        = 'title';
+    progress     = 0;
+    speed        = BASE_SPEED;
+    round        = 0;
+    score        = 0;
+    combo        = 0;
+    shakeAmt     = 0;
+    zoom         = 1;
+    hitStop      = 0;
+    flashes      = [];
+    stutter      = null;
+    stutterQueue = [];
+    dareBeaten   = false;
+    ctaAt        = 0;
+    challengeAt  = 0;
+    botRunsDone  = 0;
+    botActionDone = false;
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { startRun(); return; }
+  }
+
+  function startRun() {
+    phase       = 'play';
+    progress    = 0;
+    round++;
+    speed       = BASE_SPEED + (round - 1) * 3.5; // gets harder each round
+    stutterQueue = makeStutters();
+    stutter     = null;
+    runStartTs  = Date.now();
+    botActionDone = false;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED, round: round });
+  }
+
+  // ------- tap / input -------
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') { attemptTap(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'ms' }); return;
+      }
+      restartRound();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.code === 'Enter') tap();
+  });
+
+  function attemptTap() {
+    // In zone [97-100]: success, earn points by accuracy
+    if (progress >= SWEET_LO && progress <= SWEET_HI) {
+      var acc = (progress - SWEET_LO) / (SWEET_HI - SWEET_LO); // 0=at 97, 1=at 100
+      var isPerfect = acc >= 0.85; // tapped between 99.55–100
+      var isGold    = Math.abs(progress - 100) < 0.5; // within 0.5% of 100
+      var pts = isGold ? 100 : isPerfect ? 60 : 30 + Math.round(acc * 30);
+      score += pts;
+      combo++;
+      hitStop = isPerfect ? 60 : 0;
+      if (isPerfect) zoom = 1.025;
+      if (isPerfect) shakeAmt = 0; // no shake on perfect — clean hit
+      if (isGold) {
+        flash('PERFECT LINK!', GOLD, 42);
+        if (window.J) { J.gold(); J.perfect(combo); }
+        if (window.LOOP) LOOP.emit('perfect_tap', { score: score, pct: +progress.toFixed(2) });
+      } else if (isPerfect) {
+        flash('PERFECT', TEAL, 40);
+        if (window.J) J.perfect(combo);
+        if (window.LOOP) LOOP.emit('tap_success', { score: score, pct: +progress.toFixed(2), quality: 'perfect' });
+      } else {
+        flash('+' + pts, TEAL, 34);
+        if (window.J) J.hit(combo);
+        if (window.LOOP) LOOP.emit('tap_success', { score: score, pct: +progress.toFixed(2), quality: 'ok' });
+      }
+      if (window.J) J.tension(Math.min(score / 300, 1));
+      // dare check
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(score);
+      }
+      // advance to next round
+      startRun();
+      return;
+    }
+    // Too early (progress < 97) — near miss if close
+    if (progress >= 90 && progress < SWEET_LO) {
+      flash('SO CLOSE', VERM, 36);
+      shakeAmt = 5;
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { pct: +progress.toFixed(2) });
+      // penalty: reset bar, lose combo
+      combo = 0;
+      loseRound('too early');
+      return;
+    }
+    // Way too early
+    if (progress < 90) {
+      flash('TOO EARLY', VERM, 36);
+      shakeAmt = 4;
+      combo = 0;
+      loseRound('too early');
+      return;
+    }
+    // progress > 100: already handled by bar overflow → game over, shouldn't reach here
+  }
+
+  function loseRound(reason) {
+    // Lose a life / reset bar (not game over yet — game over = bar hits 101)
+    // Actually: for this game, any mis-tap = game over (no lives).
+    gameOver(reason === 'too early' ? 0.4 : 0.7);
+  }
+
+  function barOverflow() {
+    // bar hit 101 — fake ad redirect → game over
+    flash('REDIRECTED!', VERM, 36);
+    shakeAmt = 8;
+    gameOver(0.8);
+  }
+
+  function gameOver(mag) {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = score > best;
+    if (window.J) {
+      J.death(mag || 0.5);
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = score;
+    if (newBest) {
+      best = score;
+      try { localStorage.setItem('lb_best', String(best)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { restartFull(); }, 700);
+    }
+  }
+
+  function restartRound() {
+    // full restart (not a new round within a run)
+    phase    = 'play';
+    progress = 0;
+    round    = 1;
+    score    = 0;
+    combo    = 0;
+    stutterQueue = makeStutters();
+    stutter  = null;
+    botActionDone = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function restartFull() {
+    score    = 0;
+    combo    = 0;
+    round    = 0;
+    progress = 0;
+    stutterQueue = [];
+    stutter  = null;
+    botActionDone = false;
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ------- autopilots -------
+  // Demo: scripted arc — near-fail + recovery then real fail
+  // beat 1 (challenge) → run: tap at 98.2, tap at 100.1 (near-miss save), tap early, then bar overflows
+  var demoStep = 0;
+  // Demo tap thresholds per round (progress % at which to tap)
+  var demoTaps = [98.5, 99.8, 91.0]; // round 1 = good, round 2 = near-perfect, round 3 = too early (gameover)
+  var demoPausing = false, demoPauseUntil = 0;
+
+  var botWaitFrames = 0;
+
+  function autopilot(now) {
+    if (phase !== 'play') return;
+    if (DEMO) {
+      // hesitate a bit before each tap
+      if (demoPausing) {
+        if (now < demoPauseUntil) return;
+        demoPausing = false;
+      }
+      var target = demoTaps[Math.min(demoStep, demoTaps.length - 1)];
+      if (progress >= target && !botActionDone) {
+        botActionDone = true;
+        if (demoStep < 2) {
+          // successful or near-perfect tap
+          var acc = (progress - SWEET_LO) / (SWEET_HI - SWEET_LO);
+          var isPerfect = progress >= 99.5;
+          var isGold = Math.abs(progress - 100) < 0.5;
+          var pts = isGold ? 100 : isPerfect ? 60 : 30 + Math.round(acc * 30);
+          score += pts;
+          combo++;
+          hitStop = isPerfect ? 60 : 0;
+          if (isPerfect) zoom = 1.025;
+          if (isGold) {
+            flash('PERFECT LINK!', GOLD, 42);
+            if (window.J) { J.gold(); J.perfect(combo); }
+          } else if (isPerfect) {
+            flash('PERFECT', TEAL, 40);
+            if (window.J) J.perfect(combo);
+          } else {
+            flash('+' + pts, TEAL, 34);
+            if (window.J) J.hit(combo);
+          }
+          if (window.J) J.tension(Math.min(score / 200, 1));
+          demoStep++;
+          // add hesitation before next round
+          demoPausing = true;
+          demoPauseUntil = now + 600 + rng() * 400;
+          startRun();
+        } else {
+          // step 2: tap too early → near miss → game over
+          flash('SO CLOSE', VERM, 36);
+          shakeAmt = 5;
+          if (window.J) J.near();
+          if (window.LOOP) LOOP.emit('near_miss', { pct: +progress.toFixed(2) });
+          combo = 0;
+          gameOver(0.5);
+        }
+      }
+      return;
+    }
+    if (BOT) {
+      // bot: gaussian-noisy tap around 99 (sometimes too early, sometimes late → overflow)
+      if (botActionDone) return;
+      // bot waits until bar is past a noisy threshold
+      var g = 99 + (rng() - 0.5) * 12; // sometimes 93 sometimes 105
+      if (progress >= g) {
+        botActionDone = true;
+        if (progress >= SWEET_LO && progress <= SWEET_HI) {
+          var bpts = 30 + Math.round(rng() * 70);
+          score += bpts;
+          combo++;
+          if (window.J) J.hit(combo);
+          var newBestB = score > best;
+          if (newBestB) { best = score; try { localStorage.setItem('lb_best', String(best)); } catch (_) {} }
+          startRun();
+        } else if (progress < SWEET_LO) {
+          combo = 0;
+          gameOver(0.4);
+        }
+        // if progress > 100, barOverflow() handles it
+      }
+    }
+  }
+
+  // ------- update stutter -------
+  var stutterPauseRemaining = 0; // ms remaining in current pause stutter
+  var stutterBackTarget = 0;     // progress target for back stutter
+
+  function updateStutter(dtMs) {
+    if (phase !== 'play') return;
+    if (stutter) {
+      if (stutter.type === 'pause') {
+        stutterPauseRemaining -= dtMs;
+        if (stutterPauseRemaining <= 0) {
+          stutter = null;
+        }
+        return; // bar frozen
+      }
+      if (stutter.type === 'back') {
+        // slide bar back to target
+        progress -= 18 * (dtMs / 1000) * 60; // fast backtrack
+        if (progress <= stutterBackTarget) {
+          progress = stutterBackTarget;
+          stutter = null;
+        }
+        return;
+      }
+    }
+    // check queue for next stutter
+    if (stutterQueue.length > 0 && stutterQueue[0].at <= progress && !stutterQueue[0].triggered) {
+      var ev = stutterQueue.shift();
+      ev.triggered = true;
+      stutter = ev;
+      if (ev.type === 'pause') {
+        stutterPauseRemaining = ev.dur;
+      } else {
+        stutterBackTarget = Math.max(0, progress - ev.amount);
+      }
+    }
+  }
+
+  // ------- render helpers -------
+  function drawRoundedRect(x, y, w, h, r) {
+    if (cx.roundRect) { cx.beginPath(); cx.roundRect(x, y, w, h, r); }
+    else { cx.beginPath(); cx.rect(x, y, w, h); }
+  }
+
+  // Phone-frame mockup (simulated Instagram/TikTok bio page)
+  function drawPhoneMockup(pct) {
+    // background card
+    cx.fillStyle = 'rgba(255,255,255,0.04)';
+    drawRoundedRect(40, 160, W - 80, 340, 18);
+    cx.fill();
+    cx.strokeStyle = 'rgba(255,255,255,0.08)'; cx.lineWidth = 1;
+    cx.stroke();
+
+    // fake avatar
+    cx.beginPath();
+    cx.arc(W / 2, 230, 36, 0, Math.PI * 2);
+    cx.fillStyle = 'rgba(255,255,255,0.07)';
+    cx.fill();
+    cx.strokeStyle = 'rgba(255,255,255,0.15)'; cx.lineWidth = 2;
+    cx.stroke();
+    // avatar ring (gradient — like IG stories)
+    cx.beginPath();
+    cx.arc(W / 2, 230, 40, 0, Math.PI * 2);
+    var ring = cx.createLinearGradient(W/2 - 40, 190, W/2 + 40, 270);
+    ring.addColorStop(0, VERM); ring.addColorStop(1, GOLD);
+    cx.strokeStyle = ring; cx.lineWidth = 2.5;
+    cx.stroke();
+
+    // fake username
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.7)';
+    cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText('@creator.handle', W / 2, 290);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '500 12px -apple-system, Helvetica, Arial';
+    cx.fillText('✦ drops here', W / 2, 310);
+
+    // "link in bio" label line
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '600 12px Menlo, monospace';
+    cx.fillText('LOADING LINK IN BIO...', W / 2, 355);
+
+    // progress bar track
+    cx.fillStyle = 'rgba(255,255,255,0.08)';
+    drawRoundedRect(BAR_X, BAR_Y, BAR_W, BAR_H, BAR_H / 2);
+    cx.fill();
+
+    // progress bar fill
+    var fillW = Math.min(BAR_W, (pct / 100) * BAR_W);
+    if (fillW > 0) {
+      var barGrad = cx.createLinearGradient(BAR_X, 0, BAR_X + BAR_W, 0);
+      var inZone = pct >= SWEET_LO;
+      if (pct >= 99) {
+        barGrad.addColorStop(0, TEAL);
+        barGrad.addColorStop(1, GOLD);
+      } else if (inZone) {
+        barGrad.addColorStop(0, TEAL);
+        barGrad.addColorStop(1, '#a0f0e8');
+      } else {
+        barGrad.addColorStop(0, 'rgba(232,80,46,0.6)');
+        barGrad.addColorStop(1, VERM);
+      }
+      cx.fillStyle = barGrad;
+      drawRoundedRect(BAR_X, BAR_Y, fillW, BAR_H, BAR_H / 2);
+      cx.fill();
+
+      // glow pulse when in zone
+      if (inZone) {
+        var glowA = 0.15 + 0.10 * Math.sin(performance.now() / 80);
+        cx.shadowColor = TEAL; cx.shadowBlur = 18 * glowA * 6;
+        drawRoundedRect(BAR_X, BAR_Y, fillW, BAR_H, BAR_H / 2);
+        cx.fill();
+        cx.shadowBlur = 0;
+      }
+    }
+
+    // pct label
+    cx.textAlign = 'center';
+    var dispPct = Math.min(100, Math.max(0, pct));
+    cx.fillStyle = pct >= SWEET_LO ? GOLD : 'rgba(255,255,255,0.55)';
+    cx.font = '700 13px Menlo, monospace';
+    cx.fillText(dispPct.toFixed(1) + '%', W / 2, BAR_Y - 8);
+
+    // "TAP NOW" cue when in zone
+    if (pct >= SWEET_LO && pct <= 100) {
+      var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 55);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = GOLD;
+      cx.font = '900 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP NOW', W / 2, BAR_Y + BAR_H + 28);
+      cx.globalAlpha = 1;
+    }
+
+    // stutter indicator — small jitter dot when pausing
+    if (stutter && stutter.type === 'pause') {
+      var blinkA = 0.5 + 0.5 * Math.sin(performance.now() / 120);
+      cx.globalAlpha = blinkA;
+      cx.fillStyle = VERM;
+      cx.font = '700 11px Menlo, monospace';
+      cx.fillText('BUFFERING…', W / 2, BAR_Y + BAR_H + 52);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  // ------- main render loop -------
+  var last = performance.now();
+
+  function frame(now) {
+    var dtMs  = Math.min(now - last, 100); last = now;
+    var dt    = dtMs / 16.667; // normalized to 60fps
+
+    // --- update ---
+    if (phase === 'play') {
+      // hit-stop: freeze bar advance but decay hitStop
+      if (hitStop > 0) {
+        hitStop -= dt;
+        // do not advance progress
+      } else {
+        updateStutter(dtMs);
+        // only advance if no active stutter freeze
+        if (!stutter || stutter.type === 'back') {
+          if (!stutter) {
+            progress += speed * (dtMs / 1000);
+          }
+        }
+        autopilot(now);
+        // overflow → fake redirect → game over
+        if (progress > 101) {
+          progress = 101;
+          if (phase === 'play') barOverflow();
+        }
+      }
+      // tension riser (only when not in a stutter)
+      if (!stutter && window.J) J.tension(Math.min(progress / 100, 0.95));
+    }
+
+    // juice decay
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom     += (1 - zoom) * 0.13 * dt;
+
+    // --- draw ---
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // score (top)
+    if (phase === 'play' || phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 60px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 118);
+
+      // combo
+      if (combo >= 2 && phase === 'play') {
+        var comboScale = 1 + Math.min(combo - 1, 6) * 0.07;
+        cx.save();
+        cx.translate(W / 2, 142); cx.scale(comboScale, comboScale); cx.translate(-W / 2, -142);
+        cx.fillStyle = GOLD;
+        cx.font = '900 ' + Math.round(14 + combo * 1.5) + 'px -apple-system, Helvetica, Arial';
+        cx.fillText('×' + combo + ' COMBO', W / 2, 142);
+        cx.restore();
+      }
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 158);
+      }
+    }
+
+    // ---- phases ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('LINK IN BIO', W / 2, 270);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('tap exactly when the bar hits 100%', W / 2, 306);
+      cx.fillStyle = 'rgba(255,255,255,0.25)';
+      cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('it stutters. it lies. it backtracks.', W / 2, 328);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM; cx.font = '800 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 390);
+      cx.globalAlpha = 1;
+
+      // draw a static mockup bar at 0
+      drawPhoneMockup(0);
+    }
+
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.48)'; cx.font = '800 15px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 290);
+      cx.fillStyle = GOLD; cx.font = '900 88px -apple-system, Helvetica, Arial';
+      cx.fillText('42', W / 2, 385);
+      cx.fillStyle = 'rgba(255,255,255,0.32)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 418);
+    }
+
+    if (phase === 'play') {
+      drawPhoneMockup(Math.min(101, progress));
+    }
+
+    if (phase === 'over') {
+      drawPhoneMockup(Math.min(101, progress));
+      cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText(progress > 100 ? 'AD REDIRECT.' : 'SLIPPED.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' pts', W / 2, 344);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 413);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL; cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE', W / 2, 458);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        drawRoundedRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    if (phase === 'cta') {
+      var t2 = (now - ctaAt) / 1000, ease = Math.min(1, t2 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('LINK IN BIO', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they scored ' + (window.__demoScore || 42) + '. now you.', W / 2, 342);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 42), W / 2, 412);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 444);
+      cx.globalAlpha = 1;
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

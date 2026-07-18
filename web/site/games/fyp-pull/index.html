@@ -1,0 +1,839 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>FYP Pull — Tilt</title>
+<!--
+  LOOP / attention-architecture — FYP Pull
+  Circuits: 01-rpe (variable reward per card), 02-novelty (unknown card type), 04-loss (dud accumulation).
+  Mechanic: pull-to-refresh lever → card reveal (points / dud / bomb). Stop after 3 duds or cash out.
+  Modes:
+    ?demo=1&seed=7        mirror-neuron scripted run → __demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay N runs → __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'fyp-pull';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // --- game state ---
+  // Card types: 'points', 'dud', 'bomb'
+  // Card values: points cards give 5–50 pts; bomb resets points to 0
+  var CARD_WEIGHTS = [
+    { type: 'points', weight: 55 },
+    { type: 'dud',    weight: 30 },
+    { type: 'bomb',   weight: 15 }
+  ];
+
+  var state, flashes, hitStop, shakeAmt, zoom, runStartTs;
+  var botRunsDone = 0;
+  var dareBeaten = false;
+  var ctaAt = 0;
+  var challengeAt = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('fyp_best') || 0; } catch (_) {}
+
+  // --- lever pull state ---
+  var lever = { y: 0, pulling: false, released: false, velocity: 0, startY: 0 };
+  var LEVER_TRIGGER = 120; // px to pull before release triggers
+  var revealAnim = null;   // { card, t, maxT, x, y } in-progress reveal
+
+  function pickCard() {
+    var total = 0;
+    for (var i = 0; i < CARD_WEIGHTS.length; i++) total += CARD_WEIGHTS[i].weight;
+    var r = rng() * total;
+    for (var j = 0; j < CARD_WEIGHTS.length; j++) {
+      r -= CARD_WEIGHTS[j].weight;
+      if (r <= 0) return CARD_WEIGHTS[j].type;
+    }
+    return 'dud';
+  }
+
+  function cardPoints() {
+    // variable reward: 5 10 15 20 30 50
+    var opts = [5, 10, 15, 20, 30, 50];
+    return opts[Math.floor(rng() * opts.length)];
+  }
+
+  function newGame() {
+    state = {
+      phase: 'title',   // title | challenge | play | over | cta
+      score: 0,
+      duds: 0,
+      combo: 0,
+      overAt: 0,
+      pulls: 0,
+      bombHit: false,
+      lastCard: null
+    };
+    flashes = []; hitStop = 0; shakeAmt = 0; zoom = 1;
+    lever = { y: 0, pulling: false, released: false, velocity: 0, startY: 0 };
+    revealAnim = null;
+    dareBeaten = false;
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function triggerReveal() {
+    if (revealAnim) return; // already revealing
+    if (state.phase !== 'play') return;
+    var type = pickCard();
+    var pts = type === 'points' ? cardPoints() : 0;
+    state.pulls++;
+    revealAnim = { card: type, pts: pts, t: 0, maxT: 45 };
+
+    // immediately play tension
+    if (window.J) J.tension(Math.min(state.pulls / 8, 1));
+  }
+
+  function applyCard() {
+    var c = revealAnim;
+    state.lastCard = c.card;
+
+    if (c.card === 'points') {
+      state.score += c.pts;
+      state.combo++;
+      if (c.pts >= 30) {
+        if (window.J) { c.pts >= 50 ? J.gold() : J.perfect(state.combo); }
+        hitStop = 5; zoom = 1.03;
+        flash('+' + c.pts, c.pts >= 50 ? GOLD : TEAL, c.pts >= 50 ? 52 : 44);
+        shakeAmt = c.pts >= 50 ? 4 : 2;
+        if (window.J) J.hit(state.combo);
+      } else {
+        if (window.J) J.hit(state.combo);
+        flash('+' + c.pts, TEAL, 36);
+      }
+      // dare check
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 40);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score);
+      }
+      if (window.LOOP) LOOP.emit('card_pulled', { type: 'points', pts: c.pts, combo: state.combo, score: state.score });
+    } else if (c.card === 'dud') {
+      state.duds++;
+      state.combo = 0;
+      if (window.J) J.near();
+      shakeAmt = 3;
+      flash('DUD', VERM, 40);
+      if (window.LOOP) LOOP.emit('card_pulled', { type: 'dud', duds: state.duds, score: state.score });
+      if (window.LOOP) LOOP.emit('near_miss', { duds: state.duds });
+      if (state.duds >= 3) {
+        gameOver(false);
+        return;
+      }
+    } else if (c.card === 'bomb') {
+      var lost = state.score;
+      state.score = 0;
+      state.combo = 0;
+      state.bombHit = true;
+      if (window.J) J.death(Math.min(0.4 + lost / 100, 1));
+      shakeAmt = 9;
+      flash('BOMB!', VERM, 52);
+      if (window.LOOP) LOOP.emit('card_pulled', { type: 'bomb', lost: lost, score: 0 });
+      gameOver(true);
+      return;
+    }
+  }
+
+  function cashOut() {
+    if (state.phase !== 'play' || revealAnim) return;
+    if (state.score === 0) return; // nothing to cash out
+    gameOver(false, true);
+  }
+
+  function gameOver(isBomb, cashout) {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (!isBomb && !cashout) {
+      // 3 duds death
+      if (window.J) { J.death(0.6); }
+      shakeAmt = 7;
+    }
+    if (newBest && !isBomb) {
+      if (window.J) setTimeout(function () { J.fanfare(); }, 300);
+      best = state.score;
+      try { localStorage.setItem('fyp_best', String(best)); } catch (_) {}
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), cashout: !!cashout, bomb: !!isBomb });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.duds = 0; state.combo = 0;
+    state.pulls = 0; state.bombHit = false; state.lastCard = null;
+    flashes = []; lever = { y: 0, pulling: false, released: false, velocity: 0, startY: 0 };
+    revealAnim = null; hitStop = 0; shakeAmt = 0; zoom = 1;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 38, t: 0 });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 60))));
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 520, w: 250, h: 46 };
+  var CASHOUT_R = { x: W / 2 - 80, y: H - 100, w: 160, h: 44 };
+
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // Touch/pointer tracking for the lever
+  var pointerDown = false, pointerStartY = 0, pointerLastY = 0;
+
+  function onPointerDown(x, y) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+
+    if (state.phase === 'title') { startRun(); return; }
+
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'pts' }); return;
+      }
+      resetRun(); return;
+    }
+
+    if (state.phase === 'play') {
+      // Cash out button
+      if (inR(CASHOUT_R, x, y) && !revealAnim && state.score > 0) {
+        cashOut(); return;
+      }
+      // Start lever pull
+      pointerDown = true;
+      pointerStartY = y;
+      pointerLastY = y;
+      lever.pulling = true;
+      lever.released = false;
+    }
+  }
+
+  function onPointerMove(x, y) {
+    if (DEMO || BOT || !pointerDown || !lever.pulling) return;
+    var dy = y - pointerStartY;
+    lever.y = Math.max(0, Math.min(dy, LEVER_TRIGGER + 20));
+    pointerLastY = y;
+  }
+
+  function onPointerUp(x, y) {
+    if (DEMO || BOT) return;
+    if (!pointerDown) return;
+    pointerDown = false;
+    if (lever.pulling && state.phase === 'play') {
+      if (lever.y >= LEVER_TRIGGER) {
+        // Full pull: trigger card reveal
+        lever.released = true;
+        lever.pulling = false;
+        triggerReveal();
+      } else {
+        // Partial pull: snap back
+        lever.pulling = false;
+        lever.released = false;
+      }
+      lever.y = 0;
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    onPointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointermove', function (e) {
+    if (!pointerDown) return;
+    var r = cv.getBoundingClientRect();
+    onPointerMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    onPointerUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.code === 'ArrowDown') {
+      if (state.phase === 'play' && !revealAnim) triggerReveal();
+      else if (state.phase === 'over') resetRun();
+      else if (state.phase === 'title') startRun();
+    }
+    if (e.code === 'KeyC' && state.phase === 'play' && state.score > 0) cashOut();
+  });
+
+  // ---- bot / demo autopilot ----
+  // Demo script: pull sequence with hesitations
+  // Arc: 2 points wins → near-fail tension → near-fail recovery at ~60% → real death (bomb or 3 duds)
+  // demoScript entries: 'pull' | 'cashout' | 'wait:<frames>'
+  var demoScript = ['pull','pull','pull','pull','pull','pull','pull','pull','bomb-pull'];
+  // We force-override card types in demo for exact arc control
+  var demoCardSequence = ['points','points','dud','points','points','dud','points','dud','bomb'];
+  var demoCardPts = [20, 30, 0, 15, 50, 0, 10, 0, 0];
+  var demoIdx = 0;
+  var demoWaits = [38, 30, 45, 55, 28, 60, 35, 50, 25]; // hesitation frames
+  var demoWait = 0;
+  var botPullCooldown = 0;
+  var botPassive = false;
+  var botPullsDone = 0;
+
+  function demoPullCard() {
+    if (demoIdx >= demoCardSequence.length) return;
+    var type = demoCardSequence[demoIdx];
+    var pts = demoCardPts[demoIdx];
+    revealAnim = { card: type, pts: pts, t: 0, maxT: 45 };
+    state.pulls++;
+    lever.y = 0;
+    if (window.J) J.tension(Math.min(state.pulls / 8, 1));
+    demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 35;
+    demoIdx++;
+  }
+
+  function autopilot(dt) {
+    if (state.phase !== 'play') return;
+
+    if (DEMO) {
+      if (revealAnim) return; // wait for reveal to finish
+      if (demoWait > 0) { demoWait -= dt; return; }
+      if (demoIdx < demoCardSequence.length) {
+        demoPullCard();
+      }
+      return;
+    }
+
+    if (BOT) {
+      if (revealAnim) return;
+      if (state.phase !== 'play') return;
+
+      // Bot plays up to 6 pulls then goes passive (lets 3-dud or bomb fire)
+      if (botPullsDone >= 6) {
+        // passive: wait for natural game over
+        // But if we have 0 duds and never got a bomb, force a bomb-path by pulling more
+        // Actually just keep pulling until death
+        if (botPullCooldown > 0) { botPullCooldown -= dt; return; }
+        triggerReveal();
+        botPullCooldown = 45;
+        return;
+      }
+
+      if (botPullCooldown > 0) { botPullCooldown -= dt; return; }
+      triggerReveal();
+      botPullsDone++;
+      botPullCooldown = 40 + rng() * 30;
+    }
+  }
+
+  // ---- render helpers ----
+  function drawRoundRect(x, y, w, h, r) {
+    cx.beginPath();
+    if (cx.roundRect) { cx.roundRect(x, y, w, h, r); }
+    else {
+      cx.moveTo(x + r, y);
+      cx.lineTo(x + w - r, y); cx.quadraticCurveTo(x + w, y, x + w, y + r);
+      cx.lineTo(x + w, y + h - r); cx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      cx.lineTo(x + r, y + h); cx.quadraticCurveTo(x, y + h, x, y + h - r);
+      cx.lineTo(x, y + r); cx.quadraticCurveTo(x, y, x + r, y);
+      cx.closePath();
+    }
+  }
+
+  function cardColor(type) {
+    if (type === 'points') return TEAL;
+    if (type === 'dud')    return 'rgba(232,80,46,0.7)';
+    if (type === 'bomb')   return VERM;
+    return '#444';
+  }
+
+  function cardEmoji(type, pts) {
+    if (type === 'points') return pts >= 50 ? '💎' : pts >= 30 ? '⭐' : '✨';
+    if (type === 'dud')    return '💀';
+    if (type === 'bomb')   return '💣';
+    return '?';
+  }
+
+  function drawCard(x, y, w, h, type, pts, alpha, scale2) {
+    cx.save();
+    cx.globalAlpha = alpha || 1;
+    cx.translate(x + w / 2, y + h / 2);
+    cx.scale(scale2 || 1, scale2 || 1);
+    cx.translate(-w / 2, -h / 2);
+
+    // card bg
+    var bg = cx.createLinearGradient(0, 0, 0, h);
+    if (type === 'points') {
+      bg.addColorStop(0, 'rgba(46,197,182,0.22)');
+      bg.addColorStop(1, 'rgba(46,197,182,0.08)');
+    } else if (type === 'dud') {
+      bg.addColorStop(0, 'rgba(232,80,46,0.22)');
+      bg.addColorStop(1, 'rgba(232,80,46,0.08)');
+    } else {
+      bg.addColorStop(0, 'rgba(232,80,46,0.4)');
+      bg.addColorStop(1, 'rgba(232,80,46,0.15)');
+    }
+    cx.fillStyle = bg;
+    drawRoundRect(0, 0, w, h, 18);
+    cx.fill();
+
+    cx.strokeStyle = cardColor(type);
+    cx.lineWidth = 2;
+    drawRoundRect(0, 0, w, h, 18);
+    cx.stroke();
+
+    // emoji / icon
+    cx.textAlign = 'center';
+    cx.font = '52px -apple-system, Helvetica, Arial';
+    cx.fillText(cardEmoji(type, pts), w / 2, 80);
+
+    // type label
+    cx.fillStyle = cardColor(type);
+    cx.font = '900 22px -apple-system, Helvetica, Arial';
+    if (type === 'points') {
+      cx.fillText('+' + pts, w / 2, 118);
+    } else if (type === 'dud') {
+      cx.fillStyle = VERM;
+      cx.fillText('DUD', w / 2, 118);
+    } else {
+      cx.fillStyle = VERM;
+      cx.fillText('BOMB', w / 2, 118);
+    }
+
+    // subtitle
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    if (type === 'points') cx.fillText('nice pull', w / 2, 142);
+    else if (type === 'dud') cx.fillText('nothing here', w / 2, 142);
+    else cx.fillText('lost everything', w / 2, 142);
+
+    cx.restore();
+  }
+
+  // draw the feed-card stack (3 stacked cards with slight perspective)
+  function drawFeedStack(centerX, centerY) {
+    // background placeholder cards (the "feed")
+    for (var i = 2; i >= 0; i--) {
+      var off = i * 6;
+      cx.save();
+      cx.globalAlpha = 0.18 - i * 0.04;
+      cx.fillStyle = 'rgba(255,255,255,0.1)';
+      drawRoundRect(centerX - 110 + off, centerY - 150 + off, 220, 160, 14);
+      cx.fill();
+      cx.restore();
+    }
+  }
+
+  // draw the pull lever
+  function drawLever(pullY) {
+    var cx2 = cx;
+    var lx = W / 2;
+    var baseY = H - 160;
+    var knobY = baseY + pullY;
+    var maxPull = LEVER_TRIGGER;
+    var progress = Math.min(pullY / maxPull, 1);
+
+    // track line
+    cx2.save();
+    cx2.strokeStyle = 'rgba(255,255,255,0.15)';
+    cx2.lineWidth = 3;
+    cx2.setLineDash([4, 6]);
+    cx2.beginPath();
+    cx2.moveTo(lx, baseY);
+    cx2.lineTo(lx, baseY + maxPull + 20);
+    cx2.stroke();
+    cx2.setLineDash([]);
+    cx2.restore();
+
+    // progress fill
+    if (pullY > 0) {
+      cx2.save();
+      cx2.strokeStyle = progress >= 1 ? TEAL : VERM;
+      cx2.lineWidth = 4;
+      cx2.globalAlpha = 0.7;
+      cx2.beginPath();
+      cx2.moveTo(lx, baseY);
+      cx2.lineTo(lx, baseY + pullY);
+      cx2.stroke();
+      cx2.restore();
+    }
+
+    // knob
+    cx2.save();
+    var kr = 22;
+    var grad = cx2.createRadialGradient(lx - 4, knobY - 4, 2, lx, knobY, kr);
+    grad.addColorStop(0, progress >= 1 ? '#5fffff' : '#ffffff');
+    grad.addColorStop(1, progress >= 1 ? TEAL : 'rgba(255,255,255,0.3)');
+    cx2.fillStyle = grad;
+    cx2.beginPath();
+    cx2.arc(lx, knobY, kr, 0, Math.PI * 2);
+    cx2.fill();
+
+    // arrow inside knob
+    cx2.fillStyle = progress >= 1 ? INK : 'rgba(0,0,0,0.5)';
+    cx2.font = '900 18px -apple-system, Helvetica, Arial';
+    cx2.textAlign = 'center';
+    cx2.fillText('↓', lx, knobY + 7);
+    cx2.restore();
+
+    // "PULL" hint when idle
+    if (pullY === 0) {
+      cx2.save();
+      var pulse = 0.5 + 0.5 * Math.sin(performance.now() / 350);
+      cx2.globalAlpha = 0.4 * pulse;
+      cx2.fillStyle = '#fff';
+      cx2.font = '700 12px -apple-system, Helvetica, Arial';
+      cx2.textAlign = 'center';
+      cx2.fillText('PULL', lx, baseY + maxPull + 38);
+      cx2.restore();
+    }
+  }
+
+  // draw dud indicators
+  function drawDudIndicators(duds) {
+    var maxDuds = 3;
+    var spacing = 28;
+    var startX = W / 2 - ((maxDuds - 1) * spacing) / 2;
+    for (var i = 0; i < maxDuds; i++) {
+      cx.save();
+      cx.beginPath();
+      cx.arc(startX + i * spacing, 56, 9, 0, Math.PI * 2);
+      if (i < duds) {
+        cx.fillStyle = VERM;
+      } else {
+        cx.strokeStyle = 'rgba(255,255,255,0.2)';
+        cx.lineWidth = 2;
+        cx.stroke();
+        cx.fillStyle = 'transparent';
+      }
+      if (i < duds) cx.fill();
+      cx.restore();
+    }
+    cx.save();
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 11px -apple-system, Helvetica, Arial';
+    cx.fillText('DUDS', W / 2, 76);
+    cx.restore();
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // decay hitStop
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      // advance reveal animation
+      if (revealAnim) {
+        revealAnim.t += dt;
+        // at midpoint of animation, apply the card effect
+        if (revealAnim.t >= revealAnim.maxT / 2 && !revealAnim.applied) {
+          revealAnim.applied = true;
+          applyCard();
+        }
+        if (revealAnim.t >= revealAnim.maxT) {
+          // if game_over was triggered inside applyCard, don't clear revealAnim
+          // unless we're in over state
+          revealAnim = null;
+        }
+      }
+
+      // run autopilot only when not revealing
+      if ((DEMO || BOT) && !revealAnim) {
+        autopilot(dt);
+      }
+    }
+
+    // lever spring back when not pulling
+    if (!lever.pulling && lever.y > 0) {
+      lever.y *= Math.pow(0.75, dt);
+      if (lever.y < 0.5) lever.y = 0;
+    }
+
+    // === draw ===
+    cx.save();
+
+    // juice transforms
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- TITLE ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('FYP PULL', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('pull down. pray for points.', W / 2, 298);
+      cx.fillStyle = VERM; cx.font = '700 14px -apple-system, Helvetica, Arial';
+      var p = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = p;
+      cx.fillText('TAP TO START', W / 2, 340);
+      cx.globalAlpha = 1;
+      // draw lever hint
+      drawLever(0);
+    }
+
+    // ---- CHALLENGE (demo beat 1) ----
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 290);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('140', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's best pull", W / 2, 428);
+    }
+
+    // ---- PLAY ----
+    if (state.phase === 'play') {
+      // score display
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 72px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 108);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 128);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 148);
+      }
+
+      // dud indicators
+      drawDudIndicators(state.duds);
+
+      // combo display
+      if (state.combo >= 2) {
+        var comboSize = 18 + Math.min(state.combo * 2, 16);
+        cx.fillStyle = GOLD;
+        cx.font = '900 ' + comboSize + 'px -apple-system, Helvetica, Arial';
+        var glow = state.combo >= 4 ? 'rgba(242,177,52,' + Math.min(state.combo * 0.15, 0.8) + ')' : 'transparent';
+        cx.shadowColor = glow; cx.shadowBlur = state.combo >= 4 ? 12 : 0;
+        cx.fillText('×' + state.combo + ' COMBO', W / 2, 170);
+        cx.shadowBlur = 0;
+      }
+
+      // feed card stack
+      drawFeedStack(W / 2, 340);
+
+      // reveal animation
+      if (revealAnim) {
+        var rt = revealAnim.t / revealAnim.maxT;
+        var cardScale, cardAlpha;
+        if (rt < 0.3) {
+          // flip in: scale from 0
+          cardScale = rt / 0.3;
+          cardAlpha = rt / 0.3;
+        } else if (rt < 0.7) {
+          cardScale = 1;
+          cardAlpha = 1;
+        } else {
+          // hold steady
+          cardScale = 1;
+          cardAlpha = 1;
+        }
+        drawCard(W / 2 - 110, 240, 220, 160, revealAnim.card, revealAnim.pts, cardAlpha, cardScale);
+      } else {
+        // show last card faded, or placeholder
+        if (state.lastCard) {
+          cx.globalAlpha = 0.25;
+          drawCard(W / 2 - 110, 240, 220, 160, state.lastCard, 0, 0.25, 1);
+          cx.globalAlpha = 1;
+        }
+      }
+
+      // lever
+      drawLever(lever.y);
+
+      // cash out button (only when score > 0 and not revealing)
+      if (state.score > 0 && !revealAnim) {
+        cx.save();
+        var cpulse = 0.85 + 0.15 * Math.sin(now / 250);
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD;
+        cx.lineWidth = 1.5;
+        cx.globalAlpha = cpulse;
+        drawRoundRect(CASHOUT_R.x, CASHOUT_R.y, CASHOUT_R.w, CASHOUT_R.h, 22);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText('CASH OUT — ' + state.score + ' pts', W / 2, CASHOUT_R.y + 28);
+        cx.restore();
+      }
+    }
+
+    // ---- GAME OVER ----
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      var overLabel = state.bombHit ? 'BOMBED.' : state.duds >= 3 ? 'THREE DUDS.' : 'CASHED OUT.';
+      cx.fillStyle = state.bombHit ? VERM : state.duds >= 3 ? VERM : TEAL;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText(overLabel, W / 2, 290);
+      cx.fillStyle = '#fff'; cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' pts', W / 2, 336);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 378);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText(state.pulls + ' pulls · ' + state.duds + ' duds', W / 2, 404);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — PULL AGAIN', W / 2, 454);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        drawRoundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- CTA (demo) ----
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('FYP PULL', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.65)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('pulled ' + (window.__demoScore || 140) + ' pts', W / 2, 328);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 140), W / 2, 398);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- floating flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

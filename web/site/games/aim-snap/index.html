@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Aim Snap — Tilt</title>
+<!--
+  LOOP / attention-architecture — Aim Snap
+  Circuits: 01-rpe (variable reward), 04-loss (the miss you felt coming), 06-zeigarnik (one more try)
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip: challenge card → human-feeling play → near-fail → fail → score → CTA
+    ?bot=1&runs=N&seed=5  imperfect autopilot; reaches game_over; sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'aim-snap';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // Seeded RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  var TARGET_R   = 38;   // outer target ring radius
+  var BULL_R     = 12;   // bullseye radius (perfect zone)
+  var NEAR_R     = 22;   // near-miss zone radius
+  var CROSSHAIR_R = 10;  // crosshair dot radius
+  var BASE_SPEED  = 90;  // px/s starting drift speed
+  var SPEED_STEP  = 8;   // px/s added each hit
+  var DECOY_COUNT = 0;   // decoys added as score grows
+
+  // ---- state ----
+  var phase;         // 'challenge' | 'play' | 'over' | 'cta' | 'title'
+  var score, combo, best = 0, runStartTs;
+  var crossX, crossY, driftAngle, driftSpeed;
+  var targets;       // array of {x, y, r, active, decoy, pulse}
+  var flashes;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var dareBeaten = false;
+  var challengeAt = 0, overAt = 0, ctaAt = 0;
+  var botRunsDone = 0;
+
+  try { best = +localStorage.getItem('as_best') || 0; } catch (_) {}
+
+  // ---- MUTE / SHARE hit zones ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- RNG helpers ----
+  function rndRange(lo, hi) { return lo + rng() * (hi - lo); }
+  function rndInt(lo, hi) { return Math.floor(rndRange(lo, hi + 1)); }
+
+  // ---- target layout ----
+  function generateTargets(sc) {
+    var count = 1 + Math.floor(sc / 4);   // more decoys as score rises, max ~4
+    count = Math.min(count, 4);
+    var ts = [];
+    // active target
+    ts.push(placeTarget(true));
+    // decoys
+    for (var d = 1; d < count; d++) {
+      var t = placeTarget(false);
+      // ensure decoy doesn't overlap active
+      var tries = 0;
+      while (tries < 20 && dist2(t, ts[0]) < (TARGET_R * 2.6) * (TARGET_R * 2.6)) {
+        t = placeTarget(false);
+        tries++;
+      }
+      ts.push(t);
+    }
+    return ts;
+  }
+
+  function placeTarget(active) {
+    var margin = TARGET_R + 16;
+    return {
+      x: rndRange(margin, W - margin),
+      y: rndRange(margin + 80, H - margin - 100),
+      r: TARGET_R,
+      active: active,
+      decoy: !active,
+      pulse: rng() * Math.PI * 2
+    };
+  }
+
+  function dist2(a, b) { var dx = a.x - b.x, dy = a.y - b.y; return dx * dx + dy * dy; }
+  function dist(ax, ay, bx, by) { var dx = ax - bx, dy = ay - by; return Math.sqrt(dx * dx + dy * dy); }
+
+  // ---- init / reset ----
+  function newGame() {
+    score = 0; combo = 0; dareBeaten = false;
+    flashes = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+
+    // start crosshair somewhere random
+    crossX = rndRange(60, W - 60);
+    crossY = rndRange(180, H - 180);
+    driftAngle = rng() * Math.PI * 2;
+    driftSpeed = BASE_SPEED;
+
+    targets = generateTargets(0);
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) {
+      phase = 'play';
+      startRun();
+      return;
+    }
+    phase = 'title';
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- tap / hit logic ----
+  function trySnap() {
+    if (phase !== 'play') return;
+    var active = targets.find(function (t) { return t.active; });
+    if (!active) return;
+
+    var d = dist(crossX, crossY, active.x, active.y);
+
+    if (d <= BULL_R) {
+      // PERFECT
+      hitStop = 4; zoom = 1.035;
+      combo++;
+      score++;
+      var pts = 3 + combo;
+      flash('+' + pts + ' PERFECT', GOLD, 42);
+      if (window.J) { J.perfect(combo); J.tension(Math.min(score / 20, 1)); }
+      if (window.LOOP) LOOP.emit('hit', { type: 'perfect', score: score, combo: combo });
+      finishHit(true);
+
+    } else if (d <= NEAR_R) {
+      // HIT
+      combo++;
+      score++;
+      shakeAmt = 2;
+      flash('+1', TEAL, 36);
+      if (window.J) { J.hit(combo); J.tension(Math.min(score / 20, 1)); }
+      if (window.LOOP) LOOP.emit('hit', { type: 'good', score: score, combo: combo });
+      finishHit(false);
+
+    } else if (d <= TARGET_R + 6) {
+      // NEAR-MISS (outer edge)
+      combo = 0;
+      shakeAmt = 4;
+      flash('SO CLOSE', VERM, 38);
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { d: +d.toFixed(1), score: score });
+      // near miss = miss → game over
+      gameOver();
+
+    } else {
+      // MISS — wrong spot or thin air
+      combo = 0;
+      gameOver();
+    }
+  }
+
+  function finishHit(perfect) {
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(score);
+    }
+
+    // gold milestone
+    if (score % 5 === 0) {
+      flash('×' + score, GOLD, 50);
+      if (window.J) J.gold();
+    }
+
+    // spawn next targets
+    targets = generateTargets(score);
+
+    // accelerate drift
+    driftSpeed = BASE_SPEED + score * SPEED_STEP;
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = score > best;
+    if (window.J) { J.death(Math.min(0.3 + score / 30, 1)); if (newBest) setTimeout(function () { J.fanfare(); }, 450); }
+    if (newBest) { best = score; try { localStorage.setItem('as_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetBotRun(); }, 600);
+    }
+  }
+
+  function resetBotRun() {
+    score = 0; combo = 0; flashes = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    crossX = rndRange(60, W - 60);
+    crossY = rndRange(180, H - 180);
+    driftAngle = rng() * Math.PI * 2;
+    driftSpeed = BASE_SPEED;
+    targets = generateTargets(0);
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function resetRun() {
+    score = 0; combo = 0; flashes = []; dareBeaten = false;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    crossX = rndRange(60, W - 60);
+    crossY = rndRange(180, H - 180);
+    driftAngle = rng() * Math.PI * 2;
+    driftSpeed = BASE_SPEED;
+    targets = generateTargets(0);
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0, x: W / 2, y: H * 0.38 }); }
+
+  // ---- percent rank ----
+  function pctTop(sc) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-sc / 9)))); }
+
+  // ---- input ----
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') { trySnap(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score, unit: '%' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- DEMO autopilot ----
+  // Arc: 2 perfect → 1 near → save → 3 hits → near-fail recovery → miss (spectacle)
+  // demoWaits = frame-counts of hesitation between each action
+  var demoScript = [
+    { type: 'perfect' },        // 0: land perfect on active
+    { type: 'perfect' },        // 1: another perfect
+    { type: 'near', frac: 0.55 }, // 2: near edge (tension)
+    { type: 'perfect' },        // 3: save (recovery)
+    { type: 'hit' },            // 4: normal hit
+    { type: 'hit' },            // 5: normal hit
+    { type: 'near', frac: 0.85 }, // 6: near-fail (looks almost lost)
+    { type: 'perfect' },        // 7: save again!
+    { type: 'miss' }            // 8: the real miss
+  ];
+  var demoIdx = 0;
+  var demoWaits = [38, 28, 45, 55, 30, 32, 60, 42, 25];
+  var demoWait = 36;
+
+  // BOT autopilot state
+  var botFrameCount = 0;
+  var botPassiveAfter = 12; // bot goes passive (misses) after this many hits per run
+
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      if (demoWait > 0) { demoWait -= dt; return; }
+      var step = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      var active = targets.find(function (t) { return t.active; });
+      if (!active) return;
+
+      // move crosshair toward desired position
+      var tx, ty;
+      if (step.type === 'miss') {
+        // aim away from active
+        tx = active.x < W / 2 ? W - 60 : 60;
+        ty = active.y < H / 2 ? H - 140 : 140;
+      } else if (step.type === 'near') {
+        // aim just outside near zone, toward edge
+        var ang = Math.atan2(crossY - active.y, crossX - active.x);
+        var frac = step.frac || 0.7;
+        tx = active.x + Math.cos(ang) * TARGET_R * frac;
+        ty = active.y + Math.sin(ang) * TARGET_R * frac;
+      } else if (step.type === 'perfect') {
+        tx = active.x; ty = active.y;
+      } else {
+        // hit — land inside near zone but not bullseye
+        var ang2 = rng() * Math.PI * 2;
+        tx = active.x + Math.cos(ang2) * (NEAR_R - 4);
+        ty = active.y + Math.sin(ang2) * (NEAR_R - 4);
+      }
+
+      // snap crosshair with some wobble (human feel)
+      crossX += (tx - crossX) * 0.45;
+      crossY += (ty - crossY) * 0.45;
+
+      // fire when close enough
+      var threshold = (step.type === 'perfect') ? 3 : (step.type === 'miss') ? 5 : 4;
+      if (Math.abs(crossX - tx) < threshold && Math.abs(crossY - ty) < threshold) {
+        demoIdx++;
+        demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 30;
+        if (step.type === 'miss') {
+          gameOver();
+        } else {
+          tryDemoSnap(step);
+        }
+      }
+      return;
+    }
+
+    if (BOT) {
+      botFrameCount += dt;
+      var active2 = targets.find(function (t) { return t.active; });
+      if (!active2) return;
+
+      // After botPassiveAfter hits, bot will eventually miss (let drift carry crosshair away)
+      if (score >= botPassiveAfter) {
+        // just let drift happen — crosshair will drift off target → game_over eventually
+        // To guarantee termination, if crosshair drifts far from active, miss deliberately
+        var dd = dist(crossX, crossY, active2.x, active2.y);
+        if (dd > TARGET_R + 40) {
+          // snap to wrong location → game over
+          trySnap();
+        }
+        return;
+      }
+
+      // Imperfect autopilot: aim near center with Gaussian error
+      var err = (rng() - 0.5) * 16;
+      var err2 = (rng() - 0.5) * 16;
+      var tx3 = active2.x + err;
+      var ty3 = active2.y + err2;
+      crossX += (tx3 - crossX) * 0.35;
+      crossY += (ty3 - crossY) * 0.35;
+
+      var d3 = dist(crossX, crossY, active2.x, active2.y);
+      if (d3 < NEAR_R + 2) {
+        trySnap();
+        botFrameCount = 0;
+      }
+    }
+  }
+
+  function tryDemoSnap(step) {
+    var active = targets.find(function (t) { return t.active; });
+    if (!active) return;
+    // Force crosshair to desired spot, then fire
+    if (step.type === 'perfect') {
+      crossX = active.x; crossY = active.y;
+    } else if (step.type === 'hit') {
+      var a = rng() * Math.PI * 2;
+      crossX = active.x + Math.cos(a) * (NEAR_R - 5);
+      crossY = active.y + Math.sin(a) * (NEAR_R - 5);
+    } else if (step.type === 'near') {
+      var a2 = rng() * Math.PI * 2;
+      var frac = step.frac || 0.7;
+      crossX = active.x + Math.cos(a2) * TARGET_R * frac;
+      crossY = active.y + Math.sin(a2) * TARGET_R * frac;
+    }
+    trySnap();
+  }
+
+  // ---- render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // physics — crosshair drifts; drift angle wanders slightly
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else if (phase === 'play') {
+      // drift
+      driftAngle += (rng() - 0.5) * 0.04 * dt;
+      var spd = driftSpeed / 60;
+      crossX += Math.cos(driftAngle) * spd * dt;
+      crossY += Math.sin(driftAngle) * spd * dt;
+      // bounce off walls
+      if (crossX < 16) { crossX = 16; driftAngle = Math.PI - driftAngle; }
+      if (crossX > W - 16) { crossX = W - 16; driftAngle = Math.PI - driftAngle; }
+      if (crossY < 80) { crossY = 80; driftAngle = -driftAngle; }
+      if (crossY > H - 80) { crossY = H - 80; driftAngle = -driftAngle; }
+
+      // pulse targets
+      for (var ti = 0; ti < targets.length; ti++) {
+        targets[ti].pulse = (targets[ti].pulse + dt * 0.06) % (Math.PI * 2);
+      }
+
+      autopilot(dt);
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // draw targets
+    if (phase === 'play' || phase === 'over') {
+      for (var i = 0; i < targets.length; i++) {
+        drawTarget(targets[i], now);
+      }
+    }
+
+    // draw crosshair
+    if (phase === 'play') {
+      drawCrosshair(crossX, crossY, now);
+    }
+
+    // score HUD
+    if (phase === 'play' || phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 80);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 104);
+
+      // combo indicator
+      if (combo >= 2 && phase === 'play') {
+        cx.fillStyle = GOLD;
+        cx.font = '900 ' + Math.min(28 + combo * 2, 46) + 'px -apple-system, Helvetica, Arial';
+        cx.globalAlpha = 0.9;
+        cx.fillText('×' + combo + ' COMBO', W / 2, 140);
+        cx.globalAlpha = 1;
+      }
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 154);
+      }
+    }
+
+    // challenge card (demo beat 1)
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('29', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // title screen
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('AIM SNAP', W / 2, 290);
+      cx.fillStyle = TEAL; cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('tap when the crosshair\nhits the target', W / 2, 330);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO AIM', W / 2, 390);
+      cx.globalAlpha = 1;
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // game over screen
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('MISSED.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' hits', W / 2, 345);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('sharper than ' + (100 - pt) + '% of players', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 462);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('AIM SNAP', W / 2, 298);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' hits. can you beat it?', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + score, W / 2, 408);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 444);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- drawing helpers ----
+  function drawTarget(t, now) {
+    var glow = 0.5 + 0.5 * Math.sin(t.pulse);
+    cx.save();
+    if (t.active) {
+      // outer ring glow
+      var gr = cx.createRadialGradient(t.x, t.y, TARGET_R * 0.6, t.x, t.y, TARGET_R + 10);
+      gr.addColorStop(0, 'rgba(242,177,52,0.0)');
+      gr.addColorStop(1, 'rgba(242,177,52,' + (0.12 + 0.08 * glow) + ')');
+      cx.fillStyle = gr;
+      cx.beginPath(); cx.arc(t.x, t.y, TARGET_R + 10, 0, Math.PI * 2); cx.fill();
+
+      // outer ring
+      cx.strokeStyle = GOLD; cx.lineWidth = 2.5;
+      cx.globalAlpha = 0.85 + 0.15 * glow;
+      cx.beginPath(); cx.arc(t.x, t.y, TARGET_R, 0, Math.PI * 2); cx.stroke();
+
+      // middle ring
+      cx.strokeStyle = 'rgba(242,177,52,0.55)'; cx.lineWidth = 1.5;
+      cx.globalAlpha = 1;
+      cx.beginPath(); cx.arc(t.x, t.y, NEAR_R, 0, Math.PI * 2); cx.stroke();
+
+      // bullseye
+      cx.fillStyle = GOLD; cx.globalAlpha = 0.22 + 0.12 * glow;
+      cx.beginPath(); cx.arc(t.x, t.y, BULL_R, 0, Math.PI * 2); cx.fill();
+      cx.globalAlpha = 1;
+      cx.strokeStyle = GOLD; cx.lineWidth = 2;
+      cx.beginPath(); cx.arc(t.x, t.y, BULL_R, 0, Math.PI * 2); cx.stroke();
+
+      // crosshair lines on target
+      cx.strokeStyle = 'rgba(242,177,52,0.3)'; cx.lineWidth = 1;
+      cx.beginPath();
+      cx.moveTo(t.x - TARGET_R - 8, t.y); cx.lineTo(t.x + TARGET_R + 8, t.y);
+      cx.moveTo(t.x, t.y - TARGET_R - 8); cx.lineTo(t.x, t.y + TARGET_R + 8);
+      cx.stroke();
+
+    } else {
+      // decoy: muted style
+      cx.strokeStyle = 'rgba(232,80,46,0.38)'; cx.lineWidth = 1.5;
+      cx.globalAlpha = 0.5 + 0.15 * glow;
+      cx.beginPath(); cx.arc(t.x, t.y, TARGET_R, 0, Math.PI * 2); cx.stroke();
+      cx.strokeStyle = 'rgba(232,80,46,0.22)'; cx.lineWidth = 1;
+      cx.beginPath(); cx.arc(t.x, t.y, NEAR_R, 0, Math.PI * 2); cx.stroke();
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+  }
+
+  function drawCrosshair(x, y, now) {
+    cx.save();
+    var spread = 14;
+    var lineLen = 18;
+    // shadow
+    cx.strokeStyle = 'rgba(0,0,0,0.4)'; cx.lineWidth = 4;
+    cx.beginPath();
+    cx.moveTo(x - spread - lineLen + 1, y + 1); cx.lineTo(x - spread + 1, y + 1);
+    cx.moveTo(x + spread + 1, y + 1); cx.lineTo(x + spread + lineLen + 1, y + 1);
+    cx.moveTo(x + 1, y - spread - lineLen + 1); cx.lineTo(x + 1, y - spread + 1);
+    cx.moveTo(x + 1, y + spread + 1); cx.lineTo(x + 1, y + spread + lineLen + 1);
+    cx.stroke();
+    // white lines
+    cx.strokeStyle = '#fff'; cx.lineWidth = 2.5;
+    cx.beginPath();
+    cx.moveTo(x - spread - lineLen, y); cx.lineTo(x - spread, y);
+    cx.moveTo(x + spread, y); cx.lineTo(x + spread + lineLen, y);
+    cx.moveTo(x, y - spread - lineLen); cx.lineTo(x, y - spread);
+    cx.moveTo(x, y + spread); cx.lineTo(x, y + spread + lineLen);
+    cx.stroke();
+    // center dot
+    cx.fillStyle = VERM;
+    cx.beginPath(); cx.arc(x, y, 4, 0, Math.PI * 2); cx.fill();
+    cx.strokeStyle = '#fff'; cx.lineWidth = 1.5;
+    cx.beginPath(); cx.arc(x, y, 4, 0, Math.PI * 2); cx.stroke();
+    cx.restore();
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Grid Curate — Tilt</title>
+<!--
+  LOOP / attention-architecture — Grid Curate
+  Circuits: 01-rpe (variable harmony reward), 02-novelty (color combos), 06-zeigarnik (one more swap).
+  Mechanic: 3x3 Instagram-style grid; swap tiles to maximize color harmony before locking.
+  Modes:
+    ?demo=1&seed=7   mirror-neuron clip: challenge card → imperfect curating → near-perfection → lock → CTA
+    ?bot=1&runs=N&seed=M  imperfect autopilot N runs, window.__botDone when done
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'grid-curate';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ── palette: 9 distinct hues for the tiles ─────────────────────────────────
+  // Each tile has a hue; harmony = how smooth the overall gradient feels.
+  var TILE_HUES = [0, 28, 52, 80, 148, 195, 230, 270, 320];
+
+  // ── Grid layout ─────────────────────────────────────────────────────────────
+  var GRID_COLS = 3, GRID_ROWS = 3, GRID_N = 9;
+  var TILE_SIZE = 116, TILE_GAP = 4;
+  var GRID_W = GRID_COLS * TILE_SIZE + (GRID_COLS - 1) * TILE_GAP;
+  var GRID_H = GRID_ROWS * TILE_SIZE + (GRID_ROWS - 1) * TILE_GAP;
+  var GRID_X = (W - GRID_W) / 2;
+  var GRID_Y = 180;
+
+  // ── Game state ───────────────────────────────────────────────────────────────
+  var phase;         // 'challenge' | 'play' | 'over' | 'cta'
+  var tiles;         // array[9] of hue values (positions 0..8, row-major)
+  var selectedIdx;   // which tile is currently selected (null if none)
+  var swaps;         // number of swaps performed this run
+  var harmony;       // 0..100, current harmony score
+  var runStartTs;
+  var overAt, ctaAt;
+  var challengeAt;
+  var dareBeaten;
+  var best = 0;
+  var botRunsDone = 0;
+
+  // juice
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  var tileAnims = [];  // per-tile swap animations {i, j, t, total}
+  var meterPulse = 0;
+
+  try { best = +localStorage.getItem('gc_best') || 0; } catch (_) {}
+
+  // ── Harmony computation ──────────────────────────────────────────────────────
+  // Harmony = smoothness of the hue arrangement. We compare each adjacent pair
+  // (horizontal + vertical neighbours) and reward small angular differences.
+  function hueDiff(a, b) {
+    var d = Math.abs(a - b) % 360;
+    return d > 180 ? 360 - d : d;
+  }
+
+  function computeHarmony(tArr) {
+    var totalPairs = 0, totalScore = 0;
+    for (var r = 0; r < GRID_ROWS; r++) {
+      for (var c = 0; c < GRID_COLS; c++) {
+        var idx = r * GRID_COLS + c;
+        // right neighbour
+        if (c + 1 < GRID_COLS) {
+          var diff = hueDiff(tArr[idx], tArr[idx + 1]);
+          totalScore += Math.max(0, 1 - diff / 180);
+          totalPairs++;
+        }
+        // bottom neighbour
+        if (r + 1 < GRID_ROWS) {
+          var diff2 = hueDiff(tArr[idx], tArr[idx + GRID_COLS]);
+          totalScore += Math.max(0, 1 - diff2 / 180);
+          totalPairs++;
+        }
+      }
+    }
+    return Math.round((totalScore / totalPairs) * 100);
+  }
+
+  // ── Optimal arrangement ──────────────────────────────────────────────────────
+  // Sort hues ascending for a smooth gradient (for comparison / reference)
+  function optimalHarmony() {
+    var sorted = TILE_HUES.slice().sort(function (a, b) { return a - b; });
+    return computeHarmony(sorted);
+  }
+
+  var OPTIMAL = optimalHarmony(); // should be ~86-90%
+
+  // ── Tile helpers ─────────────────────────────────────────────────────────────
+  function tileRect(idx) {
+    var c = idx % GRID_COLS, r = Math.floor(idx / GRID_COLS);
+    return {
+      x: GRID_X + c * (TILE_SIZE + TILE_GAP),
+      y: GRID_Y + r * (TILE_SIZE + TILE_GAP),
+      w: TILE_SIZE,
+      h: TILE_SIZE
+    };
+  }
+
+  function hitTile(px, py) {
+    for (var i = 0; i < GRID_N; i++) {
+      var r = tileRect(i);
+      if (px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h) return i;
+    }
+    return -1;
+  }
+
+  // ── Tile color ────────────────────────────────────────────────────────────────
+  // Each tile is a small "photo" represented by a gradient from hue.
+  function tileGradient(hue, rect) {
+    var g = cx.createLinearGradient(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
+    g.addColorStop(0,   'hsl(' + hue       + ',62%,58%)');
+    g.addColorStop(0.5, 'hsl(' + ((hue+15)%360) + ',55%,46%)');
+    g.addColorStop(1,   'hsl(' + ((hue+30)%360) + ',68%,36%)');
+    return g;
+  }
+
+  // ── Shuffle helper ───────────────────────────────────────────────────────────
+  function shuffle(arr) {
+    for (var i = arr.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+    }
+    return arr;
+  }
+
+  // ── New game ──────────────────────────────────────────────────────────────────
+  function newGame() {
+    tiles       = shuffle(TILE_HUES.slice());
+    selectedIdx = null;
+    swaps       = 0;
+    harmony     = computeHarmony(tiles);
+    dareBeaten  = false;
+    flashes     = [];
+    tileAnims   = [];
+    hitStop     = 0; shakeAmt = 0; zoom = 1; meterPulse = 0;
+
+    if (DEMO) {
+      phase        = 'challenge';
+      challengeAt  = performance.now();
+      setTimeout(startRun, 1250);
+    } else if (BOT) {
+      phase = 'play';
+      startRun();
+    } else {
+      phase = 'play';
+      startRun();
+    }
+  }
+
+  function startRun() {
+    phase      = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ── Swap two tiles ───────────────────────────────────────────────────────────
+  function doSwap(a, b) {
+    var prevHarmony = harmony;
+    var tmp = tiles[a]; tiles[a] = tiles[b]; tiles[b] = tmp;
+    harmony = computeHarmony(tiles);
+    swaps++;
+
+    var gain = harmony - prevHarmony;
+    var isPerfect = harmony >= OPTIMAL - 2;
+    var isNear    = harmony >= OPTIMAL - 10 && !isPerfect;
+
+    // sound
+    if (window.J) {
+      if (isPerfect) {
+        J.perfect(swaps);
+        J.fanfare();
+      } else if (gain >= 8) {
+        J.hit(swaps);
+        J.tension(Math.min(harmony / 100, 1));
+      } else if (isNear) {
+        J.near();
+      } else if (gain < -2) {
+        J.death(0.3);
+      } else {
+        J.hit(1);
+      }
+    }
+
+    // visual juice
+    if (isPerfect) {
+      hitStop  = 5;
+      zoom     = 1.03;
+      shakeAmt = 2;
+      meterPulse = 1;
+      flash('PERFECT!', TEAL, 44);
+    } else if (isNear) {
+      shakeAmt = 3;
+      meterPulse = 0.7;
+      flash('SO CLOSE', GOLD, 38);
+      if (window.LOOP) LOOP.emit('near_miss', { harmony: harmony });
+    } else if (gain >= 8) {
+      zoom     = 1.015;
+      meterPulse = 0.4;
+      flash('+' + gain + '%', TEAL, 34);
+    } else if (gain < 0) {
+      shakeAmt = 2;
+      flash(gain + '%', VERM, 30);
+    }
+
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && harmony > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(harmony);
+    }
+
+    // tile swap animation
+    tileAnims.push({ a: a, b: b, t: 0, total: 12 });
+
+    if (window.LOOP) LOOP.emit('tile_swapped', { swaps: swaps, harmony: harmony, gain: gain });
+    selectedIdx = null;
+  }
+
+  // ── Lock (game over) ──────────────────────────────────────────────────────────
+  // Player decides to "lock" their grid — score is current harmony %.
+  // Also triggers automatically after MAX_SWAPS to ensure bot runs end.
+  var MAX_SWAPS = 18;
+
+  function lockGrid() {
+    if (phase !== 'play') return;
+    phase  = 'over';
+    overAt = performance.now();
+
+    var score = harmony;
+    var dur   = (Date.now() - runStartTs) / 1000;
+    var newBest = score > best;
+
+    shakeAmt = score >= OPTIMAL - 2 ? 4 : 1;
+    if (window.J) {
+      if (score >= OPTIMAL - 2) { J.perfect(swaps); setTimeout(function () { J.fanfare(); }, 200); }
+      else { J.death(Math.max(0.2, 1 - score / 100)); }
+    }
+
+    if (DEMO) window.__demoScore = score;
+    if (newBest) {
+      best = score;
+      try { localStorage.setItem('gc_best', String(best)); } catch (_) {}
+      if (window.J) setTimeout(function () { J.fanfare(); }, 450);
+    }
+
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase  = 'cta';
+        ctaAt  = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    tiles       = shuffle(TILE_HUES.slice());
+    selectedIdx = null;
+    swaps       = 0;
+    harmony     = computeHarmony(tiles);
+    flashes     = [];
+    tileAnims   = [];
+    hitStop     = 0; shakeAmt = 0; zoom = 1; meterPulse = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ── Flash text ────────────────────────────────────────────────────────────────
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ── pctTop ────────────────────────────────────────────────────────────────────
+  function pctTop(score) {
+    // harmony scores above 70 = top tier
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-(score - 50) / 18))));
+  }
+
+  // ── Input regions ─────────────────────────────────────────────────────────────
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var LOCK_R  = { x: W / 2 - 110, y: 628, w: 220, h: 48 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+
+    if (phase === 'play') {
+      // Lock button
+      if (px !== undefined && inR(LOCK_R, px, py)) { lockGrid(); return; }
+
+      var idx = hitTile(px, py);
+      if (idx === -1) {
+        selectedIdx = null;
+        return;
+      }
+      if (selectedIdx === null) {
+        selectedIdx = idx;
+        if (window.J) J.hit(1);
+      } else if (selectedIdx === idx) {
+        selectedIdx = null;
+      } else {
+        doSwap(selectedIdx, idx);
+      }
+      return;
+    }
+
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: harmony, unit: '%' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') tap();
+  });
+
+  // ── Demo / bot autopilots ─────────────────────────────────────────────────────
+  // Demo script: a sequence of swap pairs (indices) with wait frames between.
+  // Arc: challenge → 4 smart swaps (harmony rises nicely) → near-fail bad swap
+  //      → great recovery swap → 2 more → 1 panic bad swap → lock (near-perfect).
+  // All indices into the 3x3 grid (0-8, row-major).
+
+  var demoScript = [
+    { a: 0, b: 8, wait: 38 },   // big cross swap — looks decisive
+    { a: 1, b: 7, wait: 44 },   // hesitation
+    { a: 3, b: 5, wait: 30 },
+    { a: 2, b: 6, wait: 52 },   // longer hesitation = tension
+    // near-fail: swap two adjacent good ones (lowers harmony a bit)
+    { a: 4, b: 5, wait: 28 },
+    // recovery: swap back + one more smart move
+    { a: 5, b: 4, wait: 24 },
+    { a: 0, b: 3, wait: 36 },
+    { a: 1, b: 4, wait: 42 },
+    // "panic" bad swap
+    { a: 2, b: 8, wait: 20 },
+    { action: 'lock', wait: 0 }
+  ];
+  var demoIdx = 0, demoWait = 55; // start with initial hesitation on challenge card
+
+  // Bot: pick a random swap pair each action, run MAX_SWAPS then lock
+  var botActionsDone = 0;
+  var botWait = 0;
+
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      if (demoWait > 0) { demoWait -= dt; return; }
+      if (demoIdx >= demoScript.length) return;
+      var step = demoScript[demoIdx];
+      if (step.action === 'lock') {
+        demoIdx++;
+        lockGrid();
+        return;
+      }
+      var sa = step.a, sb = step.b;
+      // ensure indices are within range and different
+      if (sa !== sb && sa < GRID_N && sb < GRID_N) {
+        doSwap(sa, sb);
+      }
+      demoWait = step.wait;
+      demoIdx++;
+    } else if (BOT) {
+      if (botWait > 0) { botWait -= dt; return; }
+      if (botActionsDone >= MAX_SWAPS) {
+        lockGrid();
+        botActionsDone = 0;
+        return;
+      }
+      // pick a random pair
+      var ai = Math.floor(rng() * GRID_N);
+      var bi = Math.floor(rng() * GRID_N);
+      if (ai !== bi) {
+        doSwap(ai, bi);
+        botActionsDone++;
+      }
+      botWait = 18 + Math.floor(rng() * 14);
+    }
+  }
+
+  // ── Render helpers ────────────────────────────────────────────────────────────
+  function drawRoundRect(x, y, w, h, r) {
+    if (cx.roundRect) { cx.roundRect(x, y, w, h, r); }
+    else {
+      cx.beginPath();
+      cx.moveTo(x + r, y);
+      cx.lineTo(x + w - r, y); cx.arcTo(x + w, y, x + w, y + r, r);
+      cx.lineTo(x + w, y + h - r); cx.arcTo(x + w, y + h, x + w - r, y + h, r);
+      cx.lineTo(x + r, y + h); cx.arcTo(x, y + h, x, y + h - r, r);
+      cx.lineTo(x, y + r); cx.arcTo(x, y, x + r, y, r);
+      cx.closePath();
+    }
+  }
+
+  function drawMeter(x, y, w, h, pct, pulse) {
+    // track
+    cx.fillStyle = 'rgba(255,255,255,0.08)';
+    drawRoundRect(x, y, w, h, h / 2); cx.fill();
+    // fill
+    var fillW = Math.round(w * pct / 100);
+    if (fillW > 0) {
+      var hue = Math.round(pct * 1.2);  // 0=red, 100=green
+      var g = cx.createLinearGradient(x, 0, x + fillW, 0);
+      g.addColorStop(0, 'hsl(' + (hue * 0.4) + ',90%,55%)');
+      g.addColorStop(1, 'hsl(' + (100 + hue * 0.8) + ',90%,55%)');
+      cx.fillStyle = g;
+      cx.globalAlpha = 1 + pulse * 0.15;
+      drawRoundRect(x, y, Math.max(fillW, h), h, h / 2); cx.fill();
+      cx.globalAlpha = 1;
+    }
+    // label
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '700 13px -apple-system, Helvetica, Arial';
+    cx.fillText(pct + '% HARMONY', x + w / 2, y + h + 18);
+  }
+
+  // ── Main frame ────────────────────────────────────────────────────────────────
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // autopilot tick (with hitStop guard — decay first)
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      autopilot(dt);
+    }
+
+    // decay juice
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom     += (1 - zoom) * 0.14 * dt;
+    meterPulse *= Math.pow(0.9, dt);
+
+    // ── juice transform wrapper ──────────────────────────────────────────────
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // ── background ──────────────────────────────────────────────────────────
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ── challenge card ───────────────────────────────────────────────────────
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '800 15px Menlo, monospace';
+      cx.fillText('HARMONY TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('72%', W / 2, 404);
+      cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top curator", W / 2, 434);
+    }
+
+    // ── play + over (both show the grid) ────────────────────────────────────
+    if (phase === 'play' || phase === 'over') {
+      // header
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '800 46px -apple-system, Helvetica, Arial';
+      cx.fillText(harmony + '%', W / 2, 76);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best + '%', W / 2, 98);
+
+      // harmony bar
+      drawMeter(GRID_X, 114, GRID_W, 10, harmony, meterPulse);
+
+      // swaps counter
+      cx.textAlign = 'right';
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText(swaps + ' SWAPS', W - GRID_X, 140);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+        cx.textAlign = 'center';
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + '%' + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 160);
+      }
+
+      // ── Draw tiles ─────────────────────────────────────────────────────────
+      // Compute per-tile offsets from active swap animations
+      var tileOffsets = {};
+      for (var ai = 0; ai < tileAnims.length; ai++) {
+        var an = tileAnims[ai];
+        an.t += dt;
+        var prog = Math.min(an.t / an.total, 1);
+        // easeInOut
+        var e = prog < 0.5 ? 2 * prog * prog : -1 + (4 - 2 * prog) * prog;
+        var ra = tileRect(an.a), rb = tileRect(an.b);
+        var dxa = (rb.x - ra.x) * e, dya = (rb.y - ra.y) * e;
+        var dxb = (ra.x - rb.x) * e, dyb = (ra.y - rb.y) * e;
+        if (!tileOffsets[an.a]) tileOffsets[an.a] = { x: 0, y: 0 };
+        if (!tileOffsets[an.b]) tileOffsets[an.b] = { x: 0, y: 0 };
+        tileOffsets[an.a].x += dxa; tileOffsets[an.a].y += dya;
+        tileOffsets[an.b].x += dxb; tileOffsets[an.b].y += dyb;
+      }
+      // clean finished anims
+      for (var ai2 = tileAnims.length - 1; ai2 >= 0; ai2--) {
+        if (tileAnims[ai2].t >= tileAnims[ai2].total) tileAnims.splice(ai2, 1);
+      }
+
+      for (var ti = 0; ti < GRID_N; ti++) {
+        var rect = tileRect(ti);
+        var offX = (tileOffsets[ti] || { x: 0 }).x;
+        var offY = (tileOffsets[ti] || { y: 0 }).y;
+        var rx = rect.x + offX, ry = rect.y + offY;
+        var hue = tiles[ti];
+
+        cx.save();
+        // selected = lifted + glow
+        if (ti === selectedIdx) {
+          cx.shadowColor = TEAL; cx.shadowBlur = 16;
+          cx.translate(rx + TILE_SIZE / 2, ry + TILE_SIZE / 2);
+          cx.scale(1.06, 1.06);
+          cx.translate(-(rx + TILE_SIZE / 2), -(ry + TILE_SIZE / 2));
+        }
+
+        // tile bg gradient (photo-like)
+        cx.fillStyle = tileGradient(hue, { x: rx, y: ry, w: TILE_SIZE, h: TILE_SIZE });
+        drawRoundRect(rx, ry, TILE_SIZE, TILE_SIZE, 8);
+        cx.fill();
+
+        // inner texture lines (simulate photo content)
+        cx.globalAlpha = 0.18;
+        for (var li = 0; li < 4; li++) {
+          cx.fillStyle = 'hsl(' + ((hue + 40) % 360) + ',50%,80%)';
+          cx.fillRect(rx + 10 + li * 22, ry + 10, 14, TILE_SIZE - 20);
+        }
+        cx.globalAlpha = 1;
+
+        // selected border
+        if (ti === selectedIdx) {
+          cx.strokeStyle = TEAL; cx.lineWidth = 3;
+          drawRoundRect(rx + 1.5, ry + 1.5, TILE_SIZE - 3, TILE_SIZE - 3, 7);
+          cx.stroke();
+        }
+
+        cx.restore();
+
+        // hue label (dev/debug feel, gives the "photo filter" look)
+        cx.textAlign = 'center';
+        cx.fillStyle = 'rgba(255,255,255,0.7)';
+        cx.font = '700 11px Menlo, monospace';
+        cx.fillText('H' + hue, rx + TILE_SIZE / 2, ry + TILE_SIZE - 8);
+      }
+
+      // ── LOCK button (play only) ──────────────────────────────────────────
+      if (phase === 'play') {
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        drawRoundRect(LOCK_R.x, LOCK_R.y, LOCK_R.w, LOCK_R.h, 24);
+        cx.fill(); cx.stroke();
+        cx.textAlign = 'center';
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText('LOCK IT ✓', W / 2, LOCK_R.y + 31);
+
+        cx.fillStyle = 'rgba(255,255,255,0.25)';
+        cx.font = '600 11px -apple-system, Helvetica, Arial';
+        cx.fillText('tap two tiles to swap', W / 2, LOCK_R.y + 50);
+      }
+
+      // ── Over overlay ────────────────────────────────────────────────────────
+      if (phase === 'over') {
+        cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+        cx.textAlign = 'center';
+
+        var label = harmony >= OPTIMAL - 2 ? 'FLAWLESS.' :
+                    harmony >= 80          ? 'LOCKED.' : 'GOOD ENOUGH?';
+        cx.fillStyle = harmony >= 80 ? TEAL : VERM;
+        cx.font = '900 38px -apple-system, Helvetica, Arial';
+        cx.fillText(label, W / 2, 306);
+
+        cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+        cx.fillText(harmony + '% harmony', W / 2, 350);
+
+        var pt = pctTop(harmony);
+        cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+        cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+
+        cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+        cx.fillText(swaps + ' swaps · ' + (100 - pt) + '% of curators below you', W / 2, 418);
+
+        if (!DEMO && !BOT) {
+          var pulse = 0.6 + 0.4 * Math.sin(now / 280);
+          cx.globalAlpha = pulse; cx.fillStyle = TEAL;
+          cx.font = '700 16px -apple-system, Helvetica, Arial';
+          cx.fillText('TAP — CURATE AGAIN', W / 2, 460);
+          cx.globalAlpha = 1;
+
+          // share pill
+          cx.fillStyle = 'rgba(242,177,52,0.14)';
+          cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+          cx.beginPath();
+          drawRoundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+          cx.fill(); cx.stroke();
+          cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+          cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 29);
+        }
+      }
+    }
+
+    // ── Floating reward flashes ──────────────────────────────────────────────
+    for (var ki = flashes.length - 1; ki >= 0; ki--) {
+      var fl = flashes[ki]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 155 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(ki, 1);
+    }
+
+    // ── Demo CTA card ────────────────────────────────────────────────────────
+    if (phase === 'cta') {
+      var ct = (now - ctaAt) / 1000;
+      var ease = Math.min(1, ct * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('GRID CURATE', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they hit ' + (window.__demoScore || 72) + '%. beat it.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 72) + '%', W / 2, 408);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // ── Mute toggle (human only) ─────────────────────────────────────────────
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

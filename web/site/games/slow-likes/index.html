@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Slow Likes — Tilt</title>
+<!--
+  LOOP / attention-architecture — Slow Likes
+  Circuits: 01-soft-rpe, 05-ease, 07-timing, 08-garden.
+  Conditioned path: the like-count refresh. The move your thumb already knows.
+  Modes (query params):
+    ?demo=1&seed=7        scripted calm arc ~16s → soft CTA, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay (gives in and refreshes), sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'slow-likes';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134';
+  var TARGET = 30, DEMO_TARGET = 24;
+
+  var state, runStartTs, best = 0, dareBeaten = false;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var likesTimer = 0, heartPulse = 0, flashes = [];
+  try { best = +localStorage.getItem('sl_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = { phase: DEMO ? 'play' : 'title', likes: 0, refreshed: false };
+    flashes = []; heartPulse = 0; dareBeaten = false;
+    botRunsDone = 0;
+    if (DEMO || BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.likes = 0; state.refreshed = false;
+    runStartTs = Date.now();
+    if (DEMO) { demoIdx = 0; likesTimer = demoWaits[0]; }
+    else { likesTimer = 35 + rng() * 25; }
+    if (BOT) { botTargetLikes = 6 + Math.floor(rng() * 18); }
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 11))));
+  }
+
+  function onLike() {
+    var n = ++state.likes;
+    heartPulse = 1;
+    var big = n > 0 && n % 10 === 0;
+    if (big) {
+      hitStop = 5; zoom = 1.04; shakeAmt = 2.5;
+      flash('BREATHE', TEAL, 38, W / 2, 310);
+      if (window.J) J.calm(Math.floor(n / 10));
+    } else {
+      zoom = 1.015;
+      flash('+1', GOLD, 20, 95, 405);
+      if (window.J) J.calm(n % 6);
+    }
+    if (window.LOOP) LOOP.emit('like', { n: n });
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && n > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 42, W / 2, 280);
+      if (window.J) J.calm(0);
+      SHARE.beaten(n);
+    }
+
+    if (DEMO && n >= DEMO_TARGET) {
+      state.phase = 'cta';
+      ctaAt = performance.now();
+      window.__demoScore = n;
+      setTimeout(function () { window.__demoDone = true; }, 3500);
+    } else if (!DEMO && n >= TARGET) {
+      gameOver(false);
+    }
+  }
+
+  function gameOver(refreshed) {
+    state.phase = 'over';
+    state.refreshed = refreshed;
+    state.overAt = performance.now();
+    shakeAmt = refreshed ? 5 : 2;
+    zoom = 1.02;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.likes > best;
+    if (newBest) {
+      best = state.likes;
+      try { localStorage.setItem('sl_best', String(best)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.likes, dur_s: +dur.toFixed(1) });
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else { setTimeout(resetRun, 900); }
+    }
+  }
+
+  function resetRun() {
+    state.likes = 0; state.phase = 'title'; state.refreshed = false;
+    flashes = []; heartPulse = 0; dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    if (BOT) startRun();
+  }
+
+  function refreshPressed() {
+    if (state.phase !== 'play') return;
+    if (window.LOOP) LOOP.emit('refresh', { n: state.likes });
+    gameOver(true);
+  }
+
+  function flash(txt, color, size, x, y) {
+    flashes.push({ txt: txt, color: color, size: size, x: x, y: y, t: 0 });
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 540, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function dist(x1, y1, x2, y2) { return Math.sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2)); }
+  function tap(x, y) {
+    if (DEMO || BOT) return;                 // scripted modes ignore human taps
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') {
+      if (dist(x, y, W / 2, 590) <= 42) { refreshPressed(); return; }
+      // other taps are ignored — the discipline is to watch
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.likes, unit: 'likes' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  // scripted calm arc: settle → deepen → resolve
+  var demoWaits = [
+    58, 52, 46, 40, 36, 32, 28, 26, 24, 22,
+    24, 26, 28, 30, 34, 38, 44, 50, 58, 54,
+    48, 42, 38, 34
+  ];
+  var demoIdx = 0, botRunsDone = 0, botTargetLikes = 0;
+
+  function nextWait() {
+    if (DEMO) {
+      demoIdx++;
+      return demoIdx < demoWaits.length ? demoWaits[demoIdx] : 99999;
+    }
+    return 28 + rng() * 30;                  // ~0.5–1.0s between likes
+  }
+
+  function autopilot() {
+    if (BOT && state.phase === 'play' && state.likes >= botTargetLikes) { refreshPressed(); }
+  }
+
+  // ---- drawing helpers ----
+  function rrPath(x, y, w, h, r) {
+    var rr = Math.min(r, w / 2, h / 2);
+    cx.beginPath();
+    cx.moveTo(x + rr, y);
+    cx.arcTo(x + w, y, x + w, y + h, rr);
+    cx.arcTo(x + w, y + h, x, y + h, rr);
+    cx.arcTo(x, y + h, x, y, rr);
+    cx.arcTo(x, y, x + w, y, rr);
+    cx.closePath();
+  }
+
+  function heartPath(x, y, s) {
+    cx.beginPath();
+    cx.moveTo(x, y + s * 0.4);
+    cx.bezierCurveTo(x, y - s * 0.2, x - s * 0.9, y - s * 0.7, x - s * 0.9, y - s * 0.1);
+    cx.bezierCurveTo(x - s * 0.9, y + s * 0.4, x, y + s * 0.85, x, y + s * 0.85);
+    cx.bezierCurveTo(x, y + s * 0.85, x + s * 0.9, y + s * 0.4, x + s * 0.9, y - s * 0.1);
+    cx.bezierCurveTo(x + s * 0.9, y - s * 0.7, x, y - s * 0.2, x, y + s * 0.4);
+    cx.closePath();
+  }
+
+  function drawRefreshIcon(x, y, r) {
+    cx.save();
+    cx.translate(x, y);
+    cx.strokeStyle = 'rgba(255,255,255,0.75)';
+    cx.lineWidth = 3;
+    cx.lineCap = 'round';
+    cx.beginPath();
+    cx.arc(0, 0, r * 0.55, -Math.PI / 2, Math.PI * 1.25);
+    cx.stroke();
+    cx.beginPath();
+    cx.moveTo(r * 0.32, -r * 0.38);
+    cx.lineTo(r * 0.5, -r * 0.58);
+    cx.lineTo(r * 0.15, -r * 0.55);
+    cx.stroke();
+    cx.restore();
+  }
+
+  function drawPost() {
+    var cardX = 55, cardY = 130, cardW = 295, cardH = 385;
+
+    // card backing
+    var cg = cx.createLinearGradient(cardX, cardY, cardX, cardY + cardH);
+    cg.addColorStop(0, '#161a22'); cg.addColorStop(1, '#10131a');
+    cx.fillStyle = cg;
+    rrPath(cardX, cardY, cardW, cardH, 18);
+    cx.fill();
+    cx.strokeStyle = 'rgba(255,255,255,0.06)';
+    cx.lineWidth = 1;
+    cx.stroke();
+
+    // header
+    cx.fillStyle = 'rgba(255,255,255,0.03)';
+    rrPath(cardX, cardY, cardW, 46, 18);
+    cx.fill();
+
+    // avatar
+    var ag = cx.createLinearGradient(75, 138, 105, 168);
+    ag.addColorStop(0, TEAL); ag.addColorStop(1, GOLD);
+    cx.fillStyle = ag;
+    cx.beginPath();
+    cx.arc(90, 153, 15, 0, Math.PI * 2);
+    cx.fill();
+
+    // username
+    cx.textAlign = 'left';
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '700 14px -apple-system, Helvetica, Arial';
+    cx.fillText('you', 115, 158);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 11px -apple-system, Helvetica, Arial';
+    cx.fillText('just now', 115, 172);
+
+    // photo area
+    var px = 70, py = 185, pw = 265, ph = 225;
+    var pg = cx.createLinearGradient(px, py, px + pw, py + ph);
+    pg.addColorStop(0, '#1b212d'); pg.addColorStop(0.5, '#11151d'); pg.addColorStop(1, '#1a2030');
+    cx.fillStyle = pg;
+    rrPath(px, py, pw, ph, 12);
+    cx.fill();
+
+    // soft landscape shimmer
+    cx.fillStyle = 'rgba(46,197,182,0.05)';
+    cx.beginPath();
+    cx.moveTo(px, py + ph * 0.65);
+    cx.bezierCurveTo(px + pw * 0.35, py + ph * 0.45, px + pw * 0.7, py + ph * 0.8, px + pw, py + ph * 0.55);
+    cx.lineTo(px + pw, py + ph);
+    cx.lineTo(px, py + ph);
+    cx.closePath();
+    cx.fill();
+
+    // heart
+    var beat = 1 + 0.10 * Math.sin(performance.now() / 700) + heartPulse * 0.18;
+    heartPulse += (0 - heartPulse) * 0.08;
+    var full = state.likes >= TARGET || (DEMO && state.likes >= DEMO_TARGET);
+    cx.save();
+    cx.translate(95, 410);
+    cx.scale(beat, beat);
+    cx.fillStyle = full ? GOLD : TEAL;
+    heartPath(0, 0, 24);
+    cx.fill();
+    cx.restore();
+
+    // like count
+    cx.textAlign = 'left';
+    cx.fillStyle = '#fff';
+    cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText(String(state.likes), 125, 418);
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 11px -apple-system, Helvetica, Arial';
+    cx.fillText('likes', 125, 432);
+
+    // caption
+    cx.fillStyle = 'rgba(255,255,255,0.75)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('the likes arrive slowly.', 70, 456);
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.fillText('your only job: let them.', 70, 476);
+  }
+
+  function drawRefreshButton() {
+    // subtle ring
+    cx.strokeStyle = 'rgba(255,255,255,0.12)';
+    cx.lineWidth = 1;
+    cx.beginPath();
+    cx.arc(W / 2, 590, 42, 0, Math.PI * 2);
+    cx.stroke();
+    drawRefreshIcon(W / 2, 590, 42);
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 11px -apple-system, Helvetica, Arial';
+    cx.fillText('refresh', W / 2, 650);
+  }
+
+  var ctaAt = 0, last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // juice transforms: decaying shake + zoom-pulse
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(242,177,52,0.04)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // like loop
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') {
+      likesTimer -= dt;
+      if (likesTimer <= 0) {
+        onLike();
+        likesTimer = nextWait();
+      }
+      autopilot();
+    }
+
+    // top score
+    if (state.phase !== 'cta') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(state.likes, W / 2, 95);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('LIKES', W / 2, 120);
+      if (state.phase === 'title') {
+        cx.fillText('BEST ' + best, W / 2, 144);
+      }
+    }
+
+    // post + refresh
+    drawPost();
+    if (state.phase !== 'cta') drawRefreshButton();
+
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+      cx.textAlign = 'center';
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 146);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 50);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.25) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) flashes.splice(k, 1);
+    }
+
+    // title overlay
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('SLOW LIKES', W / 2, 620);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 652);
+      cx.globalAlpha = 1;
+    }
+
+    // game over card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = state.refreshed ? GOLD : TEAL;
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText(state.refreshed ? 'REFRESHED.' : 'COMPLETE.', W / 2, 290);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.likes + ' likes', W / 2, 335);
+      var pt = pctTop(state.likes);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 380);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 404);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 478);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card (soft invitation, not a dare)
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('SLOW LIKES', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('let them arrive.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

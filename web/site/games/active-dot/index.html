@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Active Dot — Tilt</title>
+<!--
+  LOOP / attention-architecture — Active Dot
+  Circuits: 02-novelty, 06-zeigarnik, 03-social
+  Conditioned path: the green dot (seen-receipt / active-now) — the player's
+  thumb already knows this move. The green windows get shorter and rarer.
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N&seed=M  imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'active-dot';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var GREEN = '#25d366';   // the active-dot green (WhatsApp / iMessage palette)
+  var GREY  = '#3a3f4b';
+
+  // ---- contact list config ----
+  var NAMES = [
+    'Alex','Jordan','Sam','Taylor','Morgan','Casey','Riley','Jamie',
+    'Quinn','Avery','Sage','River','Dakota','Reese','Blake','Finley',
+    'Peyton','Hayden','Drew','Cameron','Emery','Skylar','Logan','Parker'
+  ];
+  var NUM_CONTACTS = 10;
+  var ROW_H = 62;
+
+  // ---- game state ----
+  var state, flashes, hitStop, zoom, shakeAmt, dareBeaten, runStartTs;
+  var best = 0;
+  try { best = +localStorage.getItem('ad_best') || 0; } catch(_) {}
+
+  // contacts[i] = { name, initials, x_shake, green: bool, greenLeft: ms, baseGreen: ms }
+  // active = index of currently green contact (-1 if none)
+  // catches = score
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 8))));
+  }
+
+  function makeContacts() {
+    var used = {}, contacts = [];
+    for (var i = 0; i < NUM_CONTACTS; i++) {
+      var n;
+      do { n = NAMES[Math.floor(rng() * NAMES.length)]; } while (used[n]);
+      used[n] = true;
+      contacts.push({
+        name: n,
+        initials: n.slice(0, 2).toUpperCase(),
+        green: false,
+        greenLeft: 0,
+        baseGreen: 0,
+        shakeX: 0
+      });
+    }
+    return contacts;
+  }
+
+  function newGame() {
+    hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    flashes = [];
+    state = {
+      phase: 'title',    // title | challenge | play | over | cta
+      contacts: makeContacts(),
+      activeIdx: -1,     // which contact is green
+      catches: 0,
+      combo: 0,
+      overAt: 0,
+      // timing
+      nextGreenIn: 0,    // ms until next green fires
+      greenBaseDur: 1800,// ms the green stays on (shrinks as score rises)
+      scrollOffset: 0,   // pixel scroll of the list (optional ambient scroll)
+      tick: 0,           // ms elapsed in play
+      // near-miss tracking
+      nearMissSlot: -1,  // contact idx that just turned grey (fresh near-miss window)
+      nearMissLeft: 0    // ms remaining in near-miss window
+    };
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    // first green fires quickly
+    state.nextGreenIn = 600 + rng() * 400;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // difficulty: green window shrinks, gaps between greens grow
+  function greenDuration(catches) {
+    // starts 1800ms, minimum 450ms
+    return Math.max(450, 1800 - catches * 90);
+  }
+  function greenGap(catches) {
+    // starts 900ms between greens, grows slightly then plateaus
+    return 600 + Math.min(catches * 60, 800) + rng() * 400;
+  }
+
+  function fireGreen() {
+    // pick a random contact (not currently green)
+    var candidates = [];
+    for (var i = 0; i < state.contacts.length; i++) {
+      if (!state.contacts[i].green) candidates.push(i);
+    }
+    if (candidates.length === 0) return;
+    var idx = candidates[Math.floor(rng() * candidates.length)];
+    var dur = greenDuration(state.catches);
+    state.contacts[idx].green = true;
+    state.contacts[idx].greenLeft = dur;
+    state.contacts[idx].baseGreen = dur;
+    state.activeIdx = idx;
+    if (window.J) J.tension(Math.min(state.catches / 20, 1));
+    // scroll so active contact is visible
+    targetScrollTo(idx);
+  }
+
+  var scrollTarget = 0;
+  function targetScrollTo(idx) {
+    var rowY = 140 + idx * ROW_H;
+    var listH = NUM_CONTACTS * ROW_H;
+    // keep contact roughly centered
+    scrollTarget = Math.max(0, Math.min(rowY - H / 2 + ROW_H, listH - (H - 200)));
+    if (scrollTarget < 0) scrollTarget = 0;
+  }
+
+  function tapContact(idx) {
+    if (state.phase !== 'play') return;
+    var c = state.contacts[idx];
+    if (!c.green) {
+      // tapped grey — wrong move (small shake, no penalty to score but feels bad)
+      shakeAmt = 2;
+      return;
+    }
+    // catch it!
+    c.green = false; c.greenLeft = 0;
+    state.activeIdx = -1;
+    state.catches++;
+    state.combo++;
+    var newBest = state.catches > best;
+
+    // sound
+    if (window.J) {
+      if (c.greenLeft / c.baseGreen > 0.6) J.perfect(state.combo);
+      else J.hit(state.combo);
+      J.tension(0);
+    }
+    hitStop = 45;
+    zoom = 1.025;
+    if (state.combo >= 3) {
+      flash('×' + state.combo + ' STREAK', GOLD, 38);
+      if (window.J) J.gold();
+    } else {
+      flash('CAUGHT!', TEAL, 36);
+    }
+    c.shakeX = 6;  // wiggle the row
+
+    // dare beaten?
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.catches > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 42);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.catches);
+    }
+    if (window.LOOP) LOOP.emit('dot_caught', { n: state.catches, combo: state.combo });
+
+    // schedule next green
+    state.nextGreenIn = greenGap(state.catches);
+  }
+
+  function missGreen(idx) {
+    // the green expired without a tap
+    var c = state.contacts[idx];
+    c.green = false; c.greenLeft = 0;
+    state.activeIdx = -1;
+    state.combo = 0;
+    state.nearMissSlot = idx;
+    state.nearMissLeft = 350;  // ms for near-miss window
+
+    // tension sound
+    if (window.J) J.near();
+    flash('MISSED', VERM, 34);
+    shakeAmt = 4;
+
+    if (window.LOOP) LOOP.emit('near_miss', { n: state.catches });
+
+    // count misses — 3 misses = game over
+    state.misses = (state.misses || 0) + 1;
+    if (state.misses >= 3) {
+      state.nextGreenIn = 200;  // brief pause then die
+      setTimeout(function () { gameOver(); }, 300);
+    } else {
+      state.nextGreenIn = greenGap(state.catches) * 0.6; // shorter gap after miss
+    }
+  }
+
+  function gameOver() {
+    if (state.phase !== 'play') return;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.catches > best;
+    if (window.J) {
+      J.death(Math.min(0.4 + state.catches / 20, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 480);
+    }
+    if (newBest) {
+      best = state.catches;
+      try { localStorage.setItem('ad_best', String(best)); } catch(_) {}
+    }
+    if (DEMO) window.__demoScore = state.catches;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.catches, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 800);
+    }
+  }
+
+  function resetRun() {
+    state = {
+      phase: 'play',
+      contacts: makeContacts(),
+      activeIdx: -1,
+      catches: 0,
+      combo: 0,
+      misses: 0,
+      overAt: 0,
+      nextGreenIn: 600 + rng() * 400,
+      greenBaseDur: 1800,
+      scrollOffset: 0,
+      tick: 0,
+      nearMissSlot: -1,
+      nearMissLeft: 0
+    };
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0;
+    scrollTarget = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    runStartTs = Date.now();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function listTop() { return 140 - state.scrollOffset; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') {
+      // which contact row?
+      if (x !== undefined) {
+        var lt = listTop();
+        for (var i = 0; i < NUM_CONTACTS; i++) {
+          var rowY = lt + i * ROW_H;
+          if (y >= rowY && y < rowY + ROW_H) {
+            tapContact(i);
+            return;
+          }
+        }
+      }
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.catches, unit: 'catches' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') tap();
+  });
+
+  // ---- demo / bot autopilots ----
+  // demo script: array of { action, delay_ms }
+  // catch = tap the green dot; miss = let it expire; nearfail = let it nearly expire then catch
+  var demoScript = [
+    { action: 'catch',    delay: 0.55 },  // comfortable catch
+    { action: 'catch',    delay: 0.45 },  // quicker
+    { action: 'catch',    delay: 0.62 },  // slight hesitation
+    { action: 'catch',    delay: 0.40 },  // fast — building confidence
+    { action: 'nearfail', delay: 0.91 },  // very late catch — near-fail + recovery (~60%)
+    { action: 'catch',    delay: 0.52 },  // one more clean
+    { action: 'miss',     delay: 1.0  },  // real miss #1
+    { action: 'miss',     delay: 1.0  },  // real miss #2
+    { action: 'miss',     delay: 1.0  }   // real miss #3 → game over
+  ];
+  var demoIdx = 0;
+  var demoWaiting = false;
+  var demoTimer = null;
+  var botRunsDone = 0;
+  var botMissCount = 0;
+  // how many catches bot makes before going passive (so the natural 3-miss lose path fires)
+  var BOT_ACTIVE_CATCHES = 6 + Math.floor(rng() * 4);
+
+  function demoCatch() {
+    if (state.activeIdx < 0 || !state.contacts[state.activeIdx].green) return;
+    tapContact(state.activeIdx);
+    demoIdx++;
+    demoWaiting = false;
+    scheduleNextDemo();
+  }
+
+  function scheduleNextDemo() {
+    if (!DEMO || state.phase !== 'play') return;
+    if (demoIdx >= demoScript.length) return;
+    demoWaiting = true;
+  }
+
+  function autopilot(dt) {
+    if (state.phase !== 'play') return;
+
+    if (DEMO) {
+      if (demoIdx >= demoScript.length) return;
+      if (!demoWaiting) return;
+      var step = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      // we act when green dot's time fraction falls to step.delay ratio remaining
+      if (state.activeIdx < 0) return;
+      var c = state.contacts[state.activeIdx];
+      if (!c.green) return;
+      var frac = c.greenLeft / c.baseGreen;  // 1.0 → 0.0 as it expires
+
+      if (step.action === 'catch') {
+        // catch when fraction drops to step.delay
+        if (frac <= step.delay) demoCatch();
+      } else if (step.action === 'nearfail') {
+        // catch very late (frac ~0.09) — tension
+        if (frac <= 0.09) demoCatch();
+      } else if (step.action === 'miss') {
+        // let it expire naturally — autopilot does nothing
+        // demoIdx advances when missGreen fires
+        demoWaiting = false; // we don't act; the timer will fire missGreen
+        demoIdx++;
+      }
+    } else if (BOT) {
+      if (state.catches >= BOT_ACTIVE_CATCHES) return; // go passive → 3 misses → die
+      if (state.activeIdx < 0) return;
+      var bc = state.contacts[state.activeIdx];
+      if (!bc.green) return;
+      var bfrac = bc.greenLeft / bc.baseGreen;
+      // imperfect bot: catch anywhere in [0.65, 0.25] range (random)
+      var botThreshold = 0.25 + rng() * 0.40;
+      if (bfrac <= botThreshold) {
+        tapContact(state.activeIdx);
+      }
+    }
+  }
+
+  // ---- drawing helpers ----
+  function drawAvatar(x, y, r, initials, green) {
+    cx.save();
+    // circle bg
+    cx.beginPath(); cx.arc(x, y, r, 0, Math.PI * 2);
+    cx.fillStyle = green ? 'rgba(37,211,102,0.18)' : GREY;
+    cx.fill();
+    // initials
+    cx.fillStyle = green ? GREEN : 'rgba(255,255,255,0.55)';
+    cx.font = '700 14px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center'; cx.textBaseline = 'middle';
+    cx.fillText(initials, x, y);
+    cx.textBaseline = 'alphabetic';
+    // green dot indicator (bottom-right of avatar)
+    if (green) {
+      cx.beginPath(); cx.arc(x + r * 0.68, y + r * 0.68, 6, 0, Math.PI * 2);
+      cx.fillStyle = INK; cx.fill();
+      cx.beginPath(); cx.arc(x + r * 0.68, y + r * 0.68, 4.5, 0, Math.PI * 2);
+      cx.fillStyle = GREEN; cx.fill();
+    }
+    cx.restore();
+  }
+
+  function drawContact(i, lt, now) {
+    var c = state.contacts[i];
+    var rowY = lt + i * ROW_H;
+    if (rowY < 100 || rowY > H + ROW_H) return;  // cull off-screen
+
+    var sx = c.shakeX || 0;
+    c.shakeX = sx * 0.82;  // decay shake
+
+    // row highlight when green
+    if (c.green) {
+      var frac = c.greenLeft / c.baseGreen;
+      // pulsing highlight fades as window closes
+      var pulse = 0.06 + 0.05 * Math.sin(now / 80);
+      cx.fillStyle = 'rgba(37,211,102,' + (0.10 + frac * pulse * 4) + ')';
+      cx.fillRect(0, rowY, W, ROW_H);
+    }
+
+    // separator line
+    cx.strokeStyle = 'rgba(255,255,255,0.06)';
+    cx.lineWidth = 1;
+    cx.beginPath(); cx.moveTo(72, rowY + ROW_H - 1); cx.lineTo(W - 16, rowY + ROW_H - 1); cx.stroke();
+
+    // avatar
+    drawAvatar(36 + sx, rowY + ROW_H / 2, 20, c.initials, c.green);
+
+    // name
+    cx.textAlign = 'left';
+    cx.fillStyle = c.green ? '#fff' : 'rgba(255,255,255,0.75)';
+    cx.font = c.green ? '700 15px -apple-system, Helvetica, Arial' : '500 15px -apple-system, Helvetica, Arial';
+    cx.fillText(c.name, 70 + sx, rowY + 24);
+
+    // status text
+    if (c.green) {
+      var frac2 = c.greenLeft / c.baseGreen;
+      cx.fillStyle = GREEN;
+      cx.font = '400 12px -apple-system, Helvetica, Arial';
+      cx.fillText('active now', 70 + sx, rowY + 40);
+      // urgency bar under name
+      var barW = (W - 90) * frac2;
+      cx.fillStyle = 'rgba(37,211,102,0.25)';
+      cx.fillRect(70, rowY + ROW_H - 7, W - 90, 3);
+      cx.fillStyle = frac2 > 0.35 ? GREEN : VERM;
+      cx.fillRect(70, rowY + ROW_H - 7, barW, 3);
+    } else {
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '400 12px -apple-system, Helvetica, Arial';
+      // show recent time for offline
+      var times = ['2m ago','5m ago','12m ago','1h ago','3h ago','just now','8m ago','25m ago','45m ago','2h ago'];
+      cx.fillText(times[i % times.length], 70, rowY + 40);
+    }
+  }
+
+  // ---- render ----
+  var ctaAt = 0, challengeAt = 0, last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+    var dtMs = dt * 16.667;
+
+    // ---- update ----
+    if (state.phase === 'play') {
+      state.tick += dtMs;
+
+      // smooth scroll
+      state.scrollOffset += (scrollTarget - state.scrollOffset) * 0.08 * dt;
+
+      // green dot timer countdown
+      if (state.activeIdx >= 0) {
+        var ac = state.contacts[state.activeIdx];
+        if (ac.green) {
+          ac.greenLeft -= dtMs;
+          if (ac.greenLeft <= 0) {
+            missGreen(state.activeIdx);
+          }
+        }
+      } else {
+        // schedule next green
+        state.nextGreenIn -= dtMs;
+        if (state.nextGreenIn <= 0 && state.phase === 'play') {
+          fireGreen();
+          if (DEMO) { demoWaiting = true; }  // arm demo to act on this green
+        }
+      }
+
+      // near-miss window
+      if (state.nearMissLeft > 0) state.nearMissLeft -= dtMs;
+
+      // hit-stop: freeze sim while positive, then decay and run autopilot
+      if (hitStop > 0) {
+        hitStop -= dtMs;
+      } else {
+        autopilot(dt);
+      }
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx2 = (Math.random() - 0.5) * shakeAmt;
+      var sy2 = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx2, H / 2 + sy2); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.84, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(37,211,102,0.04)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.05)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- title phase ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('ACTIVE DOT', W / 2, 290);
+      // fake green dot preview
+      cx.beginPath(); cx.arc(W / 2, 340, 10, 0, Math.PI * 2);
+      cx.fillStyle = GREEN; cx.fill();
+      var pulse = 0.6 + 0.4 * Math.sin(now / 280);
+      cx.globalAlpha = pulse * 0.35;
+      cx.beginPath(); cx.arc(W / 2, 340, 18, 0, Math.PI * 2);
+      cx.fillStyle = GREEN; cx.fill(); cx.globalAlpha = 1;
+      cx.fillStyle = VERM; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.globalAlpha = pulse; cx.fillText('TAP TO CATCH THEM', W / 2, 380); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('catch the green dot before they go offline', W / 2, 410);
+    }
+
+    // ---- challenge card (demo beat 1) ----
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('7', W / 2, 408);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's best", W / 2, 440);
+    }
+
+    // ---- play phase ----
+    if (state.phase === 'play' || (state.phase === 'over' && !DEMO && !BOT)) {
+      // top header bar
+      cx.fillStyle = 'rgba(20,22,28,0.95)';
+      cx.fillRect(0, 0, W, 130);
+      // DM header
+      cx.textAlign = 'left';
+      cx.fillStyle = '#fff'; cx.font = '600 17px -apple-system, Helvetica, Arial';
+      cx.fillText('Messages', 20, 40);
+      // score
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 52px -apple-system, Helvetica, Arial';
+      cx.fillText(state.catches, W / 2, 88);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 112);
+
+      // incoming dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          dareBeaten ? 'DARE BEATEN ✓' : ('BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : '')),
+          W / 2, 128
+        );
+      }
+
+      // contact list
+      var lt = listTop();
+      for (var i = 0; i < NUM_CONTACTS; i++) {
+        drawContact(i, lt, now);
+      }
+
+      // misses counter (hearts / chances)
+      var misses = state.misses || 0;
+      var maxMisses = 3;
+      cx.textAlign = 'right';
+      for (var m = 0; m < maxMisses; m++) {
+        cx.globalAlpha = m < (maxMisses - misses) ? 1.0 : 0.15;
+        cx.fillStyle = VERM;
+        cx.font = '16px -apple-system, Helvetica, Arial';
+        cx.fillText('●', W - 16 - m * 22, 40);
+      }
+      cx.globalAlpha = 1;
+    }
+
+    // ---- flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 200 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // ---- game over screen ----
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.65)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('WENT OFFLINE.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.catches + ' catches', W / 2, 346);
+      var pt = pctTop(state.catches);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('faster than ' + (100 - pt) + '% of players', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 458);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          (window.SHARE && SHARE.dare !== null && dareBeaten) ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W / 2, SHARE_R.y + 30
+        );
+      }
+    }
+
+    // ---- demo CTA card ----
+    if (state.phase === 'cta') {
+      var te = (now - ctaAt) / 1000, ease = Math.min(1, te * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('ACTIVE DOT', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('caught ' + (window.__demoScore || 7) + '. think you\'re faster?', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 7), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 446);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

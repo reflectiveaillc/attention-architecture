@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Scare Release — Tilt</title>
+<!--
+  LOOP / attention-architecture — Scare Release
+  Circuits: 01-rpe (variable reward per timing), 04-loss (the flinch you failed), 07-timing.
+  Mechanic: hold thumb during quiet buildup; release EXACTLY when the jump-scare fires.
+  Early = chicken out. Late = already got you.
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip -> __demoDone
+    ?bot=1&runs=N&seed=M  imperfect autoplay, N runs -> __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'scare-release';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ── Game state ──────────────────────────────────────────────────────────────
+  // Phases: title | challenge | buildup | scare | result | over | cta
+  // One "round" = buildup (hold) → scare fires (release window) → result
+  // Miss the window → lose a life. 3 lives = game over.
+
+  var LIVES_MAX = 3;
+  // Scare fires at a random point in the buildup; player must release within WINDOW_MS
+  var WINDOW_MS = 220;   // how long the release window is open
+  var BUILDUP_MIN = 2800; // min buildup ms
+  var BUILDUP_MAX = 6200; // max buildup ms (creates anticipation variability)
+
+  var state, flashes, hitStop, zoom, shakeAmt, dareBeaten;
+  var botRunsDone = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('sr_best') || 0; } catch (_) {}
+
+  function newGame() {
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    state = {
+      phase: 'title',
+      lives: LIVES_MAX,
+      round: 0,
+      score: 0,          // total ms accuracy sum (lower=better) — displayed inverted
+      lastMs: 0,
+      overAt: 0,
+      ctaAt: 0,
+      // buildup clock
+      buildupStart: 0,
+      scareAt: 0,        // when scare fires (ms since buildupStart)
+      scareFired: false,
+      scareFireTs: 0,
+      scareExpired: false,
+      holding: false,
+      holdStart: 0,
+      // visual buildup state
+      tension: 0,        // 0→1 over buildup period
+      blink: 0,          // scare-blink flash alpha
+      blinkDecay: 0,
+      // streak
+      streak: 0,
+      // challenge
+      challengeAt: 0,
+    };
+    if (DEMO) {
+      state.phase = 'challenge';
+      state.challengeAt = performance.now();
+      setTimeout(startRound, 1250);
+      return;
+    }
+    if (BOT) {
+      startRound();
+    }
+  }
+
+  function pctTop(score) {
+    // score = best accuracy in ms (lower=better), invert to percentage
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 12))));
+  }
+
+  function startRound() {
+    state.phase = 'buildup';
+    var duration = BUILDUP_MIN + rng() * (BUILDUP_MAX - BUILDUP_MIN);
+    state.buildupStart = performance.now();
+    state.scareAt = duration;
+    state.scareFired = false;
+    state.scareFireTs = 0;
+    state.scareExpired = false;
+    state.holding = false;
+    state.holdStart = 0;
+    state.tension = 0;
+    state.blink = 0;
+    state.blinkDecay = 0;
+    state.round++;
+    if (state.round === 1) {
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+  }
+
+  function startRun() {
+    state.lives = LIVES_MAX;
+    state.round = 0;
+    state.score = 0;
+    state.streak = 0;
+    startRound();
+  }
+
+  function onRelease() {
+    if (state.phase !== 'buildup' && state.phase !== 'scare') return;
+    if (!state.holding) return;
+    state.holding = false;
+
+    var now = performance.now();
+    if (!state.scareFired) {
+      // Released BEFORE scare — chicken out!
+      resolveRound('early', 0);
+    } else {
+      // Released after scare — measure latency
+      var ms = now - state.scareFireTs;
+      if (ms <= WINDOW_MS) {
+        resolveRound('good', ms);
+      } else {
+        resolveRound('late', ms);
+      }
+    }
+  }
+
+  function resolveRound(outcome, ms) {
+    // outcome: 'early' | 'good' | 'late'
+    var accuracy = 0;
+    if (outcome === 'good') {
+      // accuracy 0..100 (100=perfect)
+      accuracy = Math.round(100 * (1 - ms / WINDOW_MS));
+      accuracy = Math.max(1, Math.min(100, accuracy));
+      state.streak++;
+      state.score += accuracy;
+      var msg, col, sz;
+      if (accuracy >= 90) { msg = 'PERFECT'; col = TEAL; sz = 48; hitStop = 5; zoom = 1.03; if (window.J) J.perfect(state.streak); }
+      else if (accuracy >= 70) { msg = '+' + accuracy; col = GOLD; sz = 40; if (window.J) J.hit(state.streak); }
+      else { msg = 'CLOSE'; col = VERM; sz = 36; shakeAmt = 3; if (window.J) J.near(); }
+      flash(msg, col, sz);
+      state.lastMs = ms;
+      if (window.LOOP) LOOP.emit('scare_released', { accuracy: accuracy, ms: ms, outcome: outcome });
+      // dare check
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score);
+      }
+      state.phase = 'result';
+      setTimeout(function () { nextOrEnd(); }, 900);
+    } else {
+      // bad outcome
+      state.streak = 0;
+      state.lives--;
+      var deathMsg = outcome === 'early' ? 'CHICKENED' : 'TOO SLOW';
+      flash(deathMsg, VERM, 42);
+      shakeAmt = 8;
+      if (window.J) J.death(0.4 + 0.3 * (LIVES_MAX - state.lives) / LIVES_MAX);
+      if (window.LOOP) LOOP.emit('scare_failed', { outcome: outcome, lives: state.lives });
+      state.phase = 'result';
+      if (state.lives <= 0) {
+        setTimeout(function () { gameOver(); }, 900);
+      } else {
+        setTimeout(function () { nextOrEnd(); }, 1100);
+      }
+    }
+  }
+
+  function nextOrEnd() {
+    if (state.lives <= 0) { gameOver(); return; }
+    startRound();
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 10;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.death(0.8);
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (newBest) { best = state.score; try { localStorage.setItem('sr_best', String(best)); } catch (_) {} }
+    if (DEMO) window.__demoScore = state.score;
+    var dur = ((performance.now() - (state.buildupStart || performance.now())) / 1000).toFixed(1);
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur });
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 900);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.lives = LIVES_MAX; state.round = 0; state.score = 0; state.streak = 0;
+    flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRound();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ── Input ────────────────────────────────────────────────────────────────────
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function onPress(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'pts' }); return;
+      }
+      resetRun(); return;
+    }
+    // hold press during buildup
+    if (state.phase === 'buildup') {
+      state.holding = true;
+      state.holdStart = performance.now();
+    }
+  }
+
+  function onUp(x, y) {
+    if (DEMO || BOT) return;
+    if (state.phase === 'buildup' || state.phase === 'scare') {
+      onRelease();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    onPress((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    onUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') onPress(); });
+  window.addEventListener('keyup',   function (e) { if (e.code === 'Space') onUp(); });
+
+  // ── Demo / Bot autopilots ────────────────────────────────────────────────────
+  // Demo: scripted accuracy per round (0-100) — last round is a miss (late)
+  // demoWaits = frames of hesitation before pressing after round starts
+  var demoRounds = [92, 78, 55, 88, 'early', 95, 'late'];
+  var demoRoundIdx = 0;
+  var demoHeld = false;
+  var demoHoldStart = 0;
+  var demoPressWait = 0;  // frames until we simulate press
+  var demoRoundStartFrame = 0;
+  var demoFrameCount = 0;
+  var demoWaits = [18, 22, 15, 25, 20, 12, 16]; // hesitation frames before hold
+
+  // Bot: random accuracy each round, occasionally misses to lose life and end run
+  var botRoundIdx = 0;
+  var botHeld = false;
+  var botHoldStart = 0;
+  var botMissChance = 0.25; // 25% chance to miss per round (ensures eventual game_over)
+  var botWaitFrames = 0;
+
+  function autopilot(now) {
+    if (state.phase !== 'buildup' && state.phase !== 'scare') return;
+
+    if (DEMO) {
+      demoPilot(now);
+    } else if (BOT) {
+      botPilot(now);
+    }
+  }
+
+  function demoPilot(now) {
+    var ridx = Math.min(demoRoundIdx, demoRounds.length - 1);
+    var target = demoRounds[ridx];
+    var elapsed = now - state.buildupStart;
+    var timeToScare = state.scareAt - elapsed;
+
+    if (!demoHeld) {
+      // wait a bit into buildup, then press (hesitation)
+      var waitMs = (demoWaits[ridx] || 20) * 16.67;
+      if (elapsed > waitMs) {
+        // start holding
+        demoHeld = true;
+        state.holding = true;
+        state.holdStart = now;
+      }
+    }
+
+    if (!state.holding) return;
+
+    if (target === 'early') {
+      // Release early (chicken) — release ~500ms before scare
+      if (timeToScare < 500 && timeToScare > 0) {
+        demoHeld = false;
+        demoRoundIdx++;
+        onRelease();
+      }
+    } else if (target === 'late') {
+      // Release late — wait until WINDOW_MS + extra
+      if (state.scareFired) {
+        var sinceScared = now - state.scareFireTs;
+        if (sinceScared > WINDOW_MS + 80) {
+          demoHeld = false;
+          demoRoundIdx++;
+          onRelease();
+        }
+      }
+    } else {
+      // Good release: accuracy = target (0-100), so ms = (1-target/100)*WINDOW_MS
+      var wantMs = (1 - target / 100) * WINDOW_MS;
+      if (state.scareFired) {
+        var sinceScared2 = now - state.scareFireTs;
+        if (sinceScared2 >= wantMs) {
+          demoHeld = false;
+          demoRoundIdx++;
+          onRelease();
+        }
+      }
+    }
+  }
+
+  function botPilot(now) {
+    var elapsed = now - state.buildupStart;
+
+    if (!botHeld) {
+      // Start holding after brief delay
+      if (elapsed > 400) {
+        botHeld = true;
+        state.holding = true;
+        state.holdStart = now;
+      }
+    }
+    if (!state.holding) return;
+
+    // decide: miss or hit?
+    var willMiss = (botRoundIdx === 0) ? false : rng() < botMissChance;
+    if (willMiss) {
+      // Early release or late
+      var doEarly = rng() < 0.5;
+      if (doEarly) {
+        var timeToScare = state.scareAt - elapsed;
+        if (timeToScare < 300) {
+          botHeld = false; botRoundIdx++;
+          onRelease();
+        }
+      } else {
+        if (state.scareFired) {
+          var late = now - state.scareFireTs;
+          if (late > WINDOW_MS + 50) {
+            botHeld = false; botRoundIdx++;
+            onRelease();
+          }
+        }
+      }
+    } else {
+      // Good release: random accuracy 40-95
+      if (state.scareFired) {
+        var acc = 40 + rng() * 55;
+        var wantMs = (1 - acc / 100) * WINDOW_MS;
+        var sinceScare = now - state.scareFireTs;
+        if (sinceScare >= wantMs) {
+          botHeld = false; botRoundIdx++;
+          onRelease();
+        }
+      }
+    }
+  }
+
+  // ── Render ────────────────────────────────────────────────────────────────────
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Update buildup tension
+    if (state.phase === 'buildup') {
+      var elapsed = now - state.buildupStart;
+      state.tension = Math.min(1, elapsed / state.scareAt);
+
+      // Tension sound hook
+      if (window.J) J.tension(state.tension);
+
+      // Fire the scare
+      if (!state.scareFired && elapsed >= state.scareAt) {
+        state.scareFired = true;
+        state.scareFireTs = now;
+        state.phase = 'scare';
+        state.blink = 1;
+        shakeAmt = 6;
+        zoom = 1.04;
+        // The window is open — bot/demo check release in autopilot
+      }
+    }
+
+    // Scare phase: window expires
+    if (state.phase === 'scare') {
+      state.blinkDecay = Math.max(0, state.blink - dt * 0.025);
+      state.blink = state.blinkDecay;
+      var sinceScareMs = now - state.scareFireTs;
+      if (sinceScareMs > WINDOW_MS + 600 && state.holding) {
+        // Missed window (still holding)
+        state.holding = false;
+        resolveRound('late', sinceScareMs);
+      } else if (sinceScareMs > WINDOW_MS + 600 && !state.holding && state.phase === 'scare') {
+        // Player released exactly in time or already resolved — just clean up phase if stuck
+        // (usually resolveRound already changed phase to 'result')
+      }
+    }
+
+    // Autopilot tick
+    if (hitStop > 0) { hitStop -= dt; }
+    else { autopilot(now); }
+
+    // Juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // Tension overlay — darkness grows
+    if (state.phase === 'buildup' || state.phase === 'scare') {
+      var tAlpha = state.tension * 0.35;
+      cx.fillStyle = 'rgba(11,13,18,' + tAlpha + ')';
+      cx.fillRect(0, 0, W, H);
+    }
+
+    // Scare flash (white blast)
+    if ((state.phase === 'scare' || state.phase === 'result') && state.blink > 0) {
+      cx.fillStyle = 'rgba(255,255,255,' + state.blink + ')';
+      cx.fillRect(0, 0, W, H);
+      state.blink = Math.max(0, state.blink - dt * 0.04);
+    }
+
+    // Draw the buildup visual — a creepy screen
+    if (state.phase === 'buildup' || state.phase === 'scare') {
+      drawBuildup(now, dt);
+    }
+
+    // Lives display
+    if (state.phase === 'buildup' || state.phase === 'scare' || state.phase === 'result') {
+      drawLives();
+      drawScore(now);
+    }
+
+    // Flashes (floating reward text)
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 50);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 280 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) flashes.splice(k, 1);
+    }
+
+    // Dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && (state.phase === 'buildup' || state.phase === 'scare')) {
+      cx.textAlign = 'center';
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 660);
+    }
+
+    // Title screen
+    if (state.phase === 'title') {
+      drawTitle(now);
+    }
+
+    // Challenge card (demo beat 1)
+    if (state.phase === 'challenge') {
+      drawChallenge(now);
+    }
+
+    // Over screen
+    if (state.phase === 'over') {
+      drawOver(now);
+    }
+
+    // CTA (demo)
+    if (state.phase === 'cta') {
+      drawCTA(now);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ── Visual sub-draws ──────────────────────────────────────────────────────────
+
+  function drawBuildup(now, dt) {
+    var t = state.tension;
+    // creepy vignette
+    var vig = cx.createRadialGradient(W/2, H/2, H*0.2, W/2, H/2, H*0.8);
+    vig.addColorStop(0, 'rgba(0,0,0,0)');
+    vig.addColorStop(1, 'rgba(0,0,0,' + (t * 0.7) + ')');
+    cx.fillStyle = vig; cx.fillRect(0, 0, W, H);
+
+    // center static-noise eye / face shape (pure canvas, no images)
+    var cx2 = W / 2, cy2 = H / 2 - 40;
+    var faceR = 80 + t * 20;
+
+    // Face outline glow — gets redder as tension climbs
+    var r = Math.round(46 + t * (232 - 46));
+    var g = Math.round(197 - t * (197 - 80));
+    var b = Math.round(182 - t * (182 - 46));
+    cx.shadowColor = 'rgba(' + r + ',' + g + ',' + b + ',0.8)';
+    cx.shadowBlur = 12 + t * 20;
+    cx.strokeStyle = 'rgba(' + r + ',' + g + ',' + b + ',' + (0.3 + t * 0.7) + ')';
+    cx.lineWidth = 2 + t * 2;
+    cx.beginPath(); cx.arc(cx2, cy2, faceR, 0, Math.PI * 2); cx.stroke();
+    cx.shadowBlur = 0;
+
+    // Eyes — wide and watching
+    var eyeY = cy2 - faceR * 0.1;
+    var eyeX1 = cx2 - faceR * 0.3, eyeX2 = cx2 + faceR * 0.3;
+    var eyeR = 10 + t * 6;
+    // Left eye
+    cx.fillStyle = 'rgba(255,255,255,' + (0.15 + t * 0.65) + ')';
+    cx.beginPath(); cx.arc(eyeX1, eyeY, eyeR, 0, Math.PI * 2); cx.fill();
+    cx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',' + (0.5 + t * 0.5) + ')';
+    cx.beginPath(); cx.arc(eyeX1, eyeY, eyeR * 0.5, 0, Math.PI * 2); cx.fill();
+    // Right eye
+    cx.fillStyle = 'rgba(255,255,255,' + (0.15 + t * 0.65) + ')';
+    cx.beginPath(); cx.arc(eyeX2, eyeY, eyeR, 0, Math.PI * 2); cx.fill();
+    cx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',' + (0.5 + t * 0.5) + ')';
+    cx.beginPath(); cx.arc(eyeX2, eyeY, eyeR * 0.5, 0, Math.PI * 2); cx.fill();
+
+    // Mouth — slight grin that widens
+    var mouthY = cy2 + faceR * 0.35;
+    var mouthW = faceR * (0.3 + t * 0.4);
+    cx.strokeStyle = 'rgba(255,255,255,' + (0.2 + t * 0.6) + ')';
+    cx.lineWidth = 2;
+    cx.beginPath();
+    cx.moveTo(cx2 - mouthW, mouthY);
+    cx.quadraticCurveTo(cx2, mouthY + mouthW * 0.4 * t, cx2 + mouthW, mouthY);
+    cx.stroke();
+
+    // static lines (noise texture) — flicker faster near scare
+    var noiseLines = Math.floor(3 + t * 12);
+    for (var i = 0; i < noiseLines; i++) {
+      var ly = rng() * H;
+      var lw = rng() * W;
+      cx.fillStyle = 'rgba(255,255,255,' + (rng() * 0.06) + ')';
+      cx.fillRect(0, ly, lw, 1);
+    }
+
+    // Hold indicator
+    if (!DEMO && !BOT) {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,' + (state.holding ? 0.9 : 0.5) + ')';
+      cx.font = '700 14px -apple-system, Helvetica, Arial';
+      var holdTxt = state.holding ? 'HOLDING — RELEASE ON SCARE' : 'HOLD DOWN TO SURVIVE';
+      cx.fillText(holdTxt, W / 2, H - 120);
+    } else {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,' + (state.holding ? 0.9 : 0.5) + ')';
+      cx.font = '700 14px -apple-system, Helvetica, Arial';
+      cx.fillText(state.holding ? 'HOLDING...' : '', W / 2, H - 120);
+    }
+
+    // Tension meter bar (bottom)
+    var barW = W - 80;
+    var barX = 40;
+    var barY = H - 90;
+    cx.fillStyle = 'rgba(255,255,255,0.08)';
+    cx.beginPath();
+    cx.roundRect ? cx.roundRect(barX, barY, barW, 8, 4) : cx.rect(barX, barY, barW, 8);
+    cx.fill();
+    var fillColor = t < 0.5 ? TEAL : t < 0.85 ? GOLD : VERM;
+    cx.fillStyle = fillColor;
+    cx.beginPath();
+    cx.roundRect ? cx.roundRect(barX, barY, barW * t, 8, 4) : cx.rect(barX, barY, barW * t, 8);
+    cx.fill();
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 11px Menlo, monospace';
+    cx.fillText('TENSION', W / 2, barY - 6);
+  }
+
+  function drawLives() {
+    cx.textAlign = 'left';
+    cx.font = '700 13px -apple-system, Helvetica, Arial';
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.fillText('LIVES', 20, 34);
+    for (var i = 0; i < LIVES_MAX; i++) {
+      cx.fillStyle = i < state.lives ? VERM : 'rgba(255,255,255,0.15)';
+      cx.beginPath(); cx.arc(20 + 18 * i, 50, 6, 0, Math.PI * 2); cx.fill();
+    }
+  }
+
+  function drawScore(now) {
+    cx.textAlign = 'right';
+    cx.fillStyle = 'rgba(255,255,255,0.92)';
+    cx.font = '800 44px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score, W - 20, 54);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 11px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + best, W - 20, 72);
+    cx.textAlign = 'center';
+  }
+
+  function drawTitle(now) {
+    // dark vignette bg
+    var vig = cx.createRadialGradient(W/2, H/2, 0, W/2, H/2, H*0.7);
+    vig.addColorStop(0, 'rgba(30,10,10,0.7)');
+    vig.addColorStop(1, 'rgba(0,0,0,0.95)');
+    cx.fillStyle = vig; cx.fillRect(0, 0, W, H);
+
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 50px -apple-system, Helvetica, Arial';
+    cx.fillText('SCARE', W / 2, 290);
+    cx.fillStyle = VERM;
+    cx.fillText('RELEASE', W / 2, 345);
+
+    cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('hold your nerve. release on the scare.', W / 2, 390);
+
+    var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+    cx.globalAlpha = pulse; cx.fillStyle = GOLD;
+    cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO START', W / 2, 450); cx.globalAlpha = 1;
+  }
+
+  function drawChallenge(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.9)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+    cx.fillText('SCORE TO BEAT', W / 2, 300);
+    cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+    cx.fillText('412', W / 2, 400);
+    cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText("today's top nerve", W / 2, 430);
+  }
+
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.7)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+
+    cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+    cx.fillText('GOT YOU.', W / 2, 295);
+    cx.fillStyle = '#fff'; cx.font = '800 28px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score + ' pts', W / 2, 342);
+
+    var pt = pctTop(state.score);
+    cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+    cx.fillText('TOP ' + pt + '% TODAY', W / 2, 386);
+    cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('braver than ' + (100 - pt) + '% of players', W / 2, 410);
+
+    if (!DEMO && !BOT) {
+      var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+      cx.globalAlpha = p2; cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — TRY AGAIN', W / 2, 456); cx.globalAlpha = 1;
+
+      // Share pill
+      cx.fillStyle = 'rgba(242,177,52,0.14)';
+      cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+      cx.beginPath();
+      cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+      cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+    }
+  }
+
+  function drawCTA(now) {
+    var t = (now - state.ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.85 * ease) + ')'; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease; cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+    cx.fillText('SCARE', W / 2, 280);
+    cx.fillStyle = VERM;
+    cx.fillText('RELEASE', W / 2, 335);
+    cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+    cx.fillText('they scored ' + (window.__demoScore || 412) + '. beat it.', W / 2, 382);
+    var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+    cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+    cx.font = '900 30px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ BEAT ' + (window.__demoScore || 412), W / 2, 442);
+    cx.globalAlpha = ease;
+    cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 474);
+    cx.globalAlpha = 1;
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

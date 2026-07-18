@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Snap Grid — Tilt</title>
+<!--
+  LOOP / attention-architecture — Snap Grid
+  Circuits: 01-rpe (variable reward per snap accuracy), 05-ease (that satisfying click-into-place),
+            06-zeigarnik (one more level)
+  Modes:
+    ?demo=1&seed=7   scripted run for clip (near-perfect snaps → near-fail recovery → miss → CTA)
+    ?bot=1&runs=N&seed=5  imperfect autoplay, N full rounds, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'snap-grid';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // Grid layout
+  var COLS = 4, ROWS = 4;
+  var CELL = 68;          // cell size px
+  var GAP  = 8;
+  var GRID_X = (W - (COLS * CELL + (COLS - 1) * GAP)) / 2;  // left edge of grid
+  var GRID_Y = 200;       // top edge of grid
+
+  // Perfect snap threshold in px (distance from cell centre)
+  var PERFECT_PX = 12;
+  var NEAR_PX    = 28;
+
+  // Shape types: 1=square, 2=circle, 3=triangle (rendered differently, same hit-box)
+  var SHAPE_TYPES = [1, 2, 3];
+
+  var state, flashes, hitStop, zoom, shakeAmt, dareBeaten, runStartTs, best;
+  best = 0;
+  try { best = +localStorage.getItem('sg_best') || 0; } catch (_) {}
+
+  // ---- State ----
+  function makeGrid() {
+    // grid: array of ROWS*COLS cells {col, row, shape, color, filled, x, y}
+    var grid = [];
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        grid.push({
+          col: c, row: r,
+          shape: SHAPE_TYPES[Math.floor(rng() * SHAPE_TYPES.length)],
+          color: pickColor(),
+          filled: false,
+          x: GRID_X + c * (CELL + GAP) + CELL / 2,
+          y: GRID_Y + r * (CELL + GAP) + CELL / 2
+        });
+      }
+    }
+    return grid;
+  }
+
+  var COLORS = [TEAL, VERM, GOLD, '#a78bfa', '#34d399'];
+  function pickColor() { return COLORS[Math.floor(rng() * COLORS.length)]; }
+
+  function newGame() {
+    rng = mulberry32(SEED);  // reset RNG for reproducibility
+    state = {
+      phase:  'title',
+      grid:   [],
+      piece:  null,    // floating piece being dragged / autopiloted
+      score:  0,
+      combo:  0,
+      level:  1,
+      levelFills: 0,   // cells filled this level
+      overAt: 0,
+      challengeAt: 0,
+      ctaAt:  0,
+      lives:  3        // miss budget per level
+    };
+    flashes  = [];
+    hitStop  = 0;
+    zoom     = 1;
+    shakeAmt = 0;
+    dareBeaten = false;
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      state.challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { startRun(); return; }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    state.grid = makeGrid();
+    botActionCount = 0; botMoving = false;
+    spawnPiece();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // Spawn a new floating piece matching an unfilled cell
+  function spawnPiece() {
+    var open = state.grid.filter(function (c) { return !c.filled; });
+    if (open.length === 0) { levelUp(); return; }
+    // pick a random open cell as the "target" (player must find it)
+    var target = open[Math.floor(rng() * open.length)];
+    // float from top area
+    state.piece = {
+      shape:  target.shape,
+      color:  target.color,
+      targetIdx: state.grid.indexOf(target),
+      x: W / 2 + (rng() - 0.5) * 140,
+      y: 80 + rng() * 40,
+      vx: (rng() - 0.5) * 1.4,
+      vy: 0.6 + rng() * 0.6,
+      dragging: false,
+      dragOffX: 0, dragOffY: 0
+    };
+  }
+
+  function levelUp() {
+    state.level++;
+    state.lives = Math.max(1, 4 - Math.floor(state.level / 2));  // harder: fewer lives
+    state.grid = makeGrid();
+    spawnPiece();
+    flash('LEVEL ' + state.level, GOLD, 36);
+    if (window.J) J.fanfare();
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 14))));
+  }
+
+  // ---- Drop / score ----
+  function tryDrop(px, py) {
+    // find closest cell that matches shape+color
+    var piece = state.piece;
+    var best_d = Infinity, best_i = -1;
+    for (var i = 0; i < state.grid.length; i++) {
+      var cell = state.grid[i];
+      if (cell.filled) continue;
+      if (cell.shape !== piece.shape || cell.color !== piece.color) continue;
+      var dx = px - cell.x, dy = py - cell.y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d < best_d) { best_d = d; best_i = i; }
+    }
+
+    if (best_i >= 0 && best_d <= NEAR_PX * 2.5) {
+      // scored — snapped to correct cell
+      var cell2 = state.grid[best_i];
+      cell2.filled = true;
+      state.score++;
+      state.levelFills++;
+
+      var perfect = best_d <= PERFECT_PX;
+      var near    = best_d <= NEAR_PX;
+
+      if (perfect) {
+        state.combo++;
+        hitStop = 5; zoom = 1.03;
+        flash('PERFECT', TEAL, 44);
+        if (window.J) { J.perfect(state.combo); J.tension(Math.min(state.score / 20, 1)); }
+        if (window.LOOP) LOOP.emit('snap_perfect', { n: state.score, combo: state.combo });
+      } else if (near) {
+        state.combo = 0;
+        shakeAmt = 3;
+        flash('SO CLOSE!', VERM, 36);
+        if (window.J) { J.near(); }
+        if (window.LOOP) LOOP.emit('near_miss', { n: state.score, dist: Math.round(best_d) });
+      } else {
+        state.combo = 0;
+        if (window.J) J.hit(state.score);
+      }
+
+      // dare check
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 42);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score);
+      }
+
+      spawnPiece();
+    } else {
+      // miss — wrong cell or too far
+      state.lives--;
+      state.combo = 0;
+      shakeAmt = 6;
+      flash('MISS', VERM, 40);
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('snap_miss', { n: state.score, lives: state.lives });
+
+      if (state.lives <= 0) {
+        gameOver();
+      } else {
+        // piece floats back to top to try again (don't re-spawn — same piece)
+        state.piece.x = W / 2 + (rng() - 0.5) * 120;
+        state.piece.y = 60;
+        state.piece.vx = (rng() - 0.5) * 1.2;
+        state.piece.vy = 0.5;
+        state.piece.dragging = false;
+      }
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 9;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + state.score / 30, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (newBest) { best = state.score; try { localStorage.setItem('sg_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    rng = mulberry32(SEED + botRunsDone * 17);
+    state.score = 0; state.combo = 0; state.level = 1; state.lives = 3;
+    state.levelFills = 0;
+    flashes = [];
+    botActionCount = 0; botMoving = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- Input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function pointerDown(px, py) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play' && state.piece) {
+      var p = state.piece;
+      var dx = px - p.x, dy = py - p.y;
+      if (Math.abs(dx) < CELL * 0.7 && Math.abs(dy) < CELL * 0.7) {
+        p.dragging = true;
+        p.dragOffX = dx; p.dragOffY = dy;
+      }
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'snaps' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  function pointerMove(px, py) {
+    if (DEMO || BOT) return;
+    if (state.phase === 'play' && state.piece && state.piece.dragging) {
+      state.piece.x = px - state.piece.dragOffX;
+      state.piece.y = py - state.piece.dragOffY;
+    }
+  }
+
+  function pointerUp(px, py) {
+    if (DEMO || BOT) return;
+    if (state.phase === 'play' && state.piece && state.piece.dragging) {
+      state.piece.dragging = false;
+      tryDrop(state.piece.x, state.piece.y);
+    }
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener('pointermove', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+
+  // ---- Autopilots ----
+  var botRunsDone = 0;
+  var botActionCount = 0;  // how many actions bot has taken this run
+  // Demo script: array of {wait (frames), errorPx}
+  // negative errorPx = intentional near-miss then correction, 'miss' = deliberate wrong drop
+  var demoScript = [
+    { wait: 40, err: 2 },    // precise near-perfect
+    { wait: 28, err: -5 },   // slight wobble
+    { wait: 50, err: 1 },    // very precise
+    { wait: 35, err: -18 },  // near-miss! reads as "oh no"
+    { wait: 25, err: 3 },    // recovery - perfect save
+    { wait: 30, err: 4 },    // still holding
+    { wait: 20, err: 'miss' } // the real fail
+  ];
+  var demoIdx  = 0;
+  var demoWait = 50;  // initial hesitation on challenge card
+  var botMoving = false;   // true while bot is smoothly moving to target
+  var botDestX = 0, botDestY = 0, botWillMiss = false;
+
+  function botPickTarget() {
+    if (!state.piece) return;
+    var piece = state.piece;
+    botActionCount++;
+    // After 8 good actions, start deliberately missing to trigger game_over
+    var forceWrongDrop = botActionCount > 8;
+    if (forceWrongDrop) {
+      // aim at a wrong cell to exhaust lives
+      var wrongCells = state.grid.filter(function (c) {
+        return !c.filled && (c.shape !== piece.shape || c.color !== piece.color);
+      });
+      if (wrongCells.length > 0) {
+        var wc = wrongCells[Math.floor(rng() * wrongCells.length)];
+        botDestX = wc.x + gauss() * 5;
+        botDestY = wc.y + gauss() * 5;
+        botWillMiss = true;
+        botMoving = true;
+        return;
+      }
+    }
+    // aim at correct cell with gaussian error
+    var tgt = state.grid[piece.targetIdx];
+    if (!tgt || tgt.filled) { spawnPiece(); return; }
+    var errBot = gauss() * 10;
+    botDestX = tgt.x + errBot;
+    botDestY = tgt.y + gauss() * 6;
+    botWillMiss = false;
+    botMoving = true;
+  }
+
+  function autopilot() {
+    if (!state.piece || state.phase !== 'play') return;
+    var piece = state.piece;
+
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      var step = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      if (!step) return;
+
+      if (step.err === 'miss') {
+        // drop on a WRONG cell — causes miss → exhaust lives → game over
+        var wrongCell = state.grid.find(function (c) {
+          return !c.filled && (c.shape !== piece.shape || c.color !== piece.color);
+        });
+        var destX0 = wrongCell ? wrongCell.x + 5 : W / 2 + 80;
+        var destY0 = wrongCell ? wrongCell.y + 5 : GRID_Y + 100;
+        var dx0 = destX0 - piece.x, dy0 = destY0 - piece.y;
+        var dist0 = Math.sqrt(dx0 * dx0 + dy0 * dy0);
+        if (dist0 < 4) {
+          piece.x = destX0; piece.y = destY0;
+          piece.dragging = false;
+          demoIdx++;
+          demoWait = 10;
+          // exhaust lives so game_over fires immediately
+          state.lives = 1;
+          tryDrop(piece.x, piece.y);
+        } else {
+          var spd0 = Math.max(5, dist0 * 0.15);
+          piece.x += (dx0 / dist0) * spd0;
+          piece.y += (dy0 / dist0) * spd0;
+        }
+        return;
+      }
+
+      // find correct cell
+      var target = state.grid[piece.targetIdx];
+      if (!target || target.filled) { spawnPiece(); return; }
+
+      var errPx = step.err;
+      var destX = target.x + errPx;
+      var destY = target.y + (rng() - 0.5) * Math.abs(Math.abs(errPx) - 1) * 0.4;
+
+      // move piece smoothly toward destination
+      var dx = destX - piece.x, dy = destY - piece.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < 3) {
+        // arrived — drop
+        piece.x = destX; piece.y = destY;
+        piece.dragging = false;
+        demoIdx++;
+        var nxt = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+        demoWait = nxt ? nxt.wait : 30;
+        tryDrop(piece.x, piece.y);
+      } else {
+        var spd = Math.max(4, dist * 0.12);
+        piece.x += (dx / dist) * spd;
+        piece.y += (dy / dist) * spd;
+      }
+
+    } else if (BOT) {
+      if (!botMoving) { botPickTarget(); return; }
+
+      var dxb = botDestX - piece.x, dyb = botDestY - piece.y;
+      var distb = Math.sqrt(dxb * dxb + dyb * dyb);
+      if (distb < 4) {
+        piece.x = botDestX; piece.y = botDestY;
+        piece.dragging = false;
+        botMoving = false;
+        tryDrop(piece.x, piece.y);
+      } else {
+        var spdBot = Math.max(5, distb * 0.14);
+        piece.x += (dxb / distb) * spdBot;
+        piece.y += (dyb / distb) * spdBot;
+      }
+    }
+  }
+
+  // ---- Rendering helpers ----
+  function drawShape(sx, sy, shape, color, size, alpha) {
+    cx.save();
+    cx.globalAlpha = alpha !== undefined ? alpha : 1;
+    cx.fillStyle = color;
+    cx.strokeStyle = 'rgba(255,255,255,0.25)';
+    cx.lineWidth = 1.5;
+    var r = size * 0.44;
+    if (shape === 1) {
+      // square
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(sx - r, sy - r, r * 2, r * 2, 6);
+      else cx.rect(sx - r, sy - r, r * 2, r * 2);
+      cx.fill(); cx.stroke();
+    } else if (shape === 2) {
+      // circle
+      cx.beginPath();
+      cx.arc(sx, sy, r, 0, Math.PI * 2);
+      cx.fill(); cx.stroke();
+    } else {
+      // triangle
+      cx.beginPath();
+      cx.moveTo(sx, sy - r);
+      cx.lineTo(sx + r, sy + r * 0.8);
+      cx.lineTo(sx - r, sy + r * 0.8);
+      cx.closePath();
+      cx.fill(); cx.stroke();
+    }
+    cx.restore();
+  }
+
+  function drawCell(cell) {
+    var x = cell.x, y = cell.y;
+    // cell background
+    cx.fillStyle = cell.filled ? 'rgba(46,197,182,0.12)' : 'rgba(255,255,255,0.06)';
+    cx.strokeStyle = cell.filled ? TEAL : 'rgba(255,255,255,0.18)';
+    cx.lineWidth = cell.filled ? 2 : 1;
+    if (cx.roundRect) {
+      cx.beginPath();
+      cx.roundRect(x - CELL / 2 + 2, y - CELL / 2 + 2, CELL - 4, CELL - 4, 8);
+      cx.fill(); cx.stroke();
+    } else {
+      cx.fillRect(x - CELL / 2 + 2, y - CELL / 2 + 2, CELL - 4, CELL - 4);
+      cx.strokeRect(x - CELL / 2 + 2, y - CELL / 2 + 2, CELL - 4, CELL - 4);
+    }
+    // shape hint or filled shape
+    if (cell.filled) {
+      drawShape(x, y, cell.shape, cell.color, CELL, 1);
+    } else {
+      drawShape(x, y, cell.shape, cell.color, CELL, 0.22);
+    }
+  }
+
+  // ---- Frame loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // decay juice
+    if (hitStop > 0) hitStop -= dt; else autopilot();
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // float piece (physics when not dragging)
+    if (state.phase === 'play' && state.piece && !state.piece.dragging && hitStop <= 0) {
+      var p = state.piece;
+      if (!DEMO && !BOT) {
+        // gentle float physics for human — keep in upper half
+        p.vy += 0.04 * dt;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        if (p.y > 150) { p.vy = -Math.abs(p.vy) * 0.7; p.y = 150; }
+        if (p.y < 40)  { p.vy =  Math.abs(p.vy); }
+        if (p.x < 30)  { p.vx =  Math.abs(p.vx); }
+        if (p.x > W - 30) { p.vx = -Math.abs(p.vx); }
+      }
+    }
+
+    // === DRAW ===
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx2 = (Math.random() - 0.5) * shakeAmt, sy2 = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx2, H / 2 + sy2);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('SNAP GRID', W / 2, 290);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillText('DRAG TO MATCH', W / 2, 338);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('place the shape in the right cell.', W / 2, 368);
+    }
+
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('22', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 432);
+    }
+
+    if (state.phase === 'play' || state.phase === 'over') {
+      // draw grid
+      for (var i = 0; i < state.grid.length; i++) drawCell(state.grid[i]);
+
+      // draw floating piece with highlight ring
+      if (state.phase === 'play' && state.piece) {
+        var pc = state.piece;
+        // glow ring
+        cx.save();
+        cx.globalAlpha = 0.35 + 0.15 * Math.sin(now / 180);
+        cx.strokeStyle = pc.color; cx.lineWidth = 3;
+        cx.beginPath(); cx.arc(pc.x, pc.y, CELL * 0.55, 0, Math.PI * 2);
+        cx.stroke();
+        cx.restore();
+        drawShape(pc.x, pc.y, pc.shape, pc.color, CELL * 0.9, 1);
+      }
+
+      // HUD
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 58px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 90);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 112);
+
+      // lives dots
+      var liveDotR = 5, liveDotSpacing = 16;
+      var totalDotW = (3 - 1) * liveDotSpacing;
+      var dotStartX = W / 2 - totalDotW / 2;
+      for (var li = 0; li < 3; li++) {
+        cx.beginPath();
+        cx.arc(dotStartX + li * liveDotSpacing, 130, liveDotR, 0, Math.PI * 2);
+        cx.fillStyle = li < state.lives ? VERM : 'rgba(255,255,255,0.15)';
+        cx.fill();
+      }
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 150);
+      }
+
+      // combo display
+      if (state.combo >= 2) {
+        var comboSize = Math.min(22 + state.combo * 3, 44);
+        cx.fillStyle = GOLD;
+        cx.font = '900 ' + comboSize + 'px -apple-system, Helvetica, Arial';
+        cx.globalAlpha = 0.85 + 0.15 * Math.sin(now / 120);
+        cx.fillText('×' + state.combo + ' COMBO', W / 2, 170);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('GRID LOST.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' snapped', W / 2, 344);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 414);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 460);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var tCta = (now - state.ctaAt) / 1000;
+      var ease = Math.min(1, tCta * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('SNAP GRID', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they snapped ' + (window.__demoScore || 22) + '. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 22), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // floating reward text
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 245 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

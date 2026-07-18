@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Badge Sit — Tilt</title>
+<!--
+  LOOP / attention-architecture — Badge Sit (calm engine)
+  Conditioned path: the red notification badge. The thumb already knows the move
+  from Instagram/TikTok — this game IS that move, refused. Badges appear one by
+  one; you do nothing. Let each fade on its own. Your score is how many you let
+  dissolve without tapping. Tapping = you gave in.
+  Circuits: 01 soft-RPE (each dissolve is a tiny reward), 05 ease, 07 timing, 08 garden.
+  Modes (query params):
+    ?demo=1&seed=7        scripted calm arc (settle → deepen → resolve → soft CTA),
+                          sets window.__demoDone when finished
+    ?bot=1&runs=3&seed=5  imperfect autopilot (resists, then gives in), sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'badge-sit';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo/bot clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  // calm palette: teal + soft gold. The single red element is the badge itself —
+  // the conditioned stimulus. Everything else stays soft.
+  var BADGE_LIFE = 1750, GAP = 300, SETTLE_IN = 420;
+  var ICX = W / 2, ICY = H / 2 + 30, ICON = 132;
+  var BX = ICX + 50, BY = ICY - 50;          // badge anchor (top-right of icon)
+
+  var state, badge, rings, flashes, runStartTs, best = 0;
+  var zoom = 1, shakeAmt = 0, nextBadgeAt = 0, ctaAt = 0, overAt = 0;
+  try { best = +localStorage.getItem('bs_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = { phase: 'title', score: 0, overAt: 0 };   // title | play | over | cta
+    badge = null; rings = []; flashes = [];
+    if (DEMO) { setTimeout(startRun, 300); return; }     // a beat of stillness, then settle in
+    if (BOT) startRun();
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 8))));
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    nextBadgeAt = performance.now() + SETTLE_IN;
+    badge = null;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    if (BOT) botGiveInAt = Math.max(2, Math.round(3 + Math.abs(gauss()) * 3 + rng() * 4));
+    if (DEMO) demoTarget = 7;
+  }
+
+  function spawnBadge() {
+    var count = 1 + Math.floor(rng() * 24);          // notification-count flavor
+    badge = { count: count, born: performance.now(), scale: 0, life: BADGE_LIFE };
+  }
+
+  // the whole game: let it fade. Dissolve is the reward.
+  function dissolve() {
+    state.score++;
+    rings.push({ t: 0 });
+    flash('+1', TEAL, 30);
+    zoom = 1.018;                                     // soft zoom-pulse, no hit-stop (calm)
+    if (window.J) J.calm(state.score);                // calm ladder only — no percussion/tension/death
+    if (window.LOOP) LOOP.emit('badge_dissolve', { n: state.score });
+    badge = null;
+    nextBadgeAt = performance.now() + GAP;
+  }
+
+  // giving in (a tap during play) — gentle, not a spectacle. Calm fail.
+  function giveIn() {
+    if (state.phase !== 'play') return;
+    state.phase = 'over'; state.overAt = performance.now();
+    shakeAmt = 2.4;                                   // tiny shake, soft
+    if (window.J) J.calm(0);                          // a single low bell, not a boom
+    badge = null;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (DEMO) window.__demoScore = state.score;
+    var newBest = state.score > best;
+    if (newBest) { best = state.score; try { localStorage.setItem('bs_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('gave_in', { n: state.score });
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(resetRun, 900);
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; badge = null; rings = []; flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 470, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;                          // scripted modes ignore human taps
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { giveIn(); return; }  // any tap = you gave in to the badge
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'let fade' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  // demo: resist everything (never tap). After demoTarget dissolves, a soft beat,
+  // then the calm CTA. Bot: resist for an imperfect count, then give in (→ game_over).
+  var demoTarget = 7, botGiveInAt = 5, botRunsDone = 0;
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    if (DEMO) {
+      if (state.score >= demoTarget && !badge && performance.now() > nextBadgeAt + 250) {
+        // resolve → soft invitation
+        state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }
+    } else if (BOT) {
+      if (state.score >= botGiveInAt) giveIn();
+    }
+  }
+
+  // ---- render helpers ----
+  function roundRect(x, y, w, h, r) {
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(x, y, w, h, r);
+    else { cx.moveTo(x + r, y); cx.arcTo(x + w, y, x + w, y + h, r); cx.arcTo(x + w, y + h, x, y + h, r); cx.arcTo(x, y + h, x, y, r); cx.arcTo(x, y, x + w, y, r); cx.closePath(); }
+  }
+  function iconGlyph() {
+    // a soft notification bell, centered on the icon
+    cx.save(); cx.translate(ICX, ICY + 4);
+    cx.fillStyle = 'rgba(255,255,255,0.92)';
+    // dome
+    cx.beginPath(); cx.arc(0, -6, 20, Math.PI, 0); cx.lineTo(20, 16); cx.lineTo(-20, 16); cx.closePath(); cx.fill();
+    // base bar
+    cx.fillRect(-24, 18, 48, 5);
+    // clapper
+    cx.beginPath(); cx.arc(0, 26, 5, 0, Math.PI * 2); cx.fill();
+    // stem
+    cx.fillRect(-3, -30, 6, 8);
+    cx.restore();
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // badge lifecycle (time-based, not gated by juice)
+    if (state.phase === 'play') {
+      if (!badge && now >= nextBadgeAt) spawnBadge();
+      if (badge) {
+        var age = now - badge.born;
+        // pop-in ease
+        badge.scale = Math.min(1, age / 180);
+        if (age >= badge.life) dissolve();
+      }
+      autopilot();
+    }
+
+    // juice transforms: decaying shake + soft zoom-pulse. wrap the whole frame.
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg — breathing teal garden glow (calm)
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var breathe = 0.5 + 0.5 * Math.sin(now / 1400);
+    var rg = cx.createRadialGradient(W / 2, ICY, 40, W / 2, ICY, 360);
+    rg.addColorStop(0, 'rgba(46,197,182,' + (0.10 + 0.04 * breathe) + ')');
+    rg.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = rg; cx.fillRect(0, 0, W, H);
+
+    // app icon (soft teal, rounded)
+    var ig = cx.createLinearGradient(0, ICY - ICON / 2, 0, ICY + ICON / 2);
+    ig.addColorStop(0, '#3ad4c4'); ig.addColorStop(1, '#239e92');
+    cx.fillStyle = ig; roundRect(ICX - ICON / 2, ICY - ICON / 2, ICON, ICON, 30); cx.fill();
+    cx.strokeStyle = 'rgba(255,255,255,0.18)'; cx.lineWidth = 1.5; cx.stroke();
+    iconGlyph();
+
+    // dissolve rings (calm completion — the beautiful frame)
+    for (var i = rings.length - 1; i >= 0; i--) {
+      var r = rings[i]; r.t += dt;
+      var rr = 18 + r.t * 3.2, a = Math.max(0, 1 - r.t / 42);
+      cx.globalAlpha = a * 0.7; cx.strokeStyle = TEAL; cx.lineWidth = 2;
+      cx.beginPath(); cx.arc(BX, BY, rr, 0, Math.PI * 2); cx.stroke();
+      cx.globalAlpha = 1;
+      if (r.t > 42) rings.splice(i, 1);
+    }
+
+    // the badge — the red dot. The conditioned stimulus. It pulses; you don't tap.
+    if (state.phase === 'play' && badge) {
+      var pulse = 1 + 0.10 * Math.sin(now / 170);
+      var s = badge.scale * pulse;
+      var rad = 22 * s;
+      // glow
+      cx.globalAlpha = 0.35; cx.fillStyle = VERM;
+      cx.beginPath(); cx.arc(BX, BY, rad * 1.5, 0, Math.PI * 2); cx.fill();
+      cx.globalAlpha = 1;
+      // body
+      var bg = cx.createRadialGradient(BX - 5, BY - 5, 2, BX, BY, rad);
+      bg.addColorStop(0, '#ff6a4a'); bg.addColorStop(1, VERM);
+      cx.fillStyle = bg; cx.beginPath(); cx.arc(BX, BY, rad, 0, Math.PI * 2); cx.fill();
+      cx.strokeStyle = 'rgba(255,255,255,0.5)'; cx.lineWidth = 1.5; cx.stroke();
+      // count
+      if (rad > 10) {
+        cx.textAlign = 'center'; cx.textBaseline = 'middle';
+        cx.fillStyle = '#fff';
+        cx.font = '800 ' + Math.round(20 * s) + 'px -apple-system, Helvetica, Arial';
+        cx.fillText(String(badge.count), BX, BY + 1);
+        cx.textBaseline = 'alphabetic';
+      }
+    }
+
+    // score
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 120);
+    }
+    // gentle in-play instruction
+    if (state.phase === 'play') {
+      cx.textAlign = 'center';
+      var a = 0.35 + 0.15 * Math.sin(now / 900);
+      cx.globalAlpha = a; cx.fillStyle = TEAL;
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('let it fade', W / 2, ICY + ICON / 2 + 56);
+      cx.globalAlpha = 1;
+    }
+
+    // flashes (floating +1)
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var af = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = af; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, BX, BY - 24 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('BADGE SIT', W / 2, 250);
+      cx.fillStyle = TEAL; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP ONCE TO BEGIN', W / 2, 300); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('then don’t tap. let every badge fade.', W / 2, 328);
+    }
+
+    // game over (calm fail — you tapped)
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.5)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.globalAlpha = 0.9; cx.fillText('you tapped.', W / 2, 300); cx.globalAlpha = 1;
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText('you let ' + state.score + ' fade', W / 2, 345);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('calmer than ' + (100 - pt) + '% of players', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — TRY AGAIN', W / 2, 540);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(46,197,182,0.14)';
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23); cx.fill(); cx.stroke();
+        cx.fillStyle = TEAL; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA — soft invitation (calm: no dare)
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('BADGE SIT', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('she let ' + (window.__demoScore || 7) + ' fade. your turn to sit.', W / 2, 332);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ GROW YOURS', W / 2, 408);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

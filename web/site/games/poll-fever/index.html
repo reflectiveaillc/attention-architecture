@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Poll Fever — Tilt</title>
+<!--
+  LOOP / attention-architecture — Poll Fever
+  Circuits: 03-social (poll/vote anticipation), 01-rpe (uncertain outcome), 04-loss
+  Mechanic: Two bars race toward 50%. Tap when your bar crosses the line.
+  Modes:
+    ?demo=1&seed=7   scripted clip — sets window.__demoDone
+    ?bot=1&runs=N    imperfect autopilot — sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'poll-fever';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  // Bar layout: two poll bars stacked vertically
+  // Player chooses bar A (top) or bar B (bottom) at start
+  // Bars fill left→right toward a 50% target line
+  // Each round: bars jitter, stall, reverse until player taps at the right moment
+  // Score = number of successful catches (bar was crossing the line when you tapped)
+  // Miss = wrong timing → bar snaps back, lose a life
+
+  var LIVES_MAX = 3;
+  var CATCH_WINDOW = 0.06; // ±6% around the 50% target counts as "on the line"
+  var PERFECT_WINDOW = 0.02;
+  var NEAR_MISS_WINDOW = 0.04;
+
+  // bar state
+  var state, flashes, best = 0, runStartTs;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  try { best = +localStorage.getItem('pf_best') || 0; } catch (_) {}
+
+  // card timers
+  var overAt = 0, ctaAt = 0, challengeAt = 0;
+  var botRunsDone = 0;
+
+  function newGame() {
+    state = {
+      phase: 'title',   // title | challenge | play | over | cta
+      // which bar the player is "voting" for: 'A' or 'B' (chosen on title tap)
+      chosen: null,
+      lives: LIVES_MAX,
+      score: 0,
+      combo: 0,
+      // bar fill values (0..1)
+      fillA: 0.20,
+      fillB: 0.20,
+      // bar velocity
+      velA: 0,
+      velB: 0,
+      // each bar cycles through phases: rising, jitter, stall, reverse
+      phaseA: 'rising',
+      phaseB: 'rising',
+      phaseTimer: 0,
+      round: 0,         // which bar is "active" this turn (0=A, 1=B, alternating)
+      roundPhase: 'approach', // approach | tension | done
+      roundTimer: 0,
+      tapReady: false,  // is the bar near the line right now?
+      roundResult: null,
+      lastTapGood: false,
+    };
+    flashes = [];
+    dareBeaten = false;
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) {
+      state.phase = 'play';
+      startRun();
+      return;
+    }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.chosen = 'A';
+    resetRound();
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- bar dynamics ----
+  // Each "round" one bar slowly approaches 50%, with jitter/stalls/reversals.
+  // The window for a valid tap is brief (±CATCH_WINDOW) around 0.50.
+
+  var ROUND_DURATION = 180;  // frames
+  var TENSION_START  = 110;  // when bar starts approaching the line seriously
+
+  function resetRound() {
+    state.roundTimer = 0;
+    state.roundPhase = 'approach';
+    state.tapReady   = false;
+    state.roundResult = null;
+    // reset bars
+    state.fillA = 0.10 + rng() * 0.12;
+    state.fillB = 0.10 + rng() * 0.12;
+    state.velA  = 0.003 + rng() * 0.002;
+    state.velB  = 0.003 + rng() * 0.002;
+    // alternate which bar is "active"
+    state.round++;
+    if (window.J) J.tension(Math.min((state.score) / 12, 1));
+  }
+
+  function updateBars(dt) {
+    if (state.phase !== 'play') return;
+    state.roundTimer += dt;
+
+    var t = state.roundTimer / ROUND_DURATION;  // 0..1+
+    var activeBar = (state.round % 2 === 1) ? 'A' : 'B';
+    var idleBar   = activeBar === 'A' ? 'B' : 'A';
+
+    // idle bar drifts aimlessly
+    var idleFill = 'fill' + idleBar, idleVel = 'vel' + idleBar;
+    state[idleFill] += state[idleVel] * dt * 0.4;
+    if (state[idleFill] > 0.44) state[idleVel] = -Math.abs(state[idleVel]);
+    if (state[idleFill] < 0.08) state[idleVel] =  Math.abs(state[idleVel]);
+
+    // active bar: approach → peak near 0.5 → then either hold or reverse
+    var activeFill = 'fill' + activeBar;
+    var f = state[activeFill];
+
+    if (state.roundPhase === 'approach') {
+      // accelerate toward 0.5 with jitter
+      var distToLine = 0.50 - f;
+      var jitter = (rng() - 0.5) * 0.006;
+      var push = Math.max(0.002, distToLine * 0.035 * dt) + jitter;
+      // add stall: every 20 frames, random brief reversal
+      if (Math.floor(state.roundTimer) % 22 === 0 && rng() < 0.4) {
+        push = -0.004 * dt;
+      }
+      state[activeFill] += push;
+      // clamp
+      if (state[activeFill] < 0.04) state[activeFill] = 0.04;
+
+      // check: near the line?
+      var nearLine = Math.abs(state[activeFill] - 0.50) < NEAR_MISS_WINDOW;
+      var onLine   = Math.abs(state[activeFill] - 0.50) < CATCH_WINDOW;
+      state.tapReady = onLine;
+
+      if (state.roundTimer > TENSION_START || t > 0.65) {
+        state.roundPhase = 'tension';
+      }
+    } else if (state.roundPhase === 'tension') {
+      // bar oscillates around 0.5 — the window opens and closes fast
+      var speed = 0.004 + state.score * 0.0003;
+      var jitter2 = (rng() - 0.5) * 0.003;
+      // push toward 0.5, overshoot, reverse — creating a sweeping motion
+      var sign = (state[activeFill] < 0.50) ? 1 : -1;
+      state[activeFill] += sign * speed * dt + jitter2;
+      state[activeFill] = Math.max(0.03, Math.min(0.92, state[activeFill]));
+
+      state.tapReady = Math.abs(state[activeFill] - 0.50) < CATCH_WINDOW;
+
+      // auto-timeout: round ends
+      if (state.roundTimer > ROUND_DURATION) {
+        // player missed — penalize
+        onMiss();
+      }
+    }
+  }
+
+  function onTap() {
+    if (state.phase !== 'play' || state.roundResult !== null) return;
+    var activeBar = (state.round % 2 === 1) ? 'A' : 'B';
+    var activeFill = 'fill' + activeBar;
+    var dist = Math.abs(state[activeFill] - 0.50);
+
+    if (dist < CATCH_WINDOW) {
+      // good catch
+      var perfect = dist < PERFECT_WINDOW;
+      state.score++;
+      state.combo++;
+      state.roundResult = 'hit';
+
+      if (window.J) {
+        if (perfect) J.perfect(state.combo);
+        else J.hit(state.combo);
+        J.tension(Math.min(state.score / 12, 1));
+      }
+      if (perfect) { hitStop = 5; zoom = 1.04; flash('PERFECT', TEAL, 46); }
+      else if (dist < NEAR_MISS_WINDOW) { flash('SO CLOSE!', GOLD, 38); shakeAmt = 3; }
+      else { flash('+' + state.score, '#fff', 36); }
+
+      if (perfect) shakeAmt = 2;
+
+      // dare beaten?
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score);
+      }
+
+      if (window.LOOP) LOOP.emit('catch', { score: state.score, dist: +dist.toFixed(3), perfect: perfect });
+      if (window.LOOP && dist < NEAR_MISS_WINDOW && dist >= PERFECT_WINDOW) {
+        LOOP.emit('near_miss', { n: state.score, dist: +dist.toFixed(3) });
+      }
+
+      if (state.score > best) {
+        best = state.score;
+        try { localStorage.setItem('pf_best', String(best)); } catch (_) {}
+        if (window.J) setTimeout(function () { J.fanfare(); }, 300);
+      }
+
+      // freeze briefly then next round
+      setTimeout(function () { resetRound(); }, 350);
+    } else {
+      // bad timing — miss
+      if (window.LOOP) LOOP.emit('bad_tap', { score: state.score, dist: +dist.toFixed(3) });
+      onMiss();
+    }
+  }
+
+  function onMiss() {
+    if (state.roundResult === 'miss') return; // don't double-fire
+    state.roundResult = 'miss';
+    state.combo = 0;
+    state.lives--;
+    shakeAmt = 7;
+    if (window.J) J.near();
+    flash('MISSED!', VERM, 42);
+
+    if (state.lives <= 0) {
+      // game over
+      setTimeout(function () { gameOver(); }, 500);
+    } else {
+      setTimeout(function () { resetRound(); }, 500);
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.death(Math.min(0.3 + state.score / 20, 1));
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { botRestart(); }, 800);
+      }
+    }
+  }
+
+  function botRestart() {
+    state.lives = LIVES_MAX;
+    state.score = 0;
+    state.combo = 0;
+    state.round = 0;
+    flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function humanRestart() {
+    state.lives = LIVES_MAX;
+    state.score = 0;
+    state.combo = 0;
+    state.round = 0;
+    flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 8))));
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') {
+      state.chosen = 'A';
+      startRun();
+      return;
+    }
+    if (state.phase === 'play') {
+      onTap();
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: '%' }); return;
+      }
+      humanRestart();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilots ----
+  // Demo script: near-perfect catches, one wobble near-miss, then a late-tap miss
+  // demoWaits controls hesitation per move (makes it feel human)
+  var demoScript = [
+    { action: 'catch', delay: 0 },   // round 1: clean catch
+    { action: 'catch', delay: 0 },   // round 2: clean
+    { action: 'near',  delay: 0 },   // round 3: near-miss save (close call)
+    { action: 'catch', delay: 0 },   // round 4: recovery
+    { action: 'miss',  delay: 0 },   // round 5: the real fail
+  ];
+  var demoWaits = [42, 38, 55, 36, 30]; // hesitation frames per script step
+  var demoIdx = 0, demoWait = 45, demoActed = false;
+
+  // bot: just track the active bar and tap when it crosses
+  var botWait = 0, botActed = false;
+  var BOT_MISS_AT = 7; // bot goes passive after this many catches so it eventually loses
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    if (state.roundResult !== null) return; // round already resolved
+
+    var activeBar = (state.round % 2 === 1) ? 'A' : 'B';
+    var activeFill = 'fill' + activeBar;
+
+    if (DEMO) {
+      if (demoActed) return;
+      if (demoWait > 0) { demoWait--; return; }
+      var step = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      if (!step) return;
+      var dist = Math.abs(state[activeFill] - 0.50);
+      var onLine = dist < CATCH_WINDOW;
+      var nearLine = dist < CATCH_WINDOW + 0.03;
+
+      if (step.action === 'catch') {
+        // tap when nicely on the line
+        if (onLine) {
+          demoActed = true;
+          onTap();
+          demoIdx++;
+          demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 36;
+          setTimeout(function () { demoActed = false; }, 400);
+        }
+      } else if (step.action === 'near') {
+        // tap at the edge of the window (near-miss success)
+        if (dist < CATCH_WINDOW && dist > NEAR_MISS_WINDOW * 0.5) {
+          demoActed = true;
+          onTap();
+          demoIdx++;
+          demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 36;
+          setTimeout(function () { demoActed = false; }, 400);
+        } else if (!onLine && nearLine) {
+          // bail if we're right at edge — take it
+          demoActed = true;
+          onTap();
+          demoIdx++;
+          demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 36;
+          setTimeout(function () { demoActed = false; }, 400);
+        }
+      } else if (step.action === 'miss') {
+        // deliberately tap when bar has overshot (bad timing)
+        if (dist > CATCH_WINDOW && state[activeFill] > 0.60) {
+          demoActed = true;
+          onTap(); // this will register as a miss
+          demoIdx++;
+          setTimeout(function () { demoActed = false; }, 400);
+        } else if (state.roundTimer > ROUND_DURATION - 5) {
+          // force timeout → miss fires naturally
+          demoActed = true;
+          setTimeout(function () { demoActed = false; }, 400);
+        }
+      }
+    } else if (BOT) {
+      if (botActed) return;
+      if (botWait > 0) { botWait--; return; }
+      var dist2 = Math.abs(state[activeFill] - 0.50);
+
+      // bot goes passive after BOT_MISS_AT catches so it eventually loses all lives
+      if (state.score >= BOT_MISS_AT) {
+        // just let timeout happen (miss will fire naturally via roundTimer)
+        return;
+      }
+
+      // imperfect: add random offset error
+      var err = (rng() - 0.5) * 0.05;
+      var onLineBot = dist2 < CATCH_WINDOW + err;
+      if (onLineBot && dist2 < CATCH_WINDOW * 1.3) {
+        botActed = true;
+        onTap();
+        botWait = 12 + Math.floor(rng() * 20);
+        setTimeout(function () { botActed = false; }, 400);
+      }
+    }
+  }
+
+  // ---- render ----
+  var BAR_Y_A = 300;   // center-y of bar A
+  var BAR_Y_B = 420;   // center-y of bar B
+  var BAR_H   = 52;
+  var BAR_X   = 32;
+  var BAR_W   = W - 64;
+  var LINE_X  = BAR_X + BAR_W * 0.50;  // the 50% target line
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // hit-stop: freeze sim, decay
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      updateBars(dt);
+      autopilot();
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (rng() - 0.5) * shakeAmt, sy = (rng() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- title screen ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('POLL FEVER', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '500 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap when the bar hits 50%', W / 2, 330);
+      var pulse = 0.55 + 0.45 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO VOTE', W / 2, 380);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- challenge card (demo beat 1) ----
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('8', W / 2, 410);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 440);
+    }
+
+    // ---- play screen ----
+    if (state.phase === 'play') {
+      drawPlayUI(now);
+    }
+
+    // ---- game over card ----
+    if (state.phase === 'over') {
+      drawPlayUI(now);
+      cx.fillStyle = 'rgba(11,13,18,0.58)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('MISSED IT.', W / 2, 290);
+      cx.fillStyle = '#fff'; cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' catches', W / 2, 338);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 382);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 406);
+      if (!DEMO && !BOT) {
+        var p2 = 0.55 + 0.45 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL; cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE VOTE', W / 2, 452);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.13)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- demo CTA card ----
+    if (state.phase === 'cta') {
+      var tCta = (now - ctaAt) / 1000, ease = Math.min(1, tCta * 2.5);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('POLL FEVER', W / 2, 296);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they got ' + (window.__demoScore || 5) + '. your vote?', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 5), W / 2, 408);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // flashes (all phases)
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + Math.round(fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 230 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawPlayUI(now) {
+    var activeBar = (state.round % 2 === 1) ? 'A' : 'B';
+
+    // score + combo
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '800 58px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score, W / 2, 88);
+    cx.fillStyle = 'rgba(255,255,255,0.38)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + best, W / 2, 110);
+
+    // combo escalation
+    if (state.combo >= 2) {
+      var comboGlow = Math.min(1, (state.combo - 1) / 6);
+      cx.globalAlpha = 0.6 + 0.4 * comboGlow;
+      cx.fillStyle = GOLD;
+      cx.font = '900 ' + Math.round(18 + state.combo * 3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText('×' + state.combo + ' STREAK', W / 2, 140);
+      cx.globalAlpha = 1;
+    }
+
+    // lives
+    var heartX = 28;
+    for (var li = 0; li < LIVES_MAX; li++) {
+      cx.globalAlpha = li < state.lives ? 1 : 0.2;
+      cx.fillStyle = VERM;
+      cx.font = '18px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'left';
+      cx.fillText('●', heartX + li * 24, 168);
+    }
+    cx.globalAlpha = 1;
+
+    // incoming dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+      cx.textAlign = 'center';
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 192);
+    }
+
+    // ----- bars -----
+    drawBar('A', BAR_Y_A, activeBar === 'A', now);
+    drawBar('B', BAR_Y_B, activeBar === 'B', now);
+
+    // instruction label
+    cx.textAlign = 'center';
+    var instA = 0.5 + 0.5 * Math.sin(now / 400);
+    cx.globalAlpha = instA;
+    cx.fillStyle = activeBar === 'A' ? TEAL : VERM;
+    cx.font = '700 14px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP WHEN IT HITS 50%', W / 2, 540);
+    cx.globalAlpha = 1;
+  }
+
+  function drawBar(id, cy, active, now) {
+    var fill = state['fill' + id];
+    var bx = BAR_X, bw = BAR_W, bh = BAR_H;
+    var by = cy - bh / 2;
+    var onLine = Math.abs(fill - 0.50) < CATCH_WINDOW;
+    var perfect = Math.abs(fill - 0.50) < PERFECT_WINDOW;
+
+    // track background
+    cx.fillStyle = 'rgba(255,255,255,0.07)';
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(bx, by, bw, bh, 8);
+    else cx.rect(bx, by, bw, bh);
+    cx.fill();
+
+    // fill bar
+    var fillW = Math.max(0, Math.min(1, fill)) * bw;
+    var barColor;
+    if (active) {
+      if (perfect) barColor = TEAL;
+      else if (onLine) barColor = GOLD;
+      else barColor = id === 'A' ? TEAL : VERM;
+    } else {
+      barColor = 'rgba(255,255,255,0.2)';
+    }
+
+    // glow on active + near line
+    if (active && onLine) {
+      cx.shadowColor = barColor;
+      cx.shadowBlur = perfect ? 22 : 12;
+    }
+
+    cx.fillStyle = barColor;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(bx, by, fillW, bh, 8);
+    else cx.rect(bx, by, fillW, bh);
+    cx.fill();
+    cx.shadowBlur = 0;
+
+    // label
+    cx.textAlign = 'left';
+    cx.fillStyle = active ? '#fff' : 'rgba(255,255,255,0.35)';
+    cx.font = '700 13px Menlo, monospace';
+    cx.fillText(id === 'A' ? 'YES' : 'NO', bx, by - 8);
+
+    // pct readout
+    cx.textAlign = 'right';
+    cx.fillStyle = active && onLine ? GOLD : (active ? '#fff' : 'rgba(255,255,255,0.3)');
+    cx.font = '700 13px Menlo, monospace';
+    cx.fillText(Math.round(fill * 100) + '%', bx + bw, by - 8);
+
+    // 50% target line (the key visual)
+    var lineX = bx + bw * 0.50;
+    cx.save();
+    cx.strokeStyle = active ? (onLine ? (perfect ? TEAL : GOLD) : 'rgba(255,255,255,0.5)') : 'rgba(255,255,255,0.18)';
+    cx.lineWidth = active ? 2.5 : 1.5;
+    if (active && onLine) {
+      cx.shadowColor = cx.strokeStyle;
+      cx.shadowBlur = 10;
+    }
+    cx.beginPath();
+    cx.moveTo(lineX, by - 6);
+    cx.lineTo(lineX, by + bh + 6);
+    cx.stroke();
+    cx.restore();
+
+    // "50%" label on the line
+    cx.textAlign = 'center';
+    cx.fillStyle = active ? 'rgba(255,255,255,0.6)' : 'rgba(255,255,255,0.2)';
+    cx.font = '600 11px Menlo, monospace';
+    cx.fillText('50%', lineX, by + bh + 18);
+
+    // pulsing ring on active bar fill edge when near line
+    if (active && onLine) {
+      var edgeX = bx + fillW;
+      var ringAlpha = 0.5 + 0.5 * Math.sin(now / 80);
+      cx.beginPath();
+      cx.arc(edgeX, cy, 10, 0, Math.PI * 2);
+      cx.strokeStyle = perfect ? TEAL : GOLD;
+      cx.globalAlpha = ringAlpha;
+      cx.lineWidth = 2;
+      cx.stroke();
+      cx.globalAlpha = 1;
+    }
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

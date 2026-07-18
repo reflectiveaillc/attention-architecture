@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Beat the Seed — Tilt</title>
+<!--
+  LOOP / attention-architecture — Beat the Seed
+  Circuits: 06-zeigarnik (incomplete run haunts), 01-rpe (variable tapping timing),
+            04-loss (seed score as anchor threat)
+  Mechanics: 60-second sprint — tap-timing rhythm game against a seeded rival score.
+  Modes:
+    ?demo=1&seed=7        mirror-neuron demo clip, sets window.__demoDone
+    ?bot=1&runs=N&seed=M  imperfect autoplay, sets window.__botDone
+    ?dare=<n>             incoming dare — "BEAT <n>" banner during play
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'beat-the-seed';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ── Game constants ──
+  var RUN_DURATION = (BOT ? 8 : 60);   // seconds (bots run 8s so __botDone fires fast)
+  var LANE_COUNT   = 5;    // number of tap lanes
+  var LANE_W       = W / LANE_COUNT;
+
+  // Target window config: a pulse travels across each lane; tap it when it's in the zone
+  var PULSE_H    = 54;     // height of a target
+  var HIT_ZONE_Y = 540;    // center of hit zone (bottom portion of canvas)
+  var HIT_ZONE_H = 70;     // height of acceptable hit window
+  var PERFECT_H  = 22;     // perfect sub-window height
+
+  // ── State ──
+  var state, flashes, hitStop, zoom, shakeAmt, dareBeaten;
+  var runStartTs, botRunsDone = 0, botRunsTarget = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('bts_best') || 0; } catch (_) {}
+
+  // per-lane pulses: each lane has its own falling pulse on a seeded cadence
+  var lanes, laneTimers;
+
+  function newGame() {
+    state = {
+      phase: 'title',   // title | challenge | play | over | cta
+      score: 0,
+      combo: 0,
+      seedScore: 33,    // rival seed score shown during challenge + play
+      timeLeft: RUN_DURATION,
+      lastTick: 0,
+      overAt: 0,
+      ctaAt: 0
+    };
+    flashes   = [];
+    hitStop   = 0;
+    zoom      = 1;
+    shakeAmt  = 0;
+    dareBeaten = false;
+    lanes      = [];
+    laneTimers = [];
+    for (var i = 0; i < LANE_COUNT; i++) {
+      lanes.push({ pulses: [] });
+      // stagger initial timers per lane
+      laneTimers.push(40 + Math.floor(rng() * 60));
+    }
+    if (DEMO) {
+      state.phase     = 'challenge';
+      state.seedScore = 33;
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) {
+      botRunsDone   = 0;
+      botRunsTarget = BOT_RUNS;
+      startRun();
+    }
+  }
+
+  function startRun() {
+    state.phase    = 'play';
+    state.score    = 0;
+    state.combo    = 0;
+    state.timeLeft = RUN_DURATION;
+    state.lastTick = performance.now();
+    lanes.forEach(function (l) { l.pulses = []; });
+    for (var i = 0; i < LANE_COUNT; i++) {
+      laneTimers[i] = 20 + Math.floor(rng() * 50);
+    }
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 14))));
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0, x: W / 2, vy: 1.2 });
+  }
+
+  // ── Input: tap lane ──
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tapLane(laneIdx) {
+    if (state.phase !== 'play') return;
+    var lane = lanes[laneIdx];
+    var bestScore = null, bestPulse = null, bestIdx = -1;
+    for (var i = 0; i < lane.pulses.length; i++) {
+      var p = lane.pulses[i];
+      if (p.hit) continue;
+      var dist = Math.abs(p.y - HIT_ZONE_Y);
+      if (dist < HIT_ZONE_H / 2) {
+        if (bestScore === null || dist < bestScore) {
+          bestScore = dist; bestPulse = p; bestIdx = i;
+        }
+      }
+    }
+    if (bestPulse) {
+      var isPerfect = bestScore < PERFECT_H / 2;
+      var isNear    = bestScore < HIT_ZONE_H / 2 * 0.55 && !isPerfect;
+      bestPulse.hit = true;
+
+      var pts = isPerfect ? 3 : 1;
+      state.score += pts;
+      state.combo++;
+
+      if (window.J) {
+        if (isPerfect)    J.perfect(state.combo);
+        else if (isNear)  J.near();
+        else              J.hit(state.combo);
+        J.tension(Math.min(state.timeLeft < 20 ? 0.7 : state.combo / 20, 1));
+      }
+      if (isPerfect) { hitStop = 4; zoom = 1.025; flash('+3 PERFECT', TEAL, 38); }
+      else if (isNear)  { shakeAmt = 2; flash('+1 SO CLOSE', GOLD, 32); }
+      else              { flash('+1', TEAL, 28); }
+
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score);
+      }
+
+      var ratio = 1 - bestScore / (HIT_ZONE_H / 2);
+      if (window.LOOP) LOOP.emit('tap_hit', { n: state.score, perfect: isPerfect, combo: state.combo });
+      if (isNear && window.LOOP) LOOP.emit('near_miss', { n: state.score, ratio: +ratio.toFixed(3) });
+    } else {
+      // miss — break combo
+      state.combo = 0;
+      shakeAmt = 3;
+      flash('MISS', VERM, 30);
+      if (window.LOOP) LOOP.emit('tap_miss', { n: state.score });
+    }
+  }
+
+  function gameOver() {
+    state.phase  = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) {
+      J.death(Math.min(0.3 + state.score / 60, 1));
+      if (state.score > best) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (state.score > best) {
+      best = state.score;
+      try { localStorage.setItem('bts_best', String(best)); } catch (_) {}
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= botRunsTarget) {
+        window.__botDone = true;
+      } else {
+        setTimeout(resetRun, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.score    = 0;
+    state.combo    = 0;
+    state.timeLeft = RUN_DURATION;
+    flashes        = [];
+    dareBeaten     = false;
+    lanes.forEach(function (l) { l.pulses = []; });
+    for (var i = 0; i < LANE_COUNT; i++) {
+      laneTimers[i] = 20 + Math.floor(rng() * 50);
+    }
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ── Autopilot (demo / bot) ──
+  // demo script: taps at specific cadence indices with hesitation
+  var demoHits = 0;
+  var demoHesitations = [32, 28, 44, 22, 50, 30, 18, 42, 26, 36, 55, 24, 38, 20, 46, 30, 25, 60, 20, 35];
+  var demoHesIdx = 0;
+  var demoHesWait = 0;
+  var demoPhasePanic = false; // near-fail moment
+
+  // Bot: random lane tap errors
+  var botHesWait = 0;
+
+  function autopilot(now) {
+    if (state.phase !== 'play') return;
+
+    if (DEMO) {
+      if (demoHesWait > 0) { demoHesWait--; return; }
+      // find a pulse near the hit zone in any lane
+      var elapsed = (now - state.lastTick) / 1000;
+      var progress = 1 - state.timeLeft / RUN_DURATION;
+      // near-fail at ~60%: intentionally miss a beat (tension), then recover
+      if (progress > 0.58 && progress < 0.63 && !demoPhasePanic) {
+        demoPhasePanic = true;
+        demoHesWait = 55; // long pause — reads as "it's over"
+        flash('SO CLOSE!', VERM, 38);
+        shakeAmt = 6;
+        state.combo = 0;
+        if (window.J) J.near();
+        return;
+      }
+      // pick best lane
+      var tapped = false;
+      for (var li = 0; li < LANE_COUNT && !tapped; li++) {
+        var lane = lanes[li];
+        for (var pi = 0; pi < lane.pulses.length; pi++) {
+          var p = lane.pulses[pi];
+          if (!p.hit && Math.abs(p.y - HIT_ZONE_Y) < HIT_ZONE_H / 2 * 0.7) {
+            tapLane(li);
+            demoHesWait = demoHesitations[demoHesIdx % demoHesitations.length];
+            demoHesIdx++;
+            demoHits++;
+            tapped = true;
+            break;
+          }
+        }
+      }
+    } else if (BOT) {
+      if (botHesWait > 0) { botHesWait--; return; }
+      // imperfect bot: sometimes misses, random lane
+      var r = rng();
+      if (r < 0.08) {
+        // intentional miss to vary combo, also ensures eventual timeout/game_over path
+        botHesWait = Math.floor(8 + rng() * 20);
+        return;
+      }
+      var tappedBot = false;
+      // pick random lane that has a pulse near zone
+      var order = [];
+      for (var i = 0; i < LANE_COUNT; i++) order.push(i);
+      // shuffle
+      for (var s = order.length - 1; s > 0; s--) {
+        var j = Math.floor(rng() * (s + 1));
+        var tmp = order[s]; order[s] = order[j]; order[j] = tmp;
+      }
+      for (var oi = 0; oi < order.length && !tappedBot; oi++) {
+        var bl = lanes[order[oi]];
+        for (var bpi = 0; bpi < bl.pulses.length; bpi++) {
+          var bp = bl.pulses[bpi];
+          if (!bp.hit && Math.abs(bp.y - HIT_ZONE_Y) < HIT_ZONE_H / 2) {
+            tapLane(order[oi]);
+            botHesWait = Math.floor(4 + rng() * 14);
+            tappedBot = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // ── Render helpers ──
+  function drawLaneLines() {
+    cx.strokeStyle = 'rgba(255,255,255,0.06)';
+    cx.lineWidth = 1;
+    for (var i = 1; i < LANE_COUNT; i++) {
+      cx.beginPath();
+      cx.moveTo(i * LANE_W, 140);
+      cx.lineTo(i * LANE_W, H - 60);
+      cx.stroke();
+    }
+  }
+
+  function drawHitZone() {
+    // glowing hit zone band
+    var gy = HIT_ZONE_Y - HIT_ZONE_H / 2;
+    var g = cx.createLinearGradient(0, gy, 0, gy + HIT_ZONE_H);
+    g.addColorStop(0,   'rgba(46,197,182,0.0)');
+    g.addColorStop(0.4, 'rgba(46,197,182,0.12)');
+    g.addColorStop(0.5, 'rgba(46,197,182,0.22)');
+    g.addColorStop(0.6, 'rgba(46,197,182,0.12)');
+    g.addColorStop(1,   'rgba(46,197,182,0.0)');
+    cx.fillStyle = g;
+    cx.fillRect(0, gy, W, HIT_ZONE_H);
+    // center line
+    cx.strokeStyle = 'rgba(46,197,182,0.35)';
+    cx.lineWidth = 1.5;
+    cx.beginPath();
+    cx.moveTo(0, HIT_ZONE_Y); cx.lineTo(W, HIT_ZONE_Y);
+    cx.stroke();
+  }
+
+  function drawPulses() {
+    for (var li = 0; li < LANE_COUNT; li++) {
+      var lane = lanes[li];
+      var lx = li * LANE_W;
+      for (var pi = 0; pi < lane.pulses.length; pi++) {
+        var p = lane.pulses[pi];
+        if (p.hit) continue;
+        var nearZone = Math.abs(p.y - HIT_ZONE_Y) < HIT_ZONE_H / 2;
+        var dist = Math.abs(p.y - HIT_ZONE_Y);
+        var bright = nearZone ? Math.max(0, 1 - dist / (HIT_ZONE_H / 2)) : 0;
+        var baseColor = p.isGold ? GOLD : TEAL;
+        cx.fillStyle = nearZone
+          ? interpolateColor(baseColor, '#ffffff', bright * 0.4)
+          : 'rgba(46,197,182,0.45)';
+        if (p.isGold) cx.fillStyle = nearZone
+          ? interpolateColor(GOLD, '#ffffff', bright * 0.35)
+          : 'rgba(242,177,52,0.45)';
+        var rx = lx + 4, rw = LANE_W - 8, ry = p.y - PULSE_H / 2;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(rx, ry, rw, PULSE_H, 8);
+        else cx.rect(rx, ry, rw, PULSE_H);
+        cx.fill();
+        if (nearZone && bright > 0.4) {
+          cx.strokeStyle = p.isGold ? GOLD : TEAL;
+          cx.lineWidth = 1.5;
+          cx.stroke();
+        }
+      }
+    }
+  }
+
+  function interpolateColor(hex1, hex2, t) {
+    function parse(h) {
+      var n = parseInt(h.replace('#',''), 16);
+      return [(n>>16)&255, (n>>8)&255, n&255];
+    }
+    var a = parse(hex1), b = parse(hex2);
+    return 'rgb(' + Math.round(a[0]+(b[0]-a[0])*t) + ',' +
+                    Math.round(a[1]+(b[1]-a[1])*t) + ',' +
+                    Math.round(a[2]+(b[2]-a[2])*t) + ')';
+  }
+
+  function drawTimerBar(timeLeft) {
+    var bw = W - 40, bh = 8, bx = 20, by = 130;
+    var pct = Math.max(0, timeLeft / RUN_DURATION);
+    cx.fillStyle = 'rgba(255,255,255,0.08)';
+    if (cx.roundRect) { cx.beginPath(); cx.roundRect(bx, by, bw, bh, 4); cx.fill(); }
+    else { cx.fillRect(bx, by, bw, bh); }
+    var col = pct > 0.35 ? TEAL : VERM;
+    cx.fillStyle = col;
+    if (cx.roundRect) { cx.beginPath(); cx.roundRect(bx, by, bw * pct, bh, 4); cx.fill(); }
+    else { cx.fillRect(bx, by, bw * pct, bh); }
+    // pulse glow when low
+    if (pct < 0.25) {
+      cx.shadowColor = VERM; cx.shadowBlur = 8;
+      if (cx.roundRect) { cx.beginPath(); cx.roundRect(bx, by, bw * pct, bh, 4); cx.fill(); }
+      else cx.fillRect(bx, by, bw * pct, bh);
+      cx.shadowBlur = 0;
+    }
+  }
+
+  function drawSeedBar(seedScore, playerScore) {
+    // show rival seed as a second bar (gold) for comparison
+    var bw = W - 40, bh = 5, bx = 20, by = 145;
+    var maxScore = Math.max(seedScore * 1.1, playerScore + 5, 30);
+    cx.fillStyle = 'rgba(242,177,52,0.18)';
+    if (cx.roundRect) { cx.beginPath(); cx.roundRect(bx, by, bw, bh, 3); cx.fill(); }
+    else cx.fillRect(bx, by, bw, bh);
+    var seedPct = Math.min(seedScore / maxScore, 1);
+    cx.fillStyle = GOLD;
+    if (cx.roundRect) { cx.beginPath(); cx.roundRect(bx, by, bw * seedPct, bh, 3); cx.fill(); }
+    else cx.fillRect(bx, by, bw * seedPct, bh);
+    cx.fillStyle = 'rgba(242,177,52,0.65)';
+    cx.font = '500 10px Menlo, monospace';
+    cx.textAlign = 'left';
+    cx.fillText('SEED ' + seedScore, bx, by - 2);
+  }
+
+  // ── Main loop ──
+  var last = performance.now();
+  var ctaPhaseAt = 0;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // ── Timer tick ──
+    if (state.phase === 'play') {
+      var elapsed = (now - state.lastTick) / 1000;
+      state.lastTick = now;
+      state.timeLeft -= elapsed;
+      if (state.timeLeft <= 10 && state.timeLeft + elapsed > 10) {
+        if (window.J) J.tension(0.7);
+      }
+      if (state.timeLeft <= 0) {
+        state.timeLeft = 0;
+        gameOver();
+      }
+      // spawn pulses on timers
+      for (var li = 0; li < LANE_COUNT; li++) {
+        laneTimers[li] -= dt;
+        if (laneTimers[li] <= 0) {
+          var isGold = rng() < 0.12;
+          lanes[li].pulses.push({ y: 155, vy: 2.6 + rng() * 0.8, hit: false, isGold: isGold });
+          // interval varies — more pressure as time drains
+          var urgency = 1 - state.timeLeft / RUN_DURATION;
+          laneTimers[li] = 28 + Math.floor(rng() * 40) - urgency * 12;
+        }
+      }
+      // move pulses
+      for (var li2 = 0; li2 < LANE_COUNT; li2++) {
+        var lane = lanes[li2];
+        for (var pi = lane.pulses.length - 1; pi >= 0; pi--) {
+          var p = lane.pulses[pi];
+          if (!p.hit) p.y += p.vy * dt;
+          if (p.y - PULSE_H / 2 > H - 50 || (p.hit && p.y > H + 80)) {
+            lane.pulses.splice(pi, 1);
+          }
+        }
+      }
+      // autopilot
+      if (hitStop > 0) hitStop -= dt;
+      else autopilot(now);
+    }
+
+    // ── Juice: shake + zoom decay ──
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // ── BG ──
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ── Challenge card (demo beat 1) ──
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 15px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 295);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText(String(state.seedScore), W / 2, 405);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's seed", W / 2, 435);
+    }
+
+    // ── Play ──
+    if (state.phase === 'play') {
+      drawLaneLines();
+      drawHitZone();
+      drawPulses();
+      drawTimerBar(state.timeLeft);
+      drawSeedBar(state.seedScore, state.score);
+
+      // score
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(String(state.score), W / 2, 98);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 120);
+
+      // seed score banner
+      var beating = state.score > state.seedScore;
+      cx.fillStyle = beating ? TEAL : GOLD;
+      cx.font = '700 13px Menlo, monospace';
+      cx.fillText(beating ? '▲ SEED BEATEN' : 'SEED: ' + state.seedScore, W / 2, 162);
+
+      // time left
+      cx.fillStyle = state.timeLeft < 10 ? VERM : 'rgba(255,255,255,0.6)';
+      cx.font = '700 14px Menlo, monospace';
+      cx.fillText(Math.ceil(state.timeLeft) + 's', W / 2, 185);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : VERM;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 210);
+      }
+
+      // combo
+      if (state.combo > 2) {
+        var comboScale = 1 + Math.min(state.combo / 40, 0.6);
+        cx.save();
+        cx.translate(W / 2, H - 85);
+        cx.scale(comboScale, comboScale);
+        cx.fillStyle = state.combo > 8 ? VERM : TEAL;
+        cx.font = '900 ' + Math.round(22 + Math.min(state.combo, 18)) + 'px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText('×' + state.combo + ' COMBO', 0, 0);
+        cx.restore();
+      }
+    }
+
+    // ── Game over ──
+    if (state.phase === 'over') {
+      // still draw play field dimmed
+      drawLaneLines();
+      drawHitZone();
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      var won = state.score > state.seedScore;
+      cx.fillStyle = won ? TEAL : VERM;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText(won ? 'SEED CRUSHED.' : 'SEED STANDS.', W / 2, 298);
+      cx.fillStyle = '#fff';
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' pts', W / 2, 340);
+      if (!won) {
+        cx.fillStyle = 'rgba(255,255,255,0.5)';
+        cx.font = '600 14px -apple-system, Helvetica, Arial';
+        cx.fillText('seed: ' + state.seedScore, W / 2, 365);
+      }
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 398);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 420);
+      if (!DEMO && !BOT) {
+        var pulse = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = pulse;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE RUN', W / 2, 460);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ── Demo CTA ──
+    if (state.phase === 'cta') {
+      var t = (now - state.ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT THE SEED', W / 2, 298);
+      cx.fillStyle = 'rgba(255,255,255,0.72)';
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they scored ' + (window.__demoScore || 33) + '. uprooted?', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 33), W / 2, 406);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // ── Title ──
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT THE SEED', W / 2, 280);
+      cx.fillStyle = GOLD;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('60 seconds. one chance.', W / 2, 318);
+      var pulse2 = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse2;
+      cx.fillStyle = VERM;
+      cx.font = '800 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP THE BEAT', W / 2, 365);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('outlast the seed. dare your rivals.', W / 2, 395);
+    }
+
+    // ── Floating flashes ──
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, 260 - fl.t * fl.vy * 1.4);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // ── Mute toggle ──
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ── Event binding ──
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale;
+    var y = (e.clientY - r.top) / scale;
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') {
+      var li = Math.floor(x / LANE_W);
+      li = Math.max(0, Math.min(LANE_COUNT - 1, li));
+      tapLane(li);
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'pts' }); return;
+      }
+      resetRun();
+    }
+  });
+  window.addEventListener('keydown', function (e) {
+    if (DEMO || BOT) return;
+    // keys 1-5 or ASDFG map to lanes
+    var laneMap = { '1':0, '2':1, '3':2, '4':3, '5':4,
+                    'a':0, 's':1, 'd':2, 'f':3, 'g':4,
+                    'Space':2 };
+    var li = laneMap[e.key];
+    if (li === undefined) li = laneMap[e.code === 'Space' ? 'Space' : null];
+    if (li !== undefined) {
+      if (state.phase === 'title') { startRun(); return; }
+      if (state.phase === 'play') tapLane(li);
+    }
+  });
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

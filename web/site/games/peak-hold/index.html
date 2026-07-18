@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Peak Hold — Tilt</title>
+<!--
+  LOOP / attention-architecture — Peak Hold
+  Circuits: 01-rpe (variable reward per release), 04-loss (timing window), 07-timing (hold & release).
+  Mechanic: hold thumb while meter rises to green zone, release at peak. PB = closest release %.
+  Modes:
+    ?demo=1&seed=7        scripted run — challenge card → human-feeling hold → near-fail → fail → CTA
+    ?bot=1&runs=N&seed=5  imperfect autoplay N runs, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'peak-hold';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  var METER_X = W / 2 - 28, METER_W = 56, METER_TOP = 140, METER_BOT = 580;
+  var METER_H  = METER_BOT - METER_TOP;
+  // target zone — fill in 60%–80% range (higher = harder)
+  var ZONE_LO  = 0.60, ZONE_HI = 0.80;
+  // perfect zone tight: within 2% of the midpoint
+  var PERFECT_BAND = 0.02;
+
+  // ---- state ----
+  var phase, runStartTs, pb, runNumber;
+  var fillPct;        // 0–1 (0 = bottom, 1 = full)
+  var rising;         // true while thumb held
+  var releasePct;     // where thumb was released this round
+  var roundDone;      // result of this round
+  var score;          // current PB score (100 - abs distance from midpoint * 100, capped 0..100)
+  var combo;
+  var hitStop, shakeAmt, zoomVal;
+  var flashes;
+  var dareBeaten;
+  var overAt, ctaAt;
+  var challengeAt;
+  var botRunsDone;
+  var botPhase;       // 'holding' | 'wait'
+  var botWait;
+  var botTargetPct;
+  var roundsThisBot;
+
+  // demo uses time-based scheduling (no frame-level state machine)
+
+  // ---- persistence ----
+  var best = 0;
+  try { best = +localStorage.getItem('ph_best') || 0; } catch (_) {}
+
+  function saveBest(v) {
+    if (v > best) { best = v; try { localStorage.setItem('ph_best', String(best)); } catch (_) {} return true; }
+    return false;
+  }
+
+  function pctTop(sc) {
+    // Rough rank: score=100 → top 1%, score=50 → top 35%
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-sc / 28))));
+  }
+
+  function scoreFromRelease(pct) {
+    // score = how close to midpoint of zone (mid = 0.70)
+    var mid = (ZONE_LO + ZONE_HI) / 2;
+    if (pct < ZONE_LO || pct > ZONE_HI) return 0;   // missed zone
+    var dist = Math.abs(pct - mid) / ((ZONE_HI - ZONE_LO) / 2); // 0=perfect 1=edge
+    return Math.round((1 - dist) * 100);
+  }
+
+  function isPerfect(pct) {
+    var mid = (ZONE_LO + ZONE_HI) / 2;
+    return Math.abs(pct - mid) <= PERFECT_BAND;
+  }
+
+  // ---- newGame ----
+  function newGame() {
+    phase = 'title';
+    fillPct = 0; rising = false; releasePct = null; roundDone = null;
+    score = 0; combo = 0; pb = 0;
+    hitStop = 0; shakeAmt = 0; zoomVal = 1;
+    flashes = []; dareBeaten = false; overAt = 0; ctaAt = 0;
+    botRunsDone = 0; botPhase = 'wait'; botWait = 0; botTargetPct = -1; roundsThisBot = 0;
+    runNumber = 0;
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1200);
+    } else if (BOT) {
+      startRun();
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    fillPct = 0; rising = false; releasePct = null; roundDone = null;
+    runNumber++;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    if (DEMO) scheduleDemoRounds();
+  }
+
+  // Demo: schedule holds and releases at absolute times (no frame-level state machine).
+  // Fill speed is fixed 0.003/frame at 60fps ≈ 0.18/s for demo/bot.
+  // Times are ms from startRun(). Arc: 3 good → near-fail → recovery perfect → FAIL.
+  function scheduleDemoRounds() {
+    var SPEED = 0.003 * 60; // fill per second at 60fps = 0.18/s
+    var at = 0; // cursor in ms from startRun()
+
+    function schedRound(holdPct, gapAfterMs, isLast) {
+      var holdMs = Math.round(holdPct / SPEED * 1000);
+      var pressAt = at;
+      var releaseAt = at + holdMs;
+      setTimeout(function () { fillPct = 0; rising = true; }, pressAt);
+      setTimeout(function () {
+        if (isLast) {
+          doRelease();
+        } else {
+          rising = false;
+          var sc2 = scoreFromRelease(holdPct);
+          score = sc2; releasePct = holdPct; roundDone = sc2 > 0 ? 'hit' : 'miss';
+          if (sc2 > 0) flash('+' + sc2, TEAL, 44); else flash('MISS', VERM, 40);
+          setTimeout(function () { fillPct = 0; rising = false; releasePct = null; roundDone = null; }, 400);
+        }
+      }, releaseAt);
+      at = releaseAt + gapAfterMs; // next press can start gapAfterMs after release
+    }
+
+    at = 300;                           // initial hesitation
+    schedRound(0.72, 700, false);       // good hold #1, gap 700ms
+    schedRound(0.68, 700, false);       // good hold #2, gap 700ms
+    schedRound(0.80, 700, false);       // near-fail: zone top edge, gap 700ms
+    schedRound(0.70, 700, false);       // recovery: perfect zone, gap 700ms
+    schedRound(0.45, 0,   true);        // FAIL: too early, misses zone → gameOver
+  }
+
+  // ---- releasing ----
+  function doRelease() {
+    // internal: called by autopilots and pointerUp; skips the rising guard
+    if (phase !== 'play' || roundDone !== null) return;
+    rising = false;
+    releasePct = fillPct;
+    var sc = scoreFromRelease(releasePct);
+    var perf = isPerfect(releasePct);
+    var inZone = sc > 0;
+    score = sc;
+    roundDone = inZone ? 'hit' : 'miss';
+
+    if (window.J) {
+      if (perf) { J.perfect(combo + 1); }
+      else if (inZone) { J.hit(combo + 1); }
+      else { J.near(); }
+      J.tension(0);
+    }
+    if (perf) { hitStop = 5; zoomVal = 1.03; combo++; }
+    else if (inZone) { combo++; }
+    else { combo = 0; }
+
+    var nearMiss = !inZone && releasePct >= ZONE_LO - 0.06 && releasePct <= ZONE_HI + 0.06;
+    if (nearMiss) {
+      flash('SO CLOSE!', VERM, 40);
+      if (window.LOOP) LOOP.emit('near_miss', { pct: +releasePct.toFixed(3) });
+    } else if (perf) {
+      flash('PERFECT', TEAL, 48);
+    } else if (inZone) {
+      flash('+' + sc, TEAL, 44);
+    } else {
+      flash('MISS', VERM, 44);
+    }
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(score);
+    }
+
+    if (window.LOOP) LOOP.emit('release', { pct: +releasePct.toFixed(3), score: sc, perfect: perf, in_zone: inZone });
+
+    // trigger game-over after short pause to show result
+    var delay = perf ? 900 : 700;
+    if (!inZone) delay = 600;
+    setTimeout(function () { gameOver(sc, perf, inZone, nearMiss); }, delay);
+  }
+
+  function release() {
+    if (!rising) return;
+    doRelease();
+  }
+
+  function gameOver(sc, perf, inZone, nearMiss) {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newPB = saveBest(sc);
+
+    if (window.J) {
+      if (!inZone || sc < 20) J.death(0.7);
+      else if (newPB) { J.fanfare(); }
+      else J.hit(1);
+    }
+    shakeAmt = inZone ? 3 : 8;
+    window.__demoScore = sc;
+    if (window.LOOP) LOOP.emit('game_over', { score: sc, dur_s: +dur.toFixed(1), in_zone: inZone, perfect: perf });
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = 0;  // reset so frame() picks up the new time
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 700);
+      }
+    }
+  }
+
+  function resetRun() {
+    fillPct = 0; rising = false; releasePct = null; roundDone = null;
+    score = 0; combo = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10,  w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 130, y: 490, w: 260, h: 48 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function pointerDown(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play' && roundDone === null) {
+      rising = true;
+      if (window.J) J.tension(fillPct);
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score, unit: '%' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  function pointerUp(x, y) {
+    if (DEMO || BOT) return;
+    if (phase === 'play' && rising) {
+      release();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') { e.preventDefault(); pointerDown(); }
+  });
+  window.addEventListener('keyup', function (e) {
+    if (e.code === 'Space') { e.preventDefault(); pointerUp(); }
+  });
+
+  // ---- autopilots ----
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+
+    if (BOT) {
+      if (roundDone !== null) return;
+      if (botPhase === 'wait') {
+        botWait -= dt * 16.667;
+        if (botWait <= 0) {
+          botPhase = 'holding';
+          // pick a target with some noise — mostly land in zone
+          var mid = (ZONE_LO + ZONE_HI) / 2;
+          botTargetPct = mid + gauss() * 0.12;
+          botTargetPct = Math.max(0.25, Math.min(0.95, botTargetPct));
+          rising = true;
+        }
+      } else if (botPhase === 'holding') {
+        if (fillPct >= botTargetPct) {
+          botPhase = 'wait';
+          botWait = 400 + rng() * 600;
+          roundsThisBot++;
+          doRelease();
+        }
+      }
+    }
+  }
+
+  // ---- render ----
+  var last = performance.now(), ctaAtLocal = 0;
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // rise speed — fixed base rate (score modifier only in human play for tension)
+    var riseSpeed = (!DEMO && !BOT ? (0.003 + score * 0.000015) : 0.003) * dt;
+    if (rising && phase === 'play' && roundDone === null) {
+      fillPct = Math.min(1, fillPct + riseSpeed);
+      if (window.J) J.tension(fillPct);
+    } else if (!rising && phase === 'play' && roundDone === null) {
+      // meter drops slowly when not holding
+      fillPct = Math.max(0, fillPct - 0.0008 * dt);
+    }
+
+    // juice decay
+    if (hitStop > 0) { hitStop -= dt; }
+    else { autopilot(dt); }
+    shakeAmt *= Math.pow(0.84, dt);
+    zoomVal  += (1 - zoomVal) * 0.12 * dt;
+
+    // canvas transforms
+    cx.save();
+    if (shakeAmt > 0.3 || zoomVal > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoomVal, zoomVal);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // draw meter (only in play/over)
+    if (phase === 'play' || phase === 'over') {
+      drawMeter(now);
+    }
+
+    // title
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('PEAK HOLD', W / 2, 280);
+      cx.fillStyle = TEAL; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillText('HOLD & RELEASE AT PEAK', W / 2, 330);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('how close can you get?', W / 2, 362);
+    }
+
+    // challenge card (demo beat 1)
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('88', W / 2, 405);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 435);
+    }
+
+    // game over screen
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      var inZone = score > 0;
+      if (inZone) {
+        cx.fillStyle = score >= 90 ? GOLD : TEAL;
+        cx.font = '900 40px -apple-system, Helvetica, Arial';
+        cx.fillText(score >= 90 ? 'PERFECT.' : 'NICE HOLD.', W / 2, 300);
+      } else {
+        cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+        cx.fillText('MISSED.', W / 2, 300);
+      }
+      cx.fillStyle = '#fff'; cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(score + '%', W / 2, 348);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('PB: ' + best + '%', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 458);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 24);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W / 2, SHARE_R.y + 31
+        );
+      }
+    }
+
+    // demo CTA card
+    if (phase === 'cta') {
+      if (!ctaAtLocal) ctaAtLocal = now;
+      var t = (now - ctaAtLocal) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 50px -apple-system, Helvetica, Arial';
+      cx.fillText('PEAK HOLD', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they hit ' + (window.__demoScore || 0) + '%. your move.', W / 2, 342);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 0) + '%', W / 2, 414);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 448);
+      cx.globalAlpha = 1;
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 42);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 235 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- meter drawing ----
+  function drawMeter(now) {
+    var mx = METER_X, mw = METER_W;
+    var mt = METER_TOP, mh = METER_H;
+
+    // background track
+    cx.fillStyle = 'rgba(255,255,255,0.07)';
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(mx, mt, mw, mh, 8);
+    else cx.rect(mx, mt, mw, mh);
+    cx.fill();
+
+    // green zone band
+    var zoneTop  = mt + mh * (1 - ZONE_HI);
+    var zoneHt   = mh * (ZONE_HI - ZONE_LO);
+    cx.fillStyle = 'rgba(46,197,182,0.20)';
+    cx.fillRect(mx, zoneTop, mw, zoneHt);
+    cx.strokeStyle = 'rgba(46,197,182,0.60)'; cx.lineWidth = 1.5;
+    cx.strokeRect(mx + 0.75, zoneTop + 0.75, mw - 1.5, zoneHt - 1.5);
+
+    // perfect band (center of zone)
+    var mid = (ZONE_LO + ZONE_HI) / 2;
+    var perfTop = mt + mh * (1 - mid - PERFECT_BAND);
+    var perfHt  = mh * PERFECT_BAND * 2;
+    cx.fillStyle = 'rgba(242,177,52,0.45)';
+    cx.fillRect(mx + 2, perfTop, mw - 4, perfHt);
+
+    // fill bar (the rising liquid)
+    if (fillPct > 0) {
+      var fillH = mh * fillPct;
+      var fillY = mt + mh - fillH;
+      // color: teal inside zone, vermillion outside
+      var inZone = fillPct >= ZONE_LO && fillPct <= ZONE_HI;
+      var aboveZone = fillPct > ZONE_HI;
+      var fillColor;
+      if (aboveZone) fillColor = VERM;
+      else if (inZone) {
+        // gradient from teal to gold as approaches perfect
+        var mid2 = (ZONE_LO + ZONE_HI) / 2;
+        var t2 = 1 - Math.abs(fillPct - mid2) / ((ZONE_HI - ZONE_LO) / 2);
+        fillColor = TEAL;
+        if (t2 > 0.7) fillColor = GOLD;
+      } else {
+        fillColor = 'rgba(255,255,255,0.3)';
+      }
+      var gr = cx.createLinearGradient(0, fillY, 0, mt + mh);
+      gr.addColorStop(0, fillColor);
+      gr.addColorStop(1, fillColor === TEAL ? '#1a8a84' : fillColor === GOLD ? '#b8851e' : fillColor);
+      cx.fillStyle = gr;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(mx + 2, fillY, mw - 4, fillH, fillH < 8 ? 2 : 6);
+      else cx.rect(mx + 2, fillY, mw - 4, fillH);
+      cx.fill();
+
+      // glow when in zone
+      if (inZone) {
+        cx.shadowBlur = 18 + 10 * Math.sin(now / 120);
+        cx.shadowColor = fillColor === GOLD ? GOLD : TEAL;
+        cx.fillStyle = 'rgba(255,255,255,0.12)';
+        cx.fillRect(mx + 2, fillY, mw - 4, fillH);
+        cx.shadowBlur = 0;
+      }
+    }
+
+    // release marker line (if just released this round)
+    if (phase === 'over' && releasePct !== null) {
+      var lineY = mt + mh * (1 - releasePct);
+      cx.strokeStyle = score > 0 ? GOLD : VERM;
+      cx.lineWidth = 2.5;
+      cx.beginPath(); cx.moveTo(mx - 6, lineY); cx.lineTo(mx + mw + 6, lineY);
+      cx.stroke();
+      // tick label
+      cx.fillStyle = score > 0 ? GOLD : VERM;
+      cx.font = '700 11px Menlo, monospace';
+      cx.textAlign = 'left';
+      cx.fillText(Math.round(releasePct * 100) + '%', mx + mw + 10, lineY + 4);
+    }
+
+    // zone labels
+    cx.textAlign = 'right';
+    cx.fillStyle = 'rgba(46,197,182,0.7)'; cx.font = '600 10px Menlo, monospace';
+    cx.fillText(Math.round(ZONE_HI * 100) + '%', mx - 6, zoneTop + 10);
+    cx.fillText(Math.round(ZONE_LO * 100) + '%', mx - 6, zoneTop + zoneHt + 4);
+
+    // hold instruction (play only, before first press)
+    if (phase === 'play' && fillPct < 0.05 && !rising) {
+      cx.textAlign = 'center';
+      var pulse = 0.5 + 0.5 * Math.sin(now / 350);
+      cx.globalAlpha = 0.5 + 0.5 * pulse;
+      cx.fillStyle = '#fff'; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('HOLD', W / 2 + 70, H / 2 + 10);
+      cx.globalAlpha = 1;
+    }
+
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+      cx.textAlign = 'center';
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText(
+        dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + '%' + (SHARE.by ? ' — ' + SHARE.by : ''),
+        W / 2, 128
+      );
+    }
+
+    // score PB display during play
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '800 58px -apple-system, Helvetica, Arial';
+    cx.fillText(score > 0 ? score + '%' : '—', W / 2, 94);
+    cx.fillStyle = 'rgba(255,255,255,0.38)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('PB ' + (best > 0 ? best + '%' : '—'), W / 2, 116);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

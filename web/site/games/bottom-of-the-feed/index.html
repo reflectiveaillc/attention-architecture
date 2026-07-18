@@ -1,0 +1,839 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Bottom of the Feed — Tilt</title>
+<!--
+  LOOP / attention-architecture — Bottom of the Feed (calm engine flagship)
+  Circuits: 01 RPE (gentle found-moments), 07 breath pacing, 08 memory artifact.
+  Modes:
+    ?demo=1&seed=7        scripted descent for clip capture, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  fast autoplay for traffic sim, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#07070d; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:none; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#07070d; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'bottom-of-the-feed';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var DEPTH = 30000;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // ---- deterministic RNG ----
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function rnd(a, b) { return a + (b - a) * rng(); }
+  function rndInt(a, b) { return Math.floor(rnd(a, b + 1)); }
+
+  // ---- canvas setup ----
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // ---- palette ----
+  var INK     = '#07070d';
+  var TEAL    = '#0e3a3f';
+  var INDIGO  = '#101228';
+  var CYAN    = '#7fe8dc';
+  var GOLD    = '#f2d9a0';
+  var MINT    = '#9de8dc';
+
+  // ---- helpers ----
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function smoothstep(edge0, edge1, x) {
+    var t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
+    return t * t * (3 - 2 * t);
+  }
+  function toHex(c) {
+    var r = Math.round(c[0]), g = Math.round(c[1]), b = Math.round(c[2]);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+  function hexToRgb(hex) {
+    var v = parseInt(hex.slice(1), 16);
+    return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+  }
+  function colorLerp(a, b, t) {
+    var A = hexToRgb(a), B = hexToRgb(b);
+    return toHex([lerp(A[0], B[0], t), lerp(A[1], B[1], t), lerp(A[2], B[2], t)]);
+  }
+  function fmtDate(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+
+  // ---- state ----
+  var scrollY = 0, velocity = 0;
+  var phase = 'surface'; // surface | descent | bottom | cta
+  var runStartTs = 0, startedEmitted = false;
+  var foundCount = 0;
+  var foundThisRun = [];
+  var bottomAt = 0;
+  var botRunsDone = 0;
+  var demoStart = 0;
+  var demoPulses = [];
+  var rings = [];
+  var journal = [];
+  var hintSeen = false;
+  var firstSwipeDone = false;
+  var whale = { x: -220, y: DEPTH * 0.6, w: 340, speed: 0.045 };
+  var creatures = [];
+  var particles = [];
+  var whispers = [
+    { pct: 0.12, text: "you've scrolled 900 ft" },
+    { pct: 0.25, text: "no ads down here" },
+    { pct: 0.40, text: "the unconscious scroll — you'd normally not notice the time" },
+    { pct: 0.55, text: "it gets quieter" },
+    { pct: 0.75, text: "almost" },
+    { pct: 0.88, text: "most feeds never let you reach this" }
+  ];
+  var bottomLines = [
+    { t: 0.0, text: "the bottom.", color: '#fff' },
+    { t: 1.2, text: "your feed doesn't have one. this one does.", color: CYAN },
+    { t: 2.4, text: function () { return 'found tonight: ' + foundCount + ' light' + (foundCount === 1 ? '' : 's'); }, color: GOLD },
+    { t: 3.6, text: "come back tomorrow — the sea remembers.", color: 'rgba(255,255,255,0.75)' }
+  ];
+  var surfaceBtn = { x: W / 2, y: H / 2 + 190, w: 160, h: 42 };
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 100, y: H / 2 + 240, w: 200, h: 40 };
+
+  // ---- juice layer ----
+  var zoom = 1;
+  var floats = [];
+
+  // ---- load memory (human only) ----
+  if (!DEMO && !BOT) {
+    try {
+      var j = localStorage.getItem('botf_journal');
+      journal = j ? JSON.parse(j) : [];
+      hintSeen = localStorage.getItem('botf_hint_seen') === '1';
+    } catch (_) { journal = []; }
+  }
+
+  // ---- world generation ----
+  function generateWorld() {
+    creatures = [];
+    particles = [];
+
+    // parallax motes (three layers)
+    for (var l = 0; l < 3; l++) {
+      var count = [40, 60, 90][l];
+      var factor = [0.20, 0.55, 0.90][l];
+      var size = [1.4, 1.0, 0.7][l];
+      for (var i = 0; i < count; i++) {
+        particles.push({
+          x: rnd(0, W), y: rnd(0, DEPTH + 2000), factor: factor,
+          r: rnd(0.5, 3.2) * size, alpha: rnd(0.08, 0.35),
+          phase: rnd(0, Math.PI * 2), speed: rnd(0.0005, 0.002)
+        });
+      }
+    }
+
+    // jellyfish
+    var y = 900;
+    while (y < DEPTH - 1200) {
+      y += rnd(1600, 2600);
+      creatures.push({
+        type: 'jelly', x: rnd(40, W - 40), y: y, w: rnd(26, 46),
+        tentacles: rndInt(4, 7), len: rnd(50, 110), phase: rnd(0, Math.PI * 2),
+        color: rng() < 0.65 ? CYAN : GOLD, glow: rng() < 0.35
+      });
+    }
+
+    // fish schools
+    y = 1400;
+    while (y < DEPTH - 800) {
+      y += rnd(1100, 1900);
+      creatures.push({
+        type: 'fish', x: rnd(50, W - 50), y: y, count: rndInt(5, 11),
+        spread: rnd(24, 46), phase: rnd(0, Math.PI * 2), speed: rnd(0.001, 0.003),
+        color: rng() < 0.6 ? MINT : GOLD, glow: rng() < 0.25
+      });
+    }
+
+    // whale
+    creatures.push({ type: 'whale', x: whale.x, y: whale.y, w: whale.w, phase: 0 });
+
+    // seeded found moments: pick 10 glowing creatures
+    var candidates = creatures.filter(function (c) { return c.type !== 'whale'; });
+    var picks = Math.min(10, candidates.length);
+    // shuffle via seeded Fisher-Yates
+    for (var k = candidates.length - 1; k > 0; k--) {
+      var idx = rndInt(0, k);
+      var tmp = candidates[k]; candidates[k] = candidates[idx]; candidates[idx] = tmp;
+    }
+    for (var p = 0; p < picks; p++) candidates[p].found = true;
+
+    // demo pulse depths (scripted, not found-moment seeded)
+    if (DEMO) demoPulses = [
+      { depth: 4000, hit: false },
+      { depth: 11000, hit: false },
+      { depth: 18000, hit: false },
+      { depth: 24000, hit: false }
+    ];
+  }
+
+  // ---- descent lifecycle ----
+  function newDescent() {
+    scrollY = 0; velocity = 0;
+    phase = 'surface';
+    runStartTs = Date.now();
+    startedEmitted = false;
+    foundCount = 0;
+    foundThisRun = [];
+    rings = [];
+    floats = [];
+    bottomAt = 0;
+    whale.x = -220;
+    zoom = 1;
+    if (DEMO) demoStart = performance.now();
+    generateWorld();
+    if (DEMO || BOT) startAutoplay();
+  }
+
+  function startAutoplay() {
+    runStartTs = Date.now();
+    startedEmitted = true;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function emitStartIfNeeded() {
+    if (!startedEmitted) {
+      startedEmitted = true;
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+  }
+
+  function recordFound(n, depthPct, sx, sy) {
+    foundCount = n;
+    foundThisRun.push({ depthPct: depthPct, ts: Date.now() });
+    rings.push({ x: sx || rnd(40, W - 40), y: sy || H / 2, t: 0 });
+    floats.push({ txt: '+1 light', x: sx || W / 2, y: sy || H / 2, t: 0, color: GOLD });
+    if (window.J) J.calm(foundCount);
+    zoom = 1.02;
+    if (window.LOOP) LOOP.emit('found', { n: n, depth_pct: +depthPct.toFixed(3) });
+  }
+
+  function completeDescent() {
+    if (phase === 'bottom' || phase === 'cta') return;
+    phase = 'bottom';
+    bottomAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (!DEMO && !BOT) {
+      journal.push({ date: fmtDate(new Date()), lights: foundCount });
+      try { localStorage.setItem('botf_journal', JSON.stringify(journal.slice(-365))); } catch (_) {}
+    }
+    if (DEMO) window.__demoScore = foundCount;
+    if (window.J) J.calm(Math.min(foundCount, 5));
+    if (window.LOOP) LOOP.emit('game_over', { score: foundCount, dur_s: +dur.toFixed(1) });
+  }
+
+  function surface() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    newDescent();
+  }
+
+  // ---- input ----
+  var dragging = false, dragLastY = 0, dragStartScroll = 0;
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function inSurfaceBtn(x, y) {
+    var b = surfaceBtn;
+    return x >= b.x - b.w / 2 && x <= b.x + b.w / 2 && y >= b.y - b.h / 2 && y <= b.y + b.h / 2;
+  }
+  function tap(x, y) {
+    if (DEMO || BOT) return false;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return true; }
+    if (phase === 'bottom' && bottomAt) {
+      var bottomT = (performance.now() - bottomAt) / 1000;
+      if (bottomT > 7 && inSurfaceBtn(x, y)) { surface(); return true; }
+      if (bottomT > 7.5 && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: foundCount, unit: 'lights' });
+        return true;
+      }
+    }
+    return false;
+  }
+  function onPointerDown(e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale;
+    var y = (e.clientY - r.top) / scale;
+    if (tap(x, y)) return;
+    dragging = true; dragLastY = e.clientY; dragStartScroll = scrollY;
+  }
+  function onPointerMove(e) {
+    if (!dragging || DEMO || BOT) return;
+    var delta = e.clientY - dragLastY;
+    dragLastY = e.clientY;
+    if (delta > 0) {
+      firstSwipeDone = true;
+      emitStartIfNeeded();
+      velocity += delta * 0.12;
+    }
+  }
+  function onPointerUp() { dragging = false; }
+  function onWheel(e) {
+    if (DEMO || BOT) return;
+    e.preventDefault();
+    firstSwipeDone = true;
+    emitStartIfNeeded();
+    velocity += e.deltaY * 0.05;
+  }
+
+  cv.addEventListener('pointerdown', onPointerDown);
+  window.addEventListener('pointermove', onPointerMove);
+  window.addEventListener('pointerup', onPointerUp);
+  window.addEventListener('pointercancel', onPointerUp);
+  window.addEventListener('wheel', onWheel, { passive: false });
+
+  // tab hide mid-descent
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden && phase !== 'bottom' && phase !== 'cta' && startedEmitted) {
+      var dur = (Date.now() - runStartTs) / 1000;
+      if (window.LOOP) LOOP.emit('game_over', { score: foundCount, dur_s: +dur.toFixed(1) });
+    }
+  });
+
+  // ---- autopilots ----
+  function demoPosition(t) {
+    // settle -> deepen -> resolve; human pauses, never robotic
+    if (t < 1.5) return 1600 * (1 - Math.pow(1 - t / 1.5, 2));
+    if (t < 2.2) return 1600;
+    if (t < 6.2) {
+      var u = (t - 2.2) / 4.0;
+      return 1600 + (9500 - 1600) * u;
+    }
+    if (t < 7.1) return 9500;
+    if (t < 10.6) {
+      var u = (t - 7.1) / 3.5;
+      return 9500 + (17000 - 9500) * u;
+    }
+    if (t < 11.5) return 17000;
+    if (t < 14.6) {
+      var u = (t - 11.5) / 3.1;
+      return 17000 + (25000 - 17000) * u;
+    }
+    if (t < 17.5) {
+      var u = (t - 14.6) / 2.9;
+      var e = u * u * (3 - 2 * u);
+      return 25000 + (DEPTH - 25000) * e;
+    }
+    return DEPTH;
+  }
+
+  function autopilot(now, dt) {
+    if (DEMO) {
+      var t = (now - demoStart) / 1000;
+      if (phase !== 'bottom' && phase !== 'cta') {
+        scrollY = demoPosition(t);
+        if (!startedEmitted && t > 0.1) startAutoplay();
+        // demo found pulses
+        for (var i = 0; i < demoPulses.length; i++) {
+          var p = demoPulses[i];
+          if (!p.hit && scrollY >= p.depth) {
+            p.hit = true;
+            recordFound(foundCount + 1, p.depth / DEPTH, rnd(60, W - 60), H * 0.4 + rnd(-60, 60));
+          }
+        }
+        if (scrollY >= DEPTH) completeDescent();
+      } else if (phase === 'bottom') {
+        var bottomT = (now - bottomAt) / 1000;
+        if (bottomT > 7.5) { phase = 'cta'; bottomAt = now; }
+      } else if (phase === 'cta') {
+        if ((now - bottomAt) / 1000 > 3.5) window.__demoDone = true;
+      }
+    } else if (BOT) {
+      if (phase !== 'bottom') {
+        velocity = 62.5;                       // ~8s descent at 60fps
+        scrollY += velocity * dt;
+        if (!startedEmitted && scrollY > 20) startAutoplay();
+        if (scrollY >= DEPTH) {
+          completeDescent();
+          botRunsDone++;
+          if (botRunsDone >= BOT_RUNS) window.__botDone = true;
+          else setTimeout(function () { newDescent(); }, 120);
+        }
+      }
+    }
+  }
+
+  // ---- rendering ----
+  function bgColorAt(pct) {
+    if (pct < 0.5) return colorLerp(TEAL, INDIGO, smoothstep(0, 0.5, pct));
+    return colorLerp(INDIGO, INK, smoothstep(0.5, 1, pct));
+  }
+
+  function drawBackground() {
+    var topPct = scrollY / DEPTH;
+    var botPct = (scrollY + H) / DEPTH;
+    var g = cx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, bgColorAt(topPct));
+    g.addColorStop(1, bgColorAt(botPct));
+    cx.fillStyle = g; cx.fillRect(0, 0, W, H);
+  }
+
+  function drawGodRays() {
+    var fade = 1 - smoothstep(0, 0.2, scrollY / DEPTH);
+    if (fade <= 0.02) return;
+    cx.save();
+    cx.globalCompositeOperation = 'screen';
+    var grad = cx.createLinearGradient(0, 0, 0, H * 0.55);
+    grad.addColorStop(0, 'rgba(127,232,220,' + (0.12 * fade) + ')');
+    grad.addColorStop(1, 'rgba(127,232,220,0)');
+    cx.fillStyle = grad;
+    cx.beginPath();
+    for (var i = 0; i < 5; i++) {
+      var x0 = -40 + i * 100;
+      var x1 = x0 + 160;
+      cx.moveTo(x0, 0); cx.lineTo(x1, 0); cx.lineTo(x1 + 70, H * 0.55); cx.lineTo(x0 + 20, H * 0.55);
+    }
+    cx.fill();
+    cx.restore();
+  }
+
+  function drawParticles(now) {
+    for (var i = 0; i < particles.length; i++) {
+      var p = particles[i];
+      var sy = p.y - scrollY * p.factor;
+      while (sy < -20) sy += H + 40;
+      while (sy > H + 20) sy -= H + 40;
+      var sx = p.x + Math.sin(now * 0.0004 + p.phase) * 12;
+      cx.globalAlpha = p.alpha * (0.7 + 0.3 * Math.sin(now * p.speed + p.phase));
+      cx.fillStyle = (p.factor > 0.7 ? CYAN : '#fff');
+      cx.beginPath(); cx.arc(sx, sy, p.r, 0, Math.PI * 2); cx.fill();
+    }
+    cx.globalAlpha = 1;
+  }
+
+  function drawJelly(c, now, sy) {
+    var t = now * 0.0012 + c.phase;
+    var x = c.x + Math.sin(t) * 18;
+    var y = sy + Math.sin(t * 1.3) * 8;
+    var w = c.w;
+    var h = w * 0.45;
+    var glow = (c.found || c.glow) ? 18 : 8;
+    cx.save();
+    cx.globalCompositeOperation = 'screen';
+    cx.shadowColor = c.color; cx.shadowBlur = glow;
+    cx.fillStyle = c.color;
+    cx.globalAlpha = 0.45;
+    cx.beginPath();
+    cx.ellipse(x, y, w / 2, h, 0, Math.PI, 0, true);
+    cx.fill();
+    // tentacles
+    cx.globalAlpha = 0.35;
+    cx.strokeStyle = c.color;
+    cx.lineWidth = 1.2;
+    for (var i = 0; i < c.tentacles; i++) {
+      var off = (i / (c.tentacles - 1) - 0.5) * w * 0.6;
+      cx.beginPath();
+      cx.moveTo(x + off, y);
+      for (var j = 1; j <= 8; j++) {
+        var yy = y + (c.len * j / 8);
+        var xx = x + off + Math.sin(t * 1.5 + j * 0.7 + i) * (6 + j * 1.2);
+        cx.lineTo(xx, yy);
+      }
+      cx.stroke();
+    }
+    cx.restore();
+    cx.globalAlpha = 1;
+  }
+
+  function drawFish(c, now, sy) {
+    var t = now * 0.0008 + c.phase;
+    var cx0 = c.x + Math.sin(t) * 28;
+    var cy0 = sy + Math.cos(t * 0.7) * 12;
+    cx.save();
+    cx.globalCompositeOperation = 'screen';
+    cx.fillStyle = c.color;
+    cx.shadowColor = c.color; cx.shadowBlur = (c.found || c.glow) ? 12 : 4;
+    for (var i = 0; i < c.count; i++) {
+      var ang = (i / c.count) * Math.PI * 2 + t * 0.5;
+      var fx = cx0 + Math.cos(ang) * c.spread * (0.7 + 0.3 * Math.sin(t + i));
+      var fy = cy0 + Math.sin(ang) * c.spread * 0.35;
+      var r = 2.2 + (i % 3) * 0.7;
+      cx.globalAlpha = (c.found || c.glow) ? 0.75 : 0.45;
+      cx.beginPath(); cx.arc(fx, fy, r, 0, Math.PI * 2); cx.fill();
+    }
+    cx.restore();
+    cx.globalAlpha = 1;
+  }
+
+  function drawWhale(now, sy) {
+    // slow cross, ~36s total; offset so the demo passes it near center
+    var x = -220 + (((now / 1000) + 8) * 22) % (W + 400);
+    whale.x = x;
+    var y = sy;
+    if (y < -160 || y > H + 160) return;
+    cx.save();
+    cx.fillStyle = '#05050a';
+    cx.shadowColor = '#000'; cx.shadowBlur = 0;
+    cx.beginPath();
+    // body
+    cx.ellipse(x, y, whale.w / 2, 32, 0, 0, Math.PI * 2);
+    cx.fill();
+    // tail flukes
+    cx.beginPath();
+    cx.moveTo(x + whale.w / 2 - 10, y);
+    cx.lineTo(x + whale.w / 2 + 44, y - 28);
+    cx.lineTo(x + whale.w / 2 + 34, y);
+    cx.lineTo(x + whale.w / 2 + 44, y + 28);
+    cx.closePath();
+    cx.fill();
+    cx.restore();
+  }
+
+  function drawCreatures(now) {
+    // whale first so silhouette sits behind
+    for (var i = 0; i < creatures.length; i++) {
+      var c = creatures[i];
+      var sy = c.y - scrollY;
+      if (c.type === 'whale') { drawWhale(now, sy); break; }
+    }
+    for (var j = 0; j < creatures.length; j++) {
+      var cc = creatures[j];
+      var sy = cc.y - scrollY;
+      if (sy < -180 || sy > H + 180) continue;
+      if (cc.type === 'jelly') drawJelly(cc, now, sy);
+      else if (cc.type === 'fish') drawFish(cc, now, sy);
+    }
+  }
+
+  function checkFoundMoments() {
+    if (DEMO || BOT) return;
+    if (phase !== 'descent' && phase !== 'surface') return;
+    for (var i = 0; i < creatures.length; i++) {
+      var c = creatures[i];
+      if (!c.found || c.triggered) continue;
+      var sy = c.y - scrollY;
+      // trigger when creature is in the middle third of the screen
+      if (sy >= H * 0.35 && sy <= H * 0.65) {
+        c.triggered = true;
+        recordFound(foundCount + 1, c.y / DEPTH, c.x, sy);
+      }
+    }
+  }
+
+  function drawWhispers(now) {
+    cx.textAlign = 'center';
+    for (var i = 0; i < whispers.length; i++) {
+      var w = whispers[i];
+      var sy = w.pct * DEPTH - scrollY;
+      if (sy < -120 || sy > H + 120) continue;
+      var dist = Math.abs(sy - H / 2) / (H / 2);
+      var alpha = (1 - dist) * 0.55;
+      if (alpha <= 0) continue;
+      cx.save();
+      cx.globalAlpha = alpha;
+      cx.fillStyle = '#fff';
+      cx.font = '400 15px -apple-system, Helvetica, Arial';
+      cx.fillText(w.text, W / 2, sy);
+      cx.restore();
+    }
+  }
+
+  function drawRings(now) {
+    for (var i = rings.length - 1; i >= 0; i--) {
+      var r = rings[i];
+      r.t += 1;
+      var radius = 10 + r.t * 2.2;
+      var alpha = Math.max(0, 1 - r.t / 55);
+      if (alpha <= 0) { rings.splice(i, 1); continue; }
+      cx.save();
+      cx.globalCompositeOperation = 'screen';
+      cx.strokeStyle = GOLD;
+      cx.lineWidth = 2;
+      cx.globalAlpha = alpha * 0.7;
+      cx.shadowColor = GOLD; cx.shadowBlur = 14;
+      cx.beginPath(); cx.arc(r.x, r.y, radius, 0, Math.PI * 2); cx.stroke();
+      cx.restore();
+    }
+  }
+
+  function drawFloats() {
+    cx.textAlign = 'center';
+    for (var i = floats.length - 1; i >= 0; i--) {
+      var f = floats[i];
+      f.t += 1;
+      var alpha = Math.max(0, 1 - f.t / 55);
+      if (alpha <= 0) { floats.splice(i, 1); continue; }
+      cx.save();
+      cx.globalAlpha = alpha;
+      cx.fillStyle = f.color;
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText(f.txt, f.x, f.y - f.t * 0.65);
+      cx.restore();
+    }
+  }
+
+  function drawSeafloor(now) {
+    // floor gradient
+    var g = cx.createLinearGradient(0, H - 220, 0, H);
+    g.addColorStop(0, 'rgba(7,7,13,0)');
+    g.addColorStop(0.4, 'rgba(16,18,40,0.85)');
+    g.addColorStop(1, 'rgba(14,58,63,0.95)');
+    cx.fillStyle = g; cx.fillRect(0, H - 220, W, 220);
+
+    // anemones / glowing plants
+    var plants = [
+      { x: 45, h: 90, color: CYAN }, { x: 110, h: 130, color: GOLD },
+      { x: 200, h: 110, color: CYAN }, { x: 285, h: 75, color: MINT },
+      { x: 360, h: 100, color: GOLD }
+    ];
+    for (var i = 0; i < plants.length; i++) {
+      var pl = plants[i];
+      var t = now * 0.0015 + i;
+      cx.save();
+      cx.strokeStyle = pl.color;
+      cx.lineWidth = 2.2;
+      cx.shadowColor = pl.color; cx.shadowBlur = 16;
+      cx.globalAlpha = 0.8;
+      for (var j = 0; j < 5; j++) {
+        cx.beginPath();
+        cx.moveTo(pl.x, H);
+        var tipX = pl.x + Math.sin(t + j * 1.2) * (14 + j * 3);
+        var tipY = H - pl.h * (0.65 + j * 0.08);
+        cx.quadraticCurveTo(pl.x + Math.cos(t + j) * 10, H - pl.h / 2, tipX, tipY);
+        cx.stroke();
+      }
+      cx.restore();
+    }
+  }
+
+  function drawBottomText(now) {
+    var t = (now - bottomAt) / 1000;
+    cx.textAlign = 'center';
+    for (var i = 0; i < bottomLines.length; i++) {
+      var line = bottomLines[i];
+      if (t < line.t) continue;
+      var age = t - line.t;
+      var alpha = clamp(age * 1.2, 0, 1);
+      var yOff = (1 - alpha) * 18;
+      var txt = typeof line.text === 'function' ? line.text() : line.text;
+      cx.save();
+      cx.globalAlpha = alpha;
+      cx.fillStyle = line.color;
+      cx.font = (i === 0 ? '700 28px' : '500 18px') + ' -apple-system, Helvetica, Arial';
+      cx.fillText(txt, W / 2, H / 2 - 40 + i * 46 + yOff);
+      cx.restore();
+    }
+  }
+
+  function drawSurfaceButton(now) {
+    var t = (now - bottomAt) / 1000;
+    if (t < 7) return;
+    var alpha = clamp((t - 7) * 1.5, 0, 1);
+    var pulse = 0.9 + 0.1 * Math.sin(now / 300);
+    var b = surfaceBtn;
+    cx.save();
+    cx.globalAlpha = alpha;
+    cx.fillStyle = 'rgba(255,255,255,0.08)';
+    cx.strokeStyle = 'rgba(127,232,220,0.5)';
+    cx.lineWidth = 1.5;
+    cx.beginPath();
+    cx.roundRect(b.x - b.w / 2, b.y - b.h / 2, b.w, b.h, 21);
+    cx.fill(); cx.stroke();
+    cx.fillStyle = CYAN;
+    cx.font = '600 17px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.globalAlpha = alpha * pulse;
+    cx.fillText('◦ surface', b.x, b.y + 5);
+    cx.restore();
+  }
+
+  function drawShareButton(now) {
+    var t = (now - bottomAt) / 1000;
+    if (t < 7.5) return;
+    var alpha = clamp((t - 7.5) * 1.5, 0, 1);
+    var b = SHARE_R;
+    cx.save();
+    cx.globalAlpha = alpha;
+    cx.fillStyle = 'rgba(242,177,52,0.12)';
+    cx.strokeStyle = GOLD;
+    cx.lineWidth = 1.5;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(b.x, b.y, b.w, b.h, 20);
+    else cx.rect(b.x, b.y, b.w, b.h);
+    cx.fill(); cx.stroke();
+    cx.fillStyle = GOLD;
+    cx.font = '800 15px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.fillText('⚡ SHARE', b.x + b.w / 2, b.y + b.h / 2 + 5);
+    cx.restore();
+  }
+
+  function drawCTA(now) {
+    var t = (now - bottomAt) / 1000;
+    var ease = clamp(t * 1.8, 0, 1);
+    cx.save();
+    cx.fillStyle = 'rgba(7,7,13,' + (0.62 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    cx.fillStyle = CYAN;
+    cx.font = '900 42px -apple-system, Helvetica, Arial';
+    cx.fillText('BOTTOM OF', W / 2, 280);
+    cx.fillText('THE FEED', W / 2, 328);
+    cx.fillStyle = 'rgba(255,255,255,0.78)';
+    cx.font = '500 17px -apple-system, Helvetica, Arial';
+    cx.fillText('your feed doesn\'t have a bottom.', W / 2, 385);
+    cx.fillText('this one does.', W / 2, 408);
+    var pulse = 0.8 + 0.2 * Math.sin(now / 260);
+    cx.fillStyle = GOLD;
+    cx.font = '900 22px -apple-system, Helvetica, Arial';
+    cx.globalAlpha = ease * pulse;
+    cx.fillText('▶  REACH IT', W / 2, 475);
+    cx.globalAlpha = ease;
+    cx.fillStyle = '#2ec5b6';
+    cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 508);
+    cx.restore();
+  }
+
+  function drawMute() {
+    if (DEMO || BOT || !window.J) return;
+    cx.save();
+    cx.textAlign = 'center';
+    cx.globalAlpha = 0.5;
+    cx.font = '16px -apple-system, Helvetica, Arial';
+    cx.fillStyle = '#fff';
+    cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + MUTE_R.h / 2 + 6);
+    cx.restore();
+  }
+
+  function drawUI(now) {
+    // found counter bottom-right
+    if (phase !== 'cta') {
+      cx.save();
+      cx.textAlign = 'right';
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText(foundCount + ' found', W - 22, H - 22);
+      cx.restore();
+    }
+
+    // memory shelf near surface
+    if (!DEMO && !BOT && scrollY < 80 && phase === 'surface' && journal.length) {
+      var totalLights = journal.reduce(function (a, e) { return a + e.lights; }, 0);
+      cx.save();
+      cx.textAlign = 'left';
+      cx.fillStyle = 'rgba(255,255,255,0.40)';
+      cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('descents: ' + journal.length + ' · lights: ' + totalLights, 22, 46);
+      cx.restore();
+    }
+
+    // first-visit hint
+    if (!DEMO && !BOT && !hintSeen && !firstSwipeDone && scrollY < 50) {
+      var alpha = 0.6 + 0.4 * Math.sin(now / 500);
+      cx.save();
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.globalAlpha = alpha;
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('swipe down. that\'s all.', W / 2, H / 2 + 30);
+      cx.restore();
+    }
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    autopilot(now, dt);
+
+    // physics (human)
+    if (!DEMO && !BOT) {
+      var depthPct = scrollY / DEPTH;
+      var thick = smoothstep(0.5, 1, depthPct);
+      var maxSpeed = lerp(22, 3, thick);     // px per normalized frame
+      velocity = clamp(velocity, 0, maxSpeed);
+      velocity *= Math.pow(0.96, dt);
+      scrollY += velocity * dt;
+      if (scrollY < 0) { scrollY = 0; velocity = 0; }
+      if (scrollY > DEPTH) scrollY = DEPTH;
+      if (velocity > 0.5 && scrollY > 0 && phase === 'surface') {
+        phase = 'descent';
+        emitStartIfNeeded();
+      }
+      if (phase === 'descent' && scrollY >= DEPTH) completeDescent();
+      if (firstSwipeDone && !hintSeen) {
+        hintSeen = true;
+        try { localStorage.setItem('botf_hint_seen', '1'); } catch (_) {}
+      }
+    }
+
+    checkFoundMoments();
+
+    // juice transform (calm: no shake, no hit-stop — only soft zoom pulse)
+    cx.save();
+    if (zoom > 1.001) {
+      cx.translate(W / 2, H / 2);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    zoom += (1 - zoom) * 0.08 * dt;
+
+    // render
+    cx.clearRect(0, 0, W, H);
+    drawBackground();
+    drawGodRays();
+    drawParticles(now);
+    drawCreatures(now);
+    drawWhispers(now);
+    drawRings(now);
+    drawFloats();
+
+    if (phase === 'bottom' || phase === 'cta') {
+      drawSeafloor(now);
+      drawBottomText(now);
+      drawSurfaceButton(now);
+      if (phase === 'bottom' && !DEMO && !BOT) drawShareButton(now);
+    }
+
+    if (phase === 'cta') drawCTA(now);
+
+    drawUI(now);
+    drawMute();
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newDescent();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

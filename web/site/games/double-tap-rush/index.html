@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Double-Tap Rush — Tilt</title>
+<!--
+  LOOP / attention-architecture — Double-Tap Rush
+  Engine: viral. Circuits: 01-rpe, 03-social, 05-ease.
+  Mechanic: a photo feed scrolls up; double-tap each card to drop a heart on it.
+  Modes:
+    ?demo=1&seed=7       scripted mirror-neuron clip → sets window.__demoDone
+    ?bot=1&runs=N&seed=5 imperfect autoplay N runs → sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'double-tap-rush';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- Card palettes (simulate photo "thumbnails") ----
+  var PALETTES = [
+    ['#c24b8a','#7b2d6e'], ['#4b7dc2','#2d4e7b'], ['#4bc27d','#2d7b5a'],
+    ['#c27b4b','#7b4e2d'], ['#7b4bc2','#4e2d7b'], ['#c2bc4b','#7b772d'],
+    ['#4bc2c2','#2d7b7b'], ['#c24b4b','#7b2d2d']
+  ];
+
+  // ---- Game state ----
+  var CARD_H = 180, CARD_W = 340, CARD_GAP = 18;
+  var SCROLL_SPEED_BASE = 0.9; // px/frame at 60fps
+  // Double-tap window: two taps within this many ms = double-tap
+  var DOUBLE_TAP_MS = 380;
+  // Time window the card is "tappable" (visible center zone)
+  // A card must be double-tapped BEFORE it scrolls fully past the center line
+
+  var state, flashes, hearts, runStartTs, best = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  var lastTapTime = 0, lastTapY = 0;
+  try { best = +localStorage.getItem('dtr_best') || 0; } catch (_) {}
+
+  // Card object: { y (top edge in canvas coords), palette, liked, missed, heartY, shineT }
+  function makeCard(y) {
+    var pal = PALETTES[Math.floor(rng() * PALETTES.length)];
+    return { y: y, palette: pal, liked: false, missed: false, shineT: 0,
+             likeCount: Math.floor(rng() * 9000) + 100, comboGlow: 0 };
+  }
+
+  // Floating hearts
+  function spawnHeart(x, y, big) {
+    hearts.push({ x: x, y: y, t: 0, big: big || false,
+                  vx: (rng() - 0.5) * 2.4, vy: -(2.2 + rng() * 1.8) });
+  }
+
+  function newGame() {
+    state = {
+      phase: 'title',   // title | challenge | play | over | cta
+      cards: [],
+      scrollY: 0,        // cumulative scroll (px) – cards move up each frame
+      score: 0,          // likes landed
+      combo: 0,
+      overAt: 0,
+      likesMissed: 0,    // cards that scrolled past without a like
+      maxMisses: 5       // game ends when 5 cards are missed
+    };
+    hearts = []; flashes = []; dareBeaten = false;
+    lastTapTime = 0;
+    // Seed initial cards spread across the canvas
+    for (var i = 0; i < 5; i++) {
+      state.cards.push(makeCard(H - 100 - i * (CARD_H + CARD_GAP)));
+    }
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { startRun(); return; }
+    // human: show title
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 18))));
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // Returns the "active" card — the one whose center is closest to the middle of canvas
+  function activeCard() {
+    var best = null, bestDist = 999999;
+    for (var i = 0; i < state.cards.length; i++) {
+      var c = state.cards[i];
+      if (c.liked || c.missed) continue;
+      var center = c.y + CARD_H / 2;
+      // Only cards visible on screen
+      if (center < -CARD_H || center > H + CARD_H) continue;
+      var dist = Math.abs(center - H / 2);
+      if (dist < bestDist) { bestDist = dist; best = c; }
+    }
+    return best;
+  }
+
+  // Called when a valid double-tap lands on a card
+  function likeCard(card) {
+    card.liked = true;
+    card.shineT = 1;
+    state.score++;
+    state.combo++;
+    var isGold = state.combo >= 5;
+    var isPerfect = state.combo >= 3;
+    // Spawn hearts at the card center
+    var cx2 = W / 2, cy2 = card.y + CARD_H / 2;
+    for (var h = 0; h < (isGold ? 6 : 3); h++) spawnHeart(cx2 + (rng()-0.5)*80, cy2 + (rng()-0.5)*40, isGold);
+
+    // Sound
+    if (window.J) {
+      if (isGold) { J.gold(); hitStop = 5; zoom = 1.03; }
+      else if (isPerfect) { J.perfect(state.combo); hitStop = 3; zoom = 1.02; }
+      else { J.hit(state.combo); }
+      J.tension(Math.min(state.score / 30, 1));
+    }
+    if (isGold) { shakeAmt = 3; flash('+' + state.combo + '× GOLD', GOLD, 44); }
+    else if (isPerfect) flash('COMBO ×' + state.combo, TEAL, 40);
+    else flash('+1', VERM, 34);
+
+    // Dare beaten check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+
+    if (window.LOOP) LOOP.emit('like_landed', { n: state.score, combo: state.combo, gold: isGold });
+  }
+
+  // A card scrolled past the danger zone without being liked
+  function missCard(card) {
+    card.missed = true;
+    state.likesMissed++;
+    state.combo = 0;
+    shakeAmt = 4;
+    if (window.J) { J.near(); }
+    flash('MISSED', VERM, 34);
+    if (window.LOOP) LOOP.emit('near_miss', { n: state.score, missed: state.likesMissed });
+    if (state.likesMissed >= state.maxMisses) {
+      gameOver();
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 9;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + state.score / 30, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (newBest) { best = state.score; try { localStorage.setItem('dtr_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +(dur).toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 800);
+    }
+  }
+
+  function resetRun() {
+    state.cards = [];
+    state.scrollY = 0;
+    state.score = 0;
+    state.combo = 0;
+    state.likesMissed = 0;
+    hearts = []; flashes = [];
+    lastTapTime = 0;
+    // Reset bot per-run state
+    botLikesLeft = 8;
+    botPassive = false;
+    botLastCard = null;
+    for (var i = 0; i < 5; i++) state.cards.push(makeCard(H - 100 - i * (CARD_H + CARD_GAP)));
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- Input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // Track pointer for double-tap detection
+  function pointerTap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') {
+      var now2 = Date.now();
+      var dt2 = now2 - lastTapTime;
+      if (dt2 < DOUBLE_TAP_MS && dt2 > 30) {
+        // This is the second tap — check for a card
+        var card = activeCard();
+        if (card) {
+          likeCard(card);
+        }
+        lastTapTime = 0; // reset so triple-tap doesn't re-fire
+      } else {
+        // First tap
+        lastTapTime = now2;
+        lastTapY = y;
+      }
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'likes/min' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    pointerTap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') pointerTap(); });
+
+  // ---- Demo / Bot autopilots ----
+  // Demo: scripted double-tap timings (in "autopilot ticks" at 60fps)
+  // Pattern: good → good → near-miss-recovery → good → good → missed card (die)
+  // Demo script: actions with tick-wait before performing
+  // 'like' = double-tap the active card; 'skip' = let current active card scroll past
+  var demoScript = [
+    { action: 'like', wait: 55 },   // first card
+    { action: 'like', wait: 48 },   // building combo
+    { action: 'like', wait: 60 },   // near-edge timing (tension)
+    { action: 'like', wait: 38 },   // snappy recovery
+    { action: 'like', wait: 44 },   // strong streak
+    { action: 'skip', wait: 90 },   // near-fail: one slips past (dramatic)
+    { action: 'like', wait: 38 },   // SAVE — recovery
+    { action: 'like', wait: 46 },   // confidence restored
+    // Now go passive — the remaining cards scroll past → 4 more misses → game_over
+  ];
+  var demoIdx = 0, demoWait = 55;
+  var demoSeenCard = null;          // card we're targeting for current step
+
+  // Bot: plays K likes then goes passive so all remaining cards miss → natural game_over
+  var botRunsDone = 0;
+  var botLikesLeft = 8;             // likes per run before going passive
+  var botLastCard = null;           // track to avoid re-liking same card
+  var botPassive = false;
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    if (DEMO) {
+      if (demoIdx >= demoScript.length) return;  // passive — let remaining cards miss
+      if (demoWait > 0) { demoWait--; return; }
+      var step = demoScript[demoIdx];
+      if (step.action === 'like') {
+        var card = activeCard();
+        if (card && card !== demoSeenCard) {
+          demoSeenCard = card;
+          likeCard(card);
+          demoIdx++;
+          demoWait = step.wait;
+        }
+      } else if (step.action === 'skip') {
+        // ensure the active card scrolls past by doing nothing for a long pause
+        // The card will miss naturally; missCard() will fire and advance likesMissed
+        demoIdx++;
+        demoWait = step.wait;
+      }
+    } else if (BOT) {
+      if (botPassive) return;  // passive: let cards scroll past → misses → game_over
+      var card3 = activeCard();
+      if (!card3 || card3 === botLastCard) return;
+      botLastCard = card3;
+      botLikesLeft--;
+      if (botLikesLeft <= 0) {
+        botPassive = true;     // stop liking; misses will accumulate → game_over
+        return;
+      }
+      likeCard(card3);
+    }
+  }
+
+  // ---- Render helpers ----
+  function drawCard(card) {
+    var x = (W - CARD_W) / 2, y = card.y, r = 18;
+    var g = cx.createLinearGradient(x, y, x, y + CARD_H);
+    g.addColorStop(0, card.palette[0]);
+    g.addColorStop(1, card.palette[1]);
+    cx.save();
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(x, y, CARD_W, CARD_H, r);
+    else cx.rect(x, y, CARD_W, CARD_H);
+    cx.fillStyle = g;
+    cx.fill();
+    // Liked overlay
+    if (card.liked) {
+      cx.fillStyle = 'rgba(255,255,255,0.12)';
+      cx.fill();
+    }
+    cx.restore();
+
+    // Like count (bottom-left of card)
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.font = '700 13px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'left';
+    var displayLikes = card.liked ? card.likeCount + 1 : card.likeCount;
+    cx.fillText('♥ ' + displayLikes.toLocaleString(), x + 14, y + CARD_H - 14);
+
+    // Shine on like
+    if (card.shineT > 0) {
+      cx.save();
+      cx.globalAlpha = card.shineT * 0.5;
+      cx.fillStyle = '#fff';
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(x, y, CARD_W, CARD_H, r);
+      else cx.rect(x, y, CARD_W, CARD_H);
+      cx.fill();
+      cx.restore();
+      card.shineT *= 0.85;
+    }
+
+    // Tap hint (only for active unlocked card in human mode)
+    if (!card.liked && !card.missed && !DEMO && !BOT) {
+      var center = card.y + CARD_H / 2;
+      var dist = Math.abs(center - H / 2);
+      if (dist < 120) {
+        var alpha = Math.max(0, 0.55 - dist / 220);
+        cx.save();
+        cx.globalAlpha = alpha * (0.6 + 0.4 * Math.sin(Date.now() / 280));
+        cx.strokeStyle = '#fff';
+        cx.lineWidth = 2;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(x + 2, y + 2, CARD_W - 4, CARD_H - 4, r);
+        else cx.rect(x + 2, y + 2, CARD_W - 4, CARD_H - 4);
+        cx.stroke();
+        cx.restore();
+      }
+    }
+  }
+
+  function drawHeart(hrt, size) {
+    cx.save();
+    cx.globalAlpha = Math.max(0, 1 - hrt.t / 55);
+    cx.fillStyle = hrt.big ? GOLD : VERM;
+    cx.font = (hrt.big ? size * 1.6 : size) + 'px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.fillText('♥', hrt.x, hrt.y);
+    cx.restore();
+  }
+
+  // ---- Main frame loop ----
+  var ctaAt = 0, last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Advance scroll (frozen during hit-stop)
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      if (state.phase === 'play') {
+        var speed = SCROLL_SPEED_BASE + state.score * 0.06;
+        var scrollDelta = speed * dt;
+        state.scrollY += scrollDelta;
+
+        // Move all cards up
+        for (var i = 0; i < state.cards.length; i++) {
+          state.cards[i].y -= scrollDelta;
+        }
+
+        // Spawn new cards at the bottom as needed
+        var lastCard = state.cards[state.cards.length - 1];
+        if (lastCard && lastCard.y < H + CARD_GAP) {
+          state.cards.push(makeCard(lastCard.y + CARD_H + CARD_GAP));
+        }
+
+        // Check for missed cards (scrolled above the "danger zone" = top third)
+        for (var j = 0; j < state.cards.length; j++) {
+          var c = state.cards[j];
+          if (!c.liked && !c.missed && c.y + CARD_H < 60) {
+            missCard(c);
+            if (state.phase !== 'play') break;
+          }
+        }
+
+        // Remove cards well off screen
+        state.cards = state.cards.filter(function (c) { return c.y + CARD_H > -200; });
+
+        autopilot();
+      }
+    }
+
+    // Update hearts
+    for (var h = hearts.length - 1; h >= 0; h--) {
+      var hrt = hearts[h];
+      hrt.x += hrt.vx * dt; hrt.y += hrt.vy * dt;
+      hrt.vy += 0.04 * dt; // slight gravity
+      hrt.t += dt;
+      if (hrt.t > 58) hearts.splice(h, 1);
+    }
+
+    // ---- Draw ----
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.84, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // Feed lane (subtle) — just a soft vertical glow
+    cx.fillStyle = 'rgba(255,255,255,0.02)';
+    cx.fillRect((W - CARD_W) / 2 - 4, 0, CARD_W + 8, H);
+
+    // Draw cards (bottom to top render order)
+    if (state.phase === 'play' || state.phase === 'over') {
+      for (var ci = 0; ci < state.cards.length; ci++) {
+        var card = state.cards[ci];
+        if (card.y > H + 40 || card.y + CARD_H < -40) continue;
+        drawCard(card);
+      }
+    }
+
+    // Score / like counter (top HUD)
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.93)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 90);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best + '  •  MISSED ' + state.likesMissed + '/' + state.maxMisses, W / 2, 114);
+
+      // Dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 138);
+      }
+
+      // Miss warning "hearts" indicators
+      for (var mi = 0; mi < state.maxMisses; mi++) {
+        var filled = mi < (state.maxMisses - state.likesMissed);
+        cx.fillStyle = filled ? VERM : 'rgba(255,255,255,0.18)';
+        cx.font = '16px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText('♥', W / 2 - (state.maxMisses - 1) * 12 + mi * 24, 134 + (DEMO || BOT ? 0 : (window.SHARE && SHARE.dare !== null ? 20 : 0)));
+      }
+    }
+
+    // Floating hearts
+    for (var fi = 0; fi < hearts.length; fi++) drawHeart(hearts[fi], 22);
+
+    // Floating flash texts
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var alpha = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = alpha; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // Title screen
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('DOUBLE-TAP RUSH', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('double-tap each card to like it', W / 2, 328);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.globalAlpha = pulse;
+      cx.fillText('♥  TAP TO START', W / 2, 372);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('miss 5 and it\'s over', W / 2, 402);
+    }
+
+    // Challenge card (demo beat 1)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 15px Menlo, monospace';
+      cx.fillText('LIKES TO BEAT', W / 2, 310);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('28', W / 2, 415);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 447);
+    }
+
+    // Game over overlay
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.58)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('FEED\'S GONE.', W / 2, 298);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' likes', W / 2, 342);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 414);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — DOUBLE DOWN', W / 2, 460);
+        cx.globalAlpha = 1;
+        // Share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // Demo CTA card
+    if (state.phase === 'cta') {
+      var tCta = (now - ctaAt) / 1000, ease = Math.min(1, tCta * 2.4);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('DOUBLE-TAP RUSH', W / 2, 304);
+      cx.fillStyle = 'rgba(255,255,255,0.72)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they hit ' + (window.__demoScore || 28) + ' likes. your move.', W / 2, 344);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 28), W / 2, 412);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 444);
+      cx.globalAlpha = 1;
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

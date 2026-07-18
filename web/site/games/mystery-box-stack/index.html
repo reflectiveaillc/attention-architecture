@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Mystery Box Stack — Tilt</title>
+<!--
+  LOOP / attention-architecture — Mystery Box Stack
+  Circuits: 01-rpe (variable reward per unbox), 06-zeigarnik (clues pile up),
+            08-investment (each open narrows the mystery — sunk cost pulls next tap)
+  Modes:
+    ?demo=1&seed=7        mirror-neuron clip arc → sets window.__demoDone
+    ?bot=1&runs=N&seed=M  imperfect auto-play → sets window.__botDone
+    ?dare=<n>             incoming challenge banner
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'mystery-box-stack';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // ---- seeded RNG (mulberry32) ----
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  // ---- canvas / fit ----
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // ---- palette ----
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var WHITE = '#ffffff';
+
+  // ---- mystery items & clue pools ----
+  // Each set = 5 boxes; the last reveal names the item.
+  var SETS = [
+    { item: 'SNEAKERS',  clues: ['BRANDED', 'SIZE 10', 'WHITE', 'LACES', 'SNEAKERS'] },
+    { item: 'HEADPHONES', clues: ['WIRELESS', 'BLACK', 'NOISE CANCEL', 'FOLDABLE', 'HEADPHONES'] },
+    { item: 'WATCH',     clues: ['ANALOG', 'GOLD CASE', 'LEATHER BAND', 'LIMITED', 'WATCH'] },
+    { item: 'CAMERA',    clues: ['MIRRORLESS', 'PRIME LENS', 'FULL FRAME', 'SILENT SHUTTER', 'CAMERA'] },
+    { item: 'CONSOLE',   clues: ['NEXT GEN', 'DISC DRIVE', 'MATTE BLACK', 'CONTROLLER', 'CONSOLE'] },
+    { item: 'PERFUME',   clues: ['FRENCH', 'WOOD NOTES', 'GLASS BOTTLE', 'SPRAY TOP', 'PERFUME'] },
+  ];
+  var BOXES_PER_SET = 5;
+
+  // ---- juice / state ----
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  var dareBeaten = false;
+  var runStartTs, best = 0;
+  try { best = +localStorage.getItem('mbs_best') || 0; } catch (_) {}
+
+  // game state
+  var state;
+  var botRunsDone = 0;
+  var ctaAt = 0;
+  var challengeAt = 0;
+
+  // ---- box open animation particles ----
+  var particles = [];
+
+  function spawnBurst(cx2, cy, color) {
+    for (var i = 0; i < 14; i++) {
+      var angle = (i / 14) * Math.PI * 2 + rng() * 0.3;
+      var speed = 2.5 + rng() * 3.5;
+      particles.push({
+        x: cx2, y: cy,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 2,
+        color: color,
+        life: 1, maxLife: 38 + rng() * 20,
+        t: 0, size: 3 + rng() * 4
+      });
+    }
+  }
+
+  // ---- set logic ----
+  function currentSet() {
+    return SETS[state.setIdx % SETS.length];
+  }
+
+  function buildStack() {
+    // create BOXES_PER_SET boxes for the current set
+    state.boxes = [];
+    var set = currentSet();
+    for (var i = 0; i < BOXES_PER_SET; i++) {
+      state.boxes.push({
+        clue: set.clues[i],
+        isItem: i === BOXES_PER_SET - 1,
+        opened: false,
+        openAnim: 0   // 0..1 lid-fly animation progress
+      });
+    }
+    state.boxIdx = 0;  // which box is currently "active" (top of unwrapped stack)
+  }
+
+  // ---- game lifecycle ----
+  function newGame() {
+    state = {
+      phase: 'title',   // title | challenge | play | over | cta
+      score: 0,         // number of complete sets unwrapped
+      setIdx: 0,
+      cluesRevealed: 0, // clues revealed in current set
+      overAt: 0,
+      combo: 0
+    };
+    flashes = []; particles = []; dareBeaten = false;
+    buildStack();
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) {
+      startRun();
+      return;
+    }
+    // human: title screen
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function openCurrentBox() {
+    if (state.phase !== 'play') return;
+    var box = state.boxes[state.boxIdx];
+    if (!box || box.opened) return;
+
+    box.opened = true;
+    box.openAnim = 0;
+    state.cluesRevealed++;
+    state.combo++;
+
+    // determine box center for burst
+    var bx = W / 2, by = boxY(state.boxIdx);
+
+    // sounds
+    if (window.J) {
+      if (box.isItem) {
+        J.gold();
+        J.fanfare();
+      } else {
+        J.hit(state.combo);
+        J.tension(Math.min(state.cluesRevealed / BOXES_PER_SET, 1));
+      }
+    }
+
+    // juice
+    if (box.isItem) {
+      hitStop = 5;
+      zoom = 1.03;
+      shakeAmt = 4;
+      spawnBurst(bx, by, GOLD);
+      flash('MYSTERY SOLVED!', GOLD, 38);
+      flash('+' + (BOXES_PER_SET * 10), TEAL, 28);
+    } else {
+      if (state.cluesRevealed === BOXES_PER_SET - 1) {
+        // near-last clue: tension peak
+        shakeAmt = 3;
+        spawnBurst(bx, by, VERM);
+        flash('SO CLOSE!', VERM, 32);
+        if (window.LOOP) LOOP.emit('near_miss', { clue: box.clue, set: state.setIdx });
+      } else {
+        spawnBurst(bx, by, TEAL);
+        flash(box.clue, TEAL, 26);
+      }
+    }
+
+    if (window.LOOP) LOOP.emit('box_opened', { clue: box.clue, isItem: box.isItem, combo: state.combo, set: state.setIdx });
+
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+
+    state.boxIdx++;
+
+    if (state.boxIdx >= BOXES_PER_SET) {
+      // completed the set
+      state.score++;
+      var nb = state.score > best;
+      if (nb) { best = state.score; try { localStorage.setItem('mbs_best', String(best)); } catch (_) {} }
+
+      // check dare beaten by score
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score);
+      }
+
+      if (DEMO) {
+        // demo: after the 1st set solve, do a near-fail on second set then "drop" a box to trigger game_over
+        state.setIdx++;
+        buildStack();
+        // demo will handle the fail via script
+      } else if (BOT) {
+        state.setIdx++;
+        buildStack();
+        // bot plays multiple sets until it "fails" (we'll count K boxes then trigger over)
+      } else {
+        // human: advance to next set
+        state.setIdx++;
+        buildStack();
+        state.combo = 0;
+      }
+    }
+  }
+
+  function gameOver(reason) {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 9;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) {
+      J.death(Math.min(0.3 + state.score / 10, 1));
+      if (state.score > 0) setTimeout(function () { if (window.J) J.fanfare(); }, 450);
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 900);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.score = 0;
+    state.setIdx = 0;
+    state.cluesRevealed = 0;
+    state.combo = 0;
+    flashes = []; particles = [];
+    buildStack();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 5))));
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') {
+      openCurrentBox();
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'sets' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilots ----
+  // Demo script: open boxes 0..3 with hesitation, near-fail tension, then "misclick" = force game_over
+  // The "fail" for this game = missing the right moment (we add a ticking timer that kills you if too slow)
+  // Actually: we use a box-tap timer. Each box must be tapped within a time window. Timer shown.
+  // But for pure script simplicity: demo opens boxes, then on the item reveal we script a "drop" (timeout fail).
+
+  // For the game mechanic: there's a tap window (TIME_LIMIT ms) per box. If you don't tap in time, game over.
+  var TIME_LIMIT = 3200; // ms per box — creates urgency
+  var timeLeft = TIME_LIMIT;
+  var lastBoxTs = 0;
+
+  // demo beat timing (ms from run start)
+  var demoBeats = null;
+  var demoFired = false;
+  var demoBotPhase = 0; // 0=first set open, 1=second set near-fail, 2=death
+
+  function initDemoBeats() {
+    // beat sequence: open boxes in first set with varied gaps (human hesitation)
+    // then start second set, do 3 boxes, then let timer run out → death
+    demoBeats = [
+      { at: 1000, action: 'open' },  // box 0
+      { at: 1900, action: 'open' },  // box 1 (hesitation)
+      { at: 2550, action: 'open' },  // box 2
+      { at: 3400, action: 'open' },  // box 3 (longer pause — near-fail tension)
+      { at: 4050, action: 'open' },  // box 4 = item reveal → set 1 solved
+      // second set
+      { at: 5100, action: 'open' },  // box 0
+      { at: 5800, action: 'open' },  // box 1
+      { at: 6600, action: 'open' },  // box 2 — near-fail triggered via near_miss in openCurrentBox
+      // now let the timer expire for "fail" — no more opens
+    ];
+    demoBotPhase = 0;
+  }
+
+  var demoRunStart = 0;
+
+  // bot: just open a box every ~600-1200ms until enough sets done, then let timer kill
+  var botNextOpen = 0;
+  var botOpensDone = 0;
+  var BOT_MAX_OPENS = 12; // open this many boxes across runs then let timer expire
+
+  // ---- game timer logic ----
+  // Timer starts fresh each new box
+  function resetBoxTimer() {
+    timeLeft = TIME_LIMIT;
+    lastBoxTs = performance.now();
+  }
+
+  // ---- rendering helpers ----
+  var BOX_W = 220, BOX_H = 70;
+
+  function boxY(idx) {
+    // stack: bottom box at y=580, each box is 80px above the last
+    return 580 - idx * 90;
+  }
+
+  // draw a single box (closed or opening)
+  function drawBox(bx, by, box, idx) {
+    var isActive = idx === state.boxIdx && !box.opened;
+    var scale2 = box.opened ? 1 : (isActive ? 1 + 0.03 * Math.sin(performance.now() / 180) : 1);
+    var bw = BOX_W * scale2, bh = BOX_H * scale2;
+
+    // body
+    var bodyColor = box.isItem ? GOLD : (box.opened ? 'rgba(46,197,182,0.3)' : TEAL);
+    if (box.opened) {
+      cx.globalAlpha = 0.4;
+    }
+    // box body
+    cx.fillStyle = bodyColor;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(bx - bw / 2, by - bh / 2, bw, bh, 10);
+    else cx.rect(bx - bw / 2, by - bh / 2, bw, bh);
+    cx.fill();
+
+    // ribbon stripe
+    if (!box.opened) {
+      cx.fillStyle = box.isItem ? 'rgba(11,13,18,0.3)' : 'rgba(11,13,18,0.2)';
+      cx.fillRect(bx - 4, by - bh / 2, 8, bh);
+      cx.fillRect(bx - bw / 2, by - 4, bw, 8);
+
+      // bow on top
+      cx.beginPath();
+      cx.arc(bx, by - bh / 2 - 2, 10, 0, Math.PI * 2);
+      cx.fillStyle = box.isItem ? VERM : VERM;
+      cx.fill();
+    }
+
+    cx.globalAlpha = 1;
+
+    // clue text (always shown after opened)
+    if (box.opened) {
+      cx.textAlign = 'center';
+      cx.fillStyle = box.isItem ? GOLD : WHITE;
+      cx.font = (box.isItem ? '900' : '700') + ' ' + (box.isItem ? 20 : 16) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(box.clue, bx, by + 6);
+    } else if (isActive) {
+      // hint: "?" on active box
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('?', bx, by + 10);
+    }
+  }
+
+  // draw timer arc
+  function drawTimer(cx2, now2) {
+    if (state.phase !== 'play') return;
+    var ratio = Math.max(0, timeLeft / TIME_LIMIT);
+    var r = 28;
+    var cx3 = W - 60, cy = H - 60;
+
+    // bg ring
+    cx2.strokeStyle = 'rgba(255,255,255,0.12)';
+    cx2.lineWidth = 5;
+    cx2.beginPath();
+    cx2.arc(cx3, cy, r, 0, Math.PI * 2);
+    cx2.stroke();
+
+    // countdown arc
+    var color = ratio > 0.4 ? TEAL : (ratio > 0.2 ? GOLD : VERM);
+    cx2.strokeStyle = color;
+    cx2.lineWidth = 5;
+    cx2.beginPath();
+    cx2.arc(cx3, cy, r, -Math.PI / 2, -Math.PI / 2 + ratio * Math.PI * 2);
+    cx2.stroke();
+
+    // center time
+    cx2.fillStyle = color;
+    cx2.font = '700 13px Menlo, monospace';
+    cx2.textAlign = 'center';
+    cx2.fillText((timeLeft / 1000).toFixed(1), cx3, cy + 5);
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // timer countdown (play phase, first box active)
+    if (state.phase === 'play') {
+      var elapsed = now - lastBoxTs;
+      timeLeft = Math.max(0, TIME_LIMIT - elapsed);
+      if (timeLeft <= 0 && !DEMO && !BOT) {
+        // human timeout → game over
+        shakeAmt = 8;
+        if (window.J) J.near();
+        flash('TOO SLOW!', VERM, 40);
+        gameOver('timeout');
+        timeLeft = TIME_LIMIT; // reset to avoid re-triggering
+      }
+      // bot/demo timeouts handled separately
+    }
+
+    // demo auto-play
+    if (DEMO && state.phase === 'play') {
+      if (!demoBeats) {
+        initDemoBeats();
+        demoRunStart = now;
+      }
+      var elapsed2 = now - demoRunStart;
+      for (var bi = 0; bi < demoBeats.length; bi++) {
+        var beat = demoBeats[bi];
+        if (!beat.fired && elapsed2 >= beat.at) {
+          beat.fired = true;
+          if (beat.action === 'open') {
+            if (state.phase === 'play') {
+              openCurrentBox();
+              resetBoxTimer();
+            }
+          }
+        }
+      }
+      // after all beats, let timer run out → game_over
+      if (demoBeats.every(function (b) { return b.fired; })) {
+        // timer runs naturally → hits 0 in ~3s
+        if (timeLeft <= 0) {
+          if (window.J) J.death(0.7);
+          flash('TIME UP!', VERM, 40);
+          gameOver('demo-timeout');
+          timeLeft = TIME_LIMIT;
+        }
+      }
+    }
+
+    // bot auto-play
+    if (BOT && state.phase === 'play') {
+      if (botOpensDone < BOT_MAX_OPENS) {
+        if (now >= botNextOpen) {
+          openCurrentBox();
+          resetBoxTimer();
+          botOpensDone++;
+          botNextOpen = now + 500 + rng() * 700;
+        }
+      } else {
+        // let timer run to 0
+        if (timeLeft <= 0) {
+          flash('TIME UP!', VERM, 40);
+          if (window.J) J.death(0.5);
+          gameOver('bot-timeout');
+          timeLeft = TIME_LIMIT;
+          botOpensDone = 0;
+          botNextOpen = now + 900;
+        }
+      }
+    }
+
+    // hit-stop: decay every frame, gate autopilot on it
+    if (hitStop > 0) hitStop -= dt;
+
+    // particles
+    for (var pi = particles.length - 1; pi >= 0; pi--) {
+      var p = particles[pi];
+      p.t += dt;
+      p.x += p.vx * dt;
+      p.y += (p.vy + 0.25 * p.t) * dt;
+      p.life = 1 - p.t / p.maxLife;
+      if (p.t >= p.maxLife) particles.splice(pi, 1);
+    }
+
+    // ---- draw ----
+    cx.save();
+
+    // juice transforms
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(242,177,52,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- TITLE ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = WHITE;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('MYSTERY BOX', W / 2, 260);
+      cx.fillStyle = GOLD;
+      cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('STACK', W / 2, 315);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap each box before time runs out', W / 2, 355);
+      cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 280);
+      cx.globalAlpha = pulse;
+      cx.fillText('TAP TO START', W / 2, 400);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- CHALLENGE CARD (demo beat 1) ----
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('4', W / 2, 405);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 435);
+    }
+
+    // ---- PLAY ----
+    if (state.phase === 'play') {
+      // set label
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '800 54px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 80);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('SETS SOLVED   BEST ' + best, W / 2, 104);
+
+      // set title
+      var curSet = currentSet();
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '700 14px Menlo, monospace';
+      cx.fillText('SET ' + (state.setIdx + 1) + ' — UNBOX THE MYSTERY', W / 2, 145);
+
+      // clue progress bar
+      var barW = 240, barH = 5, barX = W / 2 - barW / 2, barY = 158;
+      cx.fillStyle = 'rgba(255,255,255,0.1)';
+      cx.fillRect(barX, barY, barW, barH);
+      cx.fillStyle = TEAL;
+      cx.fillRect(barX, barY, barW * (state.cluesRevealed / BOXES_PER_SET), barH);
+
+      // boxes
+      for (var bi2 = 0; bi2 < state.boxes.length; bi2++) {
+        var b = state.boxes[bi2];
+        var by = boxY(bi2);
+        // only draw visible boxes
+        if (by < -60 || by > H + 60) continue;
+        drawBox(W / 2, by, b, bi2);
+      }
+
+      // "TAP TO OPEN" arrow on active box
+      if (state.boxIdx < state.boxes.length) {
+        var activeY = boxY(state.boxIdx);
+        var arrowPulse = 0.6 + 0.4 * Math.sin(now / 220);
+        cx.globalAlpha = arrowPulse;
+        cx.fillStyle = WHITE;
+        cx.font = '700 14px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText('▼ TAP TO OPEN ▼', W / 2, activeY + BOX_H / 2 + 26);
+        cx.globalAlpha = 1;
+      }
+
+      // timer
+      drawTimer(cx, now);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.textAlign = 'center';
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : ('BEAT ' + SHARE.dare + ' SETS' + (SHARE.by ? ' — dared by ' + SHARE.by : '')), W / 2, 130);
+      }
+    }
+
+    // ---- GAME OVER ----
+    if (state.phase === 'over') {
+      // draw last state of boxes dimmed
+      for (var bi3 = 0; bi3 < state.boxes.length; bi3++) {
+        var bb = state.boxes[bi3];
+        cx.globalAlpha = 0.25;
+        drawBox(W / 2, boxY(bi3), bb, bi3);
+        cx.globalAlpha = 1;
+      }
+      cx.fillStyle = 'rgba(11,13,18,0.60)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('BOX DROPPED.', W / 2, 290);
+      cx.fillStyle = WHITE;
+      cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' set' + (state.score !== 1 ? 's' : '') + ' solved', W / 2, 334);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 376);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('faster than ' + (100 - pt) + '% of players', W / 2, 400);
+      if (!DEMO && !BOT) {
+        var pulse2 = 0.6 + 0.4 * Math.sin(now / 270);
+        cx.globalAlpha = pulse2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 450);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- DEMO CTA ----
+    if (state.phase === 'cta') {
+      var t2 = (now - ctaAt) / 1000, ease = Math.min(1, t2 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = WHITE;
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('MYSTERY BOX', W / 2, 286);
+      cx.fillStyle = GOLD;
+      cx.font = '900 50px -apple-system, Helvetica, Arial';
+      cx.fillText('STACK', W / 2, 346);
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they solved ' + (window.__demoScore || 2) + '. can you beat it?', W / 2, 388);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 230);
+      cx.fillStyle = VERM;
+      cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 2), W / 2, 436);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 468);
+      cx.globalAlpha = 1;
+    }
+
+    // particles
+    for (var pj = 0; pj < particles.length; pj++) {
+      var pp = particles[pj];
+      cx.globalAlpha = pp.life;
+      cx.fillStyle = pp.color;
+      cx.beginPath();
+      cx.arc(pp.x, pp.y, pp.size * pp.life, 0, Math.PI * 2);
+      cx.fill();
+    }
+    cx.globalAlpha = 1;
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 230 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = WHITE;
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // init box timer when game starts
+  function startRunWithTimer() {
+    startRun();
+    resetBoxTimer();
+  }
+
+  // patch newGame to init timer on BOT/DEMO
+  var _origNewGame = newGame;
+  newGame = function () {
+    _origNewGame();
+    if (DEMO || BOT) {
+      // timer starts when phase becomes play, handled in frame loop
+    }
+    lastBoxTs = performance.now();
+  };
+
+  // re-init timer when box is opened
+  var _origOpenCurrentBox = openCurrentBox;
+  // (already resets timer inside via resetBoxTimer call below)
+
+  // patch startRun to init timer
+  var origStartRun = startRun;
+  startRun = function () {
+    origStartRun();
+    lastBoxTs = performance.now();
+    timeLeft = TIME_LIMIT;
+  };
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

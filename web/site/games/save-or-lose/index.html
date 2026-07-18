@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Save or Lose — Tilt</title>
+<!--
+  LOOP / attention-architecture — Save or Lose
+  Circuits: 04-loss, 03-social, 06-zeigarnik
+  Mechanic: cards drift down the feed; tap the bookmark ribbon to save;
+            save slots cap at 5; fill them and the next high-worth card you miss = game over.
+  Modes:
+    ?demo=1&seed=7      mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N&seed=M  imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#0b0d12;overflow:hidden;
+            -webkit-user-select:none;user-select:none;touch-action:manipulation;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{display:block;background:#0b0d12;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'save-or-lose';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function(){
+'use strict';
+
+var W=405,H=720;
+var qs=new URLSearchParams(location.search);
+var DEMO=qs.get('demo')==='1';
+var BOT =qs.get('bot')==='1';
+var BOT_RUNS=+qs.get('runs')||3;
+var SEED=+qs.get('seed')||42;
+
+/* mulberry32 seeded RNG */
+function mulberry32(a){
+  return function(){
+    a|=0;a=a+0x6D2B79F5|0;
+    var t=Math.imul(a^a>>>15,1|a);
+    t=t+Math.imul(t^t>>>7,61|t)^t;
+    return((t^t>>>14)>>>0)/4294967296;
+  };
+}
+var rng=mulberry32(SEED);
+
+var cv=document.getElementById('c'),cx=cv.getContext('2d');
+var dpr=Math.min(window.devicePixelRatio||1,2),scale=1;
+function fit(){
+  var vw=window.innerWidth,vh=window.innerHeight;
+  scale=Math.min(vw/W,vh/H);
+  cv.style.width=(W*scale)+'px'; cv.style.height=(H*scale)+'px';
+  cv.width=W*dpr; cv.height=H*dpr;
+  cx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener('resize',fit); fit();
+
+/* palette */
+var INK='#0b0d12',VERM='#e8502e',TEAL='#2ec5b6',GOLD='#f2b134';
+
+/* card types */
+var TYPES=[
+  {label:'Recipe', icon:'🍜',worth:3,col:TEAL},
+  {label:'Workout',icon:'💪',worth:2,col:GOLD},
+  {label:'Meme',   icon:'😂',worth:1,col:'#666e85'},
+  {label:'Travel', icon:'✈️',worth:3,col:VERM},
+  {label:'Hack',   icon:'💡',worth:2,col:TEAL},
+  {label:'Deal',   icon:'🔥',worth:3,col:GOLD},
+  {label:'Art',    icon:'🎨',worth:2,col:VERM},
+  {label:'Quote',  icon:'💬',worth:1,col:'#666e85'},
+];
+
+var MAX_SAVES=5;
+var CARD_W=270, CARD_H=88;
+var BASE_SPEED=0.75; /* px/frame @60fps nominal */
+
+/* ---- game state ---- */
+var phase;          /* title|challenge|play|over|cta */
+var cards, saves;
+var score, combo, missStreak;
+var hitStop,shakeAmt,zoom,flashes;
+var dareBeaten,overAt,challengeAt,ctaAt;
+var runStartTs, best;
+var spawnTimer;
+
+try{best=+localStorage.getItem('sol_best')||0;}catch(_){best=0;}
+
+function rndType(){return TYPES[Math.floor(rng()*TYPES.length)];}
+
+function newCard(){
+  return{
+    x:W/2-CARD_W/2, y:-CARD_H-10,
+    w:CARD_W, h:CARD_H,
+    type:rndType(),
+    saved:false, missed:false,
+    alpha:1
+  };
+}
+
+function initState(){
+  cards=[];saves=[];
+  score=0;combo=0;missStreak=0;
+  hitStop=0;shakeAmt=0;zoom=1;
+  flashes=[];dareBeaten=false;
+  overAt=0;challengeAt=0;ctaAt=0;
+  spawnTimer=0;
+  botRunsDone=0;
+  demoIdx=0;demoWait=0;demoActed=false;
+}
+
+function newGame(){
+  initState();
+  if(DEMO){
+    phase='challenge'; challengeAt=performance.now();
+    setTimeout(startRun,1250);
+  } else if(BOT){
+    phase='play'; startRun();
+  } else {
+    phase='title';
+  }
+}
+
+function startRun(){
+  phase='play';
+  runStartTs=Date.now();
+  spawnTimer=0;
+  cards.push(newCard());
+  if(window.LOOP) LOOP.emit('play_start',{seed:SEED});
+}
+
+function flash(txt,col,sz){flashes.push({txt:txt,col:col,sz:sz||36,t:0});}
+
+/* ribbon rect for a card */
+function rb(c){
+  return{x:c.x+c.w-40,y:c.y+10,w:32,h:40};
+}
+
+function saveCard(c){
+  if(c.saved||c.missed) return;
+  if(saves.length>=MAX_SAVES){
+    flash('SLOT FULL!',VERM,34);
+    shakeAmt=6;
+    if(window.J) J.near();
+    c.missed=true;
+    missStreak++;
+    if(window.LOOP) LOOP.emit('slot_full',{worth:c.type.worth});
+    if(missStreak>=2) triggerGameOver();
+    return;
+  }
+  c.saved=true;
+  saves.push(c);
+  combo++;
+  score+=c.type.worth;
+  missStreak=0;
+
+  if(window.J){
+    if(c.type.worth>=3){
+      J.perfect(combo);
+      hitStop=5; zoom=1.028;
+      flash('+'+c.type.worth+' '+c.type.label,GOLD,42);
+      if(window.LOOP) LOOP.emit('gold_save',{worth:c.type.worth,combo:combo});
+    } else {
+      J.hit(combo);
+      flash('+'+c.type.worth,TEAL,32);
+      if(window.LOOP) LOOP.emit('card_saved',{worth:c.type.worth,combo:combo});
+    }
+    J.tension(Math.min(saves.length/MAX_SAVES,1));
+  }
+
+  if(!DEMO&&!BOT&&window.SHARE&&SHARE.dare!==null&&!dareBeaten&&score>SHARE.dare){
+    dareBeaten=true;
+    flash('DARE BEATEN',TEAL,40);
+    if(window.J) J.fanfare();
+    SHARE.beaten(score);
+  }
+}
+
+/* card scrolled past without saving */
+function cardMissed(c){
+  c.missed=true;
+  if(c.type.worth>=3){
+    missStreak++;
+    combo=0;
+    shakeAmt=4;
+    flash('MISSED IT',VERM,32);
+    if(window.J) J.near();
+    if(window.LOOP) LOOP.emit('near_miss',{worth:c.type.worth,score:score});
+    /* game over: if saves full AND missed a high-worth card, or missed 3 high-worth total */
+    if(saves.length>=MAX_SAVES||missStreak>=3){
+      triggerGameOver();
+    }
+  }
+}
+
+function triggerGameOver(){
+  if(phase==='over'||phase==='cta') return;
+  phase='over';
+  overAt=performance.now();
+  shakeAmt=11;
+  var dur=(Date.now()-runStartTs)/1000;
+  var newBest=score>best;
+  if(window.J){
+    J.death(Math.min(0.25+score/28,1));
+    if(newBest) setTimeout(function(){J.fanfare();},450);
+  }
+  if(DEMO) window.__demoScore=score;
+  if(newBest){best=score; try{localStorage.setItem('sol_best',String(best));}catch(_){}}
+  if(window.LOOP) LOOP.emit('game_over',{score:score,dur_s:+dur.toFixed(1)});
+
+  if(DEMO){
+    setTimeout(function(){
+      phase='cta'; ctaAt=performance.now();
+      setTimeout(function(){window.__demoDone=true;},3600);
+    },2600);
+  }
+  if(BOT){
+    botRunsDone++;
+    if(botRunsDone>=BOT_RUNS){ window.__botDone=true; }
+    else setTimeout(resetRun,800);
+  }
+}
+
+function resetRun(){
+  cards=[];saves=[];score=0;combo=0;missStreak=0;
+  flashes=[];dareBeaten=false;spawnTimer=0;
+  demoIdx=0;demoWait=0;demoActed=false;
+  if(window.LOOP) LOOP.emit('restart',{});
+  startRun();
+}
+
+/* ---- autopilots ---- */
+var botRunsDone=0;
+/* demo: series of actions: 's'=save, 'x'=skip, 'm'=miss-intentionally (let scroll) */
+/* arc: save-save-skip-save-save (slots filling) → skip high-worth (near-fail) → save
+   → slots full → next high-worth miss → game over */
+var demoActions=['s','s','x','s','s','m','s','s','x','s','m','end'];
+var demoIdx=0, demoWait=0, demoActed=false;
+
+function autopilot(dt){
+  if(phase!=='play') return;
+
+  if(DEMO){
+    demoWait-=dt;
+    /* find lowest on-screen, unacted card */
+    var target=null;
+    for(var i=0;i<cards.length;i++){
+      var c=cards[i];
+      if(!c.saved&&!c.missed&&c.y>80&&c.y<H-CARD_H-100){ target=c; break; }
+    }
+    if(!target) return;
+    if(demoActed){
+      /* wait for this card to leave before acting on next */
+      if(target&&(target.saved||target.missed)) demoActed=false;
+      return;
+    }
+    if(demoWait>0) return;
+
+    var act=demoActions[Math.min(demoIdx,demoActions.length-1)];
+    if(act==='end'||demoIdx>=demoActions.length){ return; }
+    demoIdx++;
+    demoActed=true;
+    if(act==='s'){
+      saveCard(target);
+      demoWait=28+Math.floor(rng()*22);
+    } else if(act==='x'||act==='m'){
+      /* intentionally skip — let it drift past */
+      target.missed=true; /* mark so we skip to next card */
+      /* 'm' triggers the missed logic without the game-over for the near-fail moment */
+      if(act==='m'&&target.type.worth<3){
+        /* re-roll type to ensure near-fail is visible */
+        target.type=TYPES[0]; /* Recipe, worth 3 */
+      }
+      demoWait=32+Math.floor(rng()*18);
+    }
+  } else if(BOT){
+    /* act on first eligible card */
+    for(var j=0;j<cards.length;j++){
+      var bc=cards[j];
+      if(!bc.saved&&!bc.missed&&bc.y>80&&bc.y<H-CARD_H-100){
+        /* save high-worth most of the time, low-worth rarely — bot will eventually fill slots */
+        var p=bc.type.worth>=3?0.80:bc.type.worth===2?0.60:0.28;
+        if(rng()<p) saveCard(bc);
+        else bc.missed=true;
+        break;
+      }
+    }
+  }
+}
+
+/* ---- input ---- */
+var MUTE_R={x:W-46,y:10,w:38,h:38};
+var SHARE_R={x:W/2-125,y:488,w:250,h:46};
+function inR(r,px,py){return px>=r.x&&px<=r.x+r.w&&py>=r.y&&py<=r.y+r.h;}
+
+function tap(px,py){
+  if(DEMO||BOT) return;
+  if(px!==undefined&&inR(MUTE_R,px,py)&&window.J){J.toggleMute();return;}
+  if(phase==='title'){startRun();return;}
+  if(phase==='play'){
+    for(var i=cards.length-1;i>=0;i--){
+      var c=cards[i];
+      if(c.saved||c.missed) continue;
+      var r=rb(c);
+      var onCard=px>=c.x&&px<=c.x+c.w&&py>=c.y&&py<=c.y+c.h;
+      var onRib=px>=r.x&&px<=r.x+r.w&&py>=r.y&&py<=r.y+r.h;
+      if(onCard||onRib){saveCard(c);return;}
+    }
+    return;
+  }
+  if(phase==='over'&&performance.now()-overAt>350){
+    if(px!==undefined&&inR(SHARE_R,px,py)&&window.SHARE){
+      SHARE.send({score:score,unit:'saved'}); return;
+    }
+    resetRun();
+  }
+}
+
+window.addEventListener('pointerdown',function(e){
+  var r=cv.getBoundingClientRect();
+  tap((e.clientX-r.left)/scale,(e.clientY-r.top)/scale);
+});
+window.addEventListener('keydown',function(e){if(e.code==='Space') tap();});
+
+/* ---- drawing helpers ---- */
+function rr(x,y,w,h,rad){
+  if(cx.roundRect){cx.roundRect(x,y,w,h,rad);}
+  else{cx.rect(x,y,w,h);}
+}
+
+function drawBookmark(bx,by,bw,bh,col){
+  cx.fillStyle=col;
+  cx.beginPath();
+  cx.moveTo(bx,by);
+  cx.lineTo(bx+bw,by);
+  cx.lineTo(bx+bw,by+bh);
+  cx.lineTo(bx+bw/2,by+bh-7);
+  cx.lineTo(bx,by+bh);
+  cx.closePath();
+  cx.fill();
+}
+
+function drawCard(c){
+  var a=c.alpha!=null?c.alpha:1;
+  cx.save();
+  cx.globalAlpha=a;
+
+  /* shadow */
+  cx.shadowColor='rgba(0,0,0,0.5)';
+  cx.shadowBlur=14;cx.shadowOffsetY=5;
+
+  /* body */
+  cx.fillStyle='#1b1f2b';
+  cx.beginPath(); rr(c.x,c.y,c.w,c.h,14); cx.fill();
+  cx.shadowBlur=0;cx.shadowOffsetY=0;
+
+  /* accent stripe */
+  cx.fillStyle=c.type.col;
+  cx.globalAlpha=a*0.75;
+  cx.beginPath(); rr(c.x,c.y,5,c.h,[14,0,0,14]); cx.fill();
+  cx.globalAlpha=a;
+
+  /* icon */
+  cx.font='26px -apple-system,Helvetica,Arial';
+  cx.textAlign='left'; cx.fillStyle='#fff';
+  cx.fillText(c.type.icon,c.x+16,c.y+36);
+
+  /* label */
+  cx.font='700 14px -apple-system,Helvetica,Arial';
+  cx.fillStyle='rgba(255,255,255,0.9)';
+  cx.fillText(c.type.label,c.x+52,c.y+29);
+
+  /* worth dots */
+  cx.fillStyle='rgba(255,255,255,0.35)';
+  cx.font='600 11px -apple-system,Helvetica,Arial';
+  var dots='';for(var d=0;d<c.type.worth;d++) dots+='●';
+  cx.fillText(dots,c.x+52,c.y+49);
+
+  /* sub-label */
+  cx.fillStyle='rgba(255,255,255,0.25)';
+  cx.font='500 11px -apple-system,Helvetica,Arial';
+  cx.fillText('worth '+c.type.worth+' pts',c.x+52,c.y+68);
+
+  /* ribbon */
+  if(!c.saved&&!c.missed){
+    var r=rb(c);
+    cx.fillStyle='rgba(255,255,255,0.07)';
+    cx.strokeStyle='rgba(255,255,255,0.18)'; cx.lineWidth=1.5;
+    cx.beginPath(); cx.rect(r.x,r.y,r.w,r.h); cx.fill(); cx.stroke();
+    drawBookmark(r.x+7,r.y+7,18,24,'rgba(255,255,255,0.55)');
+    cx.font='600 8px -apple-system,Helvetica,Arial';
+    cx.fillStyle='rgba(255,255,255,0.45)';
+    cx.textAlign='center';
+    cx.fillText('SAVE',r.x+r.w/2,r.y+r.h-3);
+  }
+
+  /* saved check */
+  if(c.saved){
+    cx.globalAlpha=a*0.5;
+    cx.fillStyle=TEAL;
+    cx.font='900 24px -apple-system,Helvetica,Arial';
+    cx.textAlign='center';
+    cx.fillText('✓',c.x+c.w-20,c.y+34);
+    cx.globalAlpha=a;
+  }
+
+  /* missed X */
+  if(c.missed){
+    cx.globalAlpha=a*0.45;
+    cx.fillStyle=VERM;
+    cx.font='900 28px -apple-system,Helvetica,Arial';
+    cx.textAlign='center';
+    cx.fillText('✕',c.x+c.w/2,c.y+c.h/2+10);
+    cx.globalAlpha=a;
+  }
+
+  cx.restore();
+}
+
+function drawSaveSlots(now){
+  var slotW=36,slotGap=8;
+  var totalW=MAX_SAVES*(slotW+slotGap)-slotGap;
+  var sx0=W/2-totalW/2, sy=H-66;
+
+  cx.textAlign='center';
+  cx.fillStyle='rgba(255,255,255,0.38)';
+  cx.font='600 10px -apple-system,Helvetica,Arial';
+  cx.fillText('SAVES  '+saves.length+'/'+MAX_SAVES,W/2,sy-10);
+
+  for(var i=0;i<MAX_SAVES;i++){
+    var sx=sx0+i*(slotW+slotGap);
+    var filled=i<saves.length;
+    cx.fillStyle=filled?saves[i].type.col:'rgba(255,255,255,0.07)';
+    cx.strokeStyle=filled?saves[i].type.col:'rgba(255,255,255,0.16)';
+    cx.lineWidth=1.5;
+    cx.beginPath(); rr(sx,sy,slotW,slotW,8); cx.fill(); cx.stroke();
+    if(filled){
+      cx.font='15px -apple-system,Helvetica,Arial';
+      cx.fillStyle='#fff';
+      cx.textAlign='center';
+      cx.fillText(saves[i].type.icon,sx+slotW/2,sy+slotW/2+6);
+    }
+  }
+
+  /* capacity warning glow */
+  if(saves.length>=MAX_SAVES){
+    cx.strokeStyle=VERM; cx.lineWidth=2.5;
+    cx.globalAlpha=0.5+0.5*Math.sin(now/90);
+    cx.beginPath(); rr(sx0-4,sy-4,totalW+8,slotW+8,10); cx.stroke();
+    cx.globalAlpha=1;
+  } else if(saves.length>=MAX_SAVES-1){
+    cx.strokeStyle=GOLD; cx.lineWidth=2;
+    cx.globalAlpha=0.4+0.4*Math.sin(now/130);
+    cx.beginPath(); rr(sx0-4,sy-4,totalW+8,slotW+8,10); cx.stroke();
+    cx.globalAlpha=1;
+  }
+}
+
+/* ---- main loop ---- */
+var last=performance.now();
+function frame(now){
+  var dt=Math.min((now-last)/16.667,3); last=now;
+
+  if(hitStop>0){
+    hitStop-=dt;
+  } else {
+    if(phase==='play'){
+      /* spawn timer */
+      spawnTimer+=dt;
+      var spawnInterval=72;
+      if(spawnTimer>=spawnInterval){
+        spawnTimer=0;
+        cards.push(newCard());
+      }
+
+      var speed=BASE_SPEED*dt;
+      for(var i=cards.length-1;i>=0;i--){
+        var c=cards[i];
+        c.y+=speed;
+        if(c.y>H+20){
+          if(!c.saved&&!c.missed) cardMissed(c);
+          if(phase==='play') cards.splice(i,1);
+        }
+      }
+
+      autopilot(dt);
+    }
+  }
+
+  /* ---- draw ---- */
+  cx.save();
+  if(shakeAmt>0.2||zoom>1.001){
+    var sx2=(Math.random()-0.5)*shakeAmt, sy2=(Math.random()-0.5)*shakeAmt;
+    cx.translate(W/2+sx2,H/2+sy2); cx.scale(zoom,zoom); cx.translate(-W/2,-H/2);
+  }
+  shakeAmt*=Math.pow(0.82,dt);
+  zoom+=(1-zoom)*0.13*dt;
+
+  /* bg */
+  cx.fillStyle=INK; cx.fillRect(-20,-20,W+40,H+40);
+  var bg=cx.createLinearGradient(0,0,0,H);
+  bg.addColorStop(0,'rgba(46,197,182,0.04)'); bg.addColorStop(1,'rgba(232,80,46,0.06)');
+  cx.fillStyle=bg; cx.fillRect(0,0,W,H);
+
+  /* top fade */
+  var tg=cx.createLinearGradient(0,0,0,115);
+  tg.addColorStop(0,INK); tg.addColorStop(1,'rgba(11,13,18,0)');
+  cx.fillStyle=tg; cx.fillRect(0,0,W,115);
+
+  /* bottom fade */
+  var bg2=cx.createLinearGradient(0,H-85,0,H);
+  bg2.addColorStop(0,'rgba(11,13,18,0)'); bg2.addColorStop(1,INK);
+  cx.fillStyle=bg2; cx.fillRect(0,H-85,W,85);
+
+  if(phase==='play'||phase==='over'){
+    /* draw cards */
+    for(var ci=0;ci<cards.length;ci++) drawCard(cards[ci]);
+    drawSaveSlots(now);
+
+    /* score */
+    cx.textAlign='center';
+    cx.fillStyle='rgba(255,255,255,0.92)';
+    cx.font='800 52px -apple-system,Helvetica,Arial';
+    cx.fillText(score,W/2,76);
+    cx.fillStyle='rgba(255,255,255,0.35)';
+    cx.font='600 11px -apple-system,Helvetica,Arial';
+    cx.fillText('BEST '+best,W/2,98);
+
+    if(!DEMO&&!BOT&&window.SHARE&&SHARE.dare!==null&&phase==='play'){
+      cx.fillStyle=dareBeaten?TEAL:GOLD;
+      cx.font='800 13px -apple-system,Helvetica,Arial';
+      cx.fillText(dareBeaten?'DARE BEATEN ✓':'BEAT '+SHARE.dare,W/2,118);
+    }
+  }
+
+  /* challenge card */
+  if(phase==='challenge'){
+    cx.textAlign='center';
+    cx.fillStyle='rgba(255,255,255,0.48)';
+    cx.font='800 15px Menlo,monospace';
+    cx.fillText('SCORE TO BEAT',W/2,295);
+    cx.fillStyle=GOLD;
+    cx.font='900 88px -apple-system,Helvetica,Arial';
+    cx.fillText('28',W/2,398);
+    cx.fillStyle='rgba(255,255,255,0.3)';
+    cx.font='600 13px -apple-system,Helvetica,Arial';
+    cx.fillText("today's top save streak",W/2,430);
+  }
+
+  /* title */
+  if(phase==='title'){
+    cx.textAlign='center';
+    cx.fillStyle='#fff';
+    cx.font='900 40px -apple-system,Helvetica,Arial';
+    cx.fillText('SAVE OR LOSE',W/2,278);
+    cx.fillStyle='rgba(255,255,255,0.48)';
+    cx.font='600 14px -apple-system,Helvetica,Arial';
+    cx.fillText('tap the ribbon. slots fill. choose wisely.',W/2,312);
+    var pulse=0.6+0.4*Math.sin(now/300);
+    cx.globalAlpha=pulse;
+    cx.fillStyle=VERM;
+    cx.font='700 17px -apple-system,Helvetica,Arial';
+    cx.fillText('TAP TO START',W/2,354);
+    cx.globalAlpha=1;
+  }
+
+  /* game over */
+  if(phase==='over'){
+    cx.fillStyle='rgba(11,13,18,0.62)'; cx.fillRect(0,0,W,H);
+    cx.textAlign='center';
+    cx.fillStyle=VERM;
+    cx.font='900 36px -apple-system,Helvetica,Arial';
+    cx.fillText('SLOTS FULL.',W/2,292);
+    cx.fillStyle='#fff';
+    cx.font='800 25px -apple-system,Helvetica,Arial';
+    cx.fillText(score+' saved',W/2,336);
+    var pt=Math.max(1,Math.min(99,Math.round(100*Math.exp(-score/9))));
+    cx.fillStyle=GOLD;
+    cx.font='900 22px -apple-system,Helvetica,Arial';
+    cx.fillText('TOP '+pt+'% TODAY',W/2,378);
+    cx.fillStyle='rgba(255,255,255,0.45)';
+    cx.font='600 12px -apple-system,Helvetica,Arial';
+    cx.fillText('better than '+(100-pt)+'% of curators',W/2,402);
+
+    if(!DEMO&&!BOT){
+      var p2=0.6+0.4*Math.sin(now/280);
+      cx.globalAlpha=p2;
+      cx.fillStyle=TEAL;
+      cx.font='700 15px -apple-system,Helvetica,Arial';
+      cx.fillText('TAP — CLEAR THE SLOTS',W/2,448);
+      cx.globalAlpha=1;
+
+      cx.fillStyle='rgba(242,177,52,0.13)';
+      cx.strokeStyle=GOLD; cx.lineWidth=1.5;
+      cx.beginPath(); rr(SHARE_R.x,SHARE_R.y,SHARE_R.w,SHARE_R.h,23); cx.fill(); cx.stroke();
+      cx.fillStyle=GOLD;
+      cx.font='800 14px -apple-system,Helvetica,Arial';
+      cx.fillText(window.SHARE&&SHARE.dare!==null&&dareBeaten?'⚡ DARE THEM BACK':'⚡ DARE A FRIEND',
+        W/2,SHARE_R.y+30);
+    }
+  }
+
+  /* CTA (demo) */
+  if(phase==='cta'){
+    var t3=(now-ctaAt)/1000, ease=Math.min(1,t3*2.2);
+    cx.fillStyle='rgba(11,13,18,'+(0.78*ease)+')'; cx.fillRect(0,0,W,H);
+    cx.globalAlpha=ease;
+    cx.textAlign='center';
+    cx.fillStyle='#fff';
+    cx.font='900 42px -apple-system,Helvetica,Arial';
+    cx.fillText('SAVE OR LOSE',W/2,296);
+    cx.fillStyle='rgba(255,255,255,0.7)';
+    cx.font='700 17px -apple-system,Helvetica,Arial';
+    cx.fillText('she saved '+(window.__demoScore||28)+'. beat it.',W/2,334);
+    var p4=0.7+0.3*Math.sin(now/240);
+    cx.fillStyle=VERM; cx.globalAlpha=ease*p4;
+    cx.font='900 28px -apple-system,Helvetica,Arial';
+    cx.fillText('▶ BEAT '+(window.__demoScore||28),W/2,404);
+    cx.globalAlpha=ease;
+    cx.fillStyle=TEAL;
+    cx.font='700 14px -apple-system,Helvetica,Arial';
+    cx.fillText('link in bio',W/2,438);
+    cx.globalAlpha=1;
+  }
+
+  /* floating flashes */
+  for(var fk=flashes.length-1;fk>=0;fk--){
+    var fl=flashes[fk]; fl.t+=dt;
+    var fa=Math.max(0,1-fl.t/36);
+    cx.globalAlpha=fa;
+    cx.textAlign='center';
+    cx.fillStyle=fl.col;
+    cx.font='900 '+(fl.sz+fl.t*0.4)+'px -apple-system,Helvetica,Arial';
+    cx.fillText(fl.txt,W/2,228-fl.t*0.65);
+    cx.globalAlpha=1;
+    if(fl.t>36) flashes.splice(fk,1);
+  }
+
+  /* mute toggle */
+  if(!DEMO&&!BOT&&window.J){
+    cx.textAlign='center'; cx.globalAlpha=0.5;
+    cx.font='16px -apple-system,Helvetica,Arial'; cx.fillStyle='#fff';
+    cx.fillText(J.muted?'🔇':'🔊',MUTE_R.x+MUTE_R.w/2,MUTE_R.y+26);
+    cx.globalAlpha=1;
+  }
+
+  cx.restore();
+  requestAnimationFrame(frame);
+}
+
+newGame();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

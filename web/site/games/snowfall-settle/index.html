@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Snowfall Settle — Tilt</title>
+<!--
+  LOOP / attention-architecture — Snowfall Settle
+  Circuits: 02-novelty, 07-timing, 06-zeigarnik
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=M  imperfect autopilot, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'snowfall-settle';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  var TOTAL_FLAKES = BOT ? 18 : 22;   // fewer for bot so it ends faster
+  var FLAKE_COLORS = ['#a8d8f0','#c5e8f5','#dff3fb','#b8dff0','#8fc9e8','#e0f4fc'];
+
+  // ---- state ----
+  var flakes, settled, phase, runStartTs, botRunsDone, score;
+  var hitStop, shakeAmt, zoom, flashes;
+  var skyDark;   // 0..1, darkens as flakes settle
+  var ctaAt, demoPhase, demoTimer;
+
+  function newGame() {
+    rng = mulberry32(SEED);
+    flakes   = [];
+    settled  = [];
+    flashes  = [];
+    phase    = 'play';  // play | over | cta
+    hitStop  = 0;
+    shakeAmt = 0;
+    zoom     = 1;
+    skyDark  = 0;
+    score    = 0;
+    demoPhase = 'settle';
+    demoTimer  = 0;
+    ctaAt      = 0;
+    runStartTs = Date.now();
+
+    spawnFlakes();
+
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function spawnFlakes() {
+    for (var i = 0; i < TOTAL_FLAKES; i++) {
+      flakes.push(makeFlake(i));
+    }
+  }
+
+  function makeFlake(i) {
+    var col = FLAKE_COLORS[Math.floor(rng() * FLAKE_COLORS.length)];
+    return {
+      id: i,
+      x: rng() * (W - 60) + 30,
+      y: -(rng() * H * 0.8 + 30),   // staggered entry
+      r: rng() * 8 - 4,              // rotation
+      vx: (rng() - 0.5) * 0.6,
+      vy: 0.5 + rng() * 0.9,
+      size: 10 + rng() * 16,
+      color: col,
+      wobble: rng() * Math.PI * 2,
+      wobbleSpeed: 0.015 + rng() * 0.015,
+      settled: false,
+      settleY: 0,
+      alpha: 1,
+      glow: 0,          // pulse on tap
+      tapable: false    // becomes true when on screen
+    };
+  }
+
+  function settleFlake(f) {
+    if (f.settled) return;
+    f.settled = true;
+    f.settleY = f.y;
+    settled.push(f);
+    score++;
+    skyDark = score / TOTAL_FLAKES;
+
+    // calm sound step
+    if (window.J) J.calm(score);
+
+    // hit-stop: gentle freeze 30ms
+    hitStop = 1.8;
+    zoom = 1.012;
+
+    // float text
+    flashText('+settle', TEAL, 22, f.x, f.y - 10);
+
+    // emit event
+    if (window.LOOP) LOOP.emit('flake_settled', { n: score, total: TOTAL_FLAKES });
+
+    // check win
+    if (score >= TOTAL_FLAKES) {
+      setTimeout(endSession, 600);
+    }
+  }
+
+  function endSession() {
+    if (phase === 'over' || phase === 'cta') return;
+    phase = 'over';
+    shakeAmt = 0;
+    if (window.J) J.calm(score + 1);
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+      ctaAt = performance.now();
+      setTimeout(function () { phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600); }, 1200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { restartRun(); }, 800);
+      }
+    }
+  }
+
+  function restartRun() {
+    flakes   = [];
+    settled  = [];
+    flashes  = [];
+    phase    = 'play';
+    hitStop  = 0;
+    shakeAmt = 0;
+    zoom     = 1;
+    skyDark  = 0;
+    score    = 0;
+    runStartTs = Date.now();
+    rng = mulberry32(SEED + botRunsDone * 31);
+    spawnFlakes();
+    if (window.LOOP) LOOP.emit('restart', {});
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function flashText(txt, color, size, x, y) {
+    flashes.push({ txt: txt, color: color, size: size, x: x || W/2, y: y || H/2, t: 0 });
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase !== 'play') return;
+    // find nearest tapable flake within radius
+    var best = null, bestD = 44;
+    for (var i = 0; i < flakes.length; i++) {
+      var f = flakes[i];
+      if (f.settled || !f.tapable) continue;
+      var dx = f.x - px, dy = f.y - py;
+      var d = Math.sqrt(dx*dx + dy*dy);
+      if (d < bestD) { bestD = d; best = f; }
+    }
+    if (best) {
+      best.glow = 1;
+      settleFlake(best);
+    }
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(W/2, H/2); });
+
+  // ---- autopilot (demo + bot) ----
+  // bot: tap flakes as they come into range, with slight random delay
+  var botQueue = [], botCooldown = 0;
+
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+    if (DEMO) {
+      demoPilot(dt);
+    } else if (BOT) {
+      botPilot(dt);
+    }
+  }
+
+  // demo pilot: settle flakes steadily with natural rhythm, all flakes
+  var demoSettleDelay = 0;
+  function demoPilot(dt) {
+    demoSettleDelay -= dt;
+    if (demoSettleDelay > 0) return;
+    // find lowest on-screen unsettled flake
+    var best = null, bestY = -9999;
+    for (var i = 0; i < flakes.length; i++) {
+      var f = flakes[i];
+      if (f.settled || !f.tapable) continue;
+      if (f.y > bestY) { bestY = f.y; best = f; }
+    }
+    if (best) {
+      best.glow = 1;
+      settleFlake(best);
+      // calm rhythm: ~0.7s between settles, with slight variance
+      demoSettleDelay = 42 + rng() * 20;
+    }
+  }
+
+  // bot pilot: settle K flakes quickly, then go passive so natural game_over fires
+  // Bot settles all flakes so game_over always fires
+  var botSettleDelay = 0;
+  function botPilot(dt) {
+    botSettleDelay -= dt;
+    if (botSettleDelay > 0) return;
+    var best = null, bestY = -9999;
+    for (var i = 0; i < flakes.length; i++) {
+      var f = flakes[i];
+      if (f.settled || !f.tapable) continue;
+      if (f.y > bestY) { bestY = f.y; best = f; }
+    }
+    if (best) {
+      best.glow = 1;
+      settleFlake(best);
+      // fast but varied
+      botSettleDelay = 18 + rng() * 24;
+    }
+  }
+
+  // ---- draw helpers ----
+  function drawSnowflake(f) {
+    var spikes = 6;
+    var r = f.size;
+    ctx.save();
+    ctx.translate(f.x, f.y);
+    ctx.rotate(f.r * Math.PI / 180);
+    ctx.globalAlpha = f.alpha * (f.settled ? 0.55 : 1);
+
+    if (f.glow > 0) {
+      ctx.shadowColor = TEAL;
+      ctx.shadowBlur  = 16 * f.glow;
+    }
+
+    ctx.strokeStyle = f.color;
+    ctx.lineWidth   = f.settled ? 1.2 : 1.8;
+
+    for (var i = 0; i < spikes; i++) {
+      var angle = (i / spikes) * Math.PI * 2;
+      var cx2 = Math.cos(angle) * r, cy2 = Math.sin(angle) * r;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(cx2, cy2);
+      // branch ticks
+      var blen = r * 0.4;
+      var ba1 = angle + Math.PI / 4;
+      var ba2 = angle - Math.PI / 4;
+      var mx = Math.cos(angle) * r * 0.55, my = Math.sin(angle) * r * 0.55;
+      ctx.moveTo(mx, my);
+      ctx.lineTo(mx + Math.cos(ba1) * blen, my + Math.sin(ba1) * blen);
+      ctx.moveTo(mx, my);
+      ctx.lineTo(mx + Math.cos(ba2) * blen, my + Math.sin(ba2) * blen);
+      ctx.stroke();
+    }
+    // center dot
+    ctx.fillStyle = f.color;
+    ctx.beginPath();
+    ctx.arc(0, 0, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.shadowBlur = 0;
+    ctx.restore();
+  }
+
+  function drawSettled() {
+    // already rendered per-flake with f.settled flag
+  }
+
+  // ---- sky gradient ----
+  function skyColor() {
+    // transitions from deep-night-blue to pure black as flakes settle
+    var t = skyDark;
+    var r0 = 11  + Math.round(t * 0),   g0 = 13  + Math.round(t * 0),   b0 = 18 + Math.round(t * 0);
+    // subtle midnight-blue tint at 0
+    var r1 = 14, g1 = 18, b1 = 34;
+    // lerp: start at subtle tint, go to pure ink
+    var ri = Math.round(r1 + (r0 - r1) * t);
+    var gi = Math.round(g1 + (g0 - g1) * t);
+    var bi = Math.round(b1 + (b0 - b1) * t);
+    return 'rgb(' + ri + ',' + gi + ',' + bi + ')';
+  }
+
+  // progress ring at bottom
+  function drawProgress() {
+    var cx2 = W / 2, cy2 = H - 52, rad = 22;
+    var frac = score / TOTAL_FLAKES;
+    ctx.strokeStyle = 'rgba(46,197,182,0.18)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(cx2, cy2, rad, 0, Math.PI * 2);
+    ctx.stroke();
+    if (frac > 0) {
+      ctx.strokeStyle = TEAL;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(cx2, cy2, rad, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.font = '700 13px Menlo, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(score + '/' + TOTAL_FLAKES, cx2, cy2 + 5);
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    requestAnimationFrame(frame);
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // juice transforms
+    ctx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      ctx.translate(W/2 + sx, H/2 + sy);
+      ctx.scale(zoom, zoom);
+      ctx.translate(-W/2, -H/2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // bg
+    ctx.fillStyle = skyColor();
+    ctx.fillRect(0, 0, W, H);
+
+    // subtle star layer — fades as sky darkens (storm dissipating)
+    if (skyDark < 0.95) {
+      var starAlpha = (1 - skyDark) * 0.3;
+      ctx.fillStyle = 'rgba(255,255,255,' + starAlpha + ')';
+      // deterministic star positions (seeded at start)
+      for (var s = 0; s < 40; s++) {
+        var sx2 = ((SEED * 17 + s * 73) % 397) / 397 * W;
+        var sy2 = ((SEED * 31 + s * 97) % 691) / 691 * H;
+        var ss  = 0.8 + (s % 3) * 0.5;
+        ctx.beginPath();
+        ctx.arc(sx2, sy2, ss, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // update & draw flakes
+    if (phase === 'play') {
+      // hit-stop: freeze flake physics but decay counter
+      if (hitStop > 0) {
+        hitStop -= dt;
+        // still draw flakes in frozen state
+        for (var i = 0; i < flakes.length; i++) {
+          if (!flakes[i].settled) drawSnowflake(flakes[i]);
+        }
+      } else {
+        autopilot(dt);
+        for (var i = 0; i < flakes.length; i++) {
+          var f = flakes[i];
+          if (f.settled) continue;
+          // physics
+          f.wobble += f.wobbleSpeed * dt;
+          f.x += (f.vx + Math.sin(f.wobble) * 0.4) * dt;
+          f.y += f.vy * dt;
+          f.r += 0.08 * dt;
+          // boundary wrap x
+          if (f.x < -f.size) f.x = W + f.size;
+          if (f.x > W + f.size) f.x = -f.size;
+          // mark tapable once on screen
+          if (f.y > -f.size) f.tapable = true;
+          // glow decay
+          if (f.glow > 0) f.glow = Math.max(0, f.glow - 0.06 * dt);
+          drawSnowflake(f);
+        }
+      }
+      // draw settled flakes
+      for (var i = 0; i < settled.length; i++) {
+        drawSnowflake(settled[i]);
+      }
+      drawProgress();
+    }
+
+    // game over (calm resolution) — show brief rest card
+    if (phase === 'over') {
+      // still draw settled flakes
+      for (var i = 0; i < settled.length; i++) {
+        drawSnowflake(settled[i]);
+      }
+      ctx.fillStyle = 'rgba(11,13,18,0.52)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(46,197,182,0.95)';
+      ctx.font = '700 32px -apple-system, Helvetica, Arial';
+      ctx.fillText('the storm has passed', W/2, 310);
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.font = '600 17px -apple-system, Helvetica, Arial';
+      ctx.fillText(score + ' flakes at rest', W/2, 348);
+      if (!DEMO && !BOT) {
+        var p = 0.5 + 0.5 * Math.sin(now / 800);
+        ctx.globalAlpha = 0.5 + 0.5 * p;
+        ctx.fillStyle = TEAL;
+        ctx.font = '600 14px -apple-system, Helvetica, Arial';
+        ctx.fillText('tap to settle again', W/2, 400);
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // demo CTA
+    if (phase === 'cta') {
+      for (var i = 0; i < settled.length; i++) drawSnowflake(settled[i]);
+      var t = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t * 2.0);
+      ctx.fillStyle = 'rgba(11,13,18,' + (0.7 * ease) + ')';
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = ease;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff';
+      ctx.font = '800 38px -apple-system, Helvetica, Arial';
+      ctx.fillText('Snowfall Settle', W/2, 296);
+      ctx.fillStyle = 'rgba(255,255,255,0.65)';
+      ctx.font = '500 17px -apple-system, Helvetica, Arial';
+      ctx.fillText('still the storm. one tap at a time.', W/2, 334);
+      var p2 = 0.7 + 0.3 * Math.sin(now / 700);
+      ctx.fillStyle = TEAL;
+      ctx.globalAlpha = ease * p2;
+      ctx.font = '800 26px -apple-system, Helvetica, Arial';
+      ctx.fillText('▶ REACH IT', W/2, 400);
+      ctx.globalAlpha = ease;
+      ctx.fillStyle = 'rgba(255,255,255,0.45)';
+      ctx.font = '600 14px -apple-system, Helvetica, Arial';
+      ctx.fillText('link in bio', W/2, 430);
+      ctx.globalAlpha = 1;
+    }
+
+    // floating reward text
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 36);
+      ctx.globalAlpha = fa;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = fl.color;
+      ctx.font = '700 ' + fl.size + 'px -apple-system, Helvetica, Arial';
+      ctx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.7);
+      ctx.globalAlpha = 1;
+      if (fl.t > 36) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      ctx.textAlign = 'center';
+      ctx.globalAlpha = 0.5;
+      ctx.font = '16px -apple-system, Helvetica, Arial';
+      ctx.fillStyle = '#fff';
+      ctx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w/2, MUTE_R.y + 26);
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.restore();
+  }
+
+  // human tap on game-over → restart
+  cv.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    if (phase === 'over') {
+      var r = cv.getBoundingClientRect();
+      var px = (e.clientX - r.left) / scale;
+      var py = (e.clientY - r.top) / scale;
+      if (!inR(MUTE_R, px, py)) {
+        rng = mulberry32(SEED + Math.floor(Date.now() % 9999));
+        flakes = []; settled = []; flashes = [];
+        phase = 'play'; hitStop = 0; shakeAmt = 0; zoom = 1;
+        skyDark = 0; score = 0;
+        runStartTs = Date.now();
+        spawnFlakes();
+        if (window.LOOP) LOOP.emit('restart', {});
+        if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      }
+    }
+  });
+
+  botRunsDone = 0;
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

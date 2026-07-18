@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Profile Settle — Tilt</title>
+<!--
+  LOOP / attention-architecture — Profile Settle
+  Circuits: 05-ease, 07-timing, 08-garden.
+  Engine: calm.
+  Mechanic: filter effects slowly orbit the avatar; hold still and they settle one by one.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'profile-settle';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // --- deterministic RNG (mulberry32) ---
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var SOFT_BLUE = '#6fb3d2', SOFT_LILAC = '#b89fd4', SOFT_GREEN = '#88c9a1';
+  var FILTER_COLORS = [TEAL, GOLD, SOFT_BLUE, SOFT_LILAC, SOFT_GREEN];
+  var FILTER_NAMES = ['polish', 'glow', 'sharpen', 'warmth', 'clarity'];
+
+  // --- avatar geometry ---
+  var AX = W / 2, AY = 320;
+  var AVATAR_R = 68;
+
+  // --- state ---
+  var phase; // 'title' | 'play' | 'over' | 'cta'
+  var filters, settledCount, score, runStartTs, overAt, ctaAt;
+  var hitStop, zoom, shakeAmt;
+  var flashes;
+  var botRunsDone, botPassive, botTick;
+  var last = performance.now();
+  var demoT = 0; // seconds elapsed in demo
+
+  // --- mute / share rects ---
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- Filter ring object ----
+  // Each filter effect orbits the avatar at a given radius and angle speed.
+  // When undisturbed, its orbit radius decays toward SETTLED_R and then it
+  // "falls away" — angle speed drops to 0 and the effect fades to a quiet halo.
+  var ORBIT_R_START = 120, SETTLED_R = 90, SETTLE_SPEED = 0.004;
+  var DISTURB_BUMP = 30;   // px pushed outward on disturbance
+
+  function makeFilter(i, total) {
+    var baseAngle = (i / total) * Math.PI * 2 + rng() * 0.4;
+    return {
+      idx:      i,
+      name:     FILTER_NAMES[i % FILTER_NAMES.length],
+      color:    FILTER_COLORS[i % FILTER_COLORS.length],
+      angle:    baseAngle,
+      angleV:   0.45 + rng() * 0.30,           // rad/s
+      orbitR:   ORBIT_R_START + rng() * 20,
+      alpha:    1.0,
+      settled:  false,
+      settleT:  0,      // cumulative calm time (seconds)
+      size:     18 + rng() * 8
+    };
+  }
+
+  function newGame() {
+    phase = DEMO ? 'play' : 'title';
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    flashes = []; score = 0; settledCount = 0;
+    botRunsDone = 0; botPassive = false; botTick = 0;
+    demoT = 0;
+    filters = [];
+    for (var i = 0; i < 5; i++) filters.push(makeFilter(i, 5));
+    if (DEMO || BOT) startRun();
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    score = 0; settledCount = 0;
+    flashes = [];
+    // reset filters
+    for (var i = 0; i < filters.length; i++) {
+      filters[i].settled  = false;
+      filters[i].settleT  = 0;
+      filters[i].orbitR   = ORBIT_R_START + rng() * 20;
+      filters[i].alpha    = 1.0;
+      filters[i].angleV   = 0.45 + rng() * 0.30;
+    }
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- disturb: touch the avatar pushes filters outward ----
+  function disturb(fx, fy) {
+    if (phase !== 'play') return;
+    for (var i = 0; i < filters.length; i++) {
+      var f = filters[i];
+      if (f.settled) continue;
+      f.orbitR   = Math.min(ORBIT_R_START + 40, f.orbitR + DISTURB_BUMP * (0.6 + rng() * 0.8));
+      f.settleT  = 0;  // reset calm timer
+    }
+  }
+
+  // ---- settle a filter ----
+  function settleFilter(f, step) {
+    f.settled = true;
+    settledCount++;
+    score = settledCount;
+    if (window.J) J.calm(step);
+    flash(f.name + ' settled', f.color, 28);
+    zoom = 1.018;
+    if (window.LOOP) LOOP.emit('filter_settled', { filter: f.name, score: score });
+    if (settledCount >= filters.length) {
+      // all settled — game over (calm completion)
+      setTimeout(gameOver, 600);
+    }
+  }
+
+  function gameOver() {
+    if (phase === 'over' || phase === 'cta') return;
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.calm(score + 2);  // soft resolution bell
+    zoom = 1.025;
+    if (DEMO) window.__demoScore = score;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 900);
+      }
+    }
+  }
+
+  function resetRun() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    botPassive = false; botTick = 0; demoT = 0;
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- input ----
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') { disturb(x, y); return; }
+    if (phase === 'over' && performance.now() - overAt > 400) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'settled' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.code === 'Enter') tap();
+  });
+
+  // ---- autopilots ----
+  // BOT: disturb a few times early to make the run longer, then go passive
+  // DEMO: completely passive — let the calm arc play out naturally
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      // fully passive — just let filters settle
+      return;
+    }
+
+    if (BOT) {
+      // Early game: disturb occasionally to simulate imperfect behavior
+      // After ~4s of sim time or when 2+ filters settled, go passive
+      botTick += dt;
+      var elapsed = (Date.now() - runStartTs) / 1000;
+      if (!botPassive && elapsed < 3.5 && settledCount < 2) {
+        // randomly disturb once per ~2 seconds
+        if (Math.floor(elapsed * 0.5) > Math.floor((elapsed - dt * 0.016) * 0.5)) {
+          disturb(AX, AY);
+        }
+      } else {
+        botPassive = true;
+      }
+    }
+  }
+
+  // ---- physics update ----
+  var SETTLE_THRESHOLD = 2.5; // seconds of calm before settling
+  function updateFilters(dt) {
+    if (phase !== 'play') return;
+    var step = 0;
+    for (var i = 0; i < filters.length; i++) {
+      var f = filters[i];
+      if (f.settled) continue;
+
+      // orbit angle advances
+      f.angle += f.angleV * dt * 0.016;
+
+      // decay orbit radius toward settled radius
+      var diff = f.orbitR - SETTLED_R;
+      f.orbitR -= diff * SETTLE_SPEED * dt;
+
+      // calm accumulator: if orbit is close to settled radius, accumulate calm time
+      if (Math.abs(f.orbitR - SETTLED_R) < 8) {
+        f.settleT += dt * 0.016;
+        f.angleV  *= Math.pow(0.97, dt); // slow down gently
+      } else {
+        f.settleT = Math.max(0, f.settleT - dt * 0.008); // lose calm faster if disturbed
+      }
+
+      // slow the angular velocity gradually even if not near settled
+      f.angleV = Math.max(0.05, f.angleV - 0.0008 * dt);
+
+      if (f.settleT >= SETTLE_THRESHOLD) {
+        settleFilter(f, step++);
+      }
+    }
+  }
+
+  // ---- render ----
+  function drawAvatar(glow) {
+    // face circle
+    var gr = cx.createRadialGradient(AX - 12, AY - 18, 4, AX, AY, AVATAR_R);
+    gr.addColorStop(0, '#e8dcc8');
+    gr.addColorStop(0.6, '#c9b89a');
+    gr.addColorStop(1, '#a8946e');
+    cx.beginPath();
+    cx.arc(AX, AY, AVATAR_R, 0, Math.PI * 2);
+    cx.fillStyle = gr;
+    cx.fill();
+
+    // eyes
+    cx.fillStyle = 'rgba(60,45,30,0.85)';
+    cx.beginPath(); cx.arc(AX - 22, AY - 14, 7, 0, Math.PI * 2); cx.fill();
+    cx.beginPath(); cx.arc(AX + 22, AY - 14, 7, 0, Math.PI * 2); cx.fill();
+    // eye highlights
+    cx.fillStyle = 'rgba(255,255,255,0.6)';
+    cx.beginPath(); cx.arc(AX - 19, AY - 17, 2.5, 0, Math.PI * 2); cx.fill();
+    cx.beginPath(); cx.arc(AX + 25, AY - 17, 2.5, 0, Math.PI * 2); cx.fill();
+    // mouth — soft smile
+    cx.strokeStyle = 'rgba(90,65,45,0.7)'; cx.lineWidth = 2.5; cx.lineCap = 'round';
+    cx.beginPath();
+    cx.arc(AX, AY + 12, 18, 0.2, Math.PI - 0.2);
+    cx.stroke();
+
+    // glow ring (calm progress)
+    if (glow > 0.05) {
+      cx.save();
+      cx.globalAlpha = glow * 0.45;
+      var rg = cx.createRadialGradient(AX, AY, AVATAR_R * 0.9, AX, AY, AVATAR_R + 24);
+      rg.addColorStop(0, TEAL);
+      rg.addColorStop(1, 'rgba(46,197,182,0)');
+      cx.fillStyle = rg;
+      cx.beginPath(); cx.arc(AX, AY, AVATAR_R + 24, 0, Math.PI * 2); cx.fill();
+      cx.restore();
+    }
+  }
+
+  function drawFilter(f, now) {
+    var fx = AX + Math.cos(f.angle) * f.orbitR;
+    var fy = AY + Math.sin(f.angle) * f.orbitR;
+    var r  = f.size;
+    // pill / tag shape
+    cx.save();
+    cx.globalAlpha = f.settled ? 0.18 : (f.alpha * 0.9);
+    cx.translate(fx, fy);
+    cx.rotate(f.angle + Math.PI / 2);
+
+    // outer glow
+    if (!f.settled) {
+      var fg = cx.createRadialGradient(0, 0, r * 0.4, 0, 0, r * 1.5);
+      fg.addColorStop(0, f.color);
+      fg.addColorStop(1, 'rgba(0,0,0,0)');
+      cx.fillStyle = fg;
+      cx.beginPath(); cx.arc(0, 0, r * 1.5, 0, Math.PI * 2); cx.fill();
+    }
+
+    // badge
+    var bw = r * 2 + 24, bh = r + 6;
+    cx.fillStyle = f.settled ? 'rgba(46,197,182,0.12)' : f.color;
+    cx.globalAlpha = f.settled ? 0.2 : (f.alpha * (0.8 + 0.2 * Math.sin(now * 0.003 + f.idx)));
+    cx.beginPath();
+    if (cx.roundRect) {
+      cx.roundRect(-bw / 2, -bh / 2, bw, bh, bh / 2);
+    } else {
+      cx.rect(-bw / 2, -bh / 2, bw, bh);
+    }
+    cx.fill();
+
+    // label
+    if (!f.settled) {
+      cx.globalAlpha = f.alpha * 0.95;
+      cx.fillStyle = INK;
+      cx.font = '700 ' + Math.round(r * 0.7) + 'px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.textBaseline = 'middle';
+      cx.fillText(f.name, 0, 0);
+    }
+
+    cx.restore();
+  }
+
+  function drawSettledHalo(now) {
+    // settled filters leave a soft halo near the avatar
+    var count = 0;
+    for (var i = 0; i < filters.length; i++) {
+      if (filters[i].settled) count++;
+    }
+    if (count === 0) return;
+    var a = Math.min(1, count / filters.length) * 0.35;
+    cx.save();
+    cx.globalAlpha = a * (0.8 + 0.2 * Math.sin(now * 0.0015));
+    var rh = cx.createRadialGradient(AX, AY, AVATAR_R, AX, AY, AVATAR_R + 36 + count * 6);
+    rh.addColorStop(0, TEAL);
+    rh.addColorStop(0.5, 'rgba(46,197,182,0.3)');
+    rh.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = rh;
+    cx.beginPath(); cx.arc(AX, AY, AVATAR_R + 36 + count * 6, 0, Math.PI * 2); cx.fill();
+    cx.restore();
+  }
+
+  function calmProgress() {
+    // 0..1 based on how close filters are to settled
+    var total = filters.length;
+    var sum = 0;
+    for (var i = 0; i < filters.length; i++) {
+      var f = filters[i];
+      if (f.settled) { sum += 1; continue; }
+      sum += Math.min(1, f.settleT / SETTLE_THRESHOLD) * 0.5 +
+             (1 - Math.min(1, (f.orbitR - SETTLED_R) / (ORBIT_R_START - SETTLED_R))) * 0.5;
+    }
+    return sum / total;
+  }
+
+  // ---- main loop ----
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // update
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      autopilot(dt);
+      updateFilters(dt);
+    }
+
+    // demo timer
+    if (DEMO && phase === 'play') demoT += dt * 0.016;
+
+    // juice decay
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // --- draw ---
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(184,159,212,0.05)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    var cp = calmProgress();
+
+    // title screen
+    if (phase === 'title') {
+      drawAvatar(0.2);
+      // spinning filter previews
+      for (var i = 0; i < filters.length; i++) drawFilter(filters[i], now);
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 38px -apple-system, Helvetica, Arial';
+      cx.fillText('PROFILE SETTLE', W / 2, 520);
+      cx.fillStyle = TEAL;
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      var pulse = 0.55 + 0.45 * Math.sin(now / 500);
+      cx.globalAlpha = pulse;
+      cx.fillText('hold still and let it settle', W / 2, 556);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to begin', W / 2, 585);
+    }
+
+    // play screen
+    if (phase === 'play') {
+      drawSettledHalo(now);
+      drawAvatar(cp);
+      for (var i = 0; i < filters.length; i++) drawFilter(filters[i], now);
+
+      // settled count indicator
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '700 52px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 94);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' / ' + filters.length + ' settled', W / 2, 118);
+
+      // calm instruction (fades as things settle)
+      var instrA = Math.max(0, 0.5 - cp * 0.8);
+      if (instrA > 0.04) {
+        cx.globalAlpha = instrA;
+        cx.fillStyle = 'rgba(255,255,255,0.55)';
+        cx.font = '500 14px -apple-system, Helvetica, Arial';
+        cx.fillText('hold still — let the effects calm', W / 2, H - 80);
+        cx.globalAlpha = 1;
+      }
+
+      // dare banner (human only)
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = GOLD;
+        cx.font = '700 14px -apple-system, Helvetica, Arial';
+        cx.fillText('SETTLE MORE THAN ' + SHARE.dare, W / 2, 144);
+      }
+    }
+
+    // over screen
+    if (phase === 'over') {
+      drawSettledHalo(now);
+      drawAvatar(1.0);
+      // all filters shown as settled halos
+      for (var i = 0; i < filters.length; i++) drawFilter(filters[i], now);
+
+      cx.fillStyle = 'rgba(11,13,18,0.50)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '800 34px -apple-system, Helvetica, Arial';
+      cx.fillText('SETTLED.', W / 2, 488);
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' layers at rest', W / 2, 524);
+      cx.fillStyle = GOLD;
+      cx.font = '800 20px -apple-system, Helvetica, Arial';
+      cx.fillText('calm complete', W / 2, 555);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 320);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '600 16px -apple-system, Helvetica, Arial';
+        cx.fillText('tap — go again', W / 2, 594);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(46,197,182,0.12)';
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) {
+          cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        } else {
+          cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        }
+        cx.fill(); cx.stroke();
+        cx.fillStyle = TEAL;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA
+    if (phase === 'cta') {
+      drawSettledHalo(now);
+      drawAvatar(1.0);
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.72 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 40px -apple-system, Helvetica, Arial';
+      cx.fillText('PROFILE SETTLE', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('your feed can rest too', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 280);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL;
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 50);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

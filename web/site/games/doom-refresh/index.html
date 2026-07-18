@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Doom Refresh — Tilt</title>
+<!--
+  LOOP / attention-architecture — Doom Refresh
+  Circuits: 01-rpe (variable reward roulette), 02-novelty (spinner pause surprises),
+            04-loss (lose connection = dopamine crash)
+  The mechanic IS the phone gesture: pull down to refresh.
+  Modes:
+    ?demo=1&seed=7        scripted mirror-neuron arc, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'doom-refresh';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO    = qs.get('demo') === '1';
+  var BOT     = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED    = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c');
+  var ctx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  var GREEN_ARC_MAX = Math.PI * 0.44;   // initial green zone arc
+  var GREEN_ARC_MIN = Math.PI * 0.10;   // narrowest green zone
+  var SPINNER_CX    = W / 2;
+  var SPINNER_CY    = 400;
+  var SPINNER_R     = 115;
+
+  // ---- game state ----
+  var g = {};   // game state object (rebuilt each run)
+  var flashes, hitStop, zoom, shakeAmt, dareBeaten;
+  var runStartTs, best = 0;
+  var botRunsDone = 0;
+  var ctaAt = 0, challengeAt = 0;
+  try { best = +localStorage.getItem('dr_best') || 0; } catch (_) {}
+
+  // phases: title | challenge | play | spinning | hang | result | over | cta
+
+  function newGame() {
+    g = {
+      phase:     'title',
+      round:     0,
+      angle:     0,        // spinner needle angle (radians, 0 = top)
+      speed:     0,        // radians per dt-unit
+      greenStart: 0,
+      greenArc:  GREEN_ARC_MAX,
+      hangMs:    0,
+      hangStart: 0,
+      pullY:     0,
+      releaseOk: false,
+      resultAt:  0,
+      overAt:    0,
+    };
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+
+    if (DEMO) {
+      g.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { startRun(); return; }
+  }
+
+  function startRun() {
+    g.phase = 'play';
+    g.round = 0;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    setupRound();
+  }
+
+  function setupRound() {
+    var progress = Math.min(g.round / 18, 1);
+    g.greenArc   = GREEN_ARC_MAX - (GREEN_ARC_MAX - GREEN_ARC_MIN) * progress;
+    g.greenStart = rng() * Math.PI * 2;
+    g.speed      = (0.030 + g.round * 0.004) * (rng() > 0.5 ? 1 : -1);
+    g.hangMs     = 0;
+    g.hangStart  = 0;
+    g.pullY      = 0;
+    g.phase      = 'play';
+    if (window.J) J.tension(Math.min(g.round / 18, 1));
+  }
+
+  function inGreen(angle) {
+    var TWO_PI = Math.PI * 2;
+    var a  = ((angle   % TWO_PI) + TWO_PI) % TWO_PI;
+    var gs = ((g.greenStart % TWO_PI) + TWO_PI) % TWO_PI;
+    var ge = (gs + g.greenArc) % TWO_PI;
+    if (ge >= gs) return a >= gs && a <= ge;
+    return a >= gs || a <= ge;
+  }
+
+  function startSpin() {
+    if (g.phase !== 'play') return;
+    var hangChance = Math.min(0.35 + g.round * 0.03, 0.75);
+    if (rng() < hangChance) {
+      // freeze near the green border to create tension
+      g.angle     = g.greenStart + g.greenArc * (0.80 + rng() * 0.30);
+      g.hangMs    = 400 + rng() * 900 + g.round * 80;
+      g.hangStart = performance.now();
+      g.phase     = 'hang';
+    } else {
+      g.phase = 'spinning';
+    }
+    if (window.J) J.tension(Math.min(g.round / 14, 1));
+  }
+
+  function release() {
+    if (g.phase !== 'spinning' && g.phase !== 'hang') return;
+    var landed   = inGreen(g.angle);
+    g.releaseOk  = landed;
+    g.phase      = 'result';
+    g.resultAt   = performance.now();
+
+    if (landed) {
+      g.round++;
+      var perfect = g.greenArc < Math.PI * 0.18;
+      hitStop = perfect ? 5 : 3;
+      zoom    = perfect ? 1.04 : 1.02;
+      shakeAmt = 2;
+      if (window.J) { if (perfect) J.perfect(g.round); else J.hit(g.round); }
+      var nearMiss = g.greenArc < Math.PI * 0.22 && !perfect;
+      if (nearMiss) {
+        if (window.J) J.near();
+        if (window.LOOP) LOOP.emit('near_miss', { round: g.round });
+      }
+      flash(perfect ? 'CLEAN' : 'CONNECTED', perfect ? TEAL : TEAL, perfect ? 42 : 36);
+      if (window.LOOP) LOOP.emit('refresh_ok', { round: g.round, arc: +g.greenArc.toFixed(3), perfect: perfect });
+
+      if (g.round > best) {
+        best = g.round;
+        try { localStorage.setItem('dr_best', String(best)); } catch (_) {}
+      }
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && g.round > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(g.round);
+      }
+      setTimeout(function () {
+        if (g.phase === 'result') setupRound();
+      }, 520);
+    } else {
+      shakeAmt = 10;
+      if (window.J) J.death(Math.min(0.3 + g.round / 18, 1));
+      flash('NO SIGNAL', VERM, 44);
+      if (window.LOOP) LOOP.emit('lost_connection', { round: g.round });
+      setTimeout(function () { gameOver(); }, 700);
+    }
+  }
+
+  function gameOver() {
+    g.phase  = 'over';
+    g.overAt = performance.now();
+    var dur  = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: g.round, dur_s: +dur.toFixed(1) });
+    if (g.round >= best && g.round > 0) {
+      if (window.J) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (DEMO) {
+      window.__demoScore = g.round;
+      setTimeout(function () {
+        g.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 900);
+      }
+    }
+  }
+
+  function resetRun() {
+    g.round = 0; flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 8))));
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10,  w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 492, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  var touchStartY = 0, touchActive = false;
+
+  function onPointerDown(e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale;
+    var py = (e.clientY - r.top)  / scale;
+
+    if (inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+
+    if (g.phase === 'title') { startRun(); return; }
+
+    if (g.phase === 'over' && performance.now() - g.overAt > 350) {
+      if (inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: g.round, unit: 'refreshes' }); return;
+      }
+      resetRun(); return;
+    }
+
+    if (g.phase === 'play') {
+      touchStartY = py; touchActive = true; g.pullY = 0;
+    }
+    if (g.phase === 'spinning' || g.phase === 'hang') {
+      release();
+    }
+  }
+
+  function onPointerMove(e) {
+    if (DEMO || BOT || !touchActive) return;
+    var r  = cv.getBoundingClientRect();
+    var py = (e.clientY - r.top) / scale;
+    if (g.phase === 'play') {
+      g.pullY = Math.max(0, Math.min(120, py - touchStartY));
+      if (g.pullY >= 110) { touchActive = false; startSpin(); }
+    }
+  }
+
+  function onPointerUp() {
+    if (DEMO || BOT) return;
+    if (touchActive && g.phase === 'play') {
+      touchActive = false;
+      if (g.pullY >= 55) startSpin();
+      else g.pullY = 0;
+    }
+    touchActive = false;
+  }
+
+  window.addEventListener('pointerdown', onPointerDown);
+  window.addEventListener('pointermove', onPointerMove);
+  window.addEventListener('pointerup',   onPointerUp);
+  window.addEventListener('keydown', function (e) {
+    if (DEMO || BOT) return;
+    if (e.code === 'Space') {
+      if (g.phase === 'play')                              { startSpin(); return; }
+      if (g.phase === 'spinning' || g.phase === 'hang')   { release();   return; }
+      if (g.phase === 'title')                             { startRun();  return; }
+      if (g.phase === 'over' && performance.now() - g.overAt > 350) { resetRun(); }
+    }
+  });
+
+  // ---- DEMO autopilot ----
+  // plan: 7 refreshes — 6 green (with a near-fail on #5) then 1 red (death)
+  // timing is in animation ticks (~60fps) from when each round's 'play' phase begins
+  var demoPlan = [
+    { pullTick: 55,  relTick: 95,  green: true  },   // round 1
+    { pullTick: 40,  relTick: 78,  green: true  },   // round 2
+    { pullTick: 50,  relTick: 92,  green: true  },   // round 3
+    { pullTick: 45,  relTick: 88,  green: true  },   // round 4
+    { pullTick: 58,  relTick: 115, green: true  },   // round 5 — near-fail save
+    { pullTick: 42,  relTick: 85,  green: true  },   // round 6 recovery
+    { pullTick: 46,  relTick: 90,  green: false },   // round 7 — miss (death)
+  ];
+  var demoRoundTick = 0;     // ticks since current round's play phase started
+  var demoPulling = false;
+  var demoPullProgress = 0;
+  var demoPulled = false;    // did we already trigger the spin this round?
+
+  function demoTick() {
+    if (g.phase === 'play' && !demoPulled) {
+      demoRoundTick++;
+      var plan = demoPlan[Math.min(g.round, demoPlan.length - 1)];
+      if (demoRoundTick >= plan.pullTick && !demoPulling) {
+        demoPulling = true; demoPullProgress = 0;
+      }
+      if (demoPulling) {
+        demoPullProgress += 5;
+        g.pullY = Math.min(demoPullProgress, 110);
+        if (g.pullY >= 108) { demoPulling = false; demoPulled = true; g.pullY = 0; startSpin(); }
+      }
+    } else if ((g.phase === 'spinning' || g.phase === 'hang') && demoPulled) {
+      demoRoundTick++;
+      var plan2 = demoPlan[Math.min(g.round > 0 ? g.round - 1 : 0, demoPlan.length - 1)];
+      // wait until relTick then steer and release
+      if (demoRoundTick >= plan2.relTick) {
+        // steer angle toward target zone
+        var TWO_PI = Math.PI * 2;
+        if (plan2.green) {
+          // aim for green center
+          var target = ((g.greenStart + g.greenArc / 2) % TWO_PI + TWO_PI) % TWO_PI;
+          var curr   = ((g.angle % TWO_PI) + TWO_PI) % TWO_PI;
+          var diff   = Math.abs(curr - target);
+          if (diff > Math.PI) diff = TWO_PI - diff;
+          if (diff < 0.25 || demoRoundTick >= plan2.relTick + 70) { release(); demoPulled = false; demoRoundTick = 0; }
+        } else {
+          // aim for red zone (past green end)
+          var target2 = ((g.greenStart + g.greenArc + Math.PI * 0.5) % TWO_PI + TWO_PI) % TWO_PI;
+          var curr2   = ((g.angle % TWO_PI) + TWO_PI) % TWO_PI;
+          var diff2   = Math.abs(curr2 - target2);
+          if (diff2 > Math.PI) diff2 = TWO_PI - diff2;
+          if (diff2 < 0.3 || demoRoundTick >= plan2.relTick + 70) { release(); demoPulled = false; demoRoundTick = 0; }
+        }
+      }
+    } else if (g.phase === 'result') {
+      // result resolving — reset tick so next round starts fresh
+      demoRoundTick = 0; demoPulling = false; demoPulled = false;
+    }
+  }
+
+  // ---- BOT autopilot ----
+  var botPhaseName = 'idle', botTimer = 0, botSuccessCount = 0;
+  var BOT_FAIL_AFTER = 3 + Math.floor(rng() * 4);  // fail after 3-6 successes
+
+  function botTick() {
+    if (g.phase === 'over') return;
+    botTimer++;
+
+    if (botPhaseName === 'idle' && g.phase === 'play') {
+      if (botTimer > 45 + rng() * 60) { startSpin(); botPhaseName = 'spinning'; botTimer = 0; }
+    } else if (botPhaseName === 'spinning' && (g.phase === 'spinning' || g.phase === 'hang')) {
+      if (botTimer > 25 + rng() * 50) {
+        var shouldFail = botSuccessCount >= BOT_FAIL_AFTER;
+        if (shouldFail) {
+          // steer into red
+          g.angle = g.greenStart + g.greenArc + Math.PI * (0.4 + rng() * 0.5);
+        }
+        release();
+        botPhaseName = 'idle'; botTimer = 0;
+        if (shouldFail) {
+          botSuccessCount = 0;
+          BOT_FAIL_AFTER = 3 + Math.floor(rng() * 4);
+        } else {
+          botSuccessCount++;
+        }
+      }
+    } else if (botPhaseName === 'spinning' && g.phase === 'play') {
+      botPhaseName = 'idle'; botTimer = 0;
+    } else if (botPhaseName === 'spinning' && g.phase === 'result') {
+      // waiting for result to clear
+    } else if (botPhaseName === 'idle' && g.phase === 'result') {
+      // nothing yet
+    }
+  }
+
+  // ---- draw helpers ----
+  function drawSpinner(spCX, spCY, radius, angle, greenStart, greenArc) {
+    var outerR = radius, innerR = radius * 0.52;
+    var TWO_PI = Math.PI * 2;
+    var gs = ((greenStart % TWO_PI) + TWO_PI) % TWO_PI;
+    var ge = (gs + greenArc) % TWO_PI;
+
+    // background ring (red zone)
+    ctx.beginPath();
+    ctx.arc(spCX, spCY, outerR, 0, TWO_PI);
+    ctx.fillStyle = 'rgba(232,80,46,0.55)';
+    ctx.fill();
+
+    // green zone arc
+    ctx.beginPath();
+    if (ge >= gs) {
+      ctx.moveTo(spCX, spCY);
+      ctx.arc(spCX, spCY, outerR, gs, ge);
+      ctx.closePath();
+    } else {
+      ctx.moveTo(spCX, spCY);
+      ctx.arc(spCX, spCY, outerR, gs, TWO_PI);
+      ctx.closePath();
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(spCX, spCY);
+      ctx.arc(spCX, spCY, outerR, 0, ge);
+      ctx.closePath();
+    }
+    ctx.fillStyle = 'rgba(46,197,182,0.88)';
+    ctx.fill();
+
+    // inner cutout (donut)
+    ctx.beginPath();
+    ctx.arc(spCX, spCY, innerR, 0, TWO_PI);
+    ctx.fillStyle = INK;
+    ctx.fill();
+
+    // ring border
+    ctx.beginPath();
+    ctx.arc(spCX, spCY, outerR, 0, TWO_PI);
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(spCX, spCY, innerR, 0, TWO_PI);
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // needle (points from center outward, rotates)
+    ctx.save();
+    ctx.translate(spCX, spCY);
+    ctx.rotate(angle);
+    ctx.beginPath();
+    ctx.moveTo(0, -(outerR - 8));
+    ctx.lineTo(-6, -(innerR + 6));
+    ctx.lineTo(6, -(innerR + 6));
+    ctx.closePath();
+    ctx.fillStyle = '#fff';
+    ctx.shadowColor = 'rgba(255,255,255,0.7)';
+    ctx.shadowBlur = 10;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.restore();
+
+    // center dot
+    ctx.beginPath();
+    ctx.arc(spCX, spCY, 9, 0, TWO_PI);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+
+    // green/red labels
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.font = '600 11px Menlo, monospace';
+    var arcPct = Math.round((greenArc / TWO_PI) * 100);
+    ctx.fillText('GREEN ' + arcPct + '%', spCX, spCY + innerR * 0.45);
+  }
+
+  function drawPhoneUI(pullY) {
+    // draw a stylized phone feed showing the pull-to-refresh gesture
+    var ph = 170, pw = 130;
+    var px = W / 2 - pw / 2, py = 200;
+
+    ctx.save();
+    ctx.globalAlpha = 0.85;
+
+    // phone frame
+    ctx.fillStyle = 'rgba(255,255,255,0.04)';
+    ctx.strokeStyle = 'rgba(255,255,255,0.20)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(px, py, pw, ph, 14);
+    else ctx.rect(px, py, pw, ph);
+    ctx.fill(); ctx.stroke();
+
+    // clip to phone
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(px, py, pw, ph, 14);
+    else ctx.rect(px, py, pw, ph);
+    ctx.clip();
+
+    // fake feed rows (shift down with pull)
+    var feedY = py + 10 + pullY * 0.5;
+    for (var i = 0; i < 5; i++) {
+      var ry = feedY + i * 34;
+      if (ry > py + ph) break;
+      ctx.globalAlpha = 0.12;
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(px + 8, ry, 20, 20);       // avatar
+      ctx.fillRect(px + 34, ry + 3, 60, 6);   // name
+      ctx.fillRect(px + 34, ry + 14, 44, 4);  // sub
+    }
+
+    // pull spinner at top
+    if (pullY > 5) {
+      var spinR2 = 11;
+      var spinCX2 = W / 2, spinCY2 = py + 6 + pullY * 0.4;
+      var prog = Math.min(pullY / 108, 1);
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.arc(spinCX2, spinCY2, spinR2, -Math.PI / 2, -Math.PI / 2 + prog * Math.PI * 2);
+      ctx.strokeStyle = TEAL;
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  // ---- main render loop ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // spinner physics (paused during hit-stop)
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      if (g.phase === 'spinning') {
+        g.angle += g.speed * dt;
+        if (DEMO) demoTick();
+        if (BOT)  botTick();
+      } else if (g.phase === 'hang') {
+        if (performance.now() - g.hangStart >= g.hangMs) { g.phase = 'spinning'; }
+        if (DEMO) demoTick();
+        if (BOT)  botTick();
+      } else if (g.phase === 'play') {
+        if (DEMO) demoTick();
+        if (BOT)  botTick();
+      }
+    }
+
+    // juice transforms
+    ctx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      ctx.translate(W / 2 + sx, H / 2 + sy);
+      ctx.scale(zoom, zoom);
+      ctx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.83, dt);
+    zoom     += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    ctx.fillStyle = INK; ctx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+
+    // ---- TITLE ----
+    if (g.phase === 'title') {
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff';
+      ctx.font = '900 40px -apple-system, Helvetica, Arial';
+      ctx.fillText('DOOM REFRESH', W / 2, 116);
+      ctx.fillStyle = 'rgba(255,255,255,0.42)';
+      ctx.font = '600 14px -apple-system, Helvetica, Arial';
+      ctx.fillText('pull down — release on green', W / 2, 142);
+
+      drawPhoneUI(0);
+      drawSpinner(SPINNER_CX, SPINNER_CY, SPINNER_R,
+                  now / 1800, Math.PI * 0.9, Math.PI * 0.44);
+
+      var pulse = 0.55 + 0.45 * Math.sin(now / 320);
+      ctx.globalAlpha = pulse;
+      ctx.fillStyle = VERM;
+      ctx.font = '700 17px -apple-system, Helvetica, Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText('TAP TO START', W / 2, 630);
+      ctx.globalAlpha = 1;
+    }
+
+    // ---- CHALLENGE CARD (demo beat 1) ----
+    if (g.phase === 'challenge') {
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.font = '800 15px Menlo, monospace';
+      ctx.fillText('SCORE TO BEAT', W / 2, 310);
+      ctx.fillStyle = GOLD;
+      ctx.font = '900 96px -apple-system, Helvetica, Arial';
+      ctx.fillText('7', W / 2, 422);
+      ctx.fillStyle = 'rgba(255,255,255,0.32)';
+      ctx.font = '600 13px -apple-system, Helvetica, Arial';
+      ctx.fillText("today's best streak", W / 2, 450);
+    }
+
+    // ---- PLAY ----
+    if (g.phase === 'play') {
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(255,255,255,0.90)';
+      ctx.font = '800 58px -apple-system, Helvetica, Arial';
+      ctx.fillText(g.round, W / 2, 94);
+      ctx.fillStyle = 'rgba(255,255,255,0.35)';
+      ctx.font = '600 12px -apple-system, Helvetica, Arial';
+      ctx.fillText('BEST ' + best, W / 2, 116);
+
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        ctx.fillStyle = dareBeaten ? TEAL : GOLD;
+        ctx.font = '700 13px -apple-system, Helvetica, Arial';
+        ctx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare, W / 2, 140);
+      }
+
+      drawPhoneUI(g.pullY);
+      drawSpinner(SPINNER_CX, SPINNER_CY, SPINNER_R,
+                  g.angle, g.greenStart, g.greenArc);
+
+      var pullAlpha = g.pullY > 8 ? 0 : 0.38 + 0.28 * Math.sin(now / 380);
+      ctx.globalAlpha = pullAlpha;
+      ctx.fillStyle = TEAL;
+      ctx.font = '700 15px -apple-system, Helvetica, Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText('↓  PULL TO REFRESH  ↓', W / 2, 606);
+      ctx.globalAlpha = 1;
+    }
+
+    // ---- SPINNING / HANG ----
+    if (g.phase === 'spinning' || g.phase === 'hang') {
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(255,255,255,0.90)';
+      ctx.font = '800 58px -apple-system, Helvetica, Arial';
+      ctx.fillText(g.round, W / 2, 94);
+      ctx.fillStyle = 'rgba(255,255,255,0.35)';
+      ctx.font = '600 12px -apple-system, Helvetica, Arial';
+      ctx.fillText('BEST ' + best, W / 2, 116);
+
+      if (g.phase === 'hang') {
+        var hp = 0.6 + 0.4 * Math.sin(now / 140);
+        ctx.globalAlpha = hp;
+        ctx.fillStyle = GOLD;
+        ctx.font = '700 13px Menlo, monospace';
+        ctx.fillText('HANGING…', W / 2, 148);
+        ctx.globalAlpha = 1;
+      }
+
+      drawSpinner(SPINNER_CX, SPINNER_CY, SPINNER_R,
+                  g.angle, g.greenStart, g.greenArc);
+
+      var tp = 0.55 + 0.45 * Math.sin(now / 220);
+      ctx.globalAlpha = tp;
+      ctx.fillStyle = '#fff';
+      ctx.font = '700 15px -apple-system, Helvetica, Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText('TAP TO RELEASE', W / 2, 598);
+      ctx.globalAlpha = 1;
+    }
+
+    // ---- RESULT ----
+    if (g.phase === 'result') {
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(255,255,255,0.90)';
+      ctx.font = '800 58px -apple-system, Helvetica, Arial';
+      ctx.fillText(g.round, W / 2, 94);
+
+      drawSpinner(SPINNER_CX, SPINNER_CY, SPINNER_R,
+                  g.angle, g.greenStart, g.greenArc);
+
+      var resT  = (now - g.resultAt) / 600;
+      var rCol  = g.releaseOk ? TEAL : VERM;
+      ctx.globalAlpha = Math.max(0, 1 - resT);
+      ctx.fillStyle = rCol;
+      ctx.font = '900 26px -apple-system, Helvetica, Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText(g.releaseOk ? '✓ CONNECTED' : '✗ NO SIGNAL', W / 2, 580);
+      ctx.globalAlpha = 1;
+    }
+
+    // ---- GAME OVER ----
+    if (g.phase === 'over') {
+      ctx.fillStyle = 'rgba(11,13,18,0.6)'; ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = VERM;
+      ctx.font = '900 36px -apple-system, Helvetica, Arial';
+      ctx.fillText('LOST CONNECTION', W / 2, 295);
+      ctx.fillStyle = '#fff';
+      ctx.font = '800 26px -apple-system, Helvetica, Arial';
+      ctx.fillText(g.round + ' refreshes', W / 2, 338);
+      var pt = pctTop(g.round);
+      ctx.fillStyle = GOLD;
+      ctx.font = '900 24px -apple-system, Helvetica, Arial';
+      ctx.fillText('TOP ' + pt + '% TODAY', W / 2, 382);
+      ctx.fillStyle = 'rgba(255,255,255,0.48)';
+      ctx.font = '600 12px -apple-system, Helvetica, Arial';
+      ctx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 405);
+
+      if (!DEMO && !BOT) {
+        var p3 = 0.55 + 0.45 * Math.sin(now / 280);
+        ctx.globalAlpha = p3; ctx.fillStyle = TEAL;
+        ctx.font = '700 16px -apple-system, Helvetica, Arial';
+        ctx.fillText('TAP — ONE MORE TRY', W / 2, 450);
+        ctx.globalAlpha = 1;
+
+        // share pill
+        ctx.fillStyle = 'rgba(242,177,52,0.14)';
+        ctx.strokeStyle = GOLD; ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else ctx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        ctx.fill(); ctx.stroke();
+        ctx.fillStyle = GOLD;
+        ctx.font = '800 15px -apple-system, Helvetica, Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText(
+          window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W / 2, SHARE_R.y + 30
+        );
+      }
+    }
+
+    // ---- CTA CARD (demo) ----
+    if (g.phase === 'cta') {
+      var tCta = (now - ctaAt) / 1000, ease = Math.min(1, tCta * 2.4);
+      ctx.fillStyle = 'rgba(11,13,18,' + (0.80 * ease) + ')'; ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = ease;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff';
+      ctx.font = '900 42px -apple-system, Helvetica, Arial';
+      ctx.fillText('DOOM REFRESH', W / 2, 295);
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.font = '700 18px -apple-system, Helvetica, Arial';
+      ctx.fillText('they got ' + (window.__demoScore || 7) + '. can you beat it?', W / 2, 334);
+      var p4 = 0.7 + 0.3 * Math.sin(now / 240);
+      ctx.fillStyle = VERM; ctx.globalAlpha = ease * p4;
+      ctx.font = '900 30px -apple-system, Helvetica, Arial';
+      ctx.fillText('▶ BEAT ' + (window.__demoScore || 7), W / 2, 400);
+      ctx.globalAlpha = ease;
+      ctx.fillStyle = TEAL;
+      ctx.font = '700 15px -apple-system, Helvetica, Arial';
+      ctx.fillText('link in bio', W / 2, 432);
+      ctx.globalAlpha = 1;
+    }
+
+    // ---- floating flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 36);
+      ctx.globalAlpha = fa;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = fl.color;
+      ctx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      ctx.fillText(fl.txt, W / 2, 220 - fl.t * 0.7);
+      ctx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      ctx.textAlign = 'center';
+      ctx.globalAlpha = 0.5;
+      ctx.font = '16px -apple-system, Helvetica, Arial';
+      ctx.fillStyle = '#fff';
+      ctx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

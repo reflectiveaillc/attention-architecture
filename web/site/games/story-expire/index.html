@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Story Expire — Tilt</title>
+<!--
+  LOOP / attention-architecture — Story Expire
+  Circuits: 04-loss (FOMO / 24h countdown), 01-RPE (hidden target zone), 06-Zeigarnik (one more try)
+  Conditioned path: thumb knows the Instagram story ring. Game IS that move.
+  Modes:
+    ?demo=1&seed=7   scripted clip (challenge → imperfect play → near-fail+save → real fail → score → CTA)
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, sets window.__botDone
+-->
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#0b0d12;overflow:hidden;
+            -webkit-user-select:none;user-select:none;touch-action:manipulation;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{display:block;background:#0b0d12;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'story-expire';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ── game constants ──
+  var CX = W / 2, CY = H / 2 - 30;
+  var RING_R  = 120;   // radius of the story ring
+  var RING_W  = 22;    // stroke width
+  var TARGET_HALF_ARC = 0.20;  // half-width of target zone in radians (start wide)
+  // base decay rate (radians/sec), increases per level
+  var BASE_DECAY = 1.2;  // radians per second arc shrinks
+
+  // ── state ──
+  var phase;         // 'title'|'challenge'|'play'|'over'|'cta'
+  var level, score, combo;
+  var arc;           // remaining arc (radians, 0..TWO_PI)
+  var targetAngle;   // center of target zone (radians from top, clockwise)
+  var targetHalf;    // half-width of revealed target (hides sooner each level)
+  var decayRate;     // arc shrink speed radians/sec
+  var runStartTs, overAt, challengeAt, ctaAt;
+  var flashes, dareBeaten;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('se_best') || 0; } catch(_) {}
+
+  var TWO_PI = Math.PI * 2;
+  var HALF_PI = Math.PI / 2;    // top of ring (12 o'clock)
+
+  // how much of the target ring is revealed vs hidden per level
+  function targetRevealHalf(lvl) {
+    // level 0: full target visible; higher: narrower reveal (hide it sooner)
+    return Math.max(0.04, TARGET_HALF_ARC - lvl * 0.025);
+  }
+
+  function pctTop(sc) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-sc / 6))));
+  }
+
+  function newGame() {
+    phase = 'title';
+    level = 0; score = 0; combo = 0;
+    arc = TWO_PI;
+    flashes = []; dareBeaten = false;
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1300);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startLevel() {
+    arc = TWO_PI;
+    // randomise target position each level (seeded so demo is deterministic)
+    var ang = rng() * TWO_PI;
+    targetAngle = ang;
+    targetHalf  = targetRevealHalf(level);
+    decayRate   = BASE_DECAY + level * 0.22;
+    if (window.J) J.tension(Math.min(level / 10, 1));
+  }
+
+  function startRun() {
+    phase = 'play';
+    level = 0; score = 0; combo = 0;
+    runStartTs = Date.now();
+    startLevel();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ── tap logic ──
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play')  { attemptTap(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'rings' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  function attemptTap() {
+    // check if the current arc end (bottom of remaining arc) is within target zone
+    // arc shrinks from the "end" (clockwise). The pointer = end of arc.
+    // arc starts at TWO_PI and shrinks. The leading edge that disappears is the CW end.
+    // The arc is drawn from (-HALF_PI) to (-HALF_PI + arc) going clockwise.
+    // The target zone is centered at targetAngle.
+    // We measure pointer position as the current arc end angle:
+    var pointerAngle = (TWO_PI - HALF_PI + arc) % TWO_PI;
+    // target zone
+    var diff = angleDiff(pointerAngle, targetAngle);
+    var hit   = Math.abs(diff) <= targetHalf;
+    var near  = !hit && Math.abs(diff) <= targetHalf * 2.5;
+
+    if (hit) {
+      var perfect = Math.abs(diff) <= targetHalf * 0.25;
+      combo++;
+      score++;
+      if (perfect) {
+        hitStop = 5; zoom = 1.03;
+        flash('PERFECT', TEAL, 46);
+        if (window.J) J.perfect(combo);
+        if (window.LOOP) LOOP.emit('ring_hit', { level: level, perfect: true, score: score });
+      } else {
+        hitStop = 2;
+        flash('+1', GOLD, 34);
+        if (window.J) J.hit(combo);
+        if (window.LOOP) LOOP.emit('ring_hit', { level: level, perfect: false, score: score });
+      }
+      if (combo >= 3 && window.J) J.gold();
+      // dare beaten?
+      if (!dareBeaten && window.SHARE && SHARE.dare !== null && score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(score);
+      }
+      level++;
+      startLevel();
+    } else if (near) {
+      // near-miss
+      flash('SO CLOSE', VERM, 36);
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { level: level, diff: +diff.toFixed(3) });
+      gameOver();
+    } else {
+      // full miss
+      gameOver();
+    }
+  }
+
+  function angleDiff(a, b) {
+    // signed shortest arc from a to b
+    var d = ((b - a) % TWO_PI + TWO_PI + Math.PI) % TWO_PI - Math.PI;
+    return d;
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 9;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + score / 20, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = score;
+    if (newBest) {
+      best = score;
+      try { localStorage.setItem('se_best', String(best)); } catch(_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3700);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(resetRun, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    level = 0; score = 0; combo = 0; flashes = []; dareBeaten = false;
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ── input ──
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ── autopilots ──
+  var botRunsDone = 0;
+  var BOT_MAX_ACTIONS = 8;  // bot hits this many levels then intentionally misses → game_over
+  var botActions = 0;
+
+  // demo script: array of {wait_frames, type} where type is 'hit'|'near'|'miss'
+  // arc shrinks at ~1.2 rad/s, each frame ~16ms → ~0.02 rad/frame at 60fps
+  // hesitation waits in frames so it feels human
+  var demoScript = [
+    { wait: 40, type: 'hit'  },   // level 0: normal tap
+    { wait: 35, type: 'hit'  },   // level 1
+    { wait: 50, type: 'hit'  },   // level 2: pause before tap
+    { wait: 28, type: 'hit'  },   // level 3: quick
+    { wait: 55, type: 'near' },   // level 4: near-fail (tension peak ~60%)
+    { wait: 30, type: 'hit'  },   // level 5: recovery after near-fail
+    { wait: 38, type: 'miss' }    // level 6: the real fail (spectacle)
+  ];
+  var demoIdx = 0, demoWait = 50;  // initial hesitation before first tap
+  var demoActed = false;
+
+  function autopilot() {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      if (demoIdx >= demoScript.length) return;
+      if (demoWait > 0) { demoWait--; return; }
+      var step = demoScript[demoIdx];
+      // execute the scripted tap type
+      var result = doDemoTap(step.type);
+      if (result) {
+        demoIdx++;
+        demoWait = (demoIdx < demoScript.length) ? demoScript[demoIdx - 1].wait : 20;
+        // set wait for NEXT step after this one
+        if (demoIdx < demoScript.length) {
+          demoWait = demoScript[demoIdx].wait;
+        }
+      }
+      return;
+    }
+
+    if (BOT) {
+      if (botActions >= BOT_MAX_ACTIONS) {
+        // intentionally miss to trigger game_over
+        doBotMiss();
+      } else {
+        doBotHit();
+      }
+    }
+  }
+
+  // demo tap helper — snaps arc pointer near/into target based on type
+  function doDemoTap(type) {
+    var pointerAngle = (TWO_PI - HALF_PI + arc) % TWO_PI;
+    var diff = angleDiff(pointerAngle, targetAngle);
+    // arc shrinks; we trigger when arc pointer is roughly in range
+    if (type === 'hit') {
+      // tap when within target zone
+      if (Math.abs(diff) <= targetHalf + 0.04) {
+        doAutopilotTap();
+        return true;
+      }
+    } else if (type === 'near') {
+      // tap just outside target zone (near-miss)
+      if (diff < 0 && Math.abs(diff) >= targetHalf * 1.3 && Math.abs(diff) <= targetHalf * 2.2) {
+        doAutopilotTap();
+        return true;
+      }
+      // if arc pointer is past the near zone (missed the near), force a miss
+      if (arc < 0.15) {
+        doAutopilotTap(); // too late, will be miss or near
+        return true;
+      }
+    } else if (type === 'miss') {
+      // tap well outside target zone
+      if (Math.abs(diff) >= targetHalf * 3.5 || arc < 0.2) {
+        doAutopilotTap();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function doAutopilotTap() {
+    // mimics attemptTap logic but called from autopilot — runs the same attempt
+    var pointerAngle = (TWO_PI - HALF_PI + arc) % TWO_PI;
+    var diff = angleDiff(pointerAngle, targetAngle);
+    var hit  = Math.abs(diff) <= targetHalf;
+    var near = !hit && Math.abs(diff) <= targetHalf * 2.5;
+
+    if (hit) {
+      var perfect = Math.abs(diff) <= targetHalf * 0.25;
+      combo++; score++;
+      if (perfect) {
+        hitStop = 5; zoom = 1.03; flash('PERFECT', TEAL, 46);
+        if (window.J) J.perfect(combo);
+        if (window.LOOP) LOOP.emit('ring_hit', { level: level, perfect: true, score: score });
+      } else {
+        hitStop = 2; flash('+1', GOLD, 34);
+        if (window.J) J.hit(combo);
+        if (window.LOOP) LOOP.emit('ring_hit', { level: level, perfect: false, score: score });
+      }
+      level++;
+      startLevel();
+    } else if (near) {
+      flash('SO CLOSE', VERM, 36);
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { level: level, diff: +diff.toFixed(3) });
+      gameOver();
+    } else {
+      gameOver();
+    }
+  }
+
+  var botActed = false;
+  function doBotHit() {
+    var pointerAngle = (TWO_PI - HALF_PI + arc) % TWO_PI;
+    var diff = angleDiff(pointerAngle, targetAngle);
+    // bot taps when within target zone (with slight randomness)
+    var margin = targetHalf * (0.5 + rng() * 0.8);
+    if (Math.abs(diff) <= margin) {
+      botActions++;
+      doAutopilotTap();
+    }
+  }
+
+  function doBotMiss() {
+    // tap when clearly outside target zone
+    var pointerAngle = (TWO_PI - HALF_PI + arc) % TWO_PI;
+    var diff = angleDiff(pointerAngle, targetAngle);
+    // wait until pointer is far from target to ensure a miss
+    if (Math.abs(diff) > targetHalf * 3.5 || arc < 0.3) {
+      doAutopilotTap();
+    }
+  }
+
+  // ── render helpers ──
+  function drawRing(now) {
+    // background ring (full circle, dim)
+    cx.save();
+    cx.beginPath();
+    cx.arc(CX, CY, RING_R, 0, TWO_PI);
+    cx.strokeStyle = 'rgba(255,255,255,0.08)';
+    cx.lineWidth = RING_W;
+    cx.stroke();
+
+    // target zone indicator (partially revealed based on level)
+    // target is centered at targetAngle. Reveal only a small arc around it.
+    var startA = targetAngle - targetHalf - HALF_PI;
+    var endA   = targetAngle + targetHalf - HALF_PI;
+    cx.beginPath();
+    cx.arc(CX, CY, RING_R, startA, endA);
+    cx.strokeStyle = GOLD;
+    cx.lineWidth = RING_W + 2;
+    cx.stroke();
+
+    // main arc (shrinking, vermillion → teal gradient as it expires)
+    var arcStart = -HALF_PI;
+    var arcEnd   = -HALF_PI + arc;
+    var g = cx.createLinearGradient(
+      CX + Math.cos(arcStart) * RING_R, CY + Math.sin(arcStart) * RING_R,
+      CX + Math.cos(arcEnd)   * RING_R, CY + Math.sin(arcEnd)   * RING_R
+    );
+    g.addColorStop(0, TEAL);
+    g.addColorStop(1, VERM);
+    cx.beginPath();
+    cx.arc(CX, CY, RING_R, arcStart, arcEnd);
+    cx.strokeStyle = g;
+    cx.lineWidth = RING_W;
+    cx.lineCap = 'round';
+    cx.stroke();
+
+    // arc pointer dot (the "needle" — where the tap registers)
+    var px = CX + Math.cos(arcEnd) * RING_R;
+    var py = CY + Math.sin(arcEnd) * RING_R;
+    cx.beginPath();
+    cx.arc(px, py, RING_W / 2 + 2, 0, TWO_PI);
+    cx.fillStyle = '#fff';
+    cx.fill();
+
+    cx.restore();
+  }
+
+  function drawLevelText() {
+    cx.save();
+    cx.textAlign = 'center';
+    // center: score big, level small
+    cx.fillStyle = 'rgba(255,255,255,0.92)';
+    cx.font = '800 68px -apple-system, Helvetica, Arial';
+    cx.fillText(score, CX, CY + 18);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('rings', CX, CY + 42);
+    cx.restore();
+  }
+
+  // ── main loop ──
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // decay arc during play (frozen during hit-stop)
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      if (phase === 'play') {
+        arc -= decayRate * (dt / 60);
+        if (arc <= 0) {
+          arc = 0;
+          gameOver();   // ran out of time
+        } else {
+          autopilot();
+        }
+      }
+    }
+
+    // juice: shake + zoom decay
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.08)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    // ── title ──
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('STORY EXPIRE', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap when the ring hits the target', W / 2, 300);
+      // draw a decorative ring preview
+      cx.save();
+      cx.beginPath();
+      cx.arc(CX, CY + 30, RING_R, 0, TWO_PI);
+      cx.strokeStyle = 'rgba(255,255,255,0.07)';
+      cx.lineWidth = RING_W;
+      cx.stroke();
+      cx.beginPath();
+      cx.arc(CX, CY + 30, RING_R, -HALF_PI, -HALF_PI + TWO_PI * 0.65);
+      cx.strokeStyle = VERM;
+      cx.lineWidth = RING_W;
+      cx.lineCap = 'round';
+      cx.stroke();
+      cx.restore();
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM;
+      cx.font = '800 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, H - 190);
+      cx.globalAlpha = 1;
+    }
+
+    // ── challenge card (demo beat 1) ──
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 280);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('7', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 420);
+    }
+
+    // ── play ──
+    if (phase === 'play') {
+      drawRing(now);
+      drawLevelText();
+      // urgency bar: thin strip at top showing % time left
+      var pct = arc / TWO_PI;
+      cx.fillStyle = pct > 0.5 ? TEAL : pct > 0.25 ? GOLD : VERM;
+      cx.fillRect(0, 0, W * pct, 4);
+      // score + best at top
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 52);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 72);
+      // level indicator
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 12px Menlo, monospace';
+      cx.fillText('RING ' + (level + 1), W / 2, H - 80);
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 96);
+      }
+    }
+
+    // ── flashes (floating text) ──
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, H / 2 - 90 - fl.t * 1.4);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // ── game over ──
+    if (phase === 'over') {
+      // draw frozen ring underneath
+      cx.save();
+      cx.beginPath();
+      cx.arc(CX, CY, RING_R, 0, TWO_PI);
+      cx.strokeStyle = 'rgba(255,255,255,0.05)';
+      cx.lineWidth = RING_W;
+      cx.stroke();
+      cx.restore();
+
+      cx.fillStyle = 'rgba(11,13,18,0.60)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('EXPIRED.', W / 2, 290);
+      cx.fillStyle = '#fff';
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' rings', W / 2, 336);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 378);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('faster than ' + (100 - pt) + '% of players', W / 2, 400);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 300);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 450);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.13)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) {
+          cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        } else {
+          cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        }
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ── demo CTA card ──
+    if (phase === 'cta') {
+      var t2 = (now - ctaAt) / 1000, ease = Math.min(1, t2 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('STORY EXPIRE', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText((window.__demoScore || 7) + ' rings. your move.', W / 2, 336);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 250);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 7), W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // ── mute toggle (human only) ──
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

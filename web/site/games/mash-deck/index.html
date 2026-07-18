@@ -1,0 +1,1086 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Mash Deck — Tilt</title>
+<!--
+  LOOP / attention-architecture — Mash Deck
+  Circuits: 02-novelty (shuffled deck, each card a fresh mini-hit),
+            01-rpe (variable reward per card type),
+            05-ease (the move is the scroll gesture you already know).
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N&seed=M  imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'mash-deck';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- card definitions ----
+  // 20 micro-tasks, each unique type
+  var CARD_DEFS = [
+    { id:'tap3',     label:'TAP 3×',       color:VERM,  bg:'rgba(232,80,46,0.18)',   desc:'tap it three times',    dur:4000, fn:'tap3'    },
+    { id:'hold1',    label:'HOLD 1s',      color:TEAL,  bg:'rgba(46,197,182,0.18)',  desc:'hold the screen',       dur:4000, fn:'hold1'   },
+    { id:'swipeleft',label:'SWIPE LEFT',   color:GOLD,  bg:'rgba(242,177,52,0.18)',  desc:'swipe across',          dur:3500, fn:'swipe'   },
+    { id:'catch2',   label:'CATCH 2',      color:VERM,  bg:'rgba(232,80,46,0.18)',   desc:'catch the falling dots',dur:5000, fn:'catch'   },
+    { id:'avoidred', label:'AVOID RED',    color:TEAL,  bg:'rgba(46,197,182,0.18)',  desc:'move away from red',    dur:4500, fn:'avoid'   },
+    { id:'doubletap',label:'DOUBLE TAP',   color:GOLD,  bg:'rgba(242,177,52,0.18)',  desc:'two quick taps',        dur:3000, fn:'dtap'    },
+    { id:'tap5',     label:'TAP 5×',       color:VERM,  bg:'rgba(232,80,46,0.18)',   desc:'tap five times fast',   dur:4500, fn:'tap5'    },
+    { id:'hold2',    label:'HOLD 2s',      color:TEAL,  bg:'rgba(46,197,182,0.18)',  desc:'hold for two seconds',  dur:5000, fn:'hold2'   },
+    { id:'swiperght',label:'SWIPE RIGHT',  color:GOLD,  bg:'rgba(242,177,52,0.18)',  desc:'swipe the other way',   dur:3500, fn:'swiper'  },
+    { id:'match',    label:'MATCH COLOR',  color:VERM,  bg:'rgba(232,80,46,0.18)',   desc:'tap the matching dot',  dur:4000, fn:'match'   },
+    { id:'tap7',     label:'TAP 7×',       color:TEAL,  bg:'rgba(46,197,182,0.18)',  desc:'keep tapping',          dur:5500, fn:'tap7'    },
+    { id:'longhold', label:'HOLD 3s',      color:GOLD,  bg:'rgba(242,177,52,0.18)',  desc:'steady… steady…',       dur:6000, fn:'hold3'   },
+    { id:'circle',   label:'CIRCLE TAP',   color:VERM,  bg:'rgba(232,80,46,0.18)',   desc:'tap the moving circle', dur:4000, fn:'circle'  },
+    { id:'dodge',    label:'DODGE IT',     color:TEAL,  bg:'rgba(46,197,182,0.18)',  desc:'tap when safe',         dur:4500, fn:'dodge'   },
+    { id:'combo3',   label:'3-TAP COMBO',  color:GOLD,  bg:'rgba(242,177,52,0.18)',  desc:'3 perfect-timed taps',  dur:5000, fn:'combo3'  },
+    { id:'burst',    label:'BURST TAP',    color:VERM,  bg:'rgba(232,80,46,0.18)',   desc:'tap as fast as you can',dur:3000, fn:'burst'   },
+    { id:'swipeup',  label:'SWIPE UP',     color:TEAL,  bg:'rgba(46,197,182,0.18)',  desc:'swipe toward sky',      dur:3500, fn:'swipeu'  },
+    { id:'snipe',    label:'SNIPE IT',     color:GOLD,  bg:'rgba(242,177,52,0.18)',  desc:'tap the tiny target',   dur:4000, fn:'snipe'   },
+    { id:'chain',    label:'CHAIN TAP',    color:VERM,  bg:'rgba(232,80,46,0.18)',   desc:'tap each dot in order', dur:5000, fn:'chain'   },
+    { id:'survive',  label:'SURVIVE 2s',   color:TEAL,  bg:'rgba(46,197,182,0.18)',  desc:'hold on for 2 seconds', dur:4500, fn:'survive' },
+  ];
+
+  // Fisher-Yates shuffle with seeded RNG
+  function shuffle(arr) {
+    var a = arr.slice();
+    for (var i = a.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var t = a[i]; a[i] = a[j]; a[j] = t;
+    }
+    return a;
+  }
+
+  // ---- state ----
+  var state, flashes, hitStop, zoom, shakeAmt, dareBeaten;
+  var runStartTs, botRunsDone, best, ctaAt, challengeAt;
+  try { best = +localStorage.getItem('md_best') || 0; } catch (_) { best = 0; }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 7))));
+  }
+
+  // ---- card mini-game state ----
+  // Each card gets a sub-state that the active card mini-game reads/writes
+  var card = null;   // the active card's runtime state
+
+  // ---- reset / new game ----
+  function newGame() {
+    rng = mulberry32(SEED);
+    var deck = shuffle(CARD_DEFS);
+    state = {
+      phase: 'title',           // title | challenge | play | over | cta
+      deck: deck,               // remaining cards
+      deckIdx: 0,               // index of current card
+      cardsCleared: 0,
+      score: 0,
+      overAt: 0,
+      cardStartTs: 0,
+      cardDone: false,
+      cardFailed: false,
+    };
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    card = null;
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1300);
+      return;
+    }
+    if (BOT) {
+      startRun();
+      return;
+    }
+    // human title
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.cardsCleared = 0;
+    state.score = 0;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    activateCard();
+  }
+
+  function activateCard() {
+    if (state.deckIdx >= state.deck.length) {
+      // cleared whole deck — win!
+      gameOver(true);
+      return;
+    }
+    var def = state.deck[state.deckIdx];
+    state.cardDone = false;
+    state.cardFailed = false;
+    state.cardStartTs = performance.now();
+    card = buildCard(def);
+    if (window.J) J.tension(Math.min(state.deckIdx / state.deck.length, 1));
+    if (window.LOOP) LOOP.emit('card_activated', { card: def.id, idx: state.deckIdx });
+  }
+
+  function nextCard() {
+    state.deckIdx++;
+    state.cardsCleared++;
+    activateCard();
+  }
+
+  function cardSuccess(perfect) {
+    if (state.cardDone || state.cardFailed) return;
+    state.cardDone = true;
+    var combo = state.cardsCleared + 1;
+    state.score += perfect ? 150 : 100;
+    if (window.J) {
+      if (perfect) { J.perfect(combo); hitStop = 5; zoom = 1.04; }
+      else J.hit(combo);
+    }
+    if (perfect) { flash('PERFECT!', TEAL, 48); shakeAmt = 3; }
+    else { flash('CLEARED', GOLD, 42); }
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score >= SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+    if (window.LOOP) LOOP.emit('card_cleared', { card: state.deck[state.deckIdx].id, perfect: perfect, score: state.score });
+    // advance after a short pause
+    setTimeout(nextCard, 420);
+  }
+
+  function cardFail(reason) {
+    if (state.cardDone || state.cardFailed) return;
+    state.cardFailed = true;
+    shakeAmt = 8;
+    if (window.J) J.near();
+    flash('SO CLOSE', VERM, 44);
+    if (window.LOOP) LOOP.emit('near_miss', { card: state.deck[state.deckIdx].id, reason: reason });
+    // fail = game over
+    setTimeout(function () { gameOver(false); }, 500);
+  }
+
+  function gameOver(won) {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = won ? 0 : 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.death(won ? 0 : Math.min(0.4 + state.cardsCleared / 20, 1));
+      if (newBest || won) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (newBest) {
+      best = state.score;
+      try { localStorage.setItem('md_best', String(best)); } catch (_) {}
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      // after score card, show CTA
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(resetRun, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    rng = mulberry32(SEED + botRunsDone * 7);
+    state.deck = shuffle(CARD_DEFS);
+    state.deckIdx = 0;
+    state.cardsCleared = 0;
+    state.score = 0;
+    state.cardDone = false;
+    state.cardFailed = false;
+    card = null;
+    flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- card mini-game builders ----
+  // Each builder returns an object { def, render(cx,now,dt), tap(x,y), swipe(dx,dy), hold(dur), tick(dt,now) }
+  function buildCard(def) {
+    var c = {
+      def: def,
+      elapsed: 0,
+      _tapCount: 0,
+      _holding: false,
+      _holdStart: 0,
+      _holdAccum: 0,
+      _swipeDone: false,
+      _swipeStartX: null,
+      _swipeStartY: null,
+      _catchTargets: [],
+      _catchHits: 0,
+      _avoidX: W * 0.5,
+      _avoidThreatX: W * 0.2,
+      _avoidSafe: false,
+      _matchColor: null,
+      _matchDots: [],
+      _circlePhi: 0,
+      _circleHit: false,
+      _dodgeSafe: true,
+      _comboHits: 0,
+      _comboWindows: [],
+      _snipeX: 0,
+      _snipeY: 0,
+      _snipeR: 28,
+      _chainDots: [],
+      _chainNext: 0,
+      _burstCount: 0,
+      _survivingTs: 0,
+      _surviveDone: false,
+    };
+    // initialize per-type state
+    var fn = def.fn;
+    if (fn === 'catch') {
+      c._catchTargets = [
+        { x: rng() * 240 + 80, y: -30, vy: 2.5 + rng() * 1.5, hit: false },
+        { x: rng() * 240 + 80, y: -120, vy: 2 + rng() * 1.5, hit: false },
+        { x: rng() * 240 + 80, y: -220, vy: 2 + rng() * 2, hit: false },
+      ];
+    } else if (fn === 'avoid') {
+      c._avoidThreatX = rng() > 0.5 ? W * 0.75 : W * 0.25;
+    } else if (fn === 'match') {
+      var colors = [VERM, TEAL, GOLD, '#9b59b6'];
+      c._matchColor = colors[Math.floor(rng() * colors.length)];
+      var positions = [];
+      for (var i = 0; i < 4; i++) {
+        positions.push({ x: 60 + i * 80, y: H * 0.62, color: colors[i], hit: false });
+      }
+      // shuffle positions
+      for (var pi = 3; pi > 0; pi--) {
+        var pj = Math.floor(rng() * (pi + 1));
+        var pt = positions[pi]; positions[pi] = positions[pj]; positions[pj] = pt;
+      }
+      c._matchDots = positions;
+    } else if (fn === 'snipe') {
+      c._snipeX = 80 + rng() * 240;
+      c._snipeY = H * 0.5 + (rng() - 0.5) * 120;
+      c._snipeR = 18;
+    } else if (fn === 'chain') {
+      c._chainDots = [];
+      for (var ci = 0; ci < 4; ci++) {
+        c._chainDots.push({ x: 70 + ci * 85, y: H * 0.55 + (rng() - 0.5) * 80, hit: false });
+      }
+    } else if (fn === 'combo3') {
+      // 3 timed beat windows
+      c._comboWindows = [1000, 2000, 3000]; // ms after card start to hit each
+      c._comboHits = 0;
+    } else if (fn === 'survive') {
+      c._survivingTs = 0;
+    }
+    return c;
+  }
+
+  function tickCard(dt, now) {
+    if (!card || state.cardDone || state.cardFailed) return;
+    card.elapsed += dt * 16.667; // to ms
+    var def = card.def;
+    var timeLeft = def.dur - card.elapsed;
+
+    // time-out check (per card)
+    if (timeLeft < 0) {
+      // check fn-specific completion
+      var fn = def.fn;
+      if (fn === 'catch' && card._catchHits >= 2) { cardSuccess(card._catchHits >= 3); return; }
+      if (fn === 'avoid' && !card._avoidSafe) { cardFail('hit_red'); return; }
+      if (fn === 'survive' && card._surviveDone) { cardSuccess(true); return; }
+      if (fn === 'burst') {
+        if (card._burstCount >= 10) cardSuccess(true);
+        else if (card._burstCount >= 6) cardSuccess(false);
+        else cardFail('too_slow');
+        return;
+      }
+      // most timed cards that haven't succeeded yet fail
+      if (!state.cardDone) cardFail('timeout');
+      return;
+    }
+
+    // per-card tick logic
+    var fn = def.fn;
+    if (fn === 'catch') {
+      for (var i = 0; i < card._catchTargets.length; i++) {
+        var t = card._catchTargets[i];
+        if (!t.hit) t.y += t.vy * dt;
+        if (!t.hit && t.y > H - 120) {
+          // missed target = fail (only if not enough caught yet)
+          if (card._catchHits < 2) { cardFail('missed'); return; }
+        }
+      }
+    }
+    if (fn === 'avoid') {
+      // threat moves across screen
+      card._avoidThreatX += (rng() - 0.5) * 3 * dt;
+      card._avoidThreatX = Math.max(60, Math.min(W - 60, card._avoidThreatX));
+      // check proximity
+      var dist = Math.abs(card._avoidX - card._avoidThreatX);
+      if (dist < 45) { card._avoidSafe = false; cardFail('too_close'); return; }
+      else card._avoidSafe = true;
+    }
+    if (fn === 'survive') {
+      if (!card._survivingTs) card._survivingTs = now;
+      if (now - card._survivingTs > 2000) {
+        card._surviveDone = true;
+        cardSuccess(true);
+      }
+    }
+    if (fn === 'circle') {
+      card._circlePhi += 0.04 * dt;
+    }
+    if (fn === 'dodge') {
+      // safe window pulses at ~1.5s interval
+      var phase2 = (now % 1500) / 1500;
+      card._dodgeSafe = phase2 > 0.4;
+    }
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  var pointerDownX = null, pointerDownY = null, pointerDownTs = null, isHolding = false;
+  var lastTapTs = 0, dtapCount = 0;
+  var holdTimer = null;
+
+  function onTap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play' && card && !state.cardDone && !state.cardFailed) {
+      handleCardTap(x, y);
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'cards' }); return;
+      }
+      // restart
+      rng = mulberry32(SEED);
+      state.deck = shuffle(CARD_DEFS);
+      state.deckIdx = 0;
+      card = null;
+      flashes = [];
+      startRun();
+    }
+  }
+
+  function handleCardTap(x, y) {
+    var fn = card.def.fn;
+    if (fn === 'tap3') {
+      card._tapCount++;
+      if (window.J) J.hit(card._tapCount);
+      if (card._tapCount >= 3) cardSuccess(card._tapCount === 3);
+    } else if (fn === 'tap5') {
+      card._tapCount++;
+      if (window.J) J.hit(card._tapCount);
+      if (card._tapCount >= 5) cardSuccess(card._tapCount === 5);
+    } else if (fn === 'tap7') {
+      card._tapCount++;
+      if (window.J) J.hit(card._tapCount);
+      if (card._tapCount >= 7) cardSuccess(card._tapCount === 7);
+    } else if (fn === 'dtap') {
+      var now2 = performance.now();
+      if (now2 - lastTapTs < 350) {
+        dtapCount++;
+        if (dtapCount >= 1) { cardSuccess(true); dtapCount = 0; }
+      } else { dtapCount = 0; }
+      lastTapTs = now2;
+      if (window.J) J.hit(1);
+    } else if (fn === 'match') {
+      // find which dot was tapped
+      for (var i = 0; i < card._matchDots.length; i++) {
+        var d = card._matchDots[i];
+        var dx = (x || 0) - d.x, dy = (y || 0) - d.y;
+        if (Math.sqrt(dx * dx + dy * dy) < 32) {
+          if (d.color === card._matchColor) {
+            d.hit = true;
+            if (window.J) J.perfect(1);
+            cardSuccess(true);
+          } else {
+            if (window.J) J.near();
+            cardFail('wrong_color');
+          }
+          return;
+        }
+      }
+    } else if (fn === 'circle') {
+      // hit the moving circle
+      var cx2 = W / 2 + Math.cos(card._circlePhi) * 100;
+      var cy2 = H * 0.55 + Math.sin(card._circlePhi) * 60;
+      var tx = (x || W / 2) - cx2, ty = (y || H * 0.55) - cy2;
+      if (Math.sqrt(tx * tx + ty * ty) < 38) {
+        if (!card._circleHit) { card._circleHit = true; cardSuccess(true); }
+      } else {
+        cardFail('missed');
+      }
+    } else if (fn === 'dodge') {
+      if (card._dodgeSafe) { cardSuccess(true); }
+      else { cardFail('hit_threat'); }
+    } else if (fn === 'combo3') {
+      var elapsed = card.elapsed;
+      var hit = false;
+      for (var w = 0; w < card._comboWindows.length; w++) {
+        if (Math.abs(elapsed - card._comboWindows[w]) < 250 && !hit) {
+          hit = true;
+          card._comboHits++;
+          if (window.J) J.hit(card._comboHits);
+          flash('HIT', TEAL, 38);
+          if (card._comboHits >= 3) { cardSuccess(true); return; }
+        }
+      }
+      if (!hit) { cardFail('mistimed'); }
+    } else if (fn === 'burst') {
+      card._burstCount++;
+      if (window.J) J.hit(card._burstCount);
+    } else if (fn === 'snipe') {
+      var sdx = (x || 0) - card._snipeX, sdy = (y || 0) - card._snipeY;
+      if (Math.sqrt(sdx * sdx + sdy * sdy) < card._snipeR + 10) {
+        cardSuccess(sdx * sdx + sdy * sdy < card._snipeR * card._snipeR);
+      } else {
+        cardFail('missed');
+      }
+    } else if (fn === 'chain') {
+      var next = card._chainNext;
+      if (next < card._chainDots.length) {
+        var cd = card._chainDots[next];
+        var cdx = (x || 0) - cd.x, cdy = (y || 0) - cd.y;
+        if (Math.sqrt(cdx * cdx + cdy * cdy) < 36) {
+          cd.hit = true;
+          card._chainNext++;
+          if (window.J) J.hit(card._chainNext);
+          if (card._chainNext >= card._chainDots.length) cardSuccess(true);
+        } else {
+          cardFail('wrong_dot');
+        }
+      }
+    } else if (fn === 'survive') {
+      // tapping during survive fails — don't register
+    } else if (fn === 'hold1' || fn === 'hold2' || fn === 'hold3') {
+      // tap starts the hold (handled in pointerdown/up)
+    }
+  }
+
+  function onPointerDown(x, y) {
+    if (DEMO || BOT) return;
+    pointerDownX = x; pointerDownY = y; pointerDownTs = performance.now();
+    isHolding = true;
+    if (state.phase === 'play' && card && !state.cardDone && !state.cardFailed) {
+      var fn = card.def.fn;
+      if (fn === 'hold1' || fn === 'hold2' || fn === 'hold3') {
+        card._holding = true;
+        card._holdStart = performance.now();
+      }
+    }
+  }
+
+  function onPointerUp(x, y, dt_ms) {
+    if (DEMO || BOT) return;
+    isHolding = false;
+    if (state.phase === 'play' && card && !state.cardDone && !state.cardFailed) {
+      var fn = card.def.fn;
+      if (fn === 'hold1' || fn === 'hold2' || fn === 'hold3') {
+        if (card._holding) {
+          card._holding = false;
+          var held = performance.now() - card._holdStart;
+          var target = fn === 'hold1' ? 1000 : fn === 'hold2' ? 2000 : 3000;
+          if (held >= target * 0.85) {
+            cardSuccess(held >= target * 0.92 && held < target * 1.15);
+          } else {
+            cardFail('too_short');
+          }
+        }
+      }
+      // swipe detection
+      if (pointerDownX !== null && dt_ms < 500) {
+        var swipeDx = x - pointerDownX, swipeDy = y - pointerDownY;
+        var swipeDist = Math.sqrt(swipeDx * swipeDx + swipeDy * swipeDy);
+        if (swipeDist > 40) {
+          onSwipe(swipeDx, swipeDy);
+          return;
+        }
+      }
+    }
+    // treat as tap if short
+    if (dt_ms < 300 && !card?._holding) {
+      onTap(x, y);
+    }
+    pointerDownX = null; pointerDownY = null;
+  }
+
+  function onSwipe(dx, dy) {
+    if (DEMO || BOT) return;
+    if (!card || state.cardDone || state.cardFailed) return;
+    var fn = card.def.fn;
+    if (fn === 'swipe' || fn === 'swiper' || fn === 'swipeu') {
+      var needLeft  = fn === 'swipe';
+      var needRight = fn === 'swiper';
+      var needUp    = fn === 'swipeu';
+      var horizontal = Math.abs(dx) > Math.abs(dy);
+      if (needLeft  && horizontal && dx < -30) { cardSuccess(dx < -80); return; }
+      if (needRight && horizontal && dx > 30)  { cardSuccess(dx > 80); return; }
+      if (needUp    && !horizontal && dy < -30) { cardSuccess(dy < -80); return; }
+      cardFail('wrong_swipe');
+    }
+  }
+
+  // pointer events
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale;
+    onPointerDown(x, y);
+  });
+  window.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale;
+    var dt_ms = pointerDownTs ? performance.now() - pointerDownTs : 999;
+    onPointerUp(x, y, dt_ms);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') onTap(W / 2, H / 2);
+    if (e.code === 'ArrowLeft') onSwipe(-100, 0);
+    if (e.code === 'ArrowRight') onSwipe(100, 0);
+    if (e.code === 'ArrowUp') onSwipe(0, -100);
+  });
+
+  // ---- demo / bot autopilot ----
+  // Demo script: card indices to succeed on, fail on card 13 (near-fail recovery) then card 15
+  var demoWaits = [32, 28, 45, 38, 52, 30, 40, 35, 60, 42, 28, 55, 70, 38, 44, 30];
+  var demoCurWait = 0, demoAction = false, demoPhase = 'playing';
+  // bot: complete K cards then fail
+  var botPassLimit = 0, botCardsDone = 0;
+
+  function autopilot(now) {
+    if (!card || state.cardDone || state.cardFailed || state.phase !== 'play') return;
+    var fn = card.def.fn;
+    var elapsed = card.elapsed;
+
+    if (DEMO) {
+      demoCurWait--;
+      if (demoCurWait > 0) return;
+      // near-fail at ~60% of deck — slow hesitation then recovery
+      var isNearFail = (state.deckIdx === 12);
+      var isFail     = (state.deckIdx === 14);
+      if (isNearFail) {
+        demoCurWait = 80; // long hesitation — near-fail tension
+        // deliberately close to timeout, then succeed
+        if (elapsed > card.def.dur * 0.85) { demoExecuteSuccess(fn, now); }
+        return;
+      }
+      if (isFail) {
+        // real fail — let timeout hit
+        return; // do nothing → timer expires
+      }
+      demoExecuteSuccess(fn, now);
+      var widx = Math.min(state.deckIdx, demoWaits.length - 1);
+      demoCurWait = demoWaits[widx];
+    } else if (BOT) {
+      // bot passes first botPassLimit cards then fails the rest
+      if (botCardsDone < botPassLimit) {
+        // succeed on current card
+        demoExecuteSuccess(fn, now);
+        botCardsDone++;
+      }
+      // else: do nothing → timeout → fail → game_over
+    }
+  }
+
+  function demoExecuteSuccess(fn, now) {
+    if (state.cardDone || state.cardFailed) return;
+    // execute the appropriate action for this card type
+    if (fn === 'tap3') { for (var i = 0; i < 3; i++) { card._tapCount = i + 1; } cardSuccess(true); }
+    else if (fn === 'tap5') { card._tapCount = 5; cardSuccess(true); }
+    else if (fn === 'tap7') { card._tapCount = 7; cardSuccess(true); }
+    else if (fn === 'dtap') { lastTapTs = now - 200; dtapCount = 1; cardSuccess(true); }
+    else if (fn === 'hold1') { card._holdAccum = 1000; cardSuccess(true); }
+    else if (fn === 'hold2') { card._holdAccum = 2000; cardSuccess(true); }
+    else if (fn === 'hold3') { card._holdAccum = 3000; cardSuccess(true); }
+    else if (fn === 'swipe')  { cardSuccess(true); }
+    else if (fn === 'swiper') { cardSuccess(true); }
+    else if (fn === 'swipeu') { cardSuccess(true); }
+    else if (fn === 'catch') { card._catchHits = 3; cardSuccess(true); }
+    else if (fn === 'avoid') { card._avoidSafe = true; cardSuccess(true); }
+    else if (fn === 'match') {
+      for (var mi = 0; mi < card._matchDots.length; mi++) {
+        if (card._matchDots[mi].color === card._matchColor) { card._matchDots[mi].hit = true; }
+      }
+      cardSuccess(true);
+    }
+    else if (fn === 'circle') { card._circleHit = true; cardSuccess(true); }
+    else if (fn === 'dodge') { card._dodgeSafe = true; cardSuccess(true); }
+    else if (fn === 'combo3') { card._comboHits = 3; cardSuccess(true); }
+    else if (fn === 'burst') { card._burstCount = 12; cardSuccess(true); }
+    else if (fn === 'snipe') { cardSuccess(true); }
+    else if (fn === 'chain') { card._chainNext = 4; for (var ci = 0; ci < card._chainDots.length; ci++) card._chainDots[ci].hit = true; cardSuccess(true); }
+    else if (fn === 'survive') { card._surviveDone = true; cardSuccess(true); }
+    else { cardSuccess(true); } // fallback
+  }
+
+  // ---- render helpers ----
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  function drawCard(now) {
+    if (!card) return;
+    var def = card.def;
+    var elapsed = card.elapsed;
+    var timeLeft = Math.max(0, def.dur - elapsed) / 1000;
+    var timerPct = Math.max(0, (def.dur - elapsed) / def.dur);
+
+    // card background
+    var cy2 = H * 0.35, ch = H * 0.42;
+    cx.fillStyle = def.bg;
+    cx.strokeStyle = def.color;
+    cx.lineWidth = 2;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(40, cy2, W - 80, ch, 16);
+    else cx.rect(40, cy2, W - 80, ch);
+    cx.fill(); cx.stroke();
+
+    // card label
+    cx.textAlign = 'center';
+    cx.fillStyle = def.color;
+    cx.font = '900 36px -apple-system, Helvetica, Arial';
+    cx.fillText(def.label, W / 2, cy2 + 56);
+
+    // card desc
+    cx.fillStyle = 'rgba(255,255,255,0.6)';
+    cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText(def.desc, W / 2, cy2 + 82);
+
+    // timer bar
+    var barY = cy2 + ch - 20, barW = (W - 100) * timerPct;
+    cx.fillStyle = 'rgba(255,255,255,0.12)';
+    cx.fillRect(50, barY, W - 100, 8);
+    cx.fillStyle = timerPct > 0.3 ? def.color : VERM;
+    cx.fillRect(50, barY, barW, 8);
+
+    // seconds left
+    cx.fillStyle = timerPct > 0.3 ? 'rgba(255,255,255,0.7)' : VERM;
+    cx.font = '700 13px Menlo, monospace';
+    cx.textAlign = 'right';
+    cx.fillText(timeLeft.toFixed(1) + 's', W - 50, barY - 4);
+    cx.textAlign = 'center';
+
+    // mini-game specific visuals
+    drawCardGame(def, now);
+  }
+
+  function drawCardGame(def, now) {
+    var fn = def.fn;
+    var cy2 = H * 0.35, ch = H * 0.42;
+    var midX = W / 2, midY = cy2 + ch * 0.58;
+
+    if (fn === 'tap3' || fn === 'tap5' || fn === 'tap7') {
+      var need = fn === 'tap3' ? 3 : fn === 'tap5' ? 5 : 7;
+      for (var i = 0; i < need; i++) {
+        var bx = W / 2 - (need - 1) * 22 + i * 44;
+        var filled = i < card._tapCount;
+        cx.beginPath();
+        cx.arc(bx, midY, 16, 0, Math.PI * 2);
+        cx.fillStyle = filled ? def.color : 'rgba(255,255,255,0.15)';
+        cx.fill();
+        if (filled) { cx.fillStyle = INK; cx.font = '700 14px -apple-system'; cx.fillText('✓', bx, midY + 5); }
+      }
+    } else if (fn === 'hold1' || fn === 'hold2' || fn === 'hold3') {
+      var target = fn === 'hold1' ? 1000 : fn === 'hold2' ? 2000 : 3000;
+      var held = card._holding ? performance.now() - card._holdStart : 0;
+      var pct = Math.min(1, held / target);
+      cx.beginPath();
+      cx.arc(midX, midY, 38, -Math.PI / 2, -Math.PI / 2 + pct * Math.PI * 2);
+      cx.strokeStyle = def.color;
+      cx.lineWidth = 5;
+      cx.stroke();
+      cx.fillStyle = card._holding ? def.color : 'rgba(255,255,255,0.25)';
+      cx.beginPath();
+      cx.arc(midX, midY, 28, 0, Math.PI * 2);
+      cx.fill();
+      cx.fillStyle = INK;
+      cx.font = '700 13px -apple-system'; cx.textAlign = 'center';
+      cx.fillText(card._holding ? 'HOLDING' : 'PRESS', midX, midY + 5);
+    } else if (fn === 'swipe' || fn === 'swiper' || fn === 'swipeu') {
+      var arrowDir = fn === 'swipe' ? '←' : fn === 'swiper' ? '→' : '↑';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 200);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = def.color;
+      cx.font = '900 52px -apple-system'; cx.textAlign = 'center';
+      cx.fillText(arrowDir, midX, midY + 14);
+      cx.globalAlpha = 1;
+    } else if (fn === 'catch') {
+      for (var ci = 0; ci < card._catchTargets.length; ci++) {
+        var t = card._catchTargets[ci];
+        if (t.hit) continue;
+        cx.beginPath();
+        cx.arc(t.x, t.y, 18, 0, Math.PI * 2);
+        cx.fillStyle = def.color;
+        cx.fill();
+        cx.fillStyle = INK;
+        cx.font = '700 12px -apple-system'; cx.textAlign = 'center';
+        cx.fillText('●', t.x, t.y + 5);
+      }
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '700 14px -apple-system'; cx.textAlign = 'center';
+      cx.fillText(card._catchHits + '/2 caught', midX, midY + 30);
+    } else if (fn === 'avoid') {
+      // show safe zone and threat
+      var dist = Math.abs(card._avoidX - card._avoidThreatX);
+      cx.beginPath();
+      cx.arc(card._avoidX, midY, 24, 0, Math.PI * 2);
+      cx.fillStyle = TEAL; cx.fill();
+      cx.fillStyle = INK; cx.font = '700 12px -apple-system'; cx.textAlign = 'center';
+      cx.fillText('YOU', card._avoidX, midY + 4);
+      cx.beginPath();
+      cx.arc(card._avoidThreatX, midY - 10, 22, 0, Math.PI * 2);
+      cx.fillStyle = VERM; cx.fill();
+      cx.fillStyle = '#fff'; cx.font = '700 12px -apple-system';
+      cx.fillText('!', card._avoidThreatX, midY - 5);
+    } else if (fn === 'match') {
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '500 13px -apple-system'; cx.textAlign = 'center';
+      cx.fillText('TAP ' + (card._matchColor === VERM ? 'RED' : card._matchColor === TEAL ? 'TEAL' : card._matchColor === GOLD ? 'GOLD' : 'PURPLE'), midX, midY - 44);
+      for (var mi = 0; mi < card._matchDots.length; mi++) {
+        var md = card._matchDots[mi];
+        cx.beginPath();
+        cx.arc(md.x, md.y, md.hit ? 14 : 26, 0, Math.PI * 2);
+        cx.fillStyle = md.color; cx.fill();
+        if (md.color === card._matchColor) {
+          cx.strokeStyle = '#fff'; cx.lineWidth = 3;
+          cx.stroke();
+        }
+      }
+    } else if (fn === 'circle') {
+      var ccx = W / 2 + Math.cos(card._circlePhi) * 100;
+      var ccy = H * 0.55 + Math.sin(card._circlePhi) * 60;
+      cx.beginPath();
+      cx.arc(ccx, ccy, 30, 0, Math.PI * 2);
+      cx.strokeStyle = def.color; cx.lineWidth = 3; cx.stroke();
+      cx.fillStyle = def.color + '44'; cx.fill();
+      cx.fillStyle = def.color; cx.font = '700 13px -apple-system'; cx.textAlign = 'center';
+      cx.fillText('TAP!', ccx, ccy + 5);
+    } else if (fn === 'dodge') {
+      var safe2 = card._dodgeSafe;
+      cx.fillStyle = safe2 ? TEAL + '44' : VERM + '44';
+      cx.fillRect(40, midY - 40, W - 80, 56);
+      cx.fillStyle = safe2 ? TEAL : VERM;
+      cx.font = '900 22px -apple-system'; cx.textAlign = 'center';
+      cx.fillText(safe2 ? 'SAFE — TAP NOW' : 'DANGER — WAIT', midX, midY - 8);
+    } else if (fn === 'combo3') {
+      // show 3 beat windows as progress circles
+      for (var wi = 0; wi < card._comboWindows.length; wi++) {
+        var bxc = W / 2 - 60 + wi * 60;
+        var isHit = card._comboHits > wi;
+        var isWindow = Math.abs(card.elapsed - card._comboWindows[wi]) < 300;
+        cx.beginPath();
+        cx.arc(bxc, midY, isWindow ? 22 : 16, 0, Math.PI * 2);
+        cx.fillStyle = isHit ? TEAL : (isWindow ? GOLD : 'rgba(255,255,255,0.15)');
+        cx.fill();
+        if (isWindow) {
+          cx.strokeStyle = '#fff'; cx.lineWidth = 3; cx.stroke();
+        }
+      }
+    } else if (fn === 'burst') {
+      var bpct = Math.min(1, card._burstCount / 10);
+      cx.fillStyle = 'rgba(255,255,255,0.1)';
+      cx.fillRect(50, midY - 16, W - 100, 18);
+      cx.fillStyle = def.color;
+      cx.fillRect(50, midY - 16, (W - 100) * bpct, 18);
+      cx.fillStyle = '#fff'; cx.font = '700 13px -apple-system'; cx.textAlign = 'center';
+      cx.fillText(card._burstCount + ' taps', midX, midY + 14);
+    } else if (fn === 'snipe') {
+      var pulseR = card._snipeR + Math.sin(now / 100) * 4;
+      cx.beginPath();
+      cx.arc(card._snipeX, card._snipeY, pulseR, 0, Math.PI * 2);
+      cx.strokeStyle = def.color; cx.lineWidth = 2; cx.stroke();
+      cx.beginPath();
+      cx.arc(card._snipeX, card._snipeY, 7, 0, Math.PI * 2);
+      cx.fillStyle = def.color; cx.fill();
+      // crosshair lines
+      cx.strokeStyle = def.color + '66'; cx.lineWidth = 1;
+      cx.beginPath(); cx.moveTo(card._snipeX - 40, card._snipeY); cx.lineTo(card._snipeX + 40, card._snipeY); cx.stroke();
+      cx.beginPath(); cx.moveTo(card._snipeX, card._snipeY - 40); cx.lineTo(card._snipeX, card._snipeY + 40); cx.stroke();
+    } else if (fn === 'chain') {
+      for (var cdi = 0; cdi < card._chainDots.length; cdi++) {
+        var cdot = card._chainDots[cdi];
+        var isNext = cdi === card._chainNext;
+        var isHitD = cdot.hit;
+        // line to next
+        if (cdi < card._chainDots.length - 1) {
+          var nd = card._chainDots[cdi + 1];
+          cx.strokeStyle = isHitD ? TEAL + '88' : 'rgba(255,255,255,0.15)';
+          cx.lineWidth = 2;
+          cx.beginPath(); cx.moveTo(cdot.x, cdot.y); cx.lineTo(nd.x, nd.y); cx.stroke();
+        }
+        cx.beginPath();
+        cx.arc(cdot.x, cdot.y, isNext ? 26 : 18, 0, Math.PI * 2);
+        cx.fillStyle = isHitD ? TEAL : (isNext ? def.color : 'rgba(255,255,255,0.15)');
+        cx.fill();
+        if (isNext) { cx.strokeStyle = '#fff'; cx.lineWidth = 2; cx.stroke(); }
+        cx.fillStyle = isHitD ? INK : '#fff';
+        cx.font = '700 13px -apple-system'; cx.textAlign = 'center';
+        cx.fillText(String(cdi + 1), cdot.x, cdot.y + 5);
+      }
+    } else if (fn === 'survive') {
+      var survPct = card._survivingTs ? Math.min(1, (performance.now() - card._survivingTs) / 2000) : 0;
+      cx.beginPath();
+      cx.arc(midX, midY, 36, -Math.PI / 2, -Math.PI / 2 + survPct * Math.PI * 2);
+      cx.strokeStyle = TEAL; cx.lineWidth = 5; cx.stroke();
+      cx.fillStyle = TEAL; cx.font = '700 13px -apple-system'; cx.textAlign = 'center';
+      cx.fillText(card._surviveDone ? 'DONE!' : 'SURVIVING…', midX, midY + 5);
+    }
+  }
+
+  function drawDeckProgress() {
+    var total = state.deck.length;
+    var done = state.deckIdx;
+    cx.textAlign = 'left';
+    cx.fillStyle = 'rgba(255,255,255,0.3)';
+    cx.font = '600 12px Menlo, monospace';
+    cx.fillText('CARD ' + (done + 1) + ' / ' + total, 24, 32);
+    // mini dots
+    var dotW = (W - 48) / total;
+    for (var di = 0; di < total; di++) {
+      var dx2 = 24 + di * dotW, dy2 = 42;
+      cx.fillStyle = di < done ? TEAL : (di === done ? GOLD : 'rgba(255,255,255,0.12)');
+      cx.fillRect(dx2 + 1, dy2, dotW - 2, 4);
+    }
+    // score
+    cx.textAlign = 'right';
+    cx.fillStyle = 'rgba(255,255,255,0.92)';
+    cx.font = '800 32px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score, W - 24, 36);
+    cx.textAlign = 'center';
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // decay hit-stop then autopilot
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') {
+      tickCard(dt, now);
+      autopilot(now);
+    }
+
+    // juice: decay shake + zoom
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx2 = (Math.random() - 0.5) * shakeAmt;
+      var sy2 = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx2, H / 2 + sy2);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // challenge card (demo beat 1)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 290);
+      cx.fillStyle = GOLD;
+      cx.font = '900 100px -apple-system, Helvetica, Arial';
+      cx.fillText('21', W / 2, 395);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 428);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('MASH DECK', W / 2, 260);
+      cx.fillStyle = TEAL;
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('20 cards. clear them all.', W / 2, 298);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 350);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 378);
+    }
+
+    // play
+    if (state.phase === 'play') {
+      drawDeckProgress();
+      drawCard(now);
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, H - 30);
+      }
+    }
+
+    // game over / score card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      var clearedAll = state.cardsCleared >= state.deck.length;
+      cx.fillStyle = clearedAll ? TEAL : VERM;
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText(clearedAll ? 'DECK CLEARED!' : 'TIMED OUT.', W / 2, 290);
+      cx.fillStyle = '#fff';
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' pts', W / 2, 334);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText(state.cardsCleared + ' / ' + state.deck.length + ' cards cleared', W / 2, 360);
+      var pt = pctTop(state.cardsCleared);
+      cx.fillStyle = GOLD;
+      cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 400);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 448);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t2 = (now - ctaAt) / 1000, ease = Math.min(1, t2 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('MASH DECK', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('cleared ' + (window.__demoScore || 21) + ' pts. your turn.', W / 2, 336);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 21), W / 2, 404);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 436);
+      cx.globalAlpha = 1;
+    }
+
+    // floating reward flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 250 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // bot pass limit: pass some cards then fail so it reaches game_over
+  botRunsDone = 0;
+  botPassLimit = 4 + Math.floor(rng() * 4); // pass 4-7 cards then fail
+
+  // demo wait initializer
+  demoCurWait = 25;
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

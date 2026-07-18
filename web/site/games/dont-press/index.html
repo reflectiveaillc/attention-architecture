@@ -1,0 +1,975 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>DON'T PRESS — Tilt</title>
+<!--
+  LOOP / attention-architecture — DON'T PRESS (Contract v2)
+  Modes (query params):
+    ?demo=1&seed=7        mirror-neuron clip: challenge → human hesitation →
+                          near-fail/recovery → score card → dare CTA, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay traffic sim, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'dont-press';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || (DEMO ? 7 : (BOT ? 5 : 42));
+
+  // deterministic RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  var total = 0, session = 0, startedAt = 0, playStarted = false;
+  try { total = +localStorage.getItem('dp_total') || 0; } catch (_) {}
+
+  var button = { x: W / 2, y: H / 2, w: 280, h: 120, label: 'DO NOT PRESS', squash: 0 };
+  var effects = {
+    cracks: [],
+    dodgeUntil: 0, dodgeBaseX: 0, dodgeBaseY: 0, dodgeTargetX: 0, dodgeTargetY: 0,
+    flipUntil: 0,
+    invertUntil: 0,
+    dead: false,
+    tremble: false,
+    alertUntil: 0,
+    mockText: '', mockUntil: 0,
+    confetti: [],
+    sweat: [],
+    decoys: false, decoyPositions: [], realDecoyIdx: 0,
+    scrambleUntil: 0,
+    achievementUntil: 0,
+    flickerUntil: 0,
+    beg: false,
+    payoff: false,
+    finale: false
+  };
+  if (total >= 100 && !DEMO && !BOT) effects.payoff = true;
+  var flashes = [];
+
+  // Contract v2 juice state
+  var hitStop = 0, shakeAmt = 0, zoom = 1, dareBeaten = false;
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: H / 2 + 42, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  var MILESTONES = [
+    { n: 1, key: 'seriously' },
+    { n: 3, key: 'dodge' },
+    { n: 5, key: 'cracks' },
+    { n: 8, key: 'sulk' },
+    { n: 10, key: 'sweat' },
+    { n: 12, key: 'flip' },
+    { n: 16, key: 'alert' },
+    { n: 20, key: 'mock' },
+    { n: 25, key: 'confetti' },
+    { n: 30, key: 'decoys' },
+    { n: 40, key: 'invert' },
+    { n: 45, key: 'scramble' },
+    { n: 50, key: 'achievement' },
+    { n: 55, key: 'flicker' },
+    { n: 66, key: 'dead' },
+    { n: 75, key: 'tremble' },
+    { n: 80, key: 'beg' },
+    { n: 90, key: 'countdown' },
+    { n: 100, key: 'payoff' }
+  ];
+
+  function getMilestone(n) {
+    for (var i = 0; i < MILESTONES.length; i++) if (MILESTONES[i].n === n) return MILESTONES[i];
+    return null;
+  }
+
+  function getLabel(n) {
+    if (n === 0) return 'DO NOT PRESS';
+    var lines = {
+      1: 'seriously?',
+      2: 'you did it again.',
+      4: 'it remembers.',
+      6: 'the cracks are spreading.',
+      7: 'the label is fading...',
+      9: 'it moved away from you.',
+      11: "you're making it nervous.",
+      13: 'gravity disagrees.',
+      14: 'still here?',
+      15: 'it can feel this.',
+      17: 'system flagged.',
+      18: "you're not stopping.",
+      19: 'neither am i.',
+      21: 'your record is meaningless.',
+      22: 'the button judges you.',
+      23: 'every press is a choice.',
+      24: 'a bad one.',
+      26: 'even the confetti left.',
+      27: 'copies incoming.',
+      28: 'nine of them now.',
+      29: 'only one is real.',
+      31: 'find it.',
+      32: 'wrong one.',
+      33: 'keep guessing.',
+      34: 'there are nine.',
+      35: 'one counts.',
+      36: 'eight are lies.',
+      37: 'look closer.',
+      38: 'it moved.',
+      39: 'still pressing?',
+      41: 'inverted.',
+      42: 'right is left.',
+      43: 'up is down.',
+      44: 'your eyes are lying.',
+      46: 'halfway.',
+      47: 'to nothing.',
+      48: 'keep going.',
+      49: 'i dare you.',
+      51: 'achievement: nothing.',
+      52: 'unlocked: regret.',
+      53: 'badge: kept pressing.',
+      54: 'rank: persistent.',
+      56: 'the lights are tired.',
+      57: 'did you see that?',
+      58: 'it flickered again.',
+      59: 'not a bug.',
+      60: 'a feature.',
+      61: 'of your behavior.',
+      62: 'stop.',
+      63: 'please.',
+      64: "i'm begging.",
+      65: 'no, really.',
+      67: 'it played dead.',
+      68: 'you killed the button.',
+      69: 'gray world now.',
+      70: 'no color left.',
+      71: 'you took it all.',
+      72: 'the button blames you.',
+      73: 'look what you did.',
+      74: 'still pressing the corpse.',
+      76: 'everything shakes.',
+      77: 'the screen is scared.',
+      78: 'or angry.',
+      79: 'probably both.',
+      81: 'the counter begs.',
+      82: 'ten more.',
+      83: 'just ten.',
+      84: "you're so close.",
+      85: 'to the end.',
+      86: 'of nothing.',
+      87: 'but still.',
+      88: 'ten more.',
+      89: 'here it comes.',
+      91: '9 more…',
+      92: '8 more…',
+      93: '7 more…',
+      94: '6 more…',
+      95: '5 more…',
+      96: '4 more…',
+      97: '3 more…',
+      98: '2 more…',
+      99: '1 more…'
+    };
+    return lines[n] || '';
+  }
+
+  function persist() {
+    if (BOT) return;
+    try { localStorage.setItem('dp_total', String(total)); } catch (_) {}
+  }
+
+  function flash(txt, color, size, y) {
+    flashes.push({ txt: txt, color: color || '#fff', size: size || 32, y: y || 220, t: 0 });
+  }
+
+  function resetButtonHome() {
+    button.x = W / 2; button.y = H / 2; button.w = 280; button.h = 120;
+  }
+
+  function spawnCracks() {
+    for (var i = 0; i < 8; i++) {
+      var x = rng() * W, y = rng() * H;
+      var len = 40 + rng() * 90, ang = rng() * Math.PI * 2;
+      var x2 = x + Math.cos(ang) * len, y2 = y + Math.sin(ang) * len;
+      effects.cracks.push({ x1: x, y1: y, x2: x2, y2: y2 });
+      if (rng() > 0.5) {
+        var br = 20 + rng() * 40, bang = ang + (rng() - 0.5);
+        effects.cracks.push({ x1: x2, y1: y2, x2: x2 + Math.cos(bang) * br, y2: y2 + Math.sin(bang) * br });
+      }
+    }
+  }
+
+  function spawnConfetti() {
+    for (var i = 0; i < 70; i++) {
+      var col = rng() < 0.33 ? VERM : (rng() < 0.5 ? TEAL : GOLD);
+      effects.confetti.push({
+        x: W / 2 + (rng() - 0.5) * 220,
+        y: H / 2 + (rng() - 0.5) * 80,
+        vx: (rng() - 0.5) * 12,
+        vy: -6 - rng() * 12,
+        r: rng() * 6 + 2,
+        color: col,
+        life: 1,
+        suck: false
+      });
+    }
+    setTimeout(function () {
+      for (var i = 0; i < effects.confetti.length; i++) effects.confetti[i].suck = true;
+    }, 700);
+  }
+
+  function spawnSweat() {
+    for (var i = 0; i < 5; i++) {
+      effects.sweat.push({
+        x: button.x + (rng() - 0.5) * button.w,
+        y: button.y - button.h / 2 + rng() * 10,
+        vy: 0.5 + rng() * 0.8,
+        life: 1
+      });
+    }
+  }
+
+  function setupDecoys() {
+    effects.decoys = true;
+    var cols = 3, rows = 3;
+    var padX = 24, padY = 80;
+    var cellW = (W - padX * 2) / cols;
+    var cellH = (H - padY * 2) / rows;
+    var bw = Math.min(cellW * 0.78, 110);
+    var bh = Math.min(cellH * 0.65, 64);
+    var positions = [];
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < cols; c++) {
+        positions.push({ x: padX + cellW * (c + 0.5), y: padY + cellH * (r + 0.5), w: bw, h: bh });
+      }
+    }
+    for (var i = positions.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = positions[i]; positions[i] = positions[j]; positions[j] = tmp;
+    }
+    effects.decoyPositions = positions;
+    effects.realDecoyIdx = 0;
+    button.x = positions[0].x; button.y = positions[0].y; button.w = positions[0].w; button.h = positions[0].h;
+  }
+
+  function bigMoment(m) {
+    // visual punctuation for major milestones (Contract v2 §3)
+    var big = m && (m.key === 'cracks' || m.key === 'decoys' || m.key === 'flip' || m.key === 'invert' ||
+                    m.key === 'scramble' || m.key === 'achievement' || m.key === 'flicker' ||
+                    m.key === 'tremble' || m.key === 'countdown');
+    var critical = m && (m.key === 'dead' || m.key === 'payoff');
+    if (big || critical) {
+      hitStop = critical ? 6 : 4;
+      shakeAmt = critical ? 8 : 4;
+      zoom = critical ? 1.03 : 1.015;
+    }
+  }
+
+  function applyMilestone(m) {
+    var now = performance.now();
+    bigMoment(m);
+    if (m.key !== 'decoys') {
+      effects.decoys = false;
+      if (m.key !== 'sulk') resetButtonHome();
+    }
+    switch (m.key) {
+      case 'seriously':
+        flash('seriously?', '#fff', 40);
+        break;
+      case 'dodge':
+        effects.dodgeUntil = now + 650;
+        effects.dodgeBaseX = button.x; effects.dodgeBaseY = button.y;
+        var ddx = (rng() - 0.5) * 180, ddy = (rng() - 0.5) * 140;
+        effects.dodgeTargetX = Math.max(button.w/2, Math.min(W - button.w/2, button.x + ddx));
+        effects.dodgeTargetY = Math.max(button.h/2, Math.min(H - button.h/2, button.y + ddy));
+        flash('it dodged.', VERM, 34);
+        break;
+      case 'cracks':
+        spawnCracks();
+        flash('CRACK', '#fff', 42);
+        break;
+      case 'sulk':
+        resetButtonHome();
+        button.x = W - 90; button.y = H - 110;
+        button.w = 130; button.h = 58;
+        flash('it sulks.', TEAL, 34);
+        break;
+      case 'sweat':
+        spawnSweat();
+        flash("it's sweating.", TEAL, 30);
+        break;
+      case 'flip':
+        effects.flipUntil = now + 3000;
+        flash('GRAVITY', GOLD, 40);
+        break;
+      case 'alert':
+        effects.alertUntil = now + 1800;
+        flash('SYSTEM ALERT', VERM, 38);
+        break;
+      case 'mock':
+        effects.mockText = 'your record is meaningless.';
+        effects.mockUntil = now + 3000;
+        flash('your record is meaningless.', GOLD, 30, 160);
+        break;
+      case 'confetti':
+        spawnConfetti();
+        break;
+      case 'decoys':
+        setupDecoys();
+        flash('NINE OF THEM', VERM, 36);
+        break;
+      case 'invert':
+        effects.invertUntil = now + 900;
+        flash('INVERTED', '#fff', 34);
+        break;
+      case 'scramble':
+        effects.scrambleUntil = now + 2500;
+        flash('scrambled.', GOLD, 30);
+        break;
+      case 'achievement':
+        effects.achievementUntil = now + 2200;
+        flash('ACHIEVEMENT: HALFWAY TO NOTHING', GOLD, 28, 170);
+        break;
+      case 'flicker':
+        effects.flickerUntil = now + 1200;
+        flash('FLICKER', '#fff', 34);
+        break;
+      case 'dead':
+        effects.dead = true;
+        flash('you did this.', '#fff', 34);
+        break;
+      case 'tremble':
+        effects.tremble = true;
+        flash('TREMBLE', VERM, 38);
+        break;
+      case 'beg':
+        effects.beg = true;
+        flash('the counter begs.', TEAL, 30);
+        break;
+      case 'countdown':
+        effects.finale = true;
+        flash('10 more…', GOLD, 42);
+        break;
+      case 'payoff':
+        effects.payoff = true;
+        break;
+    }
+  }
+
+  function press() {
+    if (effects.payoff) {
+      effects.payoff = false;
+      effects.dead = false;
+      effects.tremble = false;
+      effects.beg = false;
+      effects.finale = false;
+      effects.decoys = false;
+      effects.cracks = [];
+      effects.confetti = [];
+      effects.sweat = [];
+      effects.invertUntil = 0;
+      effects.flipUntil = 0;
+      resetButtonHome();
+      total = 0;
+      session = 0;
+      playStarted = false;
+      dareBeaten = false;
+      persist();
+      if (window.J) { J.tension(0); J.death(1); }
+      if (window.LOOP) LOOP.emit('restart', {});
+      return;
+    }
+
+    // transient one-press effects clear on next press
+    effects.invertUntil = 0;
+
+    if (!playStarted) {
+      playStarted = true;
+      startedAt = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+
+    total++;
+    session++;
+    button.squash = 1;
+
+    var m = getMilestone(total);
+
+    // Contract v2 sound: every press is a dopamine hit, milestones are criticals
+    if (window.J) {
+      if (m && m.key === 'payoff') { J.fanfare(); }
+      else if (m && (m.key === 'dead' || m.key === 'achievement')) J.gold();
+      else if (m && (m.key === 'cracks' || m.key === 'confetti' || m.key === 'decoys' || m.key === 'flip' ||
+                     m.key === 'invert' || m.key === 'scramble' || m.key === 'tremble' || m.key === 'countdown')) J.perfect(session);
+      else J.hit(session);
+      J.tension(Math.min(total / 100, 1));
+    }
+
+    if (m) {
+      if (window.LOOP) LOOP.emit('milestone', { n: total });
+      applyMilestone(m);
+    }
+
+    if (window.LOOP) LOOP.emit('press', { n: total });
+
+    // incoming dare beaten check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && total > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 40);
+      if (window.J) J.fanfare();
+      SHARE.beaten(total);
+    }
+
+    if (total % 10 === 0) {
+      var dur = (Date.now() - startedAt) / 1000;
+      if (window.LOOP) LOOP.emit('game_over', { score: session, dur_s: +dur.toFixed(1) });
+    }
+
+    persist();
+  }
+
+  // ---- input ----
+  function pointerInButton(px, py, b) {
+    return px >= b.x - b.w / 2 && px <= b.x + b.w / 2 && py >= b.y - b.h / 2 && py <= b.y + b.h / 2;
+  }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+
+    // payoff screen: share pill or reset
+    if (effects.payoff) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: total, unit: 'presses' });
+        return;
+      }
+      // fall through to reset
+      effects.payoff = false;
+      effects.dead = false;
+      effects.tremble = false;
+      effects.beg = false;
+      effects.finale = false;
+      effects.decoys = false;
+      effects.cracks = [];
+      effects.confetti = [];
+      effects.sweat = [];
+      effects.invertUntil = 0;
+      effects.flipUntil = 0;
+      resetButtonHome();
+      total = 0;
+      session = 0;
+      playStarted = false;
+      dareBeaten = false;
+      persist();
+      if (window.J) J.tension(0);
+      if (window.LOOP) LOOP.emit('restart', {});
+      return;
+    }
+
+    // keyboard / space has no coords — treat as button press
+    if (x === undefined || y === undefined) {
+      press();
+      return;
+    }
+
+    if (effects.decoys) {
+      for (var i = 0; i < effects.decoyPositions.length; i++) {
+        if (pointerInButton(x, y, effects.decoyPositions[i])) {
+          if (i === effects.realDecoyIdx) { press(); return; }
+          else {
+            flash('nope.', '#fff', 22, button.y - 60);
+            if (window.J) J.near();
+            return;
+          }
+        }
+      }
+      return;
+    }
+    if (pointerInButton(x, y, button)) press();
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space' && !DEMO && !BOT) tap(); });
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden && playStarted && window.LOOP) {
+      var dur = (Date.now() - startedAt) / 1000;
+      LOOP.emit('game_over', { score: session, dur_s: +dur.toFixed(1) });
+    }
+  });
+
+  // ---- demo / bot autopilots ----
+  var botRunsDone = 0, botPressesThisRun = 0, botNextAt = 0;
+  var demoTarget = 33;
+  var demoPhase = DEMO ? 'challenge' : 'run';
+  var challengeAt = 0, ctaAt = 0;
+  var demoNextAt = 0;
+
+  function isMilestonePress(n) { return !!getMilestone(n); }
+
+  function nextDemoDelay(totalSoFar) {
+    var recoveryPoint = Math.floor(demoTarget * 0.6);
+    if (totalSoFar === recoveryPoint) return 1100 + rng() * 400; // near-fail hesitation
+    var nextIsMilestone = isMilestonePress(totalSoFar + 1);
+    var base = nextIsMilestone ? (520 + rng() * 220) : (340 + rng() * 140);
+    if (!nextIsMilestone && totalSoFar > 12) base *= 0.65;
+    return base;
+  }
+
+  function autopilot(now) {
+    if (DEMO) {
+      if (demoPhase === 'challenge') {
+        if (challengeAt === 0) challengeAt = now;
+        if (now >= challengeAt + 1250) {
+          demoPhase = 'play';
+          demoNextAt = now;
+        }
+        return;
+      }
+      if (demoPhase === 'play') {
+        if (hitStop > 0) return; // let the impact land
+        if (now >= demoNextAt) {
+          press();
+          if (total >= demoTarget) {
+            demoPhase = 'over';
+            window.__demoScore = total;
+            if (window.LOOP) LOOP.emit('game_over', { score: session, dur_s: +((Date.now() - startedAt) / 1000).toFixed(1) });
+            demoNextAt = now + 2200;
+            return;
+          }
+          demoNextAt = now + nextDemoDelay(total);
+        }
+        return;
+      }
+      if (demoPhase === 'over') {
+        if (now >= demoNextAt) {
+          demoPhase = 'cta';
+          ctaAt = now;
+          setTimeout(function () { window.__demoDone = true; }, 3600);
+        }
+        return;
+      }
+    } else if (BOT) {
+      if (now >= botNextAt) {
+        if (botPressesThisRun >= 25) {
+          botRunsDone++;
+          if (botRunsDone >= BOT_RUNS) { window.__botDone = true; return; }
+          botPressesThisRun = 0;
+          // reset state between bot runs without persisting
+          total = 0; session = 0; playStarted = false;
+          effects.dead = false; effects.tremble = false; effects.beg = false; effects.finale = false;
+          effects.decoys = false; effects.cracks = []; effects.confetti = []; effects.sweat = [];
+          resetButtonHome();
+        }
+        press();
+        botPressesThisRun++;
+        botNextAt = now + 150 + rng() * 250;
+      }
+    }
+  }
+
+  if (DEMO || BOT) {
+    demoNextAt = performance.now();
+    botNextAt = performance.now();
+  }
+
+  // ---- render helpers ----
+  function roundedRect(x, y, w, h, r) {
+    var rr = Math.min(r, w / 2, h / 2);
+    cx.beginPath();
+    cx.moveTo(x - w / 2 + rr, y - h / 2);
+    cx.arcTo(x + w / 2, y - h / 2, x + w / 2, y + h / 2, rr);
+    cx.arcTo(x + w / 2, y + h / 2, x - w / 2, y + h / 2, rr);
+    cx.arcTo(x - w / 2, y + h / 2, x - w / 2, y - h / 2, rr);
+    cx.arcTo(x - w / 2, y - h / 2, x + w / 2, y - h / 2, rr);
+    cx.closePath();
+  }
+
+  function drawButton(b, isReal, alpha) {
+    cx.save();
+    cx.globalAlpha = alpha == null ? 1 : alpha;
+    var squashX = 1, squashY = 1;
+    if (isReal && button.squash > 0) {
+      squashX = 1 + button.squash * 0.08;
+      squashY = 1 - button.squash * 0.12;
+    }
+    var w = b.w * squashX, h = b.h * squashY;
+    var x = b.x, y = b.y;
+
+    // shadow
+    cx.shadowColor = 'rgba(232,80,46,0.35)';
+    cx.shadowBlur = 18;
+    cx.shadowOffsetY = 8;
+    var grad = cx.createLinearGradient(x, y - h / 2, x, y + h / 2);
+    grad.addColorStop(0, VERM);
+    grad.addColorStop(1, '#c13d20');
+    cx.fillStyle = grad;
+    roundedRect(x, y, w, h, 18);
+    cx.fill();
+    cx.shadowColor = 'transparent';
+
+    // border
+    cx.strokeStyle = 'rgba(255,255,255,0.22)';
+    cx.lineWidth = 1.5;
+    roundedRect(x, y, w, h, 18);
+    cx.stroke();
+
+    // text
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    cx.fillStyle = '#fff';
+    var size = Math.max(14, Math.min(26, h * 0.32));
+    cx.font = '900 ' + size + 'px -apple-system, Helvetica, Arial';
+    var label = b.label;
+    if (effects.scrambleUntil > 0 && isReal) {
+      label = scramble(label);
+    }
+    cx.fillText(label, x, y + 1);
+    cx.restore();
+  }
+
+  function scramble(s) {
+    var arr = s.split('');
+    for (var i = arr.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+    }
+    return arr.join('');
+  }
+
+  function currentButton() {
+    var now = performance.now();
+    if (effects.dodgeUntil > now) {
+      var t = 1 - (effects.dodgeUntil - now) / 650;
+      var e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      return {
+        x: effects.dodgeBaseX + (effects.dodgeTargetX - effects.dodgeBaseX) * e,
+        y: effects.dodgeBaseY + (effects.dodgeTargetY - effects.dodgeBaseY) * e,
+        w: button.w, h: button.h, label: button.label
+      };
+    }
+    return button;
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 11))));
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+    if (hitStop > 0) hitStop -= dt; // decay — without this the first milestone freezes the autopilot forever
+    else autopilot(now);
+
+    if (button.squash > 0) button.squash = Math.max(0, button.squash - 0.12 * dt);
+
+    // canvas filter
+    var filterParts = [];
+    if (effects.dead) filterParts.push('grayscale(1)');
+    if (effects.invertUntil > now) filterParts.push('invert(1)');
+    if (filterParts.length) cx.filter = filterParts.join(' ');
+    else cx.filter = 'none';
+
+    // Contract v2: global juice transform (save/scale/shake/restore)
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(232,80,46,0.08)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.05)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    // flicker overlay
+    if (effects.flickerUntil > now) {
+      var flick = (now % 160) < 80 ? 0.12 : 0;
+      cx.fillStyle = 'rgba(255,255,255,' + flick + ')';
+      cx.fillRect(0, 0, W, H);
+    }
+
+    // tremble offset
+    var tx = 0, ty = 0;
+    if (effects.tremble) {
+      tx = (rng() - 0.5) * 6;
+      ty = (rng() - 0.5) * 6;
+    }
+
+    cx.save();
+    // flip the whole UI
+    if (effects.flipUntil > now) {
+      cx.translate(0, H);
+      cx.scale(1, -1);
+    }
+    cx.translate(tx, ty);
+
+    // cracks
+    cx.strokeStyle = 'rgba(255,255,255,0.28)';
+    cx.lineWidth = 1;
+    for (var i = 0; i < effects.cracks.length; i++) {
+      var c = effects.cracks[i];
+      cx.beginPath(); cx.moveTo(c.x1, c.y1); cx.lineTo(c.x2, c.y2); cx.stroke();
+    }
+
+    // button(s)
+    var cur = currentButton();
+    if (effects.decoys) {
+      for (var i = 0; i < effects.decoyPositions.length; i++) {
+        var p = effects.decoyPositions[i];
+        drawButton({ x: p.x, y: p.y, w: p.w, h: p.h, label: 'DO NOT PRESS' }, i === effects.realDecoyIdx, 0.96);
+      }
+    } else {
+      drawButton(cur, true);
+    }
+
+    // sweat
+    for (var i = effects.sweat.length - 1; i >= 0; i--) {
+      var s = effects.sweat[i];
+      s.y += s.vy * dt; s.life -= 0.015 * dt;
+      cx.fillStyle = 'rgba(46,197,182,' + (s.life * 0.7) + ')';
+      cx.beginPath(); cx.arc(s.x, s.y, 3, 0, Math.PI * 2); cx.fill();
+      if (s.life <= 0) effects.sweat.splice(i, 1);
+    }
+
+    // confetti
+    for (var i = effects.confetti.length - 1; i >= 0; i--) {
+      var p = effects.confetti[i];
+      if (p.suck) {
+        p.x += (W / 2 - p.x) * 0.12 * dt;
+        p.y += (H / 2 - p.y) * 0.12 * dt;
+        p.life -= 0.04 * dt;
+      } else {
+        p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 0.35 * dt;
+        p.life -= 0.008 * dt;
+      }
+      cx.fillStyle = p.color;
+      cx.globalAlpha = Math.max(0, p.life);
+      cx.beginPath(); cx.arc(p.x, p.y, p.r, 0, Math.PI * 2); cx.fill();
+      cx.globalAlpha = 1;
+      if (p.life <= 0) effects.confetti.splice(i, 1);
+    }
+
+    // label above button
+    var label = '';
+    if (effects.payoff) label = '';
+    else if (effects.mockUntil > now && effects.mockText) label = effects.mockText;
+    else if (effects.beg && total >= 80 && total < 90) label = getLabel(total) || 'please stop.';
+    else if (effects.finale && total >= 90 && total < 100) label = getLabel(total) || (100 - total) + ' more…';
+    else label = getLabel(total);
+    if (label) {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.82)';
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText(label, W / 2, cur.y - cur.h / 2 - 34);
+    }
+
+    // counter + incoming dare banner
+    if (!effects.payoff && demoPhase !== 'challenge' && demoPhase !== 'over' && demoPhase !== 'cta') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 72px -apple-system, Helvetica, Arial';
+      cx.fillText(total, W / 2, 110);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('PRESSES', W / 2, 136);
+      // incoming dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 164);
+      }
+    }
+
+    cx.restore(); // end flip/tremble
+
+    // flashes (drawn after flip so text reads upright)
+    for (var i = flashes.length - 1; i >= 0; i--) {
+      var fl = flashes[i]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, fl.y - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(i, 1);
+    }
+
+    // fake alert
+    if (effects.alertUntil > now) {
+      var e2 = Math.min(1, (effects.alertUntil - now) / 300);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * e2) + ')';
+      cx.fillRect(20, 200, W - 40, 140);
+      cx.strokeStyle = VERM; cx.lineWidth = 2;
+      cx.strokeRect(22, 202, W - 44, 136);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '800 18px -apple-system, Helvetica, Arial';
+      cx.fillText('SYSTEM ALERT', W / 2, 240);
+      cx.fillStyle = '#fff';
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('USER IS STILL PRESSING', W / 2, 272);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('severity: terminal curiosity', W / 2, 298);
+    }
+
+    // fake achievement
+    if (effects.achievementUntil > now) {
+      var e3 = Math.min(1, (effects.achievementUntil - now) / 300);
+      cx.fillStyle = 'rgba(242,177,52,' + (0.18 * e3) + ')';
+      cx.fillRect(0, 180, W, 180);
+      cx.textAlign = 'center';
+      cx.fillStyle = GOLD;
+      cx.font = '800 16px -apple-system, Helvetica, Arial';
+      cx.fillText('🏆 ACHIEVEMENT UNLOCKED', W / 2, 230);
+      cx.fillStyle = '#fff';
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('HALFWAY TO NOTHING', W / 2, 272);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('progress bar: 50% of disappointment', W / 2, 302);
+    }
+
+    // payoff + share pill (human only)
+    if (effects.payoff) {
+      cx.fillStyle = 'rgba(11,13,18,0.6)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText("that's it. that's what happens.", W / 2, H / 2 - 24);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('(press to start over)', W / 2, H / 2 + 14);
+      if (!DEMO && !BOT) {
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo challenge card
+    if (DEMO && demoPhase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText(String(demoTarget), W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // demo score card
+    if (DEMO && demoPhase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('THEY PRESSED.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText((window.__demoScore || demoTarget) + ' presses', W / 2, 345);
+      var pt = pctTop(window.__demoScore || demoTarget);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 416);
+    }
+
+    // demo CTA
+    if (DEMO && demoPhase === 'cta') {
+      if (ctaAt === 0) ctaAt = now;
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '900 56px -apple-system, Helvetica, Arial';
+      cx.fillText("DON'T", W / 2, 270);
+      cx.fillText('PRESS', W / 2, 330);
+      cx.fillStyle = 'rgba(255,255,255,0.8)';
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they pressed ' + (window.__demoScore || demoTarget) + '. your move.', W / 2, 380);
+      var p2 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM;
+      cx.globalAlpha = ease * p2;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || demoTarget), W / 2, 450);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 484);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore(); // end global juice transform
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

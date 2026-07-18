@@ -1,0 +1,861 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Attention Architecture — A Field Dossier on Hacking the Brain</title>
+<meta name="description" content="How social interfaces capture human attention by targeting known neurological circuits. A diagnostic dossier on the exploits, the evidence, and the line." />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT,WONK@0,9..144,300..900,0..100,0..1;1,9..144,300..900,0..100,0..1&family=Newsreader:ital,opsz,wght@0,6..72,200..600;1,6..72,200..600&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   ATTENTION ARCHITECTURE — field dossier
+   palette encodes the thesis:
+     vermillion  = exploitation
+     teal        = humane / defense
+   ============================================================ */
+
+:root{
+  --bg:        #0b0c0e;
+  --bg-soft:   #101216;
+  --panel:     #121419;
+  --ink:       #ece8e0;
+  --ink-2:     #b9b4a9;
+  --dim:       #6c6a64;
+  --faint:     #4a4843;
+  --line:      rgba(236,232,224,0.10);
+  --line-2:    rgba(236,232,224,0.18);
+  --accent:    #ff4434;      /* exploit signal */
+  --accent-2:  #ff7a5c;
+  --accent-soft: rgba(255,68,52,0.14);
+  --accent-halo: rgba(255,68,52,0.40);
+  --bio:       #57e6c2;      /* defense signal */
+  --bio-soft:  rgba(87,230,194,0.14);
+
+  --display: "Fraunces", Georgia, serif;
+  --read:    "Newsreader", Georgia, serif;
+  --mono:    "JetBrains Mono", ui-monospace, monospace;
+}
+
+*{box-sizing:border-box; margin:0; padding:0;}
+html{scroll-behavior:smooth; -webkit-text-size-adjust:100%;}
+body{
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--read);
+  font-size: 18px;
+  line-height: 1.62;
+  letter-spacing: 0.005em;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x:hidden;
+  position:relative;
+}
+
+/* atmosphere: gradient mesh + grain ----------------------------- */
+body::before{
+  content:"";
+  position:fixed; inset:0; z-index:-2;
+  background:
+    radial-gradient(120% 80% at 78% -8%, rgba(255,68,52,0.10), transparent 55%),
+    radial-gradient(90% 70% at 8% 108%, rgba(87,230,194,0.05), transparent 60%),
+    radial-gradient(140% 120% at 50% 50%, #121317 0%, #0a0b0d 60%, #070809 100%);
+  pointer-events:none;
+}
+body::after{ /* grain */
+  content:"";
+  position:fixed; inset:0; z-index:-1;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.10 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  opacity: 0.5;
+  mix-blend-mode: overlay;
+  pointer-events:none;
+}
+
+/* progress bar ------------------------------------------------ */
+#progress{
+  position:fixed; top:0; left:0; height:2px; width:0%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  z-index:100; box-shadow: 0 0 12px var(--accent-halo);
+  transition: width .08s linear;
+}
+
+/* nav --------------------------------------------------------- */
+nav.top{
+  position:fixed; top:0; left:0; right:0; z-index:90;
+  display:flex; align-items:center; justify-content:space-between;
+  padding: 18px 28px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  backdrop-filter: blur(8px);
+  background: linear-gradient(to bottom, rgba(10,11,13,0.82), rgba(10,11,13,0));
+  border-bottom: 1px solid transparent;
+  transition: border-color .3s, background .3s;
+}
+nav.top.scrolled{ border-bottom-color: var(--line); background: rgba(10,11,13,0.88); }
+nav.top .mark{ display:flex; align-items:center; gap:10px; }
+nav.top .glyph{
+  width:14px; height:14px; border:1px solid var(--accent); border-radius:50%;
+  position:relative;
+}
+nav.top .glyph::after{
+  content:""; position:absolute; inset:3px; border-radius:50%;
+  background:var(--accent); box-shadow:0 0 8px var(--accent-halo);
+  animation: pulse 2.4s ease-in-out infinite;
+}
+nav.top .mark b{ color:var(--ink); font-weight:500; }
+nav.top .mark span{ color:var(--dim); }
+nav.top ul{ display:flex; gap:26px; list-style:none; }
+nav.top ul a{ color:var(--ink-2); text-decoration:none; transition:color .2s; position:relative; }
+nav.top ul a:hover{ color:var(--accent); }
+nav.top ul a::before{ content:"// "; color:var(--faint); }
+nav.top .stamp{ color:var(--dim); }
+nav.top .stamp b{ color:var(--accent); font-weight:500; }
+@media (max-width:820px){ nav.top ul{ display:none; } }
+
+/* shared layout ----------------------------------------------- */
+.wrap{ max-width:1240px; margin:0 auto; padding: 0 28px; }
+section{ position:relative; padding: 130px 0 90px; }
+.eyebrow{
+  font-family: var(--mono); font-size:11px; letter-spacing:.22em;
+  text-transform:uppercase; color:var(--accent); margin-bottom:22px;
+  display:flex; align-items:center; gap:12px;
+}
+.eyebrow::before{ content:""; width:26px; height:1px; background:var(--accent); display:inline-block; }
+.eyebrow.bio{ color: var(--bio); }
+.eyebrow.bio::before{ background: var(--bio); }
+
+h2.section-title{
+  font-family: var(--display); font-weight:380; font-variation-settings:"opsz" 120,"SOFT" 30,"WONK" 0;
+  font-size: clamp(38px, 5.4vw, 76px);
+  line-height: 0.98; letter-spacing:-0.02em;
+  margin-bottom: 26px; max-width: 18ch;
+}
+h2.section-title em{ font-style:italic; font-variation-settings:"opsz" 144,"SOFT" 100,"WONK" 1; color:var(--accent); }
+.lead{
+  font-family: var(--read); font-size: clamp(19px,2vw,23px);
+  line-height:1.55; color:var(--ink-2); max-width:58ch; font-weight:380;
+}
+.lead em{ font-family:var(--display); font-style:italic; color:var(--ink); }
+
+/* ============================================================ HERO */
+.hero{ min-height: 100vh; display:flex; align-items:center; padding-top:120px; }
+.hero .grid{
+  display:grid; grid-template-columns: 1.15fr .85fr; gap:40px; align-items:center; width:100%;
+}
+.hero h1{
+  font-family: var(--display);
+  font-weight: 340;
+  font-variation-settings: "opsz" 144,"SOFT" 40,"WONK" 0;
+  font-size: clamp(46px, 7.4vw, 108px);
+  line-height: 0.92; letter-spacing: -0.028em;
+  color: var(--ink);
+}
+.hero h1 .it{
+  font-style: italic; font-variation-settings:"opsz" 144,"SOFT" 100,"WONK" 1;
+  color: var(--accent);
+}
+.hero h1 .dim{ color: var(--ink-2); }
+.hero .sub{
+  margin-top: 34px; max-width: 44ch; font-size: clamp(18px,1.6vw,21px);
+  color: var(--ink-2); line-height:1.55;
+}
+.hero .meta{
+  margin-top: 42px; display:flex; gap:38px; flex-wrap:wrap;
+  font-family:var(--mono); font-size:11px; letter-spacing:.16em; text-transform:uppercase;
+  color:var(--dim);
+}
+.hero .meta b{ color:var(--ink); font-weight:500; display:block; margin-top:6px; font-size:13px; letter-spacing:.06em; text-transform:none; font-family:var(--read); }
+
+/* signal waveform */
+.signal{
+  width:100%; max-width:520px; margin-top:38px;
+}
+.signal svg{ width:100%; height:auto; display:block; }
+.signal .trace{ stroke:var(--ink-2); stroke-width:1.1; fill:none; opacity:.5; }
+.signal .trace.hot{ stroke:var(--accent); opacity:.9; filter:drop-shadow(0 0 6px var(--accent-halo)); }
+.signal .scan{ stroke:var(--accent); stroke-width:1.4; }
+.signal .blip{ fill:var(--accent); }
+
+/* hero right — neural mark */
+.hero .mark-panel{ position:relative; }
+.hero .mark-panel svg{ width:100%; height:auto; }
+.hero .corner{
+  position:absolute; font-family:var(--mono); font-size:10px;
+  letter-spacing:.18em; text-transform:uppercase; color:var(--dim);
+}
+.hero .corner.tl{ top:-6px; left:0; }
+.hero .corner.br{ bottom:-6px; right:0; }
+.hero .corner b{ color:var(--accent); }
+
+.scroll-cue{
+  position:absolute; bottom:34px; left:50%; transform:translateX(-50%);
+  font-family:var(--mono); font-size:10px; letter-spacing:.3em; text-transform:uppercase;
+  color:var(--dim); display:flex; flex-direction:column; align-items:center; gap:10px;
+}
+.scroll-cue .bar{ width:1px; height:42px; background:linear-gradient(var(--accent), transparent); animation: descend 2.2s ease-in-out infinite; }
+
+@media (max-width:880px){
+  .hero .grid{ grid-template-columns:1fr; gap:20px; }
+  .hero .mark-panel{ order:-1; max-width:340px; }
+}
+
+/* ============================================================ PREMISE */
+.premise .models{
+  margin-top: 60px; display:grid; grid-template-columns: repeat(3,1fr); gap:0;
+  border-top:1px solid var(--line); border-bottom:1px solid var(--line);
+}
+.premise .model{
+  padding: 34px 26px 38px; border-right:1px solid var(--line);
+  position:relative;
+}
+.premise .model:last-child{ border-right:0; }
+.premise .model .tag{
+  font-family:var(--mono); font-size:10px; letter-spacing:.2em; text-transform:uppercase;
+  color:var(--accent); margin-bottom:18px;
+}
+.premise .model h3{
+  font-family:var(--display); font-weight:380; font-variation-settings:"opsz" 60,"SOFT" 20;
+  font-size: 27px; line-height:1.05; letter-spacing:-0.01em; margin-bottom:14px;
+}
+.premise .model h3 em{ font-style:italic; color:var(--accent-2); font-variation-settings:"opsz" 72,"SOFT" 80,"WONK" 1; }
+.premise .model p{ color:var(--ink-2); font-size:16px; line-height:1.6; }
+.premise .model .eq{
+  margin-top:18px; font-family:var(--mono); font-size:13px; color:var(--ink);
+  letter-spacing:.04em;
+}
+.premise .model .eq span{ color:var(--accent); }
+.premise .pull{
+  margin-top:64px; font-family:var(--display); font-style:italic;
+  font-variation-settings:"opsz" 144,"SOFT" 100,"WONK" 1;
+  font-size: clamp(26px,3.4vw,42px); line-height:1.18; max-width:24ch;
+  color:var(--ink); border-left:2px solid var(--accent); padding-left:24px;
+}
+@media (max-width:820px){ .premise .models{ grid-template-columns:1fr; } .premise .model{ border-right:0; border-bottom:1px solid var(--line); } .premise .model:last-child{ border-bottom:0; } }
+
+/* ============================================================ CIRCUITS */
+.circuits .stage{
+  margin-top: 56px;
+  display:grid; grid-template-columns: 0.85fr 1.15fr; gap: 60px;
+  align-items:start;
+}
+.circuits .mapcol{
+  position:sticky; top: 90px; align-self:start;
+}
+.circuits .mapwrap{
+  position:relative; aspect-ratio: 1/1; max-width: 540px; margin:0 auto;
+}
+.circuits .mapwrap svg{ width:100%; height:100%; display:block; }
+.circuits .map-label{
+  position:absolute; top:0; left:0; font-family:var(--mono); font-size:10px;
+  letter-spacing:.2em; text-transform:uppercase; color:var(--dim);
+}
+.circuits .map-label.tr{ left:auto; right:0; text-align:right; }
+.circuits .map-label.bl{ top:auto; bottom:0; }
+.circuits .map-label.br{ top:auto; bottom:0; left:auto; right:0; text-align:right; }
+.circuits .map-label b{ color:var(--accent); font-weight:500; }
+.circuits .legend{
+  margin-top:22px; font-family:var(--mono); font-size:10px; letter-spacing:.14em;
+  text-transform:uppercase; color:var(--dim); display:flex; gap:18px; justify-content:center;
+}
+.circuits .legend i{ display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+.circuits .legend .l-on{ background:var(--accent); box-shadow:0 0 8px var(--accent-halo); }
+.circuits .legend .l-off{ background:transparent; border:1px solid var(--faint); }
+
+.circuits .cards{ display:flex; flex-direction:column; gap:24px; }
+
+.module{
+  position:relative; padding: 30px 32px 32px; border:1px solid var(--line);
+  background: linear-gradient(180deg, rgba(18,20,25,0.6), rgba(12,14,18,0.4));
+  transition: border-color .4s, background .4s, transform .4s;
+}
+.module::before{ /* left accent rail */
+  content:""; position:absolute; left:-1px; top:0; bottom:0; width:2px;
+  background: var(--accent); transform: scaleY(0); transform-origin: top;
+  transition: transform .5s cubic-bezier(.2,.8,.2,1);
+}
+.module.active::before{ transform: scaleY(1); }
+.module.active{ border-color: var(--line-2); background: linear-gradient(180deg, rgba(26,20,20,0.5), rgba(12,14,18,0.4)); }
+
+.module .head{ display:flex; align-items:baseline; justify-content:space-between; gap:16px; margin-bottom:18px; }
+.module .id{
+  font-family:var(--mono); font-size:11px; letter-spacing:.2em; color:var(--dim);
+}
+.module .id b{ color:var(--accent); font-weight:500; }
+.module .pri{
+  font-family:var(--mono); font-size:10px; letter-spacing:.16em; text-transform:uppercase;
+  padding:4px 9px; border:1px solid var(--line-2); color:var(--ink-2); border-radius:2px;
+}
+.module .pri.crit{ color:var(--accent); border-color:var(--accent); }
+.module h3{
+  font-family:var(--display); font-weight:380; font-variation-settings:"opsz" 96,"SOFT" 40;
+  font-size: clamp(28px,3.4vw,40px); line-height:1; letter-spacing:-0.018em; margin-bottom:6px;
+}
+.module h3 em{ font-style:italic; color:var(--accent-2); font-variation-settings:"opsz" 120,"SOFT" 100,"WONK" 1; }
+.module .mech{ font-family:var(--read); font-style:italic; color:var(--ink-2); font-size:17px; margin-bottom:20px; max-width:42ch; }
+
+.module .row{ display:grid; grid-template-columns: 92px 1fr; gap:18px; padding:13px 0; border-top:1px dashed var(--line); }
+.module .row .k{ font-family:var(--mono); font-size:10px; letter-spacing:.16em; text-transform:uppercase; color:var(--dim); padding-top:3px; }
+.module .row .v{ color:var(--ink); font-size:16px; line-height:1.55; }
+.module .row .v b{ color:var(--accent-2); font-weight:500; font-family:var(--display); font-style:italic; font-variation-settings:"opsz" 24,"SOFT" 60; }
+.module .row.deploy .v{ font-family:var(--mono); font-size:12.5px; letter-spacing:.02em; color:var(--ink-2); }
+.module .row.deploy .v span{ color:var(--ink); }
+.module .row.deploy .v i{ color:var(--faint); font-style:normal; margin:0 6px; }
+
+@media (max-width:920px){
+  .circuits .stage{ grid-template-columns:1fr; gap:40px; }
+  .circuits .mapcol{ position:relative; top:0; }
+  .circuits .mapwrap{ max-width:420px; }
+}
+
+/* ============================================================ LOOP */
+.loop{ background: linear-gradient(180deg, transparent, rgba(255,68,52,0.04), transparent); }
+.loop .layout{ display:grid; grid-template-columns: 1fr 1fr; gap:60px; align-items:center; margin-top:56px; }
+.loop .diagram{ position:relative; aspect-ratio:1/1; max-width:520px; }
+.loop .diagram svg{ width:100%; height:100%; }
+.loop .diagram .lab{ font-family:var(--mono); font-size:10px; letter-spacing:.16em; text-transform:uppercase; fill:var(--ink); }
+.loop .diagram .lab.dim{ fill:var(--dim); }
+.loop .steps{ display:flex; flex-direction:column; gap:26px; }
+.loop .step{ display:grid; grid-template-columns: 48px 1fr; gap:18px; align-items:start; }
+.loop .step .n{ font-family:var(--mono); font-size:11px; color:var(--accent); letter-spacing:.1em; padding-top:6px; border-top:1px solid var(--accent); }
+.loop .step h4{ font-family:var(--display); font-weight:380; font-variation-settings:"opsz" 60,"SOFT" 40; font-size:24px; margin-bottom:6px; }
+.loop .step h4 em{ font-style:italic; color:var(--accent-2); font-variation-settings:"opsz" 72,"SOFT" 100,"WONK" 1; }
+.loop .step p{ color:var(--ink-2); font-size:16px; }
+.loop .fogg{
+  margin-top:54px; padding:34px; border:1px solid var(--line); border-left:2px solid var(--accent);
+  display:flex; align-items:center; gap:34px; flex-wrap:wrap;
+}
+.loop .fogg .eq{
+  font-family:var(--display); font-size: clamp(40px,6vw,72px); font-weight:340;
+  font-variation-settings:"opsz" 144,"SOFT" 30; letter-spacing:-0.02em; color:var(--ink);
+}
+.loop .fogg .eq em{ font-style:italic; color:var(--accent); font-variation-settings:"opsz" 144,"SOFT" 100,"WONK" 1; }
+.loop .fogg .eq .dot{ color:var(--dim); }
+.loop .fogg p{ max-width:42ch; color:var(--ink-2); font-size:16px; }
+@media (max-width:880px){ .loop .layout{ grid-template-columns:1fr; } .loop .diagram{ max-width:380px; margin:0 auto; } }
+
+/* ============================================================ THE LINE (defense) */
+.theline{ }
+.theline .shell{
+  margin-top:56px; border:1px solid var(--line); padding: 48px;
+  background: linear-gradient(160deg, rgba(87,230,194,0.05), rgba(12,14,18,0.2));
+  position:relative;
+}
+.theline .shell::before{
+  content:"DEFENSIVE LAYER // CLEARANCE: PUBLIC";
+  position:absolute; top:-1px; left:24px; transform:translateY(-50%);
+  background:var(--bg); padding:0 12px;
+  font-family:var(--mono); font-size:10px; letter-spacing:.2em; color:var(--bio);
+}
+.theline .principles{ display:grid; grid-template-columns: repeat(3,1fr); gap:36px; margin-top:18px; }
+.theline .p h4{ font-family:var(--display); font-weight:380; font-variation-settings:"opsz" 72,"SOFT" 60; font-size:24px; margin-bottom:10px; color:var(--bio); }
+.theline .p h4 em{ font-style:italic; font-variation-settings:"opsz" 84,"SOFT" 100,"WONK" 1; }
+.theline .p p{ color:var(--ink-2); font-size:16px; }
+.theline .close{
+  margin-top:46px; font-family:var(--display); font-style:italic;
+  font-variation-settings:"opsz" 144,"SOFT" 100,"WONK" 1;
+  font-size: clamp(28px,3.6vw,44px); line-height:1.16; max-width:24ch; color:var(--ink);
+  border-left:2px solid var(--bio); padding-left:24px;
+}
+.theline .close span{ color:var(--bio); }
+@media (max-width:820px){ .theline .principles{ grid-template-columns:1fr; gap:28px; } .theline .shell{ padding:34px 24px; } }
+
+/* ============================================================ FOOTER */
+footer{
+  margin-top:60px; padding: 70px 0 50px; border-top:1px solid var(--line);
+}
+footer .row{ display:flex; justify-content:space-between; align-items:flex-end; gap:40px; flex-wrap:wrap; }
+footer .col h5{
+  font-family:var(--display); font-weight:380; font-variation-settings:"opsz" 120,"SOFT" 60,"WONK" 0;
+  font-size: clamp(30px,4vw,52px); line-height:1; letter-spacing:-0.02em;
+}
+footer .col h5 em{ font-style:italic; color:var(--accent); font-variation-settings:"opsz" 144,"SOFT" 100,"WONK" 1; }
+footer .meta{ font-family:var(--mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--dim); text-align:right; max-width:38ch; line-height:1.9; }
+footer .meta b{ color:var(--ink-2); font-weight:500; }
+footer .base{ margin-top:50px; display:flex; justify-content:space-between; font-family:var(--mono); font-size:10px; letter-spacing:.2em; text-transform:uppercase; color:var(--faint); }
+footer .base .blink{ color:var(--accent); }
+footer .base .blink::before{ content:"● "; animation:pulse 2.4s ease-in-out infinite; }
+
+/* animations -------------------------------------------------- */
+@keyframes pulse{ 0%,100%{ opacity:1; transform:scale(1);} 50%{ opacity:.35; transform:scale(.82);} }
+@keyframes descend{ 0%{ transform:scaleY(0); transform-origin:top; opacity:1;} 60%{ transform:scaleY(1); opacity:1;} 100%{ transform:scaleY(1); opacity:0;} }
+@keyframes dashflow{ to{ stroke-dashoffset: -1000; } }
+@keyframes blip{ 0%,100%{ opacity:.2; } 50%{ opacity:1; } }
+@keyframes float-node{ 0%,100%{ transform:translate(0,0);} 50%{ transform:translate(0,-4px);} }
+@keyframes ring-rotate{ to{ transform:rotate(360deg);} }
+@keyframes reveal{ from{ opacity:0; transform:translateY(18px);} to{ opacity:1; transform:translateY(0);} }
+
+.reveal{ opacity:0; }
+.reveal.in{ animation: reveal .9s cubic-bezier(.2,.8,.2,1) forwards; }
+
+@media (prefers-reduced-motion: reduce){
+  *{ animation: none !important; transition: none !important; }
+  .reveal{ opacity:1; }
+}
+</style>
+</head>
+<body>
+
+<div id="progress"></div>
+
+<nav class="top" id="nav">
+  <div class="mark">
+    <span class="glyph"></span>
+    <b>Attention Architecture</b> <span>// field dossier</span>
+  </div>
+  <ul>
+    <li><a href="#premise">Premise</a></li>
+    <li><a href="#circuits">Circuits</a></li>
+    <li><a href="#loop">The Loop</a></li>
+    <li><a href="#line">The Line</a></li>
+  </ul>
+  <div class="stamp">CLASS <b>EXPLOIT</b> · LIVE</div>
+</nav>
+
+<!-- ========================================================== HERO -->
+<header class="hero wrap" id="top">
+  <div class="grid">
+    <div>
+      <h1>
+        You are not the <span class="it">user.</span><br>
+        You are the <span class="it">target.</span>
+      </h1>
+      <p class="sub">
+        Every interface is designed for a brain before it is designed for a person. This dossier maps the known
+        neurological circuits social products target — the exploits, the evidence, and the line you cross
+        when engagement stops serving the human holding the screen.
+      </p>
+
+      <div class="meta">
+        <div>Document type<b>Diagnostic field guide</b></div>
+        <div>Discipline<b>Attention engineering</b></div>
+        <div>Reading time<b>~9 min</b></div>
+      </div>
+
+      <div class="signal" aria-hidden="true">
+        <svg viewBox="0 0 520 90" preserveAspectRatio="none">
+          <path class="trace" d="M0,45 L60,45 L70,45 L78,20 L86,70 L94,30 L102,60 L110,45 L160,45 L172,45 L180,18 L188,72 L196,28 L204,58 L212,45 L300,45 L312,45 L320,22 L328,68 L336,32 L344,60 L352,45 L520,45"/>
+          <path class="trace hot scan" d="M0,45 L520,45" stroke-dasharray="3 9" style="animation:dashflow 14s linear infinite;"/>
+          <circle class="blip" cx="94" cy="30" r="2.5" style="animation:blip 2.6s ease-in-out infinite;"/>
+          <circle class="blip" cx="328" cy="68" r="2.5" style="animation:blip 2.6s ease-in-out infinite .8s;"/>
+        </svg>
+      </div>
+    </div>
+
+    <div class="mark-panel">
+      <span class="corner tl">FIG. 00 · ATTENTION MAP</span>
+      <span class="corner br">N=<b>08</b> CIRCUITS</span>
+      <!-- constellation -->
+      <svg viewBox="0 0 600 600" id="heroMark" aria-hidden="true">
+        <defs>
+          <radialGradient id="halo" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stop-color="#ff4434" stop-opacity="0.22"/>
+            <stop offset="100%" stop-color="#ff4434" stop-opacity="0"/>
+          </radialGradient>
+        </defs>
+        <circle cx="300" cy="300" r="240" fill="url(#halo)"/>
+        <circle cx="300" cy="300" r="230" fill="none" stroke="rgba(236,232,224,0.06)" stroke-dasharray="2 8"/>
+        <circle cx="300" cy="300" r="160" fill="none" stroke="rgba(236,232,224,0.05)"/>
+        <circle cx="300" cy="300" r="90"  fill="none" stroke="rgba(236,232,224,0.06)"/>
+        <!-- synapse lines -->
+        <g stroke="rgba(236,232,224,0.10)" stroke-width="1">
+          <line x1="300" y1="300" x2="300" y2="120"/>
+          <line x1="300" y1="300" x2="455" y2="173"/>
+          <line x1="300" y1="300" x2="520" y2="300"/>
+          <line x1="300" y1="300" x2="455" y2="427"/>
+          <line x1="300" y1="300" x2="300" y2="480"/>
+          <line x1="300" y1="300" x2="145" y2="427"/>
+          <line x1="300" y1="300" x2="80"  y2="300"/>
+          <line x1="300" y1="300" x2="145" y2="173"/>
+        </g>
+        <!-- adjacency -->
+        <g stroke="rgba(255,68,52,0.18)" stroke-width="0.8" stroke-dasharray="2 5">
+          <path d="M300,120 L455,173 L520,300 L455,427 L300,480 L145,427 L80,300 L145,173 Z" fill="none"/>
+        </g>
+        <!-- center -->
+        <circle cx="300" cy="300" r="6" fill="#ff4434" filter="drop-shadow(0 0 8px rgba(255,68,52,0.7))"/>
+        <circle cx="300" cy="300" r="18" fill="none" stroke="#ff4434" stroke-opacity="0.5"/>
+        <text x="300" y="335" text-anchor="middle" font-family="JetBrains Mono" font-size="10" letter-spacing="2" fill="#b9b4a9">ATTENTION</text>
+        <!-- nodes -->
+        <g font-family="JetBrains Mono" font-size="10" letter-spacing="1">
+          <g><circle cx="300" cy="120" r="5" fill="#ece8e0"/><text x="300" y="104" text-anchor="middle" fill="#6c6a64">01</text></g>
+          <g><circle cx="455" cy="173" r="5" fill="#ece8e0"/><text x="478" y="170" fill="#6c6a64">02</text></g>
+          <g><circle cx="520" cy="300" r="5" fill="#ece8e0"/><text x="538" y="304" fill="#6c6a64">03</text></g>
+          <g><circle cx="455" cy="427" r="5" fill="#ece8e0"/><text x="478" y="443" fill="#6c6a64">04</text></g>
+          <g><circle cx="300" cy="480" r="5" fill="#ece8e0"/><text x="300" y="504" text-anchor="middle" fill="#6c6a64">05</text></g>
+          <g><circle cx="145" cy="427" r="5" fill="#ece8e0"/><text x="110" y="443" fill="#6c6a64">06</text></g>
+          <g><circle cx="80"  cy="300" r="5" fill="#ece8e0"/><text x="44" y="304" fill="#6c6a64">07</text></g>
+          <g><circle cx="145" cy="173" r="5" fill="#ece8e0"/><text x="110" y="170" fill="#6c6a64">08</text></g>
+        </g>
+      </svg>
+    </div>
+  </div>
+
+  <div class="scroll-cue"><span>Scroll to begin trace</span><span class="bar"></span></div>
+</header>
+
+<!-- ========================================================== PREMISE -->
+<section class="premise wrap reveal" id="premise">
+  <div class="eyebrow">Section 01 · The premise</div>
+  <h2 class="section-title">You are designing for a <em>brain</em>, not a person.</h2>
+  <p class="lead">
+    The conscious user is the last to know. Every <em>engagement</em> metric is a proxy for one question:
+    how many neurological circuits did we fire? Three models form the scaffolding an attention engineer
+    must internalize before touching a single component.
+  </p>
+
+  <div class="models">
+    <div class="model">
+      <div class="tag">Model 01 · Hooked</div>
+      <h3>The <em>loop</em> that builds itself.</h3>
+      <p>Trigger → Action → Variable Reward → Investment. The investment phase is the trap: the user feeds the machine data that personalizes the next trigger and raises the cost of leaving.</p>
+      <div class="eq">trigger → action → <span>reward?</span> → investment</div>
+    </div>
+    <div class="model">
+      <div class="tag">Model 02 · Fogg</div>
+      <h3>Behavior = <em>Motivation</em> × Ability × Prompt.</h3>
+      <p>A behavior only fires when all three clear a threshold at once. Lower the cost of acting (ability), and time the prompt to high-motivation moments — and the user acts before they decide.</p>
+      <div class="eq">B = <span>M</span> · <span>A</span> · <span>P</span></div>
+    </div>
+    <div class="model">
+      <div class="tag">Model 03 · Kahneman</div>
+      <h3>System 1 <em>acts</em>. System 2 <em>veto</em>es.</h3>
+      <p>System 1 is fast, automatic, impulsive. System 2 is slow, deliberate, easily exhausted. Social media is almost entirely a System 1 attack surface. The craft is preventing System 2 from waking up.</p>
+      <div class="eq">max <span>P(System 1)</span> · min <span>P(System 2)</span></div>
+    </div>
+  </div>
+
+  <p class="pull">The whole craft reduces to one sentence: get System 1 to act before System 2 can intervene.</p>
+</section>
+
+<!-- ========================================================== CIRCUITS -->
+<section class="circuits wrap reveal" id="circuits">
+  <div class="eyebrow">Section 02 · The circuits</div>
+  <h2 class="section-title">Eight known <em>exploits</em> in the attention system.</h2>
+  <p class="lead">
+    Each circuit is a structure evolution built for survival that a screen can fire on demand. The map on the left
+    tracks your reading — the node for whichever exploit you are examining lights up. They are ordered by leverage,
+    not chronology.
+  </p>
+
+  <div class="stage">
+    <!-- sticky neural map -->
+    <div class="mapcol">
+      <div class="mapwrap">
+        <span class="map-label">FIG. 02 · CIRCUIT MAP</span>
+        <span class="map-label tr">LIVE TRACE</span>
+        <svg viewBox="0 0 600 600" id="circuitMap" aria-hidden="true">
+          <defs>
+            <radialGradient id="halo2" cx="50%" cy="50%" r="50%">
+              <stop offset="0%" stop-color="#ff4434" stop-opacity="0.16"/>
+              <stop offset="100%" stop-color="#ff4434" stop-opacity="0"/>
+            </radialGradient>
+          </defs>
+          <circle cx="300" cy="300" r="250" fill="url(#halo2)"/>
+          <circle cx="300" cy="300" r="232" fill="none" stroke="rgba(236,232,224,0.06)" stroke-dasharray="2 9"/>
+          <circle cx="300" cy="300" r="165" fill="none" stroke="rgba(236,232,224,0.05)"/>
+          <g id="mapLines" stroke="rgba(236,232,224,0.09)" stroke-width="1"></g>
+          <g id="mapAdj" stroke="rgba(255,68,52,0.16)" stroke-width="0.8" stroke-dasharray="2 5" fill="none"></g>
+          <!-- center -->
+          <circle cx="300" cy="300" r="6" fill="#ff4434"/>
+          <circle cx="300" cy="300" r="18" fill="none" stroke="#ff4434" stroke-opacity="0.4"/>
+          <text x="300" y="334" text-anchor="middle" font-family="JetBrains Mono" font-size="9" letter-spacing="2" fill="#6c6a64">YOU</text>
+          <g id="mapNodes"></g>
+        </svg>
+        <span class="map-label bl">SOURCE · NEURO / BEHAVIORAL ECON.</span>
+        <span class="map-label br">FIDELITY · <b>FIELD-VERIFIED</b></span>
+      </div>
+      <div class="legend">
+        <span><i class="l-on"></i>Active circuit</span>
+        <span><i class="l-off"></i>Latent</span>
+      </div>
+    </div>
+
+    <!-- module cards -->
+    <div class="cards">
+
+      <article class="module" data-node="0">
+        <div class="head"><div class="id">Circuit <b>01</b> · Dopamine / RPE</div><div class="pri crit">Priority — Critical</div></div>
+        <h3>Anticipation, <em>not</em> pleasure.</h3>
+        <p class="mech">Dopamine encodes the gap between predicted and actual reward — the surprise, not the satisfaction.</p>
+        <div class="row"><div class="k">Circuit</div><div class="v">Reward prediction error (Schultz). Unpredicted reward spikes; predicted reward that fails to arrive <b>crashes</b> the signal.</div></div>
+        <div class="row"><div class="k">Exploit</div><div class="v"><b>Variable reward.</b> Predictable rewards habituate; <b>unpredictable</b> ones keep dopamine firing indefinitely. Variable-ratio reinforcement is the most extinction-resistant schedule known — it runs slot machines.</div></div>
+        <div class="row deploy"><div class="k">Deployed in</div><div class="v"><span>Infinite scroll</span> <i>·</i> <span>pull-to-refresh</span> <i>·</i> <span>deliberately mixed-quality feeds</span> <i>·</i> <span>vague notifications</span></div></div>
+      </article>
+
+      <article class="module" data-node="1">
+        <div class="head"><div class="id">Circuit <b>02</b> · Novelty / Orienting</div><div class="pri">Priority — High</div></div>
+        <h3>Manufactured <em>new</em>.</h3>
+        <p class="mech">Novel stimuli trigger the orienting response — a brief spike of attention before the brain decides whether something matters.</p>
+        <div class="row"><div class="k">Circuit</div><div class="v">VTA dopamine flags <b>new</b> as opportunity-or-threat by default. At the 200ms decision point, the brain cannot distinguish novel from meaningful.</div></div>
+        <div class="row"><div class="k">Exploit</div><div class="v"><b>Novelty without depth.</b> Refresh the surface without refreshing the substance. The re-novely effect: periodically churning format re-novelties the whole population at once.</div></div>
+        <div class="row deploy"><div class="k">Deployed in</div><div class="v"><span>Red dots & unread badges</span> <i>·</i> <span>trending rotation</span> <i>·</i> <span>thumbnail churn</span> <i>·</i> <span>format shifts (text→photo→video)</span></div></div>
+      </article>
+
+      <article class="module" data-node="2">
+        <div class="head"><div class="id">Circuit <b>03</b> · Social reward & threat</div><div class="pri crit">Priority — Critical</div></div>
+        <h3>Belonging as <em>survival</em>.</h3>
+        <p class="mech">The brain treats social approval and social rejection as survival signals, not preferences. Rejection lights the amygdala like physical pain.</p>
+        <div class="row"><div class="k">Circuit</div><div class="v">Oxytocin mediates bonding; the amygdala flags exclusion as threat (Eisenberger). Social comparison runs by default in the network's idle state.</div></div>
+        <div class="row"><div class="k">Exploit</div><div class="v"><b>Threat travels faster than reward.</b> Anger outpaces joy in diffusion rate; each moral-emotional word grows a cascade ~20% (Brady et al.). Optimizing for engagement <b>selects for</b> outrage whether anyone intended it.</div></div>
+        <div class="row deploy"><div class="k">Deployed in</div><div class="v"><span>Visible like/view counts</span> <i>·</i> <span>tags & mentions</span> <i>·</i> <span>read receipts</span> <i>·</i> <span>outrage-boosting ranking</span></div></div>
+      </article>
+
+      <article class="module" data-node="3">
+        <div class="head"><div class="id">Circuit <b>04</b> · Loss aversion / FOMO</div><div class="pri">Priority — High</div></div>
+        <h3>Losses feel <em>twice</em> as heavy.</h3>
+        <p class="mech">Prospect theory: a loss is felt roughly twice as intensely as an equivalent gain. The brain is asymmetrical by design.</p>
+        <div class="row"><div class="k">Circuit</div><div class="v">Kahneman & Tversky. Under risk, the <b>downside</b> dominates the decision, not the expected value.</div></div>
+        <div class="row"><div class="k">Exploit</div><div class="v"><b>Reframe gain as loss.</b> Convert "you could see content" into "you will <b>lose access</b> to content." Pair with a deadline and you have FOMO. The streak is a loss you own.</div></div>
+        <div class="row deploy"><div class="k">Deployed in</div><div class="v"><span>Streaks</span> <i>·</i> <span>ephemeral stories</span> <i>·</i> <span>countdowns</span> <i>·</i> <span>"you missed something" pushes</span></div></div>
+      </article>
+
+      <article class="module" data-node="4">
+        <div class="head"><div class="id">Circuit <b>05</b> · Cognitive ease / friction</div><div class="pri crit">Priority — Critical</div></div>
+        <h3>Remove <em>every</em> stopping point.</h3>
+        <p class="mech">System 2 has a small energy budget; the brain defaults to the path of least resistance. Every micro-decision is a tax.</p>
+        <div class="row"><div class="k">Circuit</div><div class="v">Cognitive fluency. Enough decision-taxes and the user leaves. A stopping point is where System 2 might wake up and decide to go.</div></div>
+        <div class="row"><div class="k">Exploit</div><div class="v"><b>Drop the cost of "next" to zero.</b> Autoplay, infinite scroll, one-tap actions, smart defaults, sub-second first content — the user decides to stay in the first ~50ms.</div></div>
+        <div class="row deploy"><div class="k">Deployed in</div><div class="v"><span>Autoplay</span> <i>·</i> <span>infinite scroll</span> <i>·</i> <span>one-tap actions</span> <i>·</i> <span>personalized "For You"</span></div></div>
+      </article>
+
+      <article class="module" data-node="5">
+        <div class="head"><div class="id">Circuit <b>06</b> · Zeigarnik / incompleteness</div><div class="pri">Priority — High</div></div>
+        <h3>Open loops <em>persist</em>.</h3>
+        <p class="mech">Unfinished or interrupted tasks hold memory and attention longer than completed ones — the brain refuses to close the file.</p>
+        <div class="row"><div class="k">Circuit</div><div class="v">The Zeigarnik effect. An unresolved signal nags until resolved.</div></div>
+        <div class="row"><div class="k">Exploit</div><div class="v"><b>Deliberately withhold.</b> Truncate. Cliffhang. Make the badge un-clearable in one visit. Strip the notification preview so the user <b>must</b> open to resolve it.</div></div>
+        <div class="row deploy"><div class="k">Deployed in</div><div class="v"><span>"See more" truncation</span> <i>·</i> <span>unclearable badges</span> <i>·</i> <span>vague push previews</span> <i>·</i> <span>half-loaded feeds</span></div></div>
+      </article>
+
+      <article class="module" data-node="6">
+        <div class="head"><div class="id">Circuit <b>07</b> · Ego depletion / timing</div><div class="pri">Priority — Moderate</div></div>
+        <h3>Hit them at <em>low</em> resistance.</h3>
+        <p class="mech">Self-control is a finite resource across the day. People make worse resistance decisions when tired, hungry, or late at night.</p>
+        <div class="row"><div class="k">Circuit</div><div class="v">Ego depletion / decision fatigue. The resistance threshold rises and falls predictably per person, per hour.</div></div>
+        <div class="row"><div class="k">Exploit</div><div class="v"><b>Time the attack.</b> Learn each user's resistance profile from behavior and fire re-engagement at their lowest hour. Personalization is what separates modern attention engineering from old advertising.</div></div>
+        <div class="row deploy"><div class="k">Deployed in</div><div class="v"><span>11pm re-engagement pushes</span> <i>·</i> <span>per-user dropout curves</span> <i>·</i> <span>Sunday-evening anxiety windows</span></div></div>
+      </article>
+
+      <article class="module" data-node="7">
+        <div class="head"><div class="id">Circuit <b>08</b> · Investment / sunk cost</div><div class="pri">Priority — High</div></div>
+        <h3>The user builds the <em>cage</em>.</h3>
+        <p class="mech">The user's own invested effort becomes a sunk cost the brain refuses to abandon — loss aversion turned against the self.</p>
+        <div class="row"><div class="k">Circuit</div><div class="v">Sunk-cost + loss aversion applied to identity and reputation. Accumulated capital is, structurally, the retention.</div></div>
+        <div class="row"><div class="k">Exploit</div><div class="v"><b>Make them build it themselves.</b> Profile, followers, streak, trained personalization — each investment raises switching cost and improves the next loop's targeting. Creators are the most locked-in users because they hold the most capital.</div></div>
+        <div class="row deploy"><div class="k">Deployed in</div><div class="v"><span>Onboarding investment</span> <i>·</i> <span>visible follower/reputation counts</span> <i>·</i> <span>creation tools</span> <i>·</i> <span>long-cold-start personalization</span></div></div>
+      </article>
+
+    </div>
+  </div>
+</section>
+
+<!-- ========================================================== LOOP -->
+<section class="loop wrap reveal" id="loop">
+  <div class="eyebrow">Section 03 · The loop</div>
+  <h2 class="section-title">Four steps, one <em>compounding</em> cycle.</h2>
+  <p class="lead">The circuits don't run in isolation — they assemble into a self-reinforcing loop. The investment step is what
+    turns a product that is <em>used</em> into one that is <em>depended on</em>.</p>
+
+  <div class="layout">
+    <div class="diagram">
+      <svg viewBox="0 0 520 520" aria-hidden="true">
+        <defs>
+          <linearGradient id="loopg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#ff4434"/>
+            <stop offset="100%" stop-color="#ff7a5c"/>
+          </linearGradient>
+        </defs>
+        <!-- ring -->
+        <circle cx="260" cy="260" r="190" fill="none" stroke="rgba(236,232,224,0.10)" stroke-width="1"/>
+        <circle cx="260" cy="260" r="190" fill="none" stroke="url(#loopg)" stroke-width="2" stroke-dasharray="6 10" style="animation:dashflow 22s linear infinite; transform-origin:260px 260px;"/>
+        <!-- arrows positions: top, right, bottom, left -->
+        <g class="lab">
+          <text x="260" y="58"  text-anchor="middle">01 · Trigger</text>
+          <text x="468" y="266" text-anchor="middle">02 · Action</text>
+          <text x="260" y="476" text-anchor="middle">03 · Variable Reward</text>
+          <text x="52"  y="266" text-anchor="middle">04 · Investment</text>
+        </g>
+        <g class="lab dim">
+          <text x="260" y="74"  text-anchor="middle">internal / external</text>
+          <text x="468" y="282" text-anchor="middle">simplest, lowest cost</text>
+          <text x="260" y="492" text-anchor="middle">unpredictable</text>
+          <text x="52"  y="282" text-anchor="middle">user puts in work</text>
+        </g>
+        <!-- nodes -->
+        <circle cx="260" cy="100" r="7" fill="#ff4434"/>
+        <circle cx="420" cy="260" r="7" fill="#ff4434"/>
+        <circle cx="260" cy="420" r="7" fill="#ff4434"/>
+        <circle cx="100" cy="260" r="7" fill="#ff4434"/>
+        <!-- center -->
+        <text x="260" y="256" text-anchor="middle" font-family="Fraunces" font-style="italic" font-size="34" fill="#ece8e0" font-variation-settings="'opsz' 120,'SOFT' 100,'WONK' 1">the</text>
+        <text x="260" y="290" text-anchor="middle" font-family="Fraunces" font-style="italic" font-size="34" fill="#ff4434" font-variation-settings="'opsz' 120,'SOFT' 100,'WONK' 1">hooked loop</text>
+      </svg>
+    </div>
+
+    <div class="steps">
+      <div class="step"><div class="n">01</div><div><h4><em>Trigger.</em></h4><p>Internal (boredom, anxiety) or external (notification, badge). Spark the craving before the conscious decision to open.</p></div></div>
+      <div class="step"><div class="n">02</div><div><h4><em>Action.</em></h4><p>The simplest possible behavior in anticipation of reward. Friction is the enemy; the action should be trivially easy.</p></div></div>
+      <div class="step"><div class="n">03</div><div><h4><em>Variable reward.</em></h4><p>The payoff is uncertain — Circuit 01. The user comes back not for what they got, but for what they might get next.</p></div></div>
+      <div class="step"><div class="n">04</div><div><h4><em>Investment.</em></h4><p>The user puts in work — a like, a follow, a post. That work personalizes the next trigger and raises the cost of leaving. The loop now feeds itself.</p></div></div>
+    </div>
+  </div>
+
+  <div class="fogg">
+    <div class="eq"><em>B</em> <span class="dot">=</span> <em>M</em> <span class="dot">·</span> <em>A</em> <span class="dot">·</span> <em>P</em></div>
+    <p>Behavior = Motivation × Ability × Prompt. A behavior fires only when all three clear the threshold together. Drop ability to near-zero and you don't need much motivation — which is exactly why friction-removal (Circuit 05) is the highest-leverage move in the set.</p>
+  </div>
+</section>
+
+<!-- ========================================================== THE LINE -->
+<section class="theline wrap reveal" id="line">
+  <div class="eyebrow bio">Section 04 · The line</div>
+  <h2 class="section-title">The same map that <em>exploits</em> can defend.</h2>
+  <p class="lead">
+    This knowledge is identical to security research: the circuit map lets you build a habit-forming product, protect
+    yourself from one, or build a <em>humane</em> product that respects attention. The line is a decision, not a
+    discovery — and it gets crossed by default the moment you optimize for raw engagement.
+  </p>
+
+  <div class="shell">
+    <div class="principles">
+      <div class="p">
+        <h4>Aligned or <em>opposed</em>.</h4>
+        <p>For every feature, name whether the user's long-term interest and your metric point the same direction. A streak that helps someone learn a language: aligned. Outrage that keeps them angry and scrolling: opposed. No feature is neutral.</p>
+      </div>
+      <div class="p">
+        <h4>Optimization is never <em>neutral</em>.</h4>
+        <p>If you maximize engagement, you are selecting for the circuits that fire most reliably — anger, anxiety, compulsion. You don't choose it; it emerges. Choosing to optimize for time-well-spent is itself the design decision.</p>
+      </div>
+      <div class="p">
+        <h4>The defense is the same <em>knowledge</em>.</h4>
+        <p>The best inoculation against manipulation is understanding the circuits being used on you. Turn this map on yourself: every product you can't put down is a case study in this dossier.</p>
+      </div>
+    </div>
+    <p class="close">Build for the human holding the screen <span>— or admit you're mining them.</span></p>
+  </div>
+</section>
+
+<!-- ========================================================== FOOTER -->
+<footer class="wrap">
+  <div class="row">
+    <div class="col">
+      <h5>Know the <em>circuit</em>.<br>Choose your <em>side</em>.</h5>
+    </div>
+    <div class="meta">
+      <b>Attention Architecture</b><br>
+      A field dossier on neurological exploits<br>
+      in social interface design<br>
+      <span style="color:var(--faint)">— for engineers, and the humans they build for.</span>
+    </div>
+  </div>
+  <div class="base">
+    <span>DOC · AA-2026.07 · FIELD VERIFIED</span>
+    <span class="blink">SIGNAL ACTIVE</span>
+  </div>
+</footer>
+
+<script>
+/* ---- progress + nav scroll state ---- */
+const progress = document.getElementById('progress');
+const nav = document.getElementById('nav');
+function onScroll(){
+  const h = document.documentElement;
+  const sc = h.scrollTop / (h.scrollHeight - h.clientHeight);
+  progress.style.width = (sc*100) + '%';
+  nav.classList.toggle('scrolled', h.scrollTop > 40);
+}
+addEventListener('scroll', onScroll, {passive:true}); onScroll();
+
+/* ---- reveal on intersect ---- */
+const io = new IntersectionObserver((es)=>{
+  es.forEach(e=>{ if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target);} });
+},{threshold:0.12});
+document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+
+/* ---- build circuit map nodes (mirrors hero constellation) ---- */
+const NODES = [
+  {x:300,y:120,id:'01',label:'Dopamine'},
+  {x:455,y:173,id:'02',label:'Novelty'},
+  {x:520,y:300,id:'03',label:'Social'},
+  {x:455,y:427,id:'04',label:'Loss'},
+  {x:300,y:480,id:'05',label:'Friction'},
+  {x:145,y:427,id:'06',label:'Zeigarnik'},
+  {x:80, y:300,id:'07',label:'Timing'},
+  {x:145,y:173,id:'08',label:'Investment'},
+];
+const cx=300, cy=300;
+const linesG = document.getElementById('mapLines');
+const adjG = document.getElementById('mapAdj');
+const nodesG = document.getElementById('mapNodes');
+const SVGNS = 'http://www.w3.org/2000/svg';
+
+// lines from center
+NODES.forEach(n=>{
+  const l = document.createElementNS(SVGNS,'line');
+  l.setAttribute('x1',cx); l.setAttribute('y1',cy);
+  l.setAttribute('x2',n.x); l.setAttribute('y2',n.y);
+  linesG.appendChild(l);
+});
+// adjacency ring
+const ring = document.createElementNS(SVGNS,'path');
+let d='';
+NODES.forEach((n,i)=>{ d += (i?' L':'M') + n.x + ',' + n.y; });
+d += ' Z';
+ring.setAttribute('d', d);
+adjG.appendChild(ring);
+// nodes
+NODES.forEach((n,i)=>{
+  const g = document.createElementNS(SVGNS,'g');
+  g.setAttribute('data-i', i);
+  const c = document.createElementNS(SVGNS,'circle');
+  c.setAttribute('cx',n.x); c.setAttribute('cy',n.y); c.setAttribute('r','6');
+  c.setAttribute('fill','#ece8e0'); c.setAttribute('stroke','none');
+  c.style.transition = 'all .45s cubic-bezier(.2,.8,.2,1)';
+  const halo = document.createElementNS(SVGNS,'circle');
+  halo.setAttribute('cx',n.x); halo.setAttribute('cy',n.y); halo.setAttribute('r','14');
+  halo.setAttribute('fill','none'); halo.setAttribute('stroke','#ff4434'); halo.setAttribute('stroke-opacity','0');
+  halo.style.transition = 'all .45s ease';
+  const t = document.createElementNS(SVGNS,'text');
+  const off = labelOffset(n);
+  t.setAttribute('x', n.x+off.x); t.setAttribute('y', n.y+off.y);
+  t.setAttribute('text-anchor', off.a);
+  t.setAttribute('font-family','JetBrains Mono'); t.setAttribute('font-size','9');
+  t.setAttribute('letter-spacing','1'); t.setAttribute('fill','#6c6a64');
+  t.textContent = n.id;
+  g.appendChild(halo); g.appendChild(c); g.appendChild(t);
+  nodesG.appendChild(g);
+  n._c = c; n._halo = halo; n._t = t;
+});
+function labelOffset(n){
+  const dx=n.x-cx, dy=n.y-cy;
+  if (Math.abs(dy) >= Math.abs(dx)) return {x:0, y: dy>0?20:-16, a:'middle'};
+  return {x: dx>0?14:-14, y:4, a: dx>0?'start':'end'};
+}
+
+/* ---- light up the active module's node ---- */
+const cards = document.querySelectorAll('.module');
+const cardIO = new IntersectionObserver((es)=>{
+  es.forEach(e=>{
+    if(e.isIntersecting && e.intersectionRatio>0.42){
+      const i = +e.target.dataset.node;
+      cards.forEach(c=>c.classList.remove('active'));
+      e.target.classList.add('active');
+      NODES.forEach((n,j)=>{
+        const on = j===i;
+        n._c.setAttribute('fill', on?'#ff4434':'#ece8e0');
+        n._c.setAttribute('r', on?'8':'6');
+        n._halo.setAttribute('stroke-opacity', on?'0.55':'0');
+        n._halo.setAttribute('r', on?'18':'14');
+        n._t.setAttribute('fill', on?'#ece8e0':'#6c6a64');
+      });
+    }
+  });
+},{threshold:[0,0.42,0.6,1], rootMargin:'-30% 0px -45% 0px'});
+cards.forEach(c=>cardIO.observe(c));
+</script>
+</body>
+</html>

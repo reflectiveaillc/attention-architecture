@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Slow Scroll — Tilt</title>
+<!--
+  LOOP / attention-architecture — Slow Scroll
+  Circuits: 05-ease, 06-zeigarnik, 07-timing
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA, sets window.__demoDone
+    ?bot=1&runs=N    imperfect autopilot, N runs, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'slow-scroll';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // ---- mulberry32 seeded RNG ----
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL2 = 'rgba(46,197,182,0.18)';
+
+  // ---- the story ----
+  // 9 lines + resolution. The last line ends the story. Bot loses at timeout.
+  var STORY = [
+    "She left the note on the counter",
+    "beside the coffee that was still warm.",
+    "He read it three times",
+    "before he understood it wasn't goodbye.",
+    "It was an address —",
+    "the old place by the water",
+    "where they used to sit until dark,",
+    "saying nothing,",
+    "which was everything.",
+    "He grabbed his keys."
+  ];
+  var TOTAL_LINES = STORY.length; // 10
+
+  // ---- state ----
+  var phase = 'title'; // title | play | resolve | cta
+  var lineIdx = 0;
+  var runStartTs = 0;
+  var overAt = 0;
+  var ctaAt  = 0;
+  var botRunsDone = 0;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+
+  // visual: each line fades in and settles
+  var lines = []; // {txt, alpha, y, targetY}
+  var scrollY = 0; // how far we've scrolled the "paper"
+
+  // ---- input zones ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var TAP_R   = { x: W / 2 - 120, y: H - 110, w: 240, h: 56 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- line management ----
+  var LINE_SPACING = 56;
+  var LINE_START_Y = 340; // where first line sits in "paper" coords
+  // In screen coords, lines drift upward as you advance
+
+  function advanceLine() {
+    if (lineIdx >= TOTAL_LINES) return; // already done
+
+    var lineText = STORY[lineIdx];
+    var screenY  = LINE_START_Y + lineIdx * LINE_SPACING - scrollY;
+
+    lines.push({
+      txt:     lineText,
+      alpha:   0,
+      y:       screenY + 18, // starts slightly below final position
+      targetY: screenY,
+      idx:     lineIdx,
+      step:    lineIdx
+    });
+
+    // sound: calm bell per step
+    if (window.J) J.calm(lineIdx);
+
+    // mild zoom-pulse on every new line
+    zoom = 1.012;
+
+    lineIdx++;
+
+    // scroll so new lines stay readable (push older lines up)
+    if (lineIdx > 5) {
+      scrollY += LINE_SPACING;
+    }
+
+    // emit event
+    if (window.LOOP) LOOP.emit('line_revealed', { n: lineIdx, total: TOTAL_LINES });
+
+    if (lineIdx >= TOTAL_LINES) {
+      // story complete — resolve
+      hitStop = 60; // ~1s freeze on the final beat
+      zoom = 1.025;
+      if (window.J) J.calm(lineIdx);
+      setTimeout(function () {
+        var dur = (Date.now() - runStartTs) / 1000;
+        if (window.LOOP) LOOP.emit('game_over', { score: TOTAL_LINES, dur_s: +dur.toFixed(1) });
+        window.__demoScore = TOTAL_LINES;
+        phase = 'resolve';
+        overAt = performance.now();
+        if (DEMO) {
+          setTimeout(function () {
+            phase = 'cta';
+            ctaAt = performance.now();
+            setTimeout(function () { window.__demoDone = true; }, 3600);
+          }, 2800);
+        }
+        if (BOT) {
+          botRunsDone++;
+          if (botRunsDone >= BOT_RUNS) {
+            window.__botDone = true;
+          } else {
+            setTimeout(function () { resetRun(); }, 800);
+          }
+        }
+      }, 1100);
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    lineIdx = 0;
+    lines = [];
+    scrollY = 0;
+    runStartTs = Date.now();
+    hitStop = 0; shakeAmt = 0; zoom = 1; flashes = [];
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    // reveal first line immediately on start
+    advanceLine();
+  }
+
+  function resetRun() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+    // re-arm bot for the new run
+    if (BOT) {
+      setTimeout(function () { botAdvance(); }, 300);
+    }
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 28, t: 0 });
+  }
+
+  // ---- tap handling ----
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') {
+      advanceLine();
+      return;
+    }
+    if (phase === 'resolve' && performance.now() - overAt > 400) {
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.code === 'ArrowDown' || e.code === 'Enter') tap();
+  });
+
+  // ---- autopilots ----
+  // Demo: scripted timing — calm hesitation before each tap, ~16s total arc
+  // Waits in ms between each advance
+  var demoWaits = [700, 950, 800, 1050, 850, 700, 1000, 850, 750, 700];
+  var demoScheduled = false;
+
+  function scheduleDemoNext(idx) {
+    if (idx >= TOTAL_LINES) return;
+    var wait = demoWaits[Math.min(idx, demoWaits.length - 1)] || 1200;
+    // add slight variance for humanity
+    wait += (rng() - 0.5) * 200;
+    setTimeout(function () {
+      if (phase !== 'play') return;
+      advanceLine();
+      scheduleDemoNext(idx + 1);
+    }, wait);
+  }
+
+  // Bot: faster taps, N runs, eventually completes
+  var botStepTimer = null;
+  function botAdvance() {
+    if (phase !== 'play') return;
+    advanceLine();
+    if (lineIdx < TOTAL_LINES) {
+      var wait = 600 + rng() * 400;
+      botStepTimer = setTimeout(botAdvance, wait);
+    }
+    // when lineIdx reaches TOTAL_LINES, advanceLine() sets timeout to reach game_over
+  }
+
+  // ---- render helpers ----
+  function wrapText(text, maxW, fontSize) {
+    cx.font = '400 ' + fontSize + 'px -apple-system, Helvetica, Arial';
+    var words = text.split(' ');
+    var lines = [], cur = '';
+    for (var i = 0; i < words.length; i++) {
+      var test = cur ? cur + ' ' + words[i] : words[i];
+      if (cx.measureText(test).width > maxW && cur) {
+        lines.push(cur);
+        cur = words[i];
+      } else {
+        cur = test;
+      }
+    }
+    if (cur) lines.push(cur);
+    return lines;
+  }
+
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // decay hit-stop, then call autopilots
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      // autopilots (only in scripted modes — never touches human flow)
+      if (DEMO && phase === 'play' && !demoScheduled) {
+        demoScheduled = true;
+        scheduleDemoNext(lineIdx); // already at 1 after startRun
+      }
+    }
+
+    // decay juice
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // animate line entries
+    for (var i = 0; i < lines.length; i++) {
+      var ln = lines[i];
+      ln.alpha = Math.min(1, ln.alpha + 0.045 * dt);
+      ln.y += (ln.targetY - ln.y) * 0.10 * dt;
+    }
+
+    // ---- draw ----
+    cx.save();
+    // juice shake/zoom
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-10, -10, W + 20, H + 20);
+    // soft gradient wash
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- title ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '700 36px -apple-system, Helvetica, Arial';
+      cx.fillText('Slow Scroll', W / 2, 280);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '400 16px -apple-system, Helvetica, Arial';
+      cx.fillText('read to the end', W / 2, 320);
+      var pulse = 0.55 + 0.35 * Math.sin(now / 700);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to begin', W / 2, 380);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- play / resolve ----
+    if (phase === 'play' || phase === 'resolve') {
+      var FONT_SIZE = 20;
+      var LINE_H    = 30;
+      var MAX_W     = W - 80;
+      var BASE_X    = 40;
+
+      // draw each revealed line
+      for (var j = 0; j < lines.length; j++) {
+        var l = lines[j];
+        // recalculate targetY based on current scroll
+        l.targetY = LINE_START_Y + l.idx * LINE_SPACING - scrollY;
+        if (l.targetY < -60 || l.targetY > H + 60) continue;
+
+        cx.globalAlpha = l.alpha * (phase === 'resolve' ? 0.55 : 1);
+        cx.textAlign = 'left';
+        cx.fillStyle = '#fff';
+
+        var wrapped = wrapText(l.txt, MAX_W, FONT_SIZE);
+        for (var k = 0; k < wrapped.length; k++) {
+          cx.fillText(wrapped[k], BASE_X, l.y + k * LINE_H);
+        }
+        cx.globalAlpha = 1;
+      }
+
+      // progress dots at bottom
+      if (phase === 'play') {
+        var dotR = 4, dotSpacing = 14, dotsW = (TOTAL_LINES - 1) * dotSpacing;
+        var dotX0 = W / 2 - dotsW / 2;
+        for (var d = 0; d < TOTAL_LINES; d++) {
+          cx.beginPath();
+          cx.arc(dotX0 + d * dotSpacing, H - 64, dotR, 0, Math.PI * 2);
+          cx.fillStyle = d < lineIdx ? TEAL : 'rgba(255,255,255,0.18)';
+          cx.fill();
+        }
+        // tap cue — soft pulse
+        if (lineIdx < TOTAL_LINES) {
+          var p2 = 0.4 + 0.3 * Math.sin(now / 900);
+          cx.globalAlpha = p2;
+          cx.textAlign = 'center';
+          cx.fillStyle = TEAL;
+          cx.font = '500 13px -apple-system, Helvetica, Arial';
+          cx.fillText('tap to continue', W / 2, H - 40);
+          cx.globalAlpha = 1;
+        }
+      }
+
+      // resolve overlay
+      if (phase === 'resolve') {
+        var elapsed = (performance.now() - overAt) / 1000;
+        var overlayA = Math.min(0.7, elapsed * 0.5);
+        cx.fillStyle = 'rgba(11,13,18,' + overlayA + ')';
+        cx.fillRect(0, 0, W, H);
+
+        var cardA = Math.min(1, (elapsed - 0.3) * 1.5);
+        if (cardA > 0) {
+          cx.globalAlpha = cardA;
+          cx.textAlign = 'center';
+          cx.fillStyle = 'rgba(255,255,255,0.9)';
+          cx.font = '300 22px -apple-system, Helvetica, Arial';
+          cx.fillText('you made it to the end.', W / 2, H / 2 - 20);
+          cx.fillStyle = TEAL;
+          cx.font = '500 14px -apple-system, Helvetica, Arial';
+          cx.fillText('tap to read again', W / 2, H / 2 + 24);
+          cx.globalAlpha = 1;
+        }
+      }
+    }
+
+    // ---- flashes ----
+    for (var fi = flashes.length - 1; fi >= 0; fi--) {
+      var fl = flashes[fi]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 36);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + fl.size + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(fi, 1);
+    }
+
+    // ---- demo CTA card ----
+    if (phase === 'cta') {
+      var ct = (now - ctaAt) / 1000;
+      var ease = Math.min(1, ct * 2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.88 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '700 38px -apple-system, Helvetica, Arial';
+      cx.fillText('Slow Scroll', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '400 17px -apple-system, Helvetica, Arial';
+      cx.fillText('reach the last line.', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 600);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL;
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 406);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- boot ----
+  if (DEMO) {
+    phase = 'title';
+    // tiny delay then auto-start
+    setTimeout(function () {
+      startRun();
+    }, 600);
+  } else if (BOT) {
+    startRun();
+    // bot taps through the story
+    setTimeout(function () { botAdvance(); }, 300);
+  }
+  // human: stays on title until tap
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

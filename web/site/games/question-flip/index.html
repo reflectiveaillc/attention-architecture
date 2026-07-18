@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Question Flip — Tilt</title>
+<!--
+  LOOP / attention-architecture — Question Flip
+  Circuits: 01-rpe (variable reward), 06-zeigarnik (one more try), 04-loss (flip budget shrinks)
+  Mechanic: tap cards to flip; one hides the answer to the riddle; find it before flips run out.
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip → window.__demoDone
+    ?bot=1&runs=N    imperfect autoplay → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'question-flip';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // riddle bank — question + answer + 5 decoy answers
+  var RIDDLES = [
+    { q: 'I speak without a mouth and hear\nwithout ears. What am I?', a: 'ECHO',
+      decoys: ['WIND', 'SHADOW', 'WATER', 'MIRROR'] },
+    { q: 'The more you take,\nthe more you leave behind. What am I?', a: 'FOOTSTEPS',
+      decoys: ['MEMORIES', 'TIME', 'LIGHT', 'WORDS'] },
+    { q: 'I have cities but no houses,\nmountains but no trees. What am I?', a: 'MAP',
+      decoys: ['DREAM', 'CLOUD', 'PAINTING', 'MIRROR'] },
+    { q: 'What has hands but\ncannot clap?', a: 'CLOCK',
+      decoys: ['GLOVE', 'STATUE', 'TREE', 'BOOK'] },
+    { q: 'I\'m always in front of you\nbut can\'t be seen. What am I?', a: 'FUTURE',
+      decoys: ['AIR', 'GLASS', 'THOUGHT', 'WIND'] },
+    { q: 'What runs but\nnever walks?', a: 'RIVER',
+      decoys: ['TIME', 'FIRE', 'SHADOW', 'THOUGHT'] },
+    { q: 'I get wetter the more\nI dry. What am I?', a: 'TOWEL',
+      decoys: ['SPONGE', 'CLOUD', 'SOAP', 'PAPER'] },
+    { q: 'What can you catch\nbut never throw?', a: 'COLD',
+      decoys: ['LIGHT', 'SLEEP', 'DREAM', 'BREATH'] }
+  ];
+
+  // card layout: 3×2 grid
+  var COLS = 3, ROWS = 2, CARD_W = 110, CARD_H = 80;
+  var GRID_X = (W - COLS * (CARD_W + 12) + 12) / 2;
+  var GRID_Y = 340;
+
+  // juice state
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+
+  // game state
+  var state, runStartTs, dareBeaten = false;
+  var botRunsDone = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('qf_best') || 0; } catch (_) {}
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 5))));
+  }
+
+  function buildCards(riddle) {
+    // 6 cards: 1 correct + 5 decoys, shuffled
+    var pool = [riddle.a].concat(riddle.decoys);
+    // Fisher-Yates with seeded rng
+    for (var i = pool.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+    }
+    var cards = [];
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        var idx = r * COLS + c;
+        var cx2 = GRID_X + c * (CARD_W + 12);
+        var cy2 = GRID_Y + r * (CARD_H + 14);
+        cards.push({
+          x: cx2, y: cy2, w: CARD_W, h: CARD_H,
+          text: pool[idx],
+          isAnswer: pool[idx] === riddle.a,
+          flipped: false,
+          flipAnim: 0,   // 0..1 for flip animation progress
+          flipping: false,
+          revealed: false,
+          locked: false,
+          glowPulse: 0
+        });
+      }
+    }
+    return cards;
+  }
+
+  function newRiddle() {
+    var idx = Math.floor(rng() * RIDDLES.length);
+    return RIDDLES[idx];
+  }
+
+  function newGame() {
+    var riddle = newRiddle();
+    state = {
+      phase: 'title',   // title | challenge | play | over | cta
+      riddle: riddle,
+      cards: buildCards(riddle),
+      flipsLeft: 5,
+      maxFlips: 5,
+      score: 0,         // rounds won
+      round: 1,
+      overAt: 0,
+      won: false,
+      ctaAt: 0
+    };
+    dareBeaten = false;
+    flashes = [];
+    shakeAmt = 0; zoom = 1; hitStop = 0;
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) {
+      state.phase = 'play';
+      startRun();
+    }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED, round: state.round });
+  }
+
+  function flipCard(cardIdx) {
+    var card = state.cards[cardIdx];
+    if (card.flipped || card.flipping || card.locked) return;
+    if (state.flipsLeft <= 0) return;
+
+    state.flipsLeft--;
+    card.flipping = true;
+    card.flipAnim = 0;
+
+    // after flip animation completes (~300ms), reveal
+    var startTime = performance.now();
+    card._flipStart = startTime;
+
+    if (window.J) J.hit(state.score + 1);
+
+    if (card.isAnswer) {
+      // won this round!
+      card._onReveal = function () {
+        hitStop = 6;
+        zoom = 1.04;
+        shakeAmt = 3;
+        state.won = true;
+        state.score++;
+        var newBest = state.score > best;
+        if (window.J) {
+          J.perfect(state.score);
+          if (newBest) setTimeout(function () { J.fanfare(); }, 300);
+        }
+        if (newBest) { best = state.score; try { localStorage.setItem('qf_best', String(best)); } catch (_) {} }
+        flash('FOUND IT!', GOLD, 48);
+        if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+          dareBeaten = true;
+          flash('DARE BEATEN', TEAL, 40);
+          if (window.J) J.fanfare();
+          SHARE.beaten(state.score);
+        }
+        if (window.LOOP) LOOP.emit('answer_found', { score: state.score, flips_used: state.maxFlips - state.flipsLeft });
+        // next round or game over
+        setTimeout(function () { advanceRound(); }, 1500);
+      };
+    } else {
+      // wrong card
+      card._onReveal = function () {
+        shakeAmt = 4;
+        if (window.J) J.near();
+        flash('NOPE', VERM, 36);
+        if (window.LOOP) LOOP.emit('wrong_flip', { flips_left: state.flipsLeft });
+        if (state.flipsLeft === 0) {
+          // reveal tension then game over
+          if (window.J) J.tension(1);
+          setTimeout(function () { revealAnswer(); }, 400);
+          setTimeout(function () { triggerGameOver(false); }, 1400);
+        } else {
+          // rising tension
+          if (window.J) J.tension(1 - state.flipsLeft / state.maxFlips);
+        }
+      };
+    }
+  }
+
+  function revealAnswer() {
+    // show where the answer was (all non-answer cards lock, answer card glows)
+    for (var i = 0; i < state.cards.length; i++) {
+      var c = state.cards[i];
+      if (c.isAnswer && !c.revealed) {
+        c.flipping = true;
+        c._flipStart = performance.now();
+        c._onReveal = null;
+        c.locked = false;
+      }
+    }
+  }
+
+  function advanceRound() {
+    state.round++;
+    state.maxFlips = Math.max(3, 5 - Math.floor((state.round - 1) / 2));
+    state.flipsLeft = state.maxFlips;
+    var riddle = newRiddle();
+    state.riddle = riddle;
+    state.cards = buildCards(riddle);
+    state.won = false;
+    if (DEMO && state.round > demoScript.length) {
+      triggerGameOver(false);
+    }
+  }
+
+  function triggerGameOver(won) {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    state.won = won || false;
+    shakeAmt = won ? 3 : 9;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) {
+      J.death(Math.min(0.3 + (state.maxFlips - state.flipsLeft) / state.maxFlips, 1));
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { restartRun(); }, 900);
+      }
+    }
+  }
+
+  function restartRun() {
+    var riddle = newRiddle();
+    state = {
+      phase: 'play',
+      riddle: riddle,
+      cards: buildCards(riddle),
+      flipsLeft: 5,
+      maxFlips: 5,
+      score: 0,
+      round: 1,
+      overAt: 0,
+      won: false,
+      ctaAt: 0
+    };
+    dareBeaten = false;
+    flashes = [];
+    shakeAmt = 0; zoom = 1; hitStop = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED, round: 1 });
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { state.phase = 'play'; startRun(); return; }
+    if (state.phase === 'play') {
+      // hit test cards
+      for (var i = 0; i < state.cards.length; i++) {
+        var card = state.cards[i];
+        if (x >= card.x && x <= card.x + card.w && y >= card.y && y <= card.y + card.h) {
+          flipCard(i);
+          return;
+        }
+      }
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'flips' }); return;
+      }
+      restartRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  // Demo script: each entry says what to do for that round
+  // 'correct' = tap the answer card, 'wrong1'/'wrong2' = tap wrong cards first then correct
+  var demoScript = [
+    { flips: ['wrong', 'wrong', 'correct'] },  // round 1: tense, 2 wrongs then find it
+    { flips: ['wrong', 'correct'] },             // round 2: near-fail energy, 1 wrong
+    { flips: ['wrong', 'wrong', 'wrong', 'wrong', 'fail'] } // round 3: run out of flips → game over
+  ];
+  var demoRound = 0, demoFlipIdx = 0, demoWait = 80, demoPhase = 'waiting';
+
+  var botActionWait = 0;
+  var botCorrectIdx = -1;
+
+  function findAnswerCard() {
+    for (var i = 0; i < state.cards.length; i++) {
+      if (state.cards[i].isAnswer && !state.cards[i].flipped && !state.cards[i].flipping) return i;
+    }
+    return -1;
+  }
+  function findUnflippedCard() {
+    for (var i = 0; i < state.cards.length; i++) {
+      if (!state.cards[i].isAnswer && !state.cards[i].flipped && !state.cards[i].flipping && !state.cards[i].locked) return i;
+    }
+    return -1;
+  }
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      if (demoRound >= demoScript.length) return;
+      var script = demoScript[demoRound];
+      if (!script) return;
+
+      // check if we need to advance to next script round
+      if (state.round > demoRound + 1) {
+        demoRound = state.round - 1;
+        demoFlipIdx = 0;
+        demoWait = 60;
+        return;
+      }
+
+      if (demoFlipIdx >= script.flips.length) {
+        demoWait = 30;
+        return;
+      }
+
+      var action = script.flips[demoFlipIdx];
+      if (action === 'fail') {
+        // run out of flips — tap wrong cards until no flips
+        var wrongIdx = findUnflippedCard();
+        if (wrongIdx >= 0 && state.flipsLeft > 0) {
+          flipCard(wrongIdx);
+          demoFlipIdx++;
+          demoWait = 55 + Math.floor(rng() * 30);
+        }
+        return;
+      }
+      if (action === 'correct') {
+        var aIdx = findAnswerCard();
+        if (aIdx >= 0) {
+          flipCard(aIdx);
+          demoFlipIdx++;
+          demoWait = 80;
+        }
+        return;
+      }
+      if (action === 'wrong') {
+        var wIdx = findUnflippedCard();
+        if (wIdx >= 0) {
+          flipCard(wIdx);
+          demoFlipIdx++;
+          demoWait = 50 + Math.floor(rng() * 40);
+        }
+        return;
+      }
+    }
+
+    if (BOT) {
+      if (botActionWait > 0) { botActionWait--; return; }
+      if (state.flipsLeft <= 0) return;
+
+      // bot: 60% chance to find correct card, else random wrong; eventually runs out or wins
+      var roll = rng();
+      if (roll < 0.5) {
+        var ai = findAnswerCard();
+        if (ai >= 0) { flipCard(ai); botActionWait = 40 + Math.floor(rng() * 40); return; }
+      }
+      var wi = findUnflippedCard();
+      if (wi >= 0) { flipCard(wi); botActionWait = 35 + Math.floor(rng() * 50); return; }
+      // all non-answer cards flipped, must flip answer
+      var ai2 = findAnswerCard();
+      if (ai2 >= 0) { flipCard(ai2); botActionWait = 40; }
+    }
+  }
+
+  // ---- render helpers ----
+  function drawRoundedRect(x, y, w, h, r) {
+    cx.beginPath();
+    if (cx.roundRect) { cx.roundRect(x, y, w, h, r); }
+    else {
+      cx.moveTo(x + r, y);
+      cx.lineTo(x + w - r, y);
+      cx.quadraticCurveTo(x + w, y, x + w, y + r);
+      cx.lineTo(x + w, y + h - r);
+      cx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      cx.lineTo(x + r, y + h);
+      cx.quadraticCurveTo(x, y + h, x, y + h - r);
+      cx.lineTo(x, y + r);
+      cx.quadraticCurveTo(x, y, x + r, y);
+      cx.closePath();
+    }
+  }
+
+  function drawCard(card, now) {
+    // handle flip animation
+    var flipP = 0;
+    if (card.flipping) {
+      var elapsed = (now - card._flipStart) / 300;
+      flipP = Math.min(1, elapsed);
+      if (flipP >= 1) {
+        card.flipping = false;
+        card.flipped = true;
+        card.revealed = true;
+        if (card._onReveal) { card._onReveal(); card._onReveal = null; }
+      }
+    } else if (card.revealed) {
+      flipP = 1;
+    }
+
+    var cx2 = card.x + card.w / 2;
+    var cy2 = card.y + card.h / 2;
+
+    cx.save();
+    cx.translate(cx2, cy2);
+
+    // flip: scale x from 1 → 0 → 1 (first half face-down, second half face-up)
+    var scaleX = 1;
+    if (flipP < 0.5) {
+      scaleX = 1 - flipP * 2;
+    } else {
+      scaleX = (flipP - 0.5) * 2;
+    }
+    scaleX = Math.max(0.01, scaleX);
+    cx.scale(scaleX, 1);
+
+    if (flipP < 0.5) {
+      // face down: teal back
+      drawRoundedRect(-card.w / 2, -card.h / 2, card.w, card.h, 10);
+      cx.fillStyle = card.locked ? '#222' : '#1a2a2e';
+      cx.fill();
+      // decorative back pattern
+      cx.strokeStyle = 'rgba(46,197,182,0.25)';
+      cx.lineWidth = 1;
+      cx.stroke();
+      // question mark
+      cx.fillStyle = 'rgba(46,197,182,0.5)';
+      cx.font = '700 28px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.textBaseline = 'middle';
+      cx.fillText('?', 0, 0);
+    } else {
+      // face up: show text
+      var bgColor = card.isAnswer ? 'rgba(242,177,52,0.18)' : 'rgba(255,255,255,0.06)';
+      drawRoundedRect(-card.w / 2, -card.h / 2, card.w, card.h, 10);
+      cx.fillStyle = bgColor;
+      cx.fill();
+      if (card.isAnswer) {
+        cx.strokeStyle = GOLD;
+        cx.lineWidth = 2;
+      } else {
+        cx.strokeStyle = 'rgba(255,255,255,0.15)';
+        cx.lineWidth = 1;
+      }
+      cx.stroke();
+      cx.fillStyle = card.isAnswer ? GOLD : 'rgba(255,255,255,0.75)';
+      cx.font = (card.isAnswer ? '800' : '600') + ' 13px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.textBaseline = 'middle';
+      cx.fillText(card.text, 0, 0);
+    }
+
+    cx.restore();
+    cx.textBaseline = 'alphabetic';
+  }
+
+  function drawFlipBar(flipsLeft, maxFlips, y) {
+    var barW = 200, barH = 8;
+    var bx = W / 2 - barW / 2;
+    cx.fillStyle = 'rgba(255,255,255,0.1)';
+    drawRoundedRect(bx, y, barW, barH, 4);
+    cx.fill();
+    var fill = flipsLeft / maxFlips;
+    var fillColor = fill > 0.5 ? TEAL : fill > 0.25 ? GOLD : VERM;
+    cx.fillStyle = fillColor;
+    drawRoundedRect(bx, y, barW * fill, barH, 4);
+    cx.fill();
+  }
+
+  // ---- main render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // advance flip animations + autopilot
+    if (hitStop > 0) { hitStop -= dt; }
+    else { autopilot(); }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // === TITLE ===
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('QUESTION FLIP', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '500 15px -apple-system, Helvetica, Arial';
+      cx.fillText('find the answer before flips run out', W / 2, 296);
+      cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillText('TAP TO START', W / 2, 360);
+      cx.globalAlpha = 1;
+    }
+
+    // === CHALLENGE CARD (demo beat 1) ===
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 14px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 296);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('4', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("rounds survived", W / 2, 430);
+    }
+
+    // === PLAY ===
+    if (state.phase === 'play') {
+      // riddle text
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '600 17px -apple-system, Helvetica, Arial';
+      var lines = state.riddle.q.split('\n');
+      for (var li = 0; li < lines.length; li++) {
+        cx.fillText(lines[li], W / 2, 100 + li * 24);
+      }
+
+      // round + score
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('ROUND ' + state.round + '  •  SCORE ' + state.score, W / 2, 155);
+
+      // flips label
+      cx.fillStyle = state.flipsLeft <= 1 ? VERM : 'rgba(255,255,255,0.55)';
+      cx.font = '700 13px -apple-system, Helvetica, Arial';
+      cx.fillText(state.flipsLeft + ' flip' + (state.flipsLeft !== 1 ? 's' : '') + ' left', W / 2, 310);
+      drawFlipBar(state.flipsLeft, state.maxFlips, 318);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 13px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 175);
+      }
+
+      // draw cards
+      for (var i = 0; i < state.cards.length; i++) {
+        drawCard(state.cards[i], now);
+      }
+
+      // instruction
+      if (!DEMO && !BOT) {
+        cx.fillStyle = 'rgba(255,255,255,0.25)';
+        cx.font = '500 12px -apple-system, Helvetica, Arial';
+        cx.fillText('tap to reveal', W / 2, 500);
+      }
+    }
+
+    // === GAME OVER ===
+    if (state.phase === 'over') {
+      // dim overlay
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+
+      cx.fillStyle = VERM;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('OUT OF FLIPS.', W / 2, 285);
+
+      cx.fillStyle = '#fff';
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' round' + (state.score !== 1 ? 's' : '') + ' survived', W / 2, 330);
+
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 372);
+
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('smarter than ' + (100 - pt) + '% of players', W / 2, 394);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 440);
+        cx.globalAlpha = 1;
+
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        drawRoundedRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+
+      // best
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 460 + ((!DEMO && !BOT) ? 50 : 0));
+    }
+
+    // === CTA (demo) ===
+    if (state.phase === 'cta') {
+      var t = (now - state.ctaAt) / 1000;
+      var ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('QUESTION FLIP', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.65)';
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('they got ' + (window.__demoScore || 4) + ' rounds. can you beat it?', W / 2, 330);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM;
+      cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 4), W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // === FLOATING FLASHES ===
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 240 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // === MUTE TOGGLE (human only) ===
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Color Taxonomy — Tilt</title>
+<!--
+  LOOP / attention-architecture — Color Taxonomy
+  Circuits: 01-rpe (variable reward per placement), 05-ease (calm flow),
+            06-zeigarnik (24 swatches, one clean wheel)
+  Modes (query params):
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'color-taxonomy';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- Color wheel constants ----
+  var NUM_SLOTS = 24;
+  var CX = W / 2, CY = 370;
+  var WHEEL_R = 128;      // radius to slot centre
+  var SLOT_R  = 18;       // radius of each slot circle
+  var SWATCH_R = 18;      // draggable swatch circle radius
+  var TRAY_Y  = 590;      // vertical center of the swatch tray
+  var TRAY_COLS = 6;
+  var TRAY_ROWS = 4;
+  var TRAY_GAP_X = 54;
+  var TRAY_GAP_Y = 48;
+
+  // Build 24 hues evenly spaced on the wheel (correct taxonomy order)
+  // hueOf(slot i) = i * 15  degrees
+  function hueOf(slot) { return (slot * 360 / NUM_SLOTS + 360) % 360; }
+  function slotAngle(slot) { return (slot * 2 * Math.PI / NUM_SLOTS) - Math.PI / 2; }
+  function slotPos(slot) {
+    var a = slotAngle(slot);
+    return { x: CX + WHEEL_R * Math.cos(a), y: CY + WHEEL_R * Math.sin(a) };
+  }
+
+  // ---- State ----
+  var slots;           // array[24]: null | hue placed
+  var swatches;        // array of { hue, slotIdx, placed, trayX, trayY }
+  var score, perfect, runStartTs;
+  var phase;           // 'play' | 'over' | 'cta'
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  var ctaAt = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('ct_best') || 0; } catch(_) {}
+
+  // drag state
+  var drag = null; // { swatchIdx, ox, oy, cx, cy }
+  var pointerPos = null; // last pointer pos
+
+  // bot/demo autopilot
+  var botRunsDone = 0;
+  var demoStep = 0;
+  var demoTimer = 0;
+  var demoPaused = false;
+  var demoPlacedCount = 0;
+
+  // Demo script: list of swatch indices in placement order with hesitation frames
+  // We'll compute these lazily in the autopilot
+  var demoQueue = [];
+  var demoQueueIdx = 0;
+  var demoHesitate = 0;
+
+  // Bot
+  var botQueue = [];
+  var botQueueIdx = 0;
+  var botHesitate = 0;
+  var botPlacing = false;
+  var botTargetSlot = -1;
+  var botAnimT = 0;
+  var botAnimDur = 0;
+  var botSwatchIdx = -1;
+  var botFromX = 0, botFromY = 0;
+  var botToX = 0, botToY = 0;
+  var botMissed = 0; // how many intentional misses (bot loses eventually)
+
+  function newGame() {
+    rng = mulberry32(SEED);
+    slots = new Array(NUM_SLOTS).fill(null);
+    score = 0; perfect = 0;
+    phase = 'play';
+    hitStop = 0; shakeAmt = 0; zoom = 1; flashes = [];
+    drag = null;
+    demoQueue = []; demoQueueIdx = 0; demoHesitate = 0;
+    demoPlacedCount = 0;
+    botQueue = []; botQueueIdx = 0; botHesitate = 0;
+    botPlacing = false; botTargetSlot = -1; botSwatchIdx = -1; botMissed = 0;
+
+    // Build shuffled swatch list
+    // Each swatch has a correct slot (its hueOf(slot) index)
+    swatches = [];
+    var order = [];
+    for (var i = 0; i < NUM_SLOTS; i++) order.push(i);
+    // Fisher-Yates shuffle
+    for (var j = order.length - 1; j > 0; j--) {
+      var k = Math.floor(rng() * (j + 1));
+      var tmp = order[j]; order[j] = order[k]; order[k] = tmp;
+    }
+    for (var s = 0; s < NUM_SLOTS; s++) {
+      var tCol = s % TRAY_COLS;
+      var tRow = Math.floor(s / TRAY_COLS);
+      var tx = (W - (TRAY_COLS - 1) * TRAY_GAP_X) / 2 + tCol * TRAY_GAP_X;
+      var ty = TRAY_Y - ((TRAY_ROWS - 1) * TRAY_GAP_Y) / 2 + tRow * TRAY_GAP_Y;
+      swatches.push({
+        slotIdx: order[s],     // correct slot
+        hue: hueOf(order[s]),  // color
+        placed: false,
+        trayX: tx,
+        trayY: ty,
+        curX: tx,
+        curY: ty
+      });
+    }
+
+    // Build demo queue (first 20 swatches placed mostly correctly, then 4 near-misses to make it interesting)
+    demoQueue = buildDemoQueue();
+    demoQueueIdx = 0;
+    demoHesitate = 40; // initial pause before first move
+
+    // Build bot queue
+    botQueue = buildBotQueue();
+    botQueueIdx = 0;
+    botHesitate = 20;
+
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function buildDemoQueue() {
+    // Demo: place swatches one at a time with varying hesitation
+    // First 20: correct placement; last 4: one slot off (near-perfection itch), then correct
+    var q = [];
+    for (var i = 0; i < NUM_SLOTS; i++) {
+      var hesitate = 28 + Math.floor(rng() * 20); // 28-47 frames
+      var miss = 0;
+      if (i >= 18 && i < 22) {
+        // near-miss: try adjacent slot first, then correct
+        miss = (rng() > 0.5) ? 1 : -1;
+      }
+      q.push({ swatchIdx: i, hesitate: hesitate, miss: miss });
+    }
+    return q;
+  }
+
+  function buildBotQueue() {
+    // Bot: mostly correct but makes some errors — ensures game_over via wrong placements
+    // After placing first 20 correctly, intentionally places rest in wrong slots → triggering game_over
+    var q = [];
+    for (var i = 0; i < NUM_SLOTS; i++) {
+      var hesitate = 15 + Math.floor(rng() * 15);
+      // Bot makes errors on last 4 swatches
+      var wrongSlot = (i >= 20) ? ((swatches[i].slotIdx + 3) % NUM_SLOTS) : -1;
+      q.push({ swatchIdx: i, hesitate: hesitate, wrongSlot: wrongSlot });
+    }
+    return q;
+  }
+
+  // ---- Placement logic ----
+  function tryPlace(swatchIdx, targetX, targetY) {
+    var sw = swatches[swatchIdx];
+    if (sw.placed) return false;
+
+    // Find nearest open slot
+    var bestSlot = -1, bestDist = Infinity;
+    for (var i = 0; i < NUM_SLOTS; i++) {
+      if (slots[i] !== null) continue;
+      var p = slotPos(i);
+      var d = Math.hypot(targetX - p.x, targetY - p.y);
+      if (d < bestDist) { bestDist = d; bestSlot = i; }
+    }
+
+    if (bestSlot === -1 || bestDist > SLOT_R * 2.2) {
+      // Snap back to tray
+      sw.curX = sw.trayX;
+      sw.curY = sw.trayY;
+      return false;
+    }
+
+    // Check correctness
+    var isCorrect = (bestSlot === sw.slotIdx);
+    var sp = slotPos(bestSlot);
+
+    sw.placed = true;
+    sw.curX = sp.x;
+    sw.curY = sp.y;
+    slots[bestSlot] = sw.hue;
+    score++;
+
+    if (isCorrect) {
+      perfect++;
+      hitStop = 5;
+      zoom = 1.015;
+      if (window.J) J.calm(perfect);
+      flash('+PERFECT', TEAL, 28);
+      if (window.LOOP) LOOP.emit('swatch_placed', { slot: bestSlot, correct: true, score: score });
+    } else {
+      shakeAmt = 2;
+      if (window.J) J.calm(score);
+      flash('+PLACED', 'rgba(255,255,255,0.7)', 24);
+      if (window.LOOP) LOOP.emit('swatch_placed', { slot: bestSlot, correct: false, score: score });
+    }
+
+    // Check if all placed
+    if (score >= NUM_SLOTS) {
+      gameOver();
+    }
+    return true;
+  }
+
+  function gameOver() {
+    phase = 'over';
+    var dur = (Date.now() - runStartTs) / 1000;
+    var s = perfect;
+    if (s > best) { best = s; try { localStorage.setItem('ct_best', String(best)); } catch(_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: s, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = s;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () {
+          newGame();
+        }, 800);
+      }
+    }
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- Input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function hitSwatch(x, y) {
+    // Returns swatch index under point, or -1
+    for (var i = swatches.length - 1; i >= 0; i--) {
+      var sw = swatches[i];
+      if (sw.placed) continue;
+      var d = Math.hypot(x - sw.curX, y - sw.curY);
+      if (d <= SWATCH_R + 4) return i;
+    }
+    return -1;
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale;
+    var y = (e.clientY - r.top) / scale;
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase !== 'play') { if (phase === 'over') resetRun(); return; }
+    var idx = hitSwatch(x, y);
+    if (idx !== -1) {
+      drag = { swatchIdx: idx, ox: x - swatches[idx].curX, oy: y - swatches[idx].curY };
+      e.preventDefault();
+    }
+  }, { passive: false });
+
+  window.addEventListener('pointermove', function (e) {
+    if (DEMO || BOT) return;
+    if (!drag) return;
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale;
+    var y = (e.clientY - r.top) / scale;
+    swatches[drag.swatchIdx].curX = x - drag.ox;
+    swatches[drag.swatchIdx].curY = y - drag.oy;
+    e.preventDefault();
+  }, { passive: false });
+
+  window.addEventListener('pointerup', function (e) {
+    if (DEMO || BOT) return;
+    if (!drag) return;
+    var sw = swatches[drag.swatchIdx];
+    tryPlace(drag.swatchIdx, sw.curX, sw.curY);
+    drag = null;
+  });
+
+  window.addEventListener('pointercancel', function () {
+    if (drag) {
+      var sw = swatches[drag.swatchIdx];
+      sw.curX = sw.trayX; sw.curY = sw.trayY;
+      drag = null;
+    }
+  });
+
+  function resetRun() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    newGame();
+  }
+
+  // ---- Demo autopilot ----
+  function demoAutopilot(dt) {
+    if (phase !== 'play') return;
+    if (demoQueueIdx >= demoQueue.length) return;
+    var step = demoQueue[demoQueueIdx];
+
+    if (demoHesitate > 0) { demoHesitate -= dt; return; }
+
+    var sw = swatches[step.swatchIdx];
+    if (!sw || sw.placed) { demoQueueIdx++; demoHesitate = 20; return; }
+
+    // Target: correct slot or near-miss adjacent slot
+    var targetSlotIdx = sw.slotIdx;
+    if (step.miss !== 0) {
+      targetSlotIdx = (sw.slotIdx + step.miss + NUM_SLOTS) % NUM_SLOTS;
+      // Check if that slot is taken; if so, just use correct
+      if (slots[targetSlotIdx] !== null) targetSlotIdx = sw.slotIdx;
+    }
+    // Check if intended near-miss slot is taken
+    if (slots[targetSlotIdx] !== null) targetSlotIdx = sw.slotIdx;
+    var sp = slotPos(targetSlotIdx);
+
+    // Animate swatch toward target
+    var speed = 6;
+    var dx = sp.x - sw.curX, dy = sp.y - sw.curY;
+    var dist = Math.hypot(dx, dy);
+    if (dist < speed * 1.5) {
+      // Snap & place
+      tryPlace(step.swatchIdx, sp.x, sp.y);
+      demoQueueIdx++;
+      demoHesitate = step.hesitate;
+      demoPlacedCount++;
+    } else {
+      sw.curX += (dx / dist) * speed * dt;
+      sw.curY += (dy / dist) * speed * dt;
+    }
+  }
+
+  // ---- Bot autopilot ----
+  function botAutopilot(dt) {
+    if (phase !== 'play') return;
+    if (botQueueIdx >= botQueue.length) return;
+
+    var step = botQueue[botQueueIdx];
+    if (botHesitate > 0) { botHesitate -= dt; return; }
+
+    var sw = swatches[step.swatchIdx];
+    if (!sw || sw.placed) { botQueueIdx++; botHesitate = 15; return; }
+
+    // Determine target slot
+    var targetSlotIdx;
+    if (step.wrongSlot !== -1 && slots[step.wrongSlot] === null) {
+      targetSlotIdx = step.wrongSlot;
+    } else {
+      // Find any open slot
+      targetSlotIdx = sw.slotIdx;
+      if (slots[targetSlotIdx] !== null) {
+        // Find another open slot
+        for (var i = 0; i < NUM_SLOTS; i++) {
+          if (slots[i] === null) { targetSlotIdx = i; break; }
+        }
+      }
+    }
+
+    // Animate toward target
+    var sp = slotPos(targetSlotIdx);
+    var speed = 8;
+    var dx = sp.x - sw.curX, dy = sp.y - sw.curY;
+    var dist = Math.hypot(dx, dy);
+    if (dist < speed * 1.5) {
+      tryPlace(step.swatchIdx, sp.x, sp.y);
+      botQueueIdx++;
+      botHesitate = step.hesitate;
+    } else {
+      sw.curX += (dx / dist) * speed * dt;
+      sw.curY += (dy / dist) * speed * dt;
+    }
+  }
+
+  // ---- Render helpers ----
+  function hslStr(h, s, l) { return 'hsl(' + h + ',' + s + '%,' + l + '%)'; }
+
+  function drawWheel(now) {
+    // Draw faint wheel ring
+    cx.beginPath();
+    cx.arc(CX, CY, WHEEL_R, 0, Math.PI * 2);
+    cx.strokeStyle = 'rgba(255,255,255,0.07)';
+    cx.lineWidth = 2;
+    cx.stroke();
+
+    for (var i = 0; i < NUM_SLOTS; i++) {
+      var p = slotPos(i);
+      var hue = hueOf(i);
+
+      if (slots[i] !== null) {
+        // Filled slot — draw placed swatch
+        cx.beginPath();
+        cx.arc(p.x, p.y, SLOT_R, 0, Math.PI * 2);
+        cx.fillStyle = hslStr(slots[i], 72, 55);
+        cx.fill();
+        // Soft white ring
+        cx.strokeStyle = 'rgba(255,255,255,0.25)';
+        cx.lineWidth = 1.5;
+        cx.stroke();
+      } else {
+        // Empty slot — ghost ring in the correct hue
+        cx.beginPath();
+        cx.arc(p.x, p.y, SLOT_R, 0, Math.PI * 2);
+        cx.strokeStyle = hslStr(hue, 55, 38);
+        cx.lineWidth = 1.5;
+        cx.stroke();
+        // Tiny dot center
+        cx.beginPath();
+        cx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+        cx.fillStyle = hslStr(hue, 40, 30);
+        cx.fill();
+      }
+    }
+  }
+
+  function drawTray() {
+    // Tray background
+    cx.fillStyle = 'rgba(255,255,255,0.04)';
+    cx.beginPath();
+    cx.roundRect ? cx.roundRect(18, TRAY_Y - 82, W - 36, 170, 16) : cx.rect(18, TRAY_Y - 82, W - 36, 170);
+    cx.fill();
+  }
+
+  function drawSwatches(now) {
+    for (var i = 0; i < swatches.length; i++) {
+      var sw = swatches[i];
+      if (sw.placed) continue;
+      var isDragging = (drag && drag.swatchIdx === i);
+      var r = isDragging ? SWATCH_R + 4 : SWATCH_R;
+      var alpha = isDragging ? 0.95 : 0.92;
+      cx.globalAlpha = alpha;
+      cx.beginPath();
+      cx.arc(sw.curX, sw.curY, r, 0, Math.PI * 2);
+      cx.fillStyle = hslStr(sw.hue, 70, 55);
+      cx.fill();
+      if (isDragging) {
+        cx.strokeStyle = 'rgba(255,255,255,0.6)';
+        cx.lineWidth = 2;
+        cx.stroke();
+      }
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawFlashes() {
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += 1;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + fl.size + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 280 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+  }
+
+  function drawScore(now) {
+    cx.textAlign = 'center';
+    // Progress ring completion
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.font = '700 38px -apple-system, Helvetica, Arial';
+    cx.fillText(score + ' / ' + NUM_SLOTS, W / 2, 72);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('PERFECT ' + perfect, W / 2, 94);
+  }
+
+  function drawOverCard(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.65)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+
+    // Title
+    cx.fillStyle = TEAL;
+    cx.font = '800 36px -apple-system, Helvetica, Arial';
+    cx.fillText('WHEEL COMPLETE', W / 2, 290);
+
+    cx.fillStyle = '#fff';
+    cx.font = '700 22px -apple-system, Helvetica, Arial';
+    cx.fillText(perfect + ' perfect placements', W / 2, 330);
+
+    // Pct top
+    var pct = Math.max(1, Math.min(99, Math.round(100 * Math.exp(-perfect / 8))));
+    cx.fillStyle = GOLD;
+    cx.font = '800 22px -apple-system, Helvetica, Arial';
+    cx.fillText('TOP ' + pct + '% TODAY', W / 2, 372);
+
+    if (!DEMO && !BOT) {
+      var pulse = 0.65 + 0.35 * Math.sin(now / 320);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO SORT AGAIN', W / 2, 430);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawCTA(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+
+    cx.fillStyle = '#fff';
+    cx.font = '800 40px -apple-system, Helvetica, Arial';
+    cx.fillText('COLOR TAXONOMY', W / 2, 300);
+
+    cx.fillStyle = 'rgba(255,255,255,0.7)';
+    cx.font = '600 18px -apple-system, Helvetica, Arial';
+    cx.fillText('sort the wheel. trust your eye.', W / 2, 338);
+
+    var pulse2 = 0.75 + 0.25 * Math.sin(now / 260);
+    cx.globalAlpha = ease * pulse2;
+    cx.fillStyle = TEAL;
+    cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 400);
+
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(46,197,182,0.55)';
+    cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 432);
+    cx.globalAlpha = 1;
+  }
+
+  function drawMuteToggle(now) {
+    if (DEMO || BOT || !window.J) return;
+    cx.textAlign = 'center';
+    cx.globalAlpha = 0.45;
+    cx.font = '16px -apple-system, Helvetica, Arial';
+    cx.fillStyle = '#fff';
+    cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- Main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Decay juice
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      // Autopilots run when hitStop is zero
+      if (DEMO) demoAutopilot(dt);
+      if (BOT)  botAutopilot(dt);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.15 * dt;
+
+    // Draw with juice transforms
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(242,177,52,0.04)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    drawScore(now);
+    drawWheel(now);
+    drawTray();
+    drawSwatches(now);
+    drawFlashes();
+
+    if (phase === 'over') drawOverCard(now);
+    if (phase === 'cta')  drawCTA(now);
+
+    drawMuteToggle(now);
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

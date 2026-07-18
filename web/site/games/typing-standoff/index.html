@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Typing Standoff — Tilt</title>
+<!--
+  LOOP / attention-architecture — Typing Standoff
+  Circuits: 01-rpe (variable reward window), 06-zeigarnik (one more try), 07-timing.
+  Conditioned path: thumb knows the typing-bubble gesture from Instagram/iMessage.
+  Mechanic: tap the instant dots vanish and message appears. Too early = desperate.
+            Too late = conversation dies. Window shrinks each round.
+  Modes:
+    ?demo=1&seed=7   mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N    imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'typing-standoff';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game config ----
+  var BASE_WINDOW  = 520;   // ms tap window after message reveal
+  var MIN_WINDOW   = 90;    // floor
+  var WINDOW_SHRINK = 28;   // ms reduction per round
+  var BASE_PAUSE   = 900;   // ms dots animate before reveal (human)
+  var MAX_PAUSE    = 4000;  // cap (human)
+  var PAUSE_GROW   = 250;   // ms growth per round (human)
+  // Bot/demo use a flat short pause so runs complete quickly
+  var AUTO_PAUSE   = BOT ? 120 : (DEMO ? 300 : -1); // -1 = use normal
+
+  // chat message pool (seeded each round)
+  var MESSAGES = [
+    'ok', 'lol', 'sure', 'maybe', 'haha', 'yeah', 'omg', 'fine', 'k', 'yes',
+    'nah', 'stop', 'wow', 'hey', 'wait', 'no way', 'really?', 'same', 'ugh', 'nice'
+  ];
+
+  // ---- state ----
+  // phase: 'title' | 'challenge' | 'waiting' | 'revealing' | 'between' | 'over' | 'cta'
+  var phase = 'title';
+  var round = 0, score = 0, combo = 0;
+  var best = 0;
+  var tapWindow = BASE_WINDOW;
+  var revealAt = 0;
+  var overAt = 0, ctaAt = 0;
+  var runStartTs = 0;
+  var earlyFail = false;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  var dareBeaten = false;
+  var botRunsDone = 0;
+  var chatHistory = [];
+  var resolved = false;   // guard: only one resolution per round
+
+  try { best = +localStorage.getItem('ts_best') || 0; } catch (_) {}
+
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function pctTop(s) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 8))));
+  }
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 36, t: 0 });
+  }
+
+  // ---- init ----
+  function initChat() {
+    chatHistory = [];
+    chatHistory.push({ side: 'them', txt: 'hey' });
+    chatHistory.push({ side: 'me',   txt: 'hey!' });
+    chatHistory.push({ side: 'them', txt: 'you there?' });
+  }
+
+  function newGame() {
+    round = 0; score = 0; combo = 0; dareBeaten = false;
+    earlyFail = false; resolved = false;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    flashes = [];
+    initChat();
+    if (DEMO) {
+      phase = 'challenge';
+      setTimeout(startRound, 1250);
+      return;
+    }
+    if (BOT) { startRound(); return; }
+    phase = 'title';
+  }
+
+  function startRound() {
+    tapWindow = Math.max(MIN_WINDOW, BASE_WINDOW - round * WINDOW_SHRINK);
+    var pauseMs = AUTO_PAUSE > 0
+      ? AUTO_PAUSE
+      : Math.min(MAX_PAUSE, BASE_PAUSE + round * PAUSE_GROW);
+    phase = 'waiting';
+    resolved = false;
+    if (round === 0) {
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+    if (window.J) J.tension(Math.min(round / 12, 1));
+    // schedule the reveal
+    setTimeout(doReveal, pauseMs);
+  }
+
+  function doReveal() {
+    if (phase !== 'waiting') return;  // already resolved early
+    phase = 'revealing';
+    revealAt = performance.now();
+    var msgIdx = Math.floor(rng() * MESSAGES.length);
+    chatHistory.push({ side: 'them', txt: MESSAGES[msgIdx] });
+    // schedule auto-fail if no tap received
+    var deadline = tapWindow * 2.0;
+    setTimeout(function () {
+      if (phase === 'revealing' && !resolved) {
+        resolveRound(false, 'late');
+      }
+    }, deadline);
+  }
+
+  function doTap() {
+    if (resolved) return;
+    if (phase === 'waiting') {
+      // tapped during dots = too early (desperate)
+      resolved = true;
+      earlyFail = true;
+      resolveRound(false, 'early');
+    } else if (phase === 'revealing') {
+      var elapsed = performance.now() - revealAt;
+      resolved = true;
+      if (elapsed <= tapWindow) {
+        resolveRound(true, elapsed);
+      } else {
+        resolveRound(false, 'late');
+      }
+    }
+  }
+
+  function resolveRound(success, detail) {
+    if (success) {
+      var elapsed = typeof detail === 'number' ? detail : 0;
+      score++;
+      combo++;
+      round++;
+      var frac = elapsed / tapWindow;
+      if (frac < 0.2) {
+        hitStop = 5; zoom = 1.03;
+        flash('PERFECT', TEAL, 44);
+        if (window.J) J.perfect(combo);
+      } else if (frac < 0.55) {
+        flash('SHARP', GOLD, 38);
+        if (window.J) J.hit(combo);
+      } else {
+        flash('CLOSE', 'rgba(255,255,255,0.85)', 34);
+        if (window.J) J.near();
+      }
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 42);
+        if (window.J) J.fanfare();
+        SHARE.beaten(score);
+      }
+      var replyIdx = Math.floor(rng() * MESSAGES.length);
+      chatHistory.push({ side: 'me', txt: MESSAGES[replyIdx] });
+      if (window.LOOP) LOOP.emit('round_passed', { round: round, elapsed_ms: Math.round(elapsed) });
+      phase = 'between';
+      setTimeout(startRound, 700);
+    } else {
+      // fail
+      shakeAmt = 9;
+      if (window.J) J.death(Math.min(0.3 + score / 15, 1));
+      if (detail === 'early') {
+        flash('TOO EAGER', VERM, 38);
+      } else {
+        flash('LEFT ON READ', VERM, 38);
+        if (window.LOOP) LOOP.emit('near_miss', { round: round, score: score });
+      }
+      gameOver(detail);
+    }
+  }
+
+  function gameOver(reason) {
+    var newBest = score > best;
+    if (newBest) {
+      best = score;
+      try { localStorage.setItem('ts_best', String(best)); } catch (_) {}
+      if (window.J) setTimeout(function () { J.fanfare(); }, 500);
+    }
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1), reason: reason || 'late' });
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    overAt = performance.now();
+    phase = 'over';
+    combo = 0;
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { restartRun(); }, 900);
+      }
+    }
+  }
+
+  function restartRun() {
+    round = 0; score = 0; combo = 0;
+    earlyFail = false; resolved = false;
+    flashes = [];
+    initChat();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRound();
+  }
+
+  // ---- input ----
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRound(); return; }
+    if (phase === 'waiting' || phase === 'revealing') { doTap(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'rounds' }); return;
+      }
+      restartRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilots ----
+  // Demo script: each entry fires during 'revealing' phase at fraction of tapWindow
+  // entry.w > 1.0 means tap after the window = late fail
+  var demoScript = [
+    { w: 0.12 },   // round 1: snap-fast, perfect
+    { w: 0.28 },   // round 2: quick
+    { w: 0.48 },   // round 3: hesitant, ok
+    { w: 0.19 },   // round 4: sharp recovery
+    { w: 0.88 },   // round 5: tension peak — barely survives (near-fail)
+    { w: 0.52 },   // round 6: solid save
+    { w: 1.18 }    // round 7: real fail — left on read
+  ];
+  // extra hesitation frames before actually tapping (makes it human-feeling)
+  var demoWaits = [14, 18, 30, 12, 42, 24, 16];
+  var demoIdx = 0, demoArmed = false, demoWaitFrames = 0;
+
+  var botArmed = false, botWaitFrames = 0;
+
+  function autopilot(now) {
+    // autopilot only acts during 'revealing'; everything else is timer-driven
+    if (phase !== 'revealing' || resolved) return;
+
+    if (DEMO) {
+      if (!demoArmed) {
+        demoArmed = true;
+        demoWaitFrames = demoWaits[Math.min(demoIdx, demoWaits.length - 1)];
+      }
+      if (demoWaitFrames > 0) { demoWaitFrames--; return; }
+      var entry = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      var elapsed = now - revealAt;
+      var target = tapWindow * entry.w;
+      if (elapsed >= target) {
+        demoArmed = false;
+        demoIdx++;
+        doTap();
+      }
+    } else if (BOT) {
+      if (!botArmed) {
+        botArmed = true;
+        // 60% succeed (fail more reliably so runs end fast), 40% late-fail
+        var frac = rng() < 0.60
+          ? 0.08 + rng() * 0.75   // 8-83% into window
+          : 1.05 + rng() * 0.30;  // 105-135% = late (fail)
+        // also force a fail after round 4 to bound run length
+        if (score >= 4) frac = 1.05 + rng() * 0.30;
+        botWaitFrames = Math.round(frac * tapWindow / 16.667);
+      }
+      if (botWaitFrames > 0) { botWaitFrames--; return; }
+      if (!resolved) {
+        botArmed = false;
+        doTap();
+      }
+    }
+  }
+
+  // ---- render ----
+  var CHAT_BG    = 'rgba(255,255,255,0.06)';
+  var BUBBLE_THEM = 'rgba(46,197,182,0.22)';
+  var BUBBLE_ME   = 'rgba(232,80,46,0.28)';
+  var DOT_PERIOD  = 580;
+
+  function drawChat(now) {
+    var chatX = 24, chatY = 165, chatW = W - 48, chatH = 330;
+    cx.fillStyle = CHAT_BG;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(chatX, chatY, chatW, chatH, 18);
+    else cx.rect(chatX, chatY, chatW, chatH);
+    cx.fill();
+
+    // messages bottom-up
+    var msgs = chatHistory.slice(-6);
+    var lineY = chatY + chatH - 14;
+    for (var i = msgs.length - 1; i >= 0; i--) {
+      var msg = msgs[i];
+      var isMe = msg.side === 'me';
+      cx.font = '500 15px -apple-system, Helvetica, Arial';
+      var tw = cx.measureText(msg.txt).width;
+      var bw = tw + 22, bh = 28;
+      lineY -= bh + 6;
+      if (lineY < chatY + 8) break;
+      var bx = isMe ? chatX + chatW - bw - 12 : chatX + 12;
+      cx.fillStyle = isMe ? BUBBLE_ME : BUBBLE_THEM;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(bx, lineY, bw, bh, 12);
+      else cx.rect(bx, lineY, bw, bh);
+      cx.fill();
+      cx.fillStyle = isMe ? '#fff' : TEAL;
+      cx.textAlign = isMe ? 'right' : 'left';
+      cx.fillText(msg.txt, isMe ? bx + bw - 11 : bx + 11, lineY + 19);
+    }
+    cx.textAlign = 'center';
+
+    // typing indicator bubble
+    var indY = chatY + chatH - 48;
+    if (phase === 'waiting') {
+      cx.fillStyle = BUBBLE_THEM;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(chatX + 12, indY, 56, 30, 12);
+      else cx.rect(chatX + 12, indY, 56, 30);
+      cx.fill();
+      var t3 = now % (DOT_PERIOD * 3);
+      for (var d = 0; d < 3; d++) {
+        var ph2 = t3 / DOT_PERIOD - d;
+        var alpha = 0.35 + 0.55 * Math.max(0, Math.sin(ph2 * Math.PI));
+        cx.globalAlpha = alpha;
+        cx.fillStyle = TEAL;
+        cx.beginPath();
+        cx.arc(chatX + 12 + 12 + d * 14, indY + 15, 4.5, 0, Math.PI * 2);
+        cx.fill();
+        cx.globalAlpha = 1;
+      }
+    } else if (phase === 'revealing') {
+      // glow ring on bubble zone decays after reveal
+      var glow = Math.max(0, 1 - (now - revealAt) / 250);
+      if (glow > 0.01) {
+        cx.strokeStyle = TEAL;
+        cx.lineWidth = 3 * glow;
+        cx.globalAlpha = glow;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(chatX + 12, indY, 56, 30, 12);
+        else cx.rect(chatX + 12, indY, 56, 30);
+        cx.stroke();
+        cx.globalAlpha = 1;
+      }
+    }
+  }
+
+  function drawTimerArc(now) {
+    if (phase !== 'revealing') return;
+    var frac = Math.max(0, 1 - (now - revealAt) / tapWindow);
+    var cx2 = W / 2, cy2 = 558, r = 30;
+    cx.strokeStyle = 'rgba(255,255,255,0.10)';
+    cx.lineWidth = 6;
+    cx.beginPath(); cx.arc(cx2, cy2, r, 0, Math.PI * 2); cx.stroke();
+    cx.strokeStyle = frac > 0.3 ? TEAL : VERM;
+    cx.lineWidth = 6;
+    cx.beginPath();
+    cx.arc(cx2, cy2, r, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2);
+    cx.stroke();
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '700 12px Menlo, monospace';
+    cx.textAlign = 'center';
+    cx.fillText('TAP', cx2, cy2 + 5);
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // hit-stop decay then autopilot
+    if (hitStop > 0) { hitStop -= dt; }
+    else { autopilot(now); }
+
+    // juice
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.84, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // header
+    cx.fillStyle = 'rgba(255,255,255,0.04)';
+    cx.fillRect(0, 0, W, 155);
+
+    // contact name + status (play phases)
+    if (phase === 'waiting' || phase === 'revealing' || phase === 'between' || phase === 'over') {
+      cx.beginPath();
+      cx.arc(38, 54, 17, 0, Math.PI * 2);
+      cx.fillStyle = TEAL; cx.fill();
+      cx.fillStyle = INK;
+      cx.font = '700 13px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('?', 38, 60);
+
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '700 14px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'left';
+      cx.fillText('them', 63, 48);
+      var statusTxt = phase === 'waiting' ? 'typing...' : (phase === 'revealing' ? 'active now' : 'active');
+      cx.fillStyle = phase === 'waiting' ? '#4CAF50' : 'rgba(255,255,255,0.38)';
+      cx.font = '500 11px -apple-system, Helvetica, Arial';
+      cx.fillText(statusTxt, 63, 65);
+      cx.textAlign = 'center';
+    }
+
+    // score (play phases + over)
+    if (phase === 'waiting' || phase === 'revealing' || phase === 'between' || phase === 'over') {
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 52px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText(score, W / 2, 124);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 11px -apple-system, Helvetica, Arial';
+      cx.fillText('ROUNDS', W / 2, 142);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase !== 'over') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '700 12px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 100);
+      }
+    }
+
+    // chat UI
+    if (phase === 'waiting' || phase === 'revealing' || phase === 'between') {
+      drawChat(now);
+    }
+
+    // timer arc (revealing phase)
+    if (phase === 'revealing') {
+      drawTimerArc(now);
+    }
+
+    // context hint
+    if (phase === 'waiting') {
+      cx.fillStyle = 'rgba(255,255,255,0.25)';
+      cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('wait for it...', W / 2, 592);
+    } else if (phase === 'revealing') {
+      var pulse4 = 0.7 + 0.3 * Math.sin(now / 120);
+      cx.globalAlpha = pulse4;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('TAP NOW', W / 2, 600);
+      cx.globalAlpha = 1;
+    }
+
+    // round progress dots
+    if (phase === 'waiting' || phase === 'revealing' || phase === 'between') {
+      var dotN = Math.min(round + 1, 12), dotSp = 14;
+      var dotStartX = W / 2 - (dotN - 1) * dotSp / 2;
+      for (var di = 0; di < dotN; di++) {
+        cx.fillStyle = di < score ? TEAL : 'rgba(255,255,255,0.18)';
+        cx.beginPath();
+        cx.arc(dotStartX + di * dotSp, 632, 4, 0, Math.PI * 2);
+        cx.fill();
+      }
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 395 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(k, 1);
+    }
+
+    // title screen
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      // fake chat window with animated dots
+      cx.fillStyle = 'rgba(255,255,255,0.05)';
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(24, 195, W - 48, 295, 18);
+      else cx.rect(24, 195, W - 48, 295);
+      cx.fill();
+      // sample bubble
+      cx.fillStyle = BUBBLE_THEM;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(36, 420, 56, 30, 12);
+      else cx.rect(36, 420, 56, 30);
+      cx.fill();
+      for (var d3 = 0; d3 < 3; d3++) {
+        var ph3 = (now % (DOT_PERIOD * 3)) / DOT_PERIOD - d3;
+        cx.globalAlpha = 0.4 + 0.5 * Math.max(0, Math.sin(ph3 * Math.PI));
+        cx.fillStyle = TEAL;
+        cx.beginPath();
+        cx.arc(48 + d3 * 14, 435, 4.5, 0, Math.PI * 2);
+        cx.fill();
+        cx.globalAlpha = 1;
+      }
+      cx.fillStyle = '#fff';
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('TYPING STANDOFF', W / 2, 286);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('tap the instant they reply', W / 2, 316);
+      cx.fillText('too early = desperate', W / 2, 338);
+      cx.fillText('too late = left on read', W / 2, 360);
+      var pls = 0.6 + 0.4 * Math.sin(now / 280);
+      cx.globalAlpha = pls;
+      cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 600);
+      cx.globalAlpha = 1;
+    }
+
+    // challenge card (demo beat 1)
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '700 14px Menlo, monospace';
+      cx.fillText('ROUNDS TO BEAT', W / 2, 298);
+      cx.fillStyle = GOLD;
+      cx.font = '900 104px -apple-system, Helvetica, Arial';
+      cx.fillText('6', W / 2, 418);
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 446);
+    }
+
+    // game over screen
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.65)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '900 34px -apple-system, Helvetica, Arial';
+      cx.fillText(earlyFail ? 'TOO EAGER.' : 'LEFT ON READ.', W / 2, 292);
+      cx.fillStyle = '#fff';
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' rounds', W / 2, 338);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 380);
+      cx.fillStyle = 'rgba(255,255,255,0.42)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 404);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE', W / 2, 454);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (phase === 'cta') {
+      var t4 = (now - ctaAt) / 1000, ease = Math.min(1, t4 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.80 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('TYPING STANDOFF', W / 2, 292);
+      cx.fillStyle = 'rgba(255,255,255,0.62)';
+      cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they lasted ' + (window.__demoScore || 6) + ' rounds.', W / 2, 332);
+      var p3b = 0.72 + 0.28 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3b;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 6), W / 2, 402);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 436);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

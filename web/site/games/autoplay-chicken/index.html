@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Autoplay Chicken — Tilt</title>
+<!--
+  LOOP / attention-architecture — Autoplay Chicken (viral engine)
+  Circuits: 01 RPE (variable reward per hold), 05 ease (the thumb already
+            knows this gesture from the feed), 06 Zeigarnik (one more video).
+  The hook: the player's thumb already knows this move — the game IS that move.
+  A countdown bar sweeps across the bottom like the next-video autoplay timer.
+  Tap to stop it as close to the end as possible without letting the next
+  'video' start. Stop late → bank more ms (you held longer). Hit the end →
+  the next video autoplays → run over. The screen jitters as if about to load.
+  Modes (query params):
+    ?demo=1&seed=7        scripted mirror-neuron run for clip capture
+                          (warmup → tense holds → near-fail save → the real
+                          autoplay fail) → score card → CTA → __demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay for traffic simulation → __botDone
+    ?clip=ID&src=tiktok   attribution
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'autoplay-chicken';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo/bot clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // curiosity-gap labels for the "next up" thumbnail — the clip hook lives here
+  var NEXT_TITLES = [
+    "wait for it…", "the ending tho", "you won't believe this",
+    "part 7 just dropped", "watch till the end", "this can't be real",
+    "how is this legal", "i wasn't ready", "the last 2 seconds"
+  ];
+
+  var state, bar, flashes, runStartTs, best = 0;
+  var hitStop = 0, zoom = 1, dareBeaten = false, shakeAmt = 0, challengeAt = 0;
+  var roundDelay = 0, jitter = 0, failFlash = 0, failSlide = 0;
+  try { best = +localStorage.getItem('ac_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',          // title | challenge | play | over | cta
+      score: 0, combo: 0, round: 0, sweepMs: 2200,
+      nextTitle: NEXT_TITLES[0]
+    };
+    bar = { t: 0, running: false };
+    flashes = []; dareBeaten = false; jitter = 0; failFlash = 0; failSlide = 0;
+    if (DEMO) {
+      // mirror-neuron beat 1: the challenge card primes "score to beat"
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 5000))));
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    startRound();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function startRound() {
+    state.sweepMs = Math.max(700, 2200 - state.round * 90);   // faster each hold
+    state.nextTitle = NEXT_TITLES[state.round % NEXT_TITLES.length];
+    bar.t = 0; bar.running = true;
+    roundDelay = 0;
+    if (BOT) { botAutoplay = rng() < 0.22; botTarget = 0.6 + rng() * 0.33; }
+    if (DEMO) { demoWait = demoWaits[Math.min(state.round, demoWaits.length - 1)]; }
+    if (window.J) J.tension(0.05);
+  }
+
+  // ---- the one move: stop the autoplay bar ----
+  function stopBar() {
+    var p = bar.t;
+    bar.running = false;
+    var banked = Math.round(p * state.sweepMs);
+    state.score += banked;
+    var perfect = p >= 0.965 && p < 0.99;
+    var jackpot = p >= 0.99;
+    var near = p >= 0.93 && p < 0.965;
+    if (jackpot || perfect) { state.combo++; hitStop = jackpot ? 5 : 4; zoom = jackpot ? 1.04 : 1.03; }
+    else if (p >= 0.80) state.combo++;
+    else state.combo = 0;
+    if (window.J) {
+      if (jackpot) { J.gold(); J.perfect(state.combo); }
+      else if (perfect) J.perfect(state.combo);
+      else if (near) J.near();
+      else J.hit(state.combo);
+    }
+    if (jackpot) { flash('JACKPOT', GOLD, 42); }
+    else if (perfect) { flash('PERFECT', TEAL, 40); }
+    else if (near) { flash('SO CLOSE!', VERM, 38); if (window.LOOP) LOOP.emit('near_miss', { round: state.round, pct: +p.toFixed(3) }); }
+    else if (p < 0.60) flash('TOO EARLY', TEAL, 28);
+    shakeAmt = jackpot ? 8 : (perfect ? 4 : (near ? 5 : 2));
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true; flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+    if (window.LOOP) LOOP.emit('stop', { round: state.round, pct: +p.toFixed(3), banked: banked, perfect: !!(perfect || jackpot) });
+    state.round++;
+    roundDelay = 12;            // brief beat, then the next video's countdown
+  }
+
+  function autoplayFail() {
+    bar.running = false; bar.t = 1;
+    failFlash = 1; failSlide = 0; shakeAmt = 14; zoom = 1.04;
+    if (window.J) J.death(Math.min(0.4 + state.score / 8000, 1));
+    gameOver();
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (newBest) { best = state.score; try { localStorage.setItem('ac_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (window.LOOP) LOOP.emit('autoplay', { round: state.round, score: state.score });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () { if (window.J) J.fanfare(); }, 600);
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600); }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 900);
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.combo = 0; state.round = 0; state.sweepMs = 2200;
+    bar = { t: 0, running: false }; flashes = []; failFlash = 0; failSlide = 0; dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 470, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;                 // scripted modes ignore human taps
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play' && bar.running) { stopBar(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'ms' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  // mirror-neuron arc: warmup holds → tense late holds → the near-fail save
+  // (a hold at 0.955 that reads as "it's gonna autoplay… no, saved") → one
+  // more clean hold → the real autoplay fail the viewer saw coming.
+  // demoWaits = beats of hesitation before each move (keeps it human, never robotic)
+  var demoScript = [0.80, 0.88, 0.92, 0.955, 0.965, 0.91, 'miss'];
+  var demoWaits  = [18, 22, 30, 50, 28, 34, 0];
+  var demoWait = 0, botRunsDone = 0, botAutoplay = false, botTarget = 0;
+
+  function autopilot() {
+    if (!bar.running || state.phase !== 'play') return;
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      var want = demoScript[Math.min(state.round, demoScript.length - 1)];
+      if (want === 'miss') return;                           // never taps → autoplay fires
+      if (bar.t >= want) stopBar();
+    } else if (BOT) {
+      if (botAutoplay) return;                                // this run: mistime → autoplay
+      if (bar.t >= botTarget) stopBar();
+    }
+  }
+
+  // ---- render ----
+  var ctaAt = 0, last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // sim: the autoplay bar sweeps; frozen during hit-stop (decayed every frame,
+    // never gating without decay). jitter rises as the next video nears.
+    if (state.phase === 'play') {
+      if (roundDelay > 0) {
+        roundDelay -= dt;
+        if (roundDelay <= 0) startRound();
+      } else if (bar.running) {
+        if (hitStop > 0) { hitStop -= dt; }
+        else {
+          bar.t += dt * (16.667 / state.sweepMs);
+          if (bar.t >= 1) autoplayFail();
+          else autopilot();
+        }
+      }
+    }
+    jitter = bar.running ? bar.t * bar.t * 4 : 0;             // "about to load" feel
+    if (window.J) { if (state.phase === 'play' && bar.running) J.tension(Math.min(bar.t, 1)); else if (state.phase !== 'play') J.tension(0); }
+
+    // juice transforms: decaying shake + jitter + zoom-pulse (wrapped)
+    cx.save();
+    var sh = shakeAmt + jitter;
+    if (sh > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * sh, sy = (Math.random() - 0.5) * sh;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+    if (failFlash > 0) failFlash -= 0.05 * dt;
+    if (state.phase === 'over') failSlide = Math.min(1, failSlide + 0.06 * dt);
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)'); bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // "next up" thumbnail (curiosity gap) — brightens as autoplay nears
+    var nx = 30, ny = 22, nw = 200, nh = 50;
+    var heat = bar.running ? bar.t : 0;
+    cx.fillStyle = 'rgba(255,255,255,' + (0.05 + heat * 0.18) + ')';
+    cx.strokeStyle = 'rgba(255,255,255,' + (0.15 + heat * 0.5) + ')'; cx.lineWidth = 1;
+    roundRect(nx, ny, nw, nh, 10); cx.fill(); cx.stroke();
+    cx.fillStyle = 'rgba(255,255,255,' + (0.35 + heat * 0.5) + ')';
+    cx.font = '700 11px Menlo, monospace'; cx.textAlign = 'left';
+    cx.fillText('NEXT ▶', nx + 12, ny + 19);
+    cx.fillStyle = 'rgba(255,255,255,' + (0.55 + heat * 0.4) + ')';
+    cx.font = '700 13px -apple-system, Helvetica, Arial';
+    cx.fillText(state.nextTitle, nx + 12, ny + 36);
+
+    // score (cumulative ms held before autoplay got you)
+    if (state.phase !== 'title' && state.phase !== 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.95)';
+      cx.font = '800 58px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 122);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '700 13px Menlo, monospace';
+      cx.fillText('MS HELD', W / 2, 142);
+      if (state.combo > 1) {
+        cx.fillStyle = TEAL; cx.font = '800 18px -apple-system, Helvetica, Arial';
+        cx.fillText('×' + state.combo + ' STREAK', W / 2, 166);
+      } else {
+        cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+        cx.fillText('BEST ' + best + 'ms', W / 2, 166);
+      }
+      // incoming dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + 'ms' + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 188);
+      }
+    }
+
+    // the feed — a "video" you're watching, dims as the next one nears
+    var fx = 30, fy = 206, fw = W - 60, fh = H - 340;
+    cx.save();
+    cx.fillStyle = 'rgba(255,255,255,' + (0.04 * (1 - heat * 0.6)) + ')';
+    roundRect(fx, fy, fw, fh, 14); cx.fill();
+    cx.strokeStyle = 'rgba(255,255,255,0.08)'; cx.lineWidth = 1; cx.stroke();
+    // abstract video content — pulsing rings + drifting sine (the "current video")
+    cx.save(); cx.beginPath(); roundRect(fx, fy, fw, fh, 14); cx.clip();
+    var cxv = fx + fw / 2, cyv = fy + fh / 2;
+    cx.globalAlpha = 0.5 * (1 - heat * 0.5);
+    for (var r = 0; r < 5; r++) {
+      var rr = 30 + r * 38 + (Math.sin(now / 600 + r) * 8);
+      cx.strokeStyle = r % 2 ? 'rgba(46,197,182,0.5)' : 'rgba(232,80,46,0.4)';
+      cx.lineWidth = 3; cx.beginPath(); cx.arc(cxv, cyv, rr, 0, Math.PI * 2); cx.stroke();
+    }
+    // scanline flicker as autoplay nears (the "about to load" jitter, visually)
+    if (heat > 0.5) {
+      cx.globalAlpha = (heat - 0.5) * 0.5 * (0.5 + 0.5 * Math.sin(now / 40));
+      cx.fillStyle = '#fff';
+      for (var sly = fy; sly < fy + fh; sly += 6) cx.fillRect(fx, sly, fw, 1);
+    }
+    cx.globalAlpha = 1; cx.restore();
+    // ▶ in the center of the feed
+    cx.globalAlpha = 0.85 * (1 - heat * 0.7);
+    cx.fillStyle = '#fff'; cx.beginPath();
+    cx.moveTo(cxv - 14, cyv - 18); cx.lineTo(cxv - 14, cyv + 18); cx.lineTo(cxv + 22, cyv);
+    cx.closePath(); cx.fill();
+    cx.globalAlpha = 1;
+    cx.restore();
+
+    // the autoplay countdown bar — the move itself (bottom, like the feed timer)
+    var bx = 30, by = H - 78, bw = W - 60, bh = 14;
+    cx.textAlign = 'left';
+    cx.fillStyle = 'rgba(255,255,255,' + (0.4 + heat * 0.4) + ')';
+    cx.font = '700 11px Menlo, monospace';
+    cx.fillText('AUTOPLAY NEXT', bx, by - 12);
+    cx.textAlign = 'right';
+    cx.fillStyle = heat > 0.9 ? VERM : 'rgba(255,255,255,0.4)';
+    cx.fillText(bar.running ? Math.floor(bar.t * 100) + '%' : 'TAP TO HOLD', bx + bw, by - 12);
+    // track
+    cx.fillStyle = 'rgba(255,255,255,0.1)';
+    roundRect(bx, by, bw, bh, 7); cx.fill();
+    // fill
+    var fw2 = Math.max(0, bw * bar.t);
+    if (fw2 > 1) {
+      var g = cx.createLinearGradient(bx, 0, bx + bw, 0);
+      g.addColorStop(0, TEAL); g.addColorStop(0.6, GOLD); g.addColorStop(1, VERM);
+      cx.fillStyle = g;
+      roundRect(bx, by, fw2, bh, 7); cx.fill();
+      // leading-edge glow
+      cx.save(); cx.shadowColor = VERM; cx.shadowBlur = 16;
+      cx.fillStyle = '#fff'; cx.fillRect(bx + fw2 - 2, by - 2, 3, bh + 4);
+      cx.restore();
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 260 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('AUTOPLAY', W / 2, 320);
+      cx.fillStyle = VERM; cx.fillText('CHICKEN', W / 2, 362);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 14px Menlo, monospace';
+      cx.fillText("don't let the next one start", W / 2, 392);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillStyle = TEAL;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO HOLD', W / 2, 430); cx.globalAlpha = 1;
+    }
+
+    // challenge card (demo beat 1)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 88px -apple-system, Helvetica, Arial';
+      cx.fillText('10690', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's longest hold (ms)", W / 2, 430);
+    }
+
+    // death spectacle: white flash + the next video sliding in
+    if (failFlash > 0) {
+      cx.fillStyle = 'rgba(255,255,255,' + (failFlash * 0.85) + ')';
+      cx.fillRect(0, 0, W, H);
+    }
+    if (state.phase === 'over' && failSlide > 0) {
+      var cardA0 = Math.max(0, Math.min(1, (performance.now() - state.overAt - 500) / 350));
+      var slideTextA = failSlide * (1 - cardA0);
+      cx.save();
+      cx.fillStyle = 'rgba(11,13,18,' + (failSlide * (1 - cardA0 * 0.7)) + ')';
+      cx.fillRect(0, 0, W, H * failSlide);
+      if (slideTextA > 0.02) {
+        cx.textAlign = 'center'; cx.globalAlpha = slideTextA;
+        cx.fillStyle = '#fff'; cx.font = '900 30px -apple-system, Helvetica, Arial';
+        cx.fillText('AUTOPLAYED ▶', W / 2, H * failSlide * 0.5);
+        cx.globalAlpha = 1;
+      }
+      cx.restore();
+    }
+
+    // game over / score card
+    if (state.phase === 'over') {
+      var cardA = Math.max(0, Math.min(1, (performance.now() - state.overAt - 500) / 350));
+      cx.fillStyle = 'rgba(11,13,18,' + (0.62 * cardA) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = cardA; cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('AUTOPLAYED.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' ms held', W / 2, 345);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('held longer than ' + (100 - pt) + '% of players', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = cardA * p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE HOLD', W / 2, 446);
+        cx.globalAlpha = cardA;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23); cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+      cx.globalAlpha = 1;
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('AUTOPLAY', W / 2, 290);
+      cx.fillStyle = VERM; cx.fillText('CHICKEN', W / 2, 332);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they held ' + (window.__demoScore || 10690) + 'ms. your move.', W / 2, 372);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 10690), W / 2, 422);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 452);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  function roundRect(x, y, w, h, r) {
+    if (cx.roundRect) { cx.beginPath(); cx.roundRect(x, y, w, h, r); }
+    else { cx.beginPath(); cx.moveTo(x + r, y); cx.arcTo(x + w, y, x + w, y + h, r); cx.arcTo(x + w, y + h, x, y + h, r); cx.arcTo(x, y + h, x, y, r); cx.arcTo(x, y, x + w, y, r); cx.closePath(); }
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

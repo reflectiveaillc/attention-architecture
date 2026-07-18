@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Split Equal — Tilt</title>
+<!--
+  LOOP / attention-architecture — Split Equal
+  Mechanic: a line travels across; tap to divide it into equal segments.
+  Each round demands one more cut. Lower variance from equal = better score.
+  Circuits: 01-rpe, 06-zeigarnik, 07-timing.
+  Modes:
+    ?demo=1&seed=7    scripted mirror-neuron clip → window.__demoDone
+    ?bot=1&runs=N     imperfect autoplay → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'split-equal';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  var LINE_Y     = H / 2;          // vertical center of the split line
+  var LINE_X0    = 60;             // left anchor
+  var LINE_X1    = W - 60;        // right anchor
+  var LINE_LEN   = LINE_X1 - LINE_X0;  // 285px
+  var LINE_H     = 8;              // thickness of the line bar
+  var CURSOR_W   = 4;
+  var PERFECT_PCT = 0.015;        // ±1.5% of segment = perfect
+  var NEAR_PCT    = 0.06;         // ±6% = near
+
+  // score = running total of error (lower = better displayed as points)
+  var BEST_KEY = 'se_best_score'; // best = lowest total error (most equal)
+  var best = Infinity;
+  try {
+    var b = parseFloat(localStorage.getItem(BEST_KEY));
+    if (!isNaN(b)) best = b;
+  } catch (_) {}
+
+  // ---- state ----
+  var state, flashes, botRunsDone = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  var runStartTs = 0, ctaAt = 0, last = performance.now();
+
+  // Per-round state
+  var round, cursor, cuts, targetN, cutPositions, roundScore;
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 530, w: 250, h: 46 };
+
+  function inR(r, x, y) {
+    return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+  }
+
+  function newGame() {
+    state = { phase: 'title', score: 0, round: 0, overAt: 0 };
+    flashes = []; dareBeaten = false;
+    round = null;
+    if (DEMO) {
+      state.phase = 'challenge';
+      setTimeout(function () { startRound(1); }, 1250);
+      return;
+    }
+    if (BOT) { startRound(1); }
+  }
+
+  // Total score: accumulate error across rounds; displayed as precision (lower = better)
+  // For display we show "Avg error %" — lower is better → invert for "points" display
+  function startRound(n) {
+    state.phase = 'play';
+    if (n === 1) {
+      state.score = 0;
+      state.round = 0;
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+    state.round = n;
+    targetN = n + 1;  // cuts needed = round (divides into round+1 segments)
+    cuts = 0;
+    cutPositions = [];
+    roundScore = 0;
+    // cursor starts at left anchor; moves right to right anchor, bounces
+    cursor = {
+      x: LINE_X0,
+      dir: 1,
+      speed: 1.8 + (n - 1) * 0.22   // faster each round
+    };
+    if (window.J && n > 1) J.tension(Math.min((n - 1) / 9, 1));
+  }
+
+  function placeCut(cx_pos) {
+    // record this cut position
+    cutPositions.push(cx_pos);
+    cuts++;
+
+    var needMore = cuts < (targetN - 1);
+
+    // compute equality error so far (only meaningful once all cuts placed)
+    if (!needMore) {
+      // all cuts placed — evaluate
+      finishRound();
+    } else {
+      // intermediate cut feedback
+      if (window.J) J.hit(cuts);
+      flash('+CUT', TEAL, 28);
+    }
+  }
+
+  function finishRound() {
+    // build sorted segments
+    var sorted = [LINE_X0].concat(cutPositions.slice().sort(function (a, b) { return a - b; })).concat([LINE_X1]);
+    var segments = [];
+    for (var i = 0; i < sorted.length - 1; i++) {
+      segments.push(sorted[i + 1] - sorted[i]);
+    }
+    var mean = LINE_LEN / segments.length;
+    var totalErr = 0;
+    var perfectCount = 0, nearCount = 0;
+    for (var j = 0; j < segments.length; j++) {
+      var err = Math.abs(segments[j] - mean) / mean;
+      totalErr += err;
+      if (err <= PERFECT_PCT) perfectCount++;
+      else if (err <= NEAR_PCT) nearCount++;
+    }
+    var avgErr = totalErr / segments.length;  // 0 = perfect
+    roundScore = avgErr;
+    state.score += avgErr;
+
+    var isPerfect = avgErr <= PERFECT_PCT;
+    var isNear    = avgErr <= NEAR_PCT;
+
+    if (isPerfect) {
+      hitStop = 5; zoom = 1.03;
+      if (window.J) J.perfect(state.round);
+      flash('PERFECT', TEAL, 48);
+    } else if (isNear) {
+      shakeAmt = 3;
+      if (window.J) J.near();
+      flash('SO CLOSE', GOLD, 40);
+      if (window.LOOP) LOOP.emit('near_miss', { round: state.round, err: +avgErr.toFixed(4) });
+    } else {
+      if (window.J) J.hit(state.round);
+      flash('+' + state.round, VERM, 36);
+    }
+    if (window.LOOP) LOOP.emit('round_done', { round: state.round, avg_err: +avgErr.toFixed(4), perfect: isPerfect });
+
+    // Check dare beaten
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten) {
+      // dare score is a total error; lower wins → we beat it if our score is lower
+      if (state.score < SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 42);
+        if (window.J) J.fanfare();
+        SHARE.beaten(+state.score.toFixed(3));
+      }
+    }
+
+    // Next round or game over
+    setTimeout(function () {
+      if (state.round >= 8) {
+        gameOver(false);
+      } else {
+        startRound(state.round + 1);
+      }
+    }, isPerfect ? 700 : 500);
+  }
+
+  function gameOver(died) {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 7;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var isNewBest = state.score < best;
+    if (window.J) {
+      J.death(0.5);
+      if (isNewBest) setTimeout(function () { J.fanfare(); }, 400);
+    }
+    if (isNewBest && isFinite(state.score)) {
+      best = state.score;
+      try { localStorage.setItem(BEST_KEY, String(best)); } catch (_) {}
+    }
+    if (DEMO) window.__demoScore = +(state.score * 100).toFixed(1);
+    if (window.LOOP) LOOP.emit('game_over', { score: +(state.score * 100).toFixed(1), dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.round = 0; state.phase = 'play';
+    flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRound(1);
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0,
+                   x: W / 2, y: LINE_Y - 80 });
+  }
+
+  // ---- input ----
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRound(1); return; }
+    if (state.phase === 'play' && cursor && hitStop <= 0) {
+      placeCut(cursor.x);
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: +(state.score * 100).toFixed(1), unit: 'err%' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilots ----
+  // Demo: scripted placement pattern — hesitation + near-fail + recovery + real-fail
+  // Round 1 (1 cut): nearly perfect
+  // Round 2 (2 cuts): good
+  // Round 3 (3 cuts): perfect
+  // Round 4 (4 cuts): near-miss tension
+  // Round 5 (5 cuts): near miss + recovery
+  // Round 6 (6 cuts): imperfect (building tension)
+  // Round 7 (7 cuts): fail by going off — game_over
+  var demoPhase = 0;
+  var demoWaiting = false, demoTimer = null;
+
+  // For demo: pre-compute cut timings based on ideal positions ± offsets
+  // Each entry: array of offsets from ideal (px), and a wait before each cut (frames)
+  var demoScript = [
+    // Round 1: 1 cut (2 segs) — ideal at 0.5 → LINE_X0+142.5
+    { offsets: [3], waits: [38] },
+    // Round 2: 2 cuts (3 segs) — ideal at 1/3, 2/3
+    { offsets: [5, -4], waits: [32, 36] },
+    // Round 3: 3 cuts — near-perfect
+    { offsets: [1, -1, 2], waits: [30, 28, 34] },
+    // Round 4: 4 cuts — slightly off
+    { offsets: [8, -9, 6, -7], waits: [26, 30, 28, 32] },
+    // Round 5: 5 cuts — near-fail (high error) then close
+    { offsets: [14, -12, 10, -11, 13], waits: [40, 35, 30, 55, 38] },
+    // Round 6: 6 cuts — recovery attempt, still bad
+    { offsets: [6, -8, 5, -7, 6, -5], waits: [28, 30, 26, 30, 28, 35] },
+    // Round 7: 7 cuts — miss, triggers game over after all cuts
+    { offsets: [18, -15, 20, -18, 16, -19, 21], waits: [30, 28, 32, 30, 35, 30, 40] }
+  ];
+  var demoRound = 0, demoCutIdx = 0, demoWait = 60, demoRoundActive = false;
+
+  function demoMakeCut() {
+    if (!cursor || state.phase !== 'play' || hitStop > 0) return;
+    var script = demoScript[Math.min(demoRound, demoScript.length - 1)];
+    var needed = targetN - 1;
+    if (demoCutIdx >= needed) return;
+    var ideal = LINE_X0 + ((demoCutIdx + 1) / targetN) * LINE_LEN;
+    var offset = script.offsets[Math.min(demoCutIdx, script.offsets.length - 1)] || 0;
+    var target = ideal + offset;
+    // wait for cursor to pass near target
+    if (Math.abs(cursor.x - target) < Math.abs(cursor.dir * cursor.speed) * 2.5) {
+      demoCutIdx++;
+      placeCut(cursor.x);
+      // after placing, schedule next cut wait
+      demoWait = (script.waits[Math.min(demoCutIdx, script.waits.length - 1)] || 30);
+    }
+  }
+
+  var botCutIdx = 0, botWait = 0, botTargets = null;
+  function botMakeCut() {
+    if (!cursor || state.phase !== 'play' || hitStop > 0) return;
+    if (botWait > 0) { botWait -= 1; return; }
+    var needed = targetN - 1;
+    if (botCutIdx >= needed) return;
+    if (!botTargets) {
+      botTargets = [];
+      for (var i = 0; i < needed; i++) {
+        var ideal = LINE_X0 + ((i + 1) / targetN) * LINE_LEN;
+        var noise = (rng() - 0.5) * 26;  // bot is imperfect → sometimes fails
+        botTargets.push(ideal + noise);
+      }
+    }
+    var target = botTargets[botCutIdx];
+    if (Math.abs(cursor.x - target) < Math.abs(cursor.dir * cursor.speed) * 2.2) {
+      botCutIdx++;
+      placeCut(cursor.x);
+      botWait = 8 + Math.floor(rng() * 12);
+      if (botCutIdx >= needed) {
+        botCutIdx = 0; botTargets = null; botWait = 0;
+      }
+    }
+  }
+
+  function autopilot() {
+    if (state.phase !== 'play' || !cursor) return;
+    if (DEMO) {
+      if (demoWait > 0) { demoWait -= 1; return; }
+      demoMakeCut();
+    } else if (BOT) {
+      botMakeCut();
+    }
+  }
+
+  // Reset cut counters when round changes (for bot)
+  var _lastRound = 0;
+  function checkRoundReset() {
+    if (state.round !== _lastRound) {
+      _lastRound = state.round;
+      demoRound = state.round - 1;
+      demoCutIdx = 0;
+      demoWait = DEMO ? (demoScript[Math.min(demoRound, demoScript.length - 1)].waits[0] || 30) : 0;
+      botCutIdx = 0; botTargets = null; botWait = 0;
+    }
+  }
+
+  // ---- scoring display helpers ----
+  function pctTop(score) {
+    // score is accumulated avg error (0=perfect, higher=worse)
+    // lower score = top players
+    return Math.max(1, Math.min(99, Math.round(100 - 100 * Math.exp(-score * 3))));
+  }
+
+  function fmtScore(s) {
+    // display as precision %, lower = better
+    return (s * 100).toFixed(1) + '%';
+  }
+
+  // ---- segment preview drawing ----
+  function drawSegmentGuide(sortedCuts) {
+    // draw ghost dividers for already-placed cuts
+    var allPts = [LINE_X0].concat(sortedCuts).concat([LINE_X1]);
+    var mean = LINE_LEN / (allPts.length - 1);
+    for (var i = 1; i < allPts.length - 1; i++) {
+      var cx2 = allPts[i];
+      // color by error
+      var seg = allPts[i] - allPts[i - 1];
+      var err = Math.abs(seg - mean) / mean;
+      var col = err <= PERFECT_PCT ? TEAL : (err <= NEAR_PCT ? GOLD : VERM);
+      cx.strokeStyle = col;
+      cx.lineWidth = 2.5;
+      cx.globalAlpha = 0.7;
+      cx.beginPath();
+      cx.moveTo(cx2, LINE_Y - 22);
+      cx.lineTo(cx2, LINE_Y + LINE_H + 22);
+      cx.stroke();
+      cx.globalAlpha = 1;
+    }
+    // draw segment length labels for already-confirmed cuts
+    cx.font = '500 10px Menlo, monospace';
+    cx.textAlign = 'center';
+    for (var j = 0; j < allPts.length - 1; j++) {
+      var midX = (allPts[j] + allPts[j + 1]) / 2;
+      var segLen = allPts[j + 1] - allPts[j];
+      var errPct = Math.abs(segLen - mean) / mean;
+      var labelCol = errPct <= PERFECT_PCT ? TEAL : (errPct <= NEAR_PCT ? GOLD : 'rgba(255,255,255,0.5)');
+      cx.fillStyle = labelCol;
+      cx.globalAlpha = 0.8;
+      cx.fillText(segLen.toFixed(0), midX, LINE_Y - 28);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  // ---- render ----
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    checkRoundReset();
+
+    // advance cursor (frozen during hit-stop)
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else if (state.phase === 'play' && cursor) {
+      cursor.x += cursor.speed * cursor.dir * dt;
+      if (cursor.x >= LINE_X1) { cursor.x = LINE_X1; cursor.dir = -1; }
+      if (cursor.x <= LINE_X0) { cursor.x = LINE_X0; cursor.dir = 1; }
+      autopilot();
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.84, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- TITLE ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('SPLIT EQUAL', W / 2, 280);
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO SPLIT', W / 2, 328); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('equal beats perfect.', W / 2, 360);
+      // draw a still example line
+      cx.strokeStyle = 'rgba(255,255,255,0.2)'; cx.lineWidth = LINE_H;
+      cx.lineCap = 'round';
+      cx.beginPath(); cx.moveTo(LINE_X0, H / 2 + 40); cx.lineTo(LINE_X1, H / 2 + 40); cx.stroke();
+    }
+
+    // ---- CHALLENGE CARD (demo beat 1) ----
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 88px -apple-system, Helvetica, Arial';
+      cx.fillText('3.2%', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('avg error — today\'s top run', W / 2, 432);
+    }
+
+    // ---- PLAY ----
+    if (state.phase === 'play' && cursor) {
+      // round label
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '700 13px Menlo, monospace';
+      cx.fillText('ROUND ' + state.round + '  —  ' + (targetN - 1) + ' CUT' + ((targetN - 1) === 1 ? '' : 'S'), W / 2, 90);
+
+      // score
+      cx.fillStyle = 'rgba(255,255,255,0.92)'; cx.font = '800 56px -apple-system, Helvetica, Arial';
+      cx.fillText(fmtScore(state.score), W / 2, 152);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('avg error' + (isFinite(best) ? '  |  BEST ' + fmtScore(best) : ''), W / 2, 174);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + '%' + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 198);
+      }
+
+      // the main split line
+      var lineGrad = cx.createLinearGradient(LINE_X0, 0, LINE_X1, 0);
+      lineGrad.addColorStop(0, 'rgba(255,255,255,0.15)');
+      lineGrad.addColorStop(1, 'rgba(255,255,255,0.15)');
+      cx.fillStyle = lineGrad;
+      cx.fillRect(LINE_X0, LINE_Y - LINE_H / 2, LINE_LEN, LINE_H);
+
+      // anchor dots
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.beginPath(); cx.arc(LINE_X0, LINE_Y, 6, 0, Math.PI * 2); cx.fill();
+      cx.beginPath(); cx.arc(LINE_X1, LINE_Y, 6, 0, Math.PI * 2); cx.fill();
+
+      // placed cuts (sorted)
+      var sortedCuts = cutPositions.slice().sort(function (a, b) { return a - b; });
+      drawSegmentGuide(sortedCuts);
+
+      // cursor (the moving split knife)
+      var isOnCut = false;
+      for (var ci = 0; ci < sortedCuts.length; ci++) {
+        if (Math.abs(cursor.x - sortedCuts[ci]) < 5) { isOnCut = true; break; }
+      }
+      var cursorAlpha = 1;
+      // glow behind cursor
+      var grd = cx.createRadialGradient(cursor.x, LINE_Y, 0, cursor.x, LINE_Y, 28);
+      grd.addColorStop(0, 'rgba(46,197,182,0.35)');
+      grd.addColorStop(1, 'rgba(46,197,182,0)');
+      cx.fillStyle = grd;
+      cx.beginPath(); cx.arc(cursor.x, LINE_Y, 28, 0, Math.PI * 2); cx.fill();
+
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = cursorAlpha;
+      cx.fillRect(cursor.x - CURSOR_W / 2, LINE_Y - 30, CURSOR_W, 60);
+      // cursor triangle tip
+      cx.fillStyle = '#fff';
+      cx.beginPath();
+      cx.moveTo(cursor.x - 6, LINE_Y - 32);
+      cx.lineTo(cursor.x + 6, LINE_Y - 32);
+      cx.lineTo(cursor.x, LINE_Y - 22);
+      cx.fill();
+      cx.beginPath();
+      cx.moveTo(cursor.x - 6, LINE_Y + 32);
+      cx.lineTo(cursor.x + 6, LINE_Y + 32);
+      cx.lineTo(cursor.x, LINE_Y + 22);
+      cx.fill();
+      cx.globalAlpha = 1;
+
+      // cuts remaining indicator
+      var remaining = (targetN - 1) - cuts;
+      if (remaining > 0) {
+        cx.textAlign = 'center';
+        cx.fillStyle = VERM;
+        cx.font = '800 18px -apple-system, Helvetica, Arial';
+        cx.fillText(remaining + ' CUT' + (remaining === 1 ? '' : 'S') + ' LEFT', W / 2, LINE_Y + 90);
+      }
+
+      // equal-segment ghost guides (faint vertical lines at ideal positions)
+      cx.setLineDash([3, 5]);
+      cx.strokeStyle = 'rgba(255,255,255,0.08)';
+      cx.lineWidth = 1;
+      for (var gi = 1; gi < targetN; gi++) {
+        var gx = LINE_X0 + (gi / targetN) * LINE_LEN;
+        cx.beginPath(); cx.moveTo(gx, LINE_Y - 45); cx.lineTo(gx, LINE_Y + 45); cx.stroke();
+      }
+      cx.setLineDash([]);
+    }
+
+    // ---- GAME OVER ----
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('DONE.', W / 2, 290);
+      cx.fillStyle = '#fff'; cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(fmtScore(state.score) + ' avg error', W / 2, 338);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 382);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('lower error = sharper eye', W / 2, 408);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — TRY AGAIN', W / 2, 460);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- CTA (demo beat 6) ----
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('SPLIT EQUAL', W / 2, 296);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they hit ' + (window.__demoScore || '3.2') + '% error. your cut?', W / 2, 336);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || '3.2') + '%', W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // ---- mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

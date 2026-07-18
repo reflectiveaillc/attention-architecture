@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Last Tab — Tilt</title>
+<!--
+  LOOP / attention-architecture — Last Tab
+  Engine: calm. Circuits: 06-zeigarnik, 08-investment, 05-ease.
+  Conditioned path: the 2am tab-hoarding rabbit hole — swipe each tab up to close it.
+  Modes:
+    ?demo=1&seed=7        scripted calm arc ~16s → soft CTA card → window.__demoDone=true
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone=true
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'last-tab';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // Palette — calm game: teal + soft tones, avoid vermillion
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var SOFT_BLUE = '#4a9eba', SOFT_LAVENDER = '#8a7fcb', SOFT_GREEN = '#5bab8a';
+  var TAB_COLORS = [TEAL, SOFT_BLUE, SOFT_LAVENDER, SOFT_GREEN, '#7bc4c4', '#a0c878'];
+
+  // Tab dimensions
+  var TAB_W = 340, TAB_H = 64, TAB_RADIUS = 10;
+  var TAB_X = (W - TAB_W) / 2;  // left edge of tab stack
+
+  // Tab titles (relatable tab-hoard content)
+  var TAB_TITLES = [
+    'The History of Jazz Music',
+    'How to Learn Piano in 30 Days',
+    'Best Cafes in Tokyo',
+    'Why Cats Purr — Science',
+    'Fermentation: A Beginners Guide',
+    'The Universe Is Expanding',
+    'How to Train for a Marathon',
+    'Ancient Roman Architecture',
+    'Deep Sea Creatures Documentary',
+    'The Art of Bread Baking',
+    'Introduction to Philosophy',
+    'Why Do We Dream?',
+    'Ocean Plastic — Solutions',
+    'The Life of Tesla',
+    'Learning Japanese: Week 1',
+    'Origami Advanced Techniques',
+    'Northern Lights Travel Guide',
+    'Quantum Computing Explained',
+    'The Perfect Sourdough Recipe',
+    'Meditation for Beginners',
+    'History of the Internet',
+    'Fungi: Nature\'s Internet',
+    'How Satellites Work',
+    'Bonsai Tree Care Guide',
+    'The Science of Sleep',
+  ];
+
+  // ---- State ----
+  var state, flashes, runStartTs;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var best = 0;
+  try { best = +localStorage.getItem('lt_best') || 0; } catch (_) {}
+
+  // A tab on screen
+  function makeTab(idx, y, titleIdx) {
+    return {
+      id: idx,
+      y: y,                         // current y centre
+      targetY: y,
+      titleIdx: titleIdx % TAB_TITLES.length,
+      colorIdx: Math.floor(rng() * TAB_COLORS.length),
+      swipeY: 0,                    // finger drag delta
+      swiping: false,
+      dismissed: false,             // flying off screen
+      dismissVy: 0,
+      alpha: 1,
+    };
+  }
+
+  function newGame() {
+    var initialCount = 5;
+    var tabs = [];
+    for (var i = 0; i < initialCount; i++) {
+      var titleIdx = Math.floor(rng() * TAB_TITLES.length);
+      tabs.push(makeTab(i, tabBaseY(i, initialCount), titleIdx));
+    }
+    state = {
+      phase: 'title',              // title | play | over | cta
+      tabs: tabs,
+      nextTabId: initialCount,
+      nextTitleIdx: initialCount,
+      score: 0,                    // tabs closed
+      overAt: 0,
+      spawnTimer: 0,
+      spawnInterval: 280,          // frames between new tabs (gets faster)
+      maxTabs: 7,                  // lose when exceeded
+    };
+    flashes = [];
+
+    if (DEMO) { state.phase = 'play'; startRun(); return; }
+    if (BOT)  { state.phase = 'play'; startRun(); return; }
+  }
+
+  function tabBaseY(i, total) {
+    // Stack tabs from bottom, leaving room at top for score
+    var bottomY = H - 80;
+    return bottomY - i * (TAB_H + 10);
+  }
+
+  function startRun() {
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- Dismiss a tab (swipe up) ----
+  function dismissTab(tab) {
+    if (tab.dismissed) return;
+    tab.dismissed = true;
+    tab.dismissVy = -18;
+    state.score++;
+    var step = Math.min(state.score, 12);
+    if (window.J) J.calm(step);
+    if (step % 5 === 0 && step > 0) { hitStop = 3; zoom = 1.015; }
+    flash('+1', TEAL, 28, W / 2, tab.y - 30);
+    repackTabs();
+    if (window.LOOP) LOOP.emit('tab_closed', { n: state.score });
+    // Speed up slightly
+    state.spawnInterval = Math.max(160, 280 - state.score * 8);
+  }
+
+  function repackTabs() {
+    // After dismissing, animate remaining tabs to new positions
+    var alive = state.tabs.filter(function (t) { return !t.dismissed; });
+    for (var i = 0; i < alive.length; i++) {
+      alive[i].targetY = tabBaseY(i, alive.length);
+    }
+  }
+
+  function spawnTab() {
+    var titleIdx = state.nextTitleIdx++ % TAB_TITLES.length;
+    // New tab arrives from top
+    var alive = state.tabs.filter(function (t) { return !t.dismissed; });
+    var newY = tabBaseY(alive.length, alive.length + 1);
+    var t = makeTab(state.nextTabId++, H + TAB_H, titleIdx);
+    t.targetY = newY;
+    state.tabs.push(t);
+  }
+
+  function checkLose() {
+    var alive = state.tabs.filter(function (t) { return !t.dismissed; });
+    if (alive.length > state.maxTabs) {
+      gameOver();
+    }
+  }
+
+  function gameOver() {
+    if (state.phase !== 'play') return;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 6;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.calm(0);  // calm game — no death sound, just silence
+    if (state.score > best) {
+      best = state.score;
+      try { localStorage.setItem('lt_best', String(best)); } catch (_) {}
+    }
+    window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { restartRun(); }, 800);
+      }
+    }
+  }
+
+  function restartRun() {
+    var initialCount = 5;
+    var tabs = [];
+    for (var i = 0; i < initialCount; i++) {
+      var titleIdx = Math.floor(rng() * TAB_TITLES.length);
+      tabs.push(makeTab(i, tabBaseY(i, initialCount), titleIdx));
+    }
+    state.tabs = tabs;
+    state.nextTabId = initialCount;
+    state.nextTitleIdx = initialCount;
+    state.score = 0;
+    state.spawnTimer = 0;
+    state.spawnInterval = 280;
+    state.phase = 'play';
+    flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size, x, y) {
+    flashes.push({ txt: txt, color: color, size: size, x: x || W / 2, y: y || H / 2, t: 0 });
+  }
+
+  // ---- Input: pointer drag to swipe tab up ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  var dragTab = null, dragStartY = 0, dragTabStartY = 0;
+
+  function hitTestTabs(x, y) {
+    // Pick topmost alive tab at (x,y)
+    var alive = state.tabs.filter(function (t) { return !t.dismissed; });
+    for (var i = alive.length - 1; i >= 0; i--) {
+      var t = alive[i];
+      var ty = t.y - TAB_H / 2;
+      if (x >= TAB_X && x <= TAB_X + TAB_W && y >= ty && y <= ty + TAB_H) {
+        return t;
+      }
+    }
+    return null;
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale;
+    var py = (e.clientY - r.top) / scale;
+
+    if (inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { state.phase = 'play'; startRun(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      restartRun(); return;
+    }
+    if (state.phase !== 'play') return;
+    var t = hitTestTabs(px, py);
+    if (t) {
+      dragTab = t;
+      dragStartY = py;
+      dragTabStartY = t.y;
+      t.swiping = true;
+    }
+  });
+
+  window.addEventListener('pointermove', function (e) {
+    if (DEMO || BOT || !dragTab) return;
+    var r = cv.getBoundingClientRect();
+    var py = (e.clientY - r.top) / scale;
+    var dy = py - dragStartY;
+    dragTab.swipeY = Math.min(0, dy);  // only allow upward drag
+    dragTab.y = dragTabStartY + dragTab.swipeY;
+  });
+
+  window.addEventListener('pointerup', function (e) {
+    if (DEMO || BOT || !dragTab) return;
+    if (dragTab.swipeY < -50) {
+      // Enough swipe — dismiss
+      dismissTab(dragTab);
+    } else {
+      // Snap back
+      dragTab.y = dragTabStartY;
+      dragTab.swipeY = 0;
+    }
+    dragTab.swiping = false;
+    dragTab = null;
+  });
+
+  // ---- Demo / Bot autopilot ----
+  // Demo: close tabs with satisfying pacing — settle → deepen → resolve
+  // Script: [delayFrames, tabIndex] pairs; tabIndex = -1 = topmost
+  var demoScript = [
+    // Settle phase: slow, deliberate closes with pauses
+    { wait: 70, which: -1 },
+    { wait: 90, which: -1 },
+    { wait: 80, which: -1 },
+    // Deepen phase: finds rhythm, closing more fluidly
+    { wait: 55, which: -1 },
+    { wait: 50, which: -1 },
+    { wait: 48, which: -1 },
+    // Resolve phase: clearing the last ones, a moment of stillness
+    { wait: 65, which: -1 },
+    { wait: 60, which: -1 },
+    // Then fail: can't keep up, tabs overflow
+    // (demo fails naturally from spawn accumulation)
+  ];
+  var demoIdx = 0, demoWaitCount = 0;
+  var botActTimer = 0, botBotActInterval = 55, botPassiveAfter = 12;
+  var botRunsDone = 0, botActionsThisRun = 0;
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    if (DEMO) {
+      demoWaitCount++;
+      if (demoIdx >= demoScript.length) return;  // demo stops acting → tabs accumulate → lose
+      var step = demoScript[demoIdx];
+      if (demoWaitCount >= step.wait) {
+        var alive = state.tabs.filter(function (t) { return !t.dismissed; });
+        if (alive.length > 0) {
+          dismissTab(alive[alive.length - 1]);  // topmost
+        }
+        demoIdx++;
+        demoWaitCount = 0;
+      }
+    } else if (BOT) {
+      // Bot closes tabs for botPassiveAfter actions, then stops → tabs overflow → lose
+      botActTimer++;
+      if (botActionsThisRun >= botPassiveAfter) return;
+      if (botActTimer >= botBotActInterval) {
+        botActTimer = 0;
+        // Some randomness: occasionally miss a beat
+        if (rng() < 0.75) {
+          var alive2 = state.tabs.filter(function (t) { return !t.dismissed; });
+          if (alive2.length > 0) {
+            var pick = alive2[Math.floor(rng() * alive2.length)];
+            dismissTab(pick);
+            botActionsThisRun++;
+          }
+        }
+      }
+    }
+  }
+
+  // ---- Drawing helpers ----
+  function drawTab(t, now) {
+    var x = TAB_X, y = t.y - TAB_H / 2;
+    var color = TAB_COLORS[t.colorIdx];
+    var alpha = t.alpha;
+    if (t.dismissed) alpha = Math.max(0, t.alpha);
+
+    cx.save();
+    cx.globalAlpha = alpha;
+
+    // Tab shadow / glow
+    cx.shadowColor = color;
+    cx.shadowBlur = t.swiping ? 14 : 6;
+
+    // Tab body
+    cx.fillStyle = 'rgba(255,255,255,0.04)';
+    roundRect(cx, x, y, TAB_W, TAB_H, TAB_RADIUS);
+    cx.fill();
+
+    // Tab accent bar (left)
+    cx.fillStyle = color;
+    cx.shadowBlur = 0;
+    roundRect(cx, x, y + 8, 4, TAB_H - 16, 2);
+    cx.fill();
+
+    // Tab border
+    cx.strokeStyle = color;
+    cx.lineWidth = t.swiping ? 1.8 : 1;
+    cx.globalAlpha = alpha * (t.swiping ? 0.9 : 0.35);
+    roundRect(cx, x, y, TAB_W, TAB_H, TAB_RADIUS);
+    cx.stroke();
+
+    cx.shadowBlur = 0;
+    cx.globalAlpha = alpha;
+
+    // Favicon dot
+    cx.fillStyle = color;
+    cx.globalAlpha = alpha * 0.9;
+    cx.beginPath();
+    cx.arc(x + 22, t.y, 7, 0, Math.PI * 2);
+    cx.fill();
+
+    // Tab title
+    cx.globalAlpha = alpha * 0.88;
+    cx.fillStyle = '#fff';
+    cx.font = '500 13px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'left';
+    cx.fillText(TAB_TITLES[t.titleIdx], x + 38, t.y + 5);
+
+    // Close hint when swiping
+    if (t.swiping && t.swipeY < -20) {
+      cx.globalAlpha = alpha * Math.min(1, Math.abs(t.swipeY) / 60);
+      cx.fillStyle = TEAL;
+      cx.font = '700 11px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'right';
+      cx.fillText('close', x + TAB_W - 14, t.y + 5);
+    }
+
+    cx.restore();
+  }
+
+  function roundRect(ctx, x, y, w, h, r) {
+    if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+    else {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r);
+      ctx.lineTo(x + w, y + h - r); ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+      ctx.lineTo(x + r, y + h); ctx.arcTo(x, y + h, x, y + h - r, r);
+      ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r);
+      ctx.closePath();
+    }
+  }
+
+  // ---- Render ----
+  var ctaAt = 0, last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // ---- Update ----
+    if (state.phase === 'play') {
+      // Spawn timer
+      state.spawnTimer += dt;
+      if (state.spawnTimer >= state.spawnInterval) {
+        state.spawnTimer = 0;
+        spawnTab();
+        checkLose();
+      }
+
+      // Animate tabs toward targetY
+      for (var i = 0; i < state.tabs.length; i++) {
+        var t = state.tabs[i];
+        if (!t.swiping) {
+          t.y += (t.targetY - t.y) * 0.1 * dt;
+        }
+        if (t.dismissed) {
+          // Fly upward off screen
+          t.dismissVy -= 1.2 * dt;
+          t.y += t.dismissVy * dt;
+          t.alpha = Math.max(0, t.alpha - 0.05 * dt);
+        }
+      }
+      // Cull gone tabs
+      state.tabs = state.tabs.filter(function (t) {
+        return !(t.dismissed && t.alpha <= 0.01);
+      });
+
+      // Autopilot
+      if (hitStop > 0) { hitStop -= dt; } else { autopilot(); }
+    }
+
+    // ---- Draw ----
+    cx.save();
+    // Juice transforms
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.1 * dt;
+
+    // Background — darkens as tabs close (calm → darkness)
+    var alive = state.tabs.filter(function (t) { return !t.dismissed; });
+    var dimProgress = Math.max(0, 1 - alive.length / state.maxTabs);
+    var bgAlpha = 0.97 - dimProgress * 0.15;
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    // Subtle ambient glow from open tabs
+    if (alive.length > 0) {
+      var grd = cx.createRadialGradient(W / 2, H * 0.6, 0, W / 2, H * 0.6, 340);
+      grd.addColorStop(0, 'rgba(46,197,182,' + (alive.length / state.maxTabs * 0.06) + ')');
+      grd.addColorStop(1, 'rgba(11,13,18,0)');
+      cx.fillStyle = grd;
+      cx.fillRect(0, 0, W, H);
+    }
+
+    // Title screen
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '700 38px -apple-system, Helvetica, Arial';
+      cx.fillText('Last Tab', W / 2, 280);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '400 16px -apple-system, Helvetica, Arial';
+      cx.fillText('swipe them closed', W / 2, 320);
+      var pulse = 0.5 + 0.5 * Math.sin(now / 500);
+      cx.globalAlpha = 0.4 + 0.3 * pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to begin', W / 2, 360);
+      cx.globalAlpha = 1;
+    }
+
+    // Play state
+    if (state.phase === 'play' || state.phase === 'over') {
+      // Score (tabs closed)
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '700 52px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 90);
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('TABS CLOSED', W / 2, 110);
+      if (best > 0) {
+        cx.fillStyle = 'rgba(255,255,255,0.22)';
+        cx.fillText('BEST ' + best, W / 2, 128);
+      }
+
+      // Open tab count indicator
+      var aliveCount = state.tabs.filter(function (t) { return !t.dismissed; }).length;
+      if (aliveCount > 0 && state.phase === 'play') {
+        cx.fillStyle = aliveCount >= state.maxTabs - 1 ? GOLD : 'rgba(255,255,255,0.2)';
+        cx.font = '500 11px -apple-system, Helvetica, Arial';
+        cx.fillText(aliveCount + ' open', W / 2, 148);
+      }
+    }
+
+    // Draw tabs
+    if (state.phase === 'play' || state.phase === 'over') {
+      // Draw bottom-to-top (index 0 = bottom)
+      for (var j = 0; j < state.tabs.length; j++) {
+        drawTab(state.tabs[j], now);
+      }
+    }
+
+    // Game over overlay
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.65)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '700 32px -apple-system, Helvetica, Arial';
+      cx.fillText('overwhelmed.', W / 2, 300);
+      cx.fillStyle = '#fff';
+      cx.font = '600 22px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' tabs closed', W / 2, 344);
+      if (state.score === best && best > 0) {
+        cx.fillStyle = GOLD;
+        cx.font = '700 14px -apple-system, Helvetica, Arial';
+        cx.fillText('new best', W / 2, 370);
+      }
+      if (!DEMO && !BOT) {
+        var p2 = 0.55 + 0.45 * Math.sin(now / 480);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '500 15px -apple-system, Helvetica, Arial';
+        cx.fillText('tap to try again', W / 2, 430);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // Demo CTA card
+    if (state.phase === 'cta') {
+      var elapsed = (now - ctaAt) / 1000;
+      var ease = Math.min(1, elapsed * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '700 40px -apple-system, Helvetica, Arial';
+      cx.fillText('Last Tab', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.65)';
+      cx.font = '400 17px -apple-system, Helvetica, Arial';
+      cx.fillText('close every loop you opened', W / 2, 328);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 340);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL;
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // Floating reward flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 36);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 1.2);
+      cx.globalAlpha = 1;
+      if (fl.t > 36) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

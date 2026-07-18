@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>FYP Breath — Tilt</title>
+<!--
+  LOOP / attention-architecture — FYP Breath (calm engine)
+  Conditioned path: the thumb already knows the FYP scroll — the game IS that move,
+  but you don't swipe. Cards drift by; a breath circle holds between them. The reward
+  is the space between, not the next card.
+  Circuits: 01 soft-RPE (variable reward per breath), 05 ease, 07 timing.
+  Modes (query params):
+    ?demo=1&seed=7        scripted calm arc (settle → deepen → resolve → soft CTA),
+                          sets window.__demoDone when finished
+    ?bot=1&runs=3&seed=7  imperfect autoplay for traffic simulation, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+  CALM game: NO dares, NO challenge card, NO tension riser. Sound = J.calm(step) only.
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'fyp-breath';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 0.30;      // autopilot jitter (scaled seconds)
+  var SEED = +qs.get('seed') || 7;
+
+  // deterministic RNG (mulberry32) so demo/bot clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function ease(t) { return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // breath pacing — base phase durations (seconds), scaled per mode
+  // phases: enter (card drifts in) → inhale (circle grows) → hold (peak, tap window)
+  //       → exhale (circle shrinks) → exit (card drifts off) → gap (the space between)
+  var PHASE_BASE = [1.2, 2.6, 0.7, 2.6, 1.1, 0.8];
+  var BREATHS = DEMO ? 3 : (BOT ? 3 : 8);
+  var TIME_SCALE = DEMO ? 0.5 : (BOT ? 0.6 : 1.0);
+  var durs = PHASE_BASE.map(function (d) { return d * TIME_SCALE; });
+  var breathLen = durs.reduce(function (a, b) { return a + b; }, 0);
+  var pEnter = durs[0], pInhale = durs[1], pHold = durs[2], pExhale = durs[3], pExit = durs[4], pGap = durs[5];
+  var tapStart = pEnter;                                   // inhale begins
+  var tapEnd   = pEnter + pInhale + pHold + pExhale;        // exhale ends
+  var peakT    = pEnter + pInhale + pHold / 2;             // the still point
+  var windowHalf = pInhale + pHold / 2;                   // tap-acceptance half-width
+
+  var R0 = 42, R1 = 116;                                   // breath circle radius range
+  var CARD_W = 300, CARD_H = 348, CARD_Y = H / 2 - 6;
+
+  var state, flashes, runStartTs, best = 0;
+  var breathT = 0, breathIdx = 0, breathTapped = false, plannedTapT = null;
+  var deepCount = 0, hitStop = 0, zoom = 1, shakeAmt = 0, overAt = 0, ctaAt = 0;
+  var botRunsDone = 0;
+  try { best = +localStorage.getItem('fypb_best') || 0; } catch (_) {}
+
+  // demo scripted arc (calm): settle → deepen → resolve. Offsets are seconds from peak
+  // in scaled time, kept out of the near-miss band so the demo reads as pure calm.
+  var demoTapOffsets = [0.34, 0.06, 0.0];
+
+  function newGame() {
+    state = { phase: 'title', score: 0, breathsTaken: 0 };
+    flashes = []; deepCount = 0; hitStop = 0; zoom = 1; shakeAmt = 0;
+    breathIdx = 0; breathT = 0; breathTapped = false; plannedTapT = null;
+    if (DEMO) { startRun(); return; }
+    if (BOT) startRun();
+  }
+
+  function startBreath(idx) {
+    breathT = 0; breathTapped = false;
+    if (DEMO) {
+      var off = demoTapOffsets[Math.min(idx, demoTapOffsets.length - 1)];
+      plannedTapT = peakT + off;
+    } else if (BOT) {
+      var j = gauss() * BOT_ERR;
+      plannedTapT = clamp(peakT + j, tapStart + 0.05, tapEnd - 0.05);
+    } else {
+      plannedTapT = null;
+    }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    breathIdx = 0; deepCount = 0;
+    startBreath(0);
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // one breath is scored by how close the tap lands to the still point (peak)
+  function qualityAt(bt) {
+    if (bt < tapStart || bt > tapEnd) return -1;
+    var q = clamp(1 - Math.abs(bt - peakT) / windowHalf, 0, 1);
+    return Math.pow(q, 1.15);                              // gentle precision curve
+  }
+
+  function mark(q) {
+    if (breathTapped || q < 0) return;
+    breathTapped = true;
+    var pts = Math.round(q * 100);
+    state.score += pts;
+    state.breathsTaken++;
+    if (window.J && q >= 0.5) J.calm(state.breathsTaken % 6);   // soft bell, one per breath
+    if (q >= 0.9) {                                        // DEEP — the calm "critical"
+      deepCount++; hitStop = 3; zoom = 1.025; shakeAmt = 1.4;
+      pop('DEEP', GOLD, 30, 0); pop('+' + pts, GOLD, 22, 26);
+      if (window.LOOP) LOOP.emit('breath_deep', { quality: +q.toFixed(3), points: pts });
+    } else if (q >= 0.7) {
+      pop('SETTLED', TEAL, 22, 0); pop('+' + pts, TEAL, 18, 24);
+    } else if (q >= 0.4) {
+      pop('REST', 'rgba(255,255,255,0.65)', 18, 0);
+      pop('+' + pts, 'rgba(255,255,255,0.55)', 14, 22);
+    } else {
+      pop('+' + pts, 'rgba(255,255,255,0.45)', 14, 0);
+    }
+    if (q >= 0.8 && q < 0.9 && window.LOOP)                // close-to-deep: near-miss data, no tension text
+      LOOP.emit('near_miss', { quality: +q.toFixed(3), points: pts });
+    if (window.LOOP) LOOP.emit('breath_marked', { quality: +q.toFixed(3), points: pts, breath: breathIdx + 1 });
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (newBest) { best = state.score; try { localStorage.setItem('fypb_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(resetRun, 900);
+    }
+  }
+
+  function resetRun() {
+    state = { phase: 'play', score: 0, breathsTaken: 0 };
+    flashes = []; deepCount = 0; hitStop = 0; zoom = 1; shakeAmt = 0;
+    breathIdx = 0; breathT = 0; breathTapped = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function pop(txt, color, size, off) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0, y: H / 2 - 150 - (off || 0) });
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;                               // scripted modes ignore human taps
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { mark(qualityAt(breathT)); return; }
+    if (state.phase === 'over' && performance.now() - overAt > 350) resetRun();
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilot (imperfect; ignores human input) ----
+  function autopilot() {
+    if (state.phase !== 'play' || breathTapped || plannedTapT === null) return;
+    if (breathT >= plannedTapT && breathT >= tapStart && breathT <= tapEnd) {
+      mark(qualityAt(breathT));
+    }
+  }
+
+  // ---- render helpers ----
+  function phaseAt(bt) {
+    var t = bt, i;
+    for (i = 0; i < 6; i++) { if (t < durs[i]) return { i: i, pT: t }; t -= durs[i]; }
+    return { i: 5, pT: durs[5] };
+  }
+
+  function circleRadius(ph) {
+    var i = ph.i, pT = ph.pT;
+    if (i === 0) return R0;
+    if (i === 1) return lerp(R0, R1, ease(pT / pInhale));
+    if (i === 2) return R1;
+    if (i === 3) return lerp(R1, R0, ease(pT / pExhale));
+    return R0;                                             // exit / gap
+  }
+
+  function cardY(ph) {
+    var i = ph.i, pT = ph.pT;
+    if (i === 0) return lerp(H + 60, CARD_Y, ease(pT / pEnter));
+    if (i === 4) return lerp(CARD_Y, -CARD_H - 20, ease(pT / pExit));
+    if (i === 5) return -CARD_H - 20;                      // gone during the space between
+    return CARD_Y;
+  }
+
+  function breathLabel(ph) {
+    if (ph.i === 1) return 'breathe in';
+    if (ph.i === 2) return 'hold';
+    if (ph.i === 3) return 'breathe out';
+    return '';
+  }
+
+  function drawCard(y) {
+    if (y > H + 40 || y < -CARD_H - 40) return;
+    var x = W / 2 - CARD_W / 2;
+    cx.save();
+    cx.globalAlpha = 0.92;
+    var g = cx.createLinearGradient(0, y, 0, y + CARD_H);
+    g.addColorStop(0, '#1a2330'); g.addColorStop(1, '#121822');
+    cx.fillStyle = g;
+    cx.beginPath();
+    cx.roundRect ? cx.roundRect(x, y, CARD_W, CARD_H, 22) : cx.rect(x, y, CARD_W, CARD_H);
+    cx.fill();
+    // faint teal top hairline — the "post" frame
+    cx.strokeStyle = 'rgba(46,197,182,0.35)'; cx.lineWidth = 1.5;
+    cx.beginPath();
+    cx.moveTo(x + 22, y + 1); cx.lineTo(x + CARD_W - 22, y + 1);
+    cx.stroke();
+    // minimal feed-post content (avatar + lines + thumbnail) at very low opacity
+    cx.globalAlpha = 0.10;
+    cx.fillStyle = '#fff';
+    cx.beginPath(); cx.arc(x + 36, y + 38, 12, 0, Math.PI * 2); cx.fill();
+    for (var k = 0; k < 2; k++) cx.fillRect(x + 58, y + 32 + k * 12, 120 - k * 26, 6);
+    cx.strokeStyle = '#fff'; cx.lineWidth = 1;
+    cx.strokeRect(x + 22, y + 70, CARD_W - 44, 150);
+    for (var m = 0; m < 3; m++) cx.fillRect(x + 22, y + 236 + m * 16, (CARD_W - 44) * (0.8 - m * 0.18), 6);
+    cx.restore();
+  }
+
+  function drawBreathCircle(r, now) {
+    var cxp = W / 2, cyp = H / 2;
+    // soft outer glow — grows with the circle
+    cx.save();
+    var glow = cx.createRadialGradient(cxp, cyp, r * 0.2, cxp, cyp, r * 1.9);
+    glow.addColorStop(0, 'rgba(46,197,182,0.18)');
+    glow.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = glow;
+    cx.fillRect(cxp - r * 2.2, cyp - r * 2.2, r * 4.4, r * 4.4);
+    // ring
+    cx.lineWidth = 2.5;
+    cx.strokeStyle = 'rgba(46,197,182,0.85)';
+    cx.beginPath(); cx.arc(cxp, cyp, r, 0, Math.PI * 2); cx.stroke();
+    // inner fill at low alpha
+    cx.fillStyle = 'rgba(46,197,182,0.08)';
+    cx.beginPath(); cx.arc(cxp, cyp, r * 0.92, 0, Math.PI * 2); cx.fill();
+    // a small still dot at center, gentle pulse on hold
+    var dotR = 5 + (r >= R1 - 1 ? 1.6 * (0.5 + 0.5 * Math.sin(now / 220)) : 0);
+    cx.fillStyle = r >= R1 - 1 ? GOLD : 'rgba(255,255,255,0.7)';
+    cx.beginPath(); cx.arc(cxp, cyp, dotR, 0, Math.PI * 2); cx.fill();
+    cx.restore();
+  }
+
+  function pctTop(score) { return clamp(Math.round(100 * Math.exp(-score / 320)), 1, 99); }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+    var dts = dt / 60;                                     // seconds this frame
+
+    // sim: advance the breath timeline (frozen briefly on a DEEP hit-stop — the calm "bite")
+    if (state.phase === 'play') {
+      if (hitStop > 0) { hitStop -= dt; }                   // decay every frame, never gate autopilot
+      else { breathT += dts; }
+      autopilot();                                         // runs every frame regardless of hitStop
+      if (breathT >= breathLen) {
+        breathIdx++;
+        if (breathIdx >= BREATHS) { gameOver(); }
+        else startBreath(breathIdx);
+      }
+    }
+
+    // juice transforms: decaying shake + zoom-pulse (calm — tiny)
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.07)'); bg.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    var ph = state.phase === 'play' ? phaseAt(breathT) : { i: 5, pT: 0 };
+
+    // the "space between" — soft teal glow during the gap (the reward is the emptiness)
+    if (state.phase === 'play' && ph.i === 5) {
+      var g2 = cx.createRadialGradient(W / 2, H / 2, 10, W / 2, H / 2, 260);
+      g2.addColorStop(0, 'rgba(46,197,182,0.10)');
+      g2.addColorStop(1, 'rgba(46,197,182,0)');
+      cx.fillStyle = g2; cx.fillRect(0, 0, W, H);
+    }
+
+    // card (behind the breath circle)
+    if (state.phase === 'play') drawCard(cardY(ph));
+
+    // breath circle (the focal pacer) — shown on title and play
+    if (state.phase === 'title' || state.phase === 'play') {
+      var r = state.phase === 'title'
+        ? R0 + (R1 - R0) * (0.5 + 0.5 * Math.sin(now / 1400))   // idle slow pulse
+        : circleRadius(ph);
+      drawBreathCircle(r, now);
+      // breath cue text
+      var lbl = state.phase === 'title' ? 'breathe' : breathLabel(ph);
+      if (lbl) {
+        cx.textAlign = 'center';
+        cx.fillStyle = 'rgba(255,255,255,0.42)';
+        cx.font = '600 15px -apple-system, Helvetica, Arial';
+        cx.fillText(lbl, W / 2, H / 2 + R1 + 40);
+      }
+    }
+
+    // score + breath counter
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 58px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 92);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 114);
+      if (state.phase === 'play') {
+        cx.fillStyle = 'rgba(46,197,182,0.7)';
+        cx.font = '700 13px Menlo, monospace';
+        cx.fillText('BREATH ' + Math.min(breathIdx + 1, BREATHS) + ' / ' + BREATHS, W / 2, 138);
+      }
+    }
+
+    // floating reward text
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 55);
+      var fy = fl.y - fl.t * 0.7;
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.18) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, fy);
+      cx.globalAlpha = 1;
+      if (fl.t > 55) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('FYP BREATH', W / 2, 300);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.fillStyle = TEAL; cx.globalAlpha = pulse;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BREATHE', W / 2, 332); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.34)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('scroll less. breathe more.', W / 2, 358);
+    }
+
+    // game over (calm completion)
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('SETTLED.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' stillness', W / 2, 346);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText(state.breathsTaken + ' breaths', W / 2, 372);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('CALM TOP ' + pt + '% TODAY', W / 2, 410);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('calmer than ' + (100 - pt) + '% of players', W / 2, 432);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 300);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — BREATHE AGAIN', W / 2, 478);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // demo CTA (soft invitation — calm engine, not a dare)
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, e = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * e) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = e; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('FYP BREATH', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.74)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('you found ' + (window.__demoScore || 0) + ' stillness.', W / 2, 336);
+      cx.fillText('the feed can wait.', W / 2, 362);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = TEAL; cx.globalAlpha = e * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 418);
+      cx.globalAlpha = e;
+      cx.fillStyle = 'rgba(46,197,182,0.7)'; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 448);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

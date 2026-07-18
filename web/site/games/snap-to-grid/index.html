@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Snap to Grid — Tilt</title>
+<!--
+  LOOP / attention-architecture — Snap to Grid
+  Circuits: 06-zeigarnik, 05-ease, 08-investment
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7     scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'snap-to-grid';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // --- grid layout ---
+  var COLS = 4, ROWS = 4;
+  var TILE_SIZE = 58, GAP = 10;
+  var GRID_W = COLS * TILE_SIZE + (COLS - 1) * GAP;
+  var GRID_H = ROWS * TILE_SIZE + (ROWS - 1) * GAP;
+  var GRID_X = (W - GRID_W) / 2;
+  var GRID_Y = H / 2 - GRID_H / 2 + 40;
+  var SNAP_DIST = 22;
+
+  // tile colors — calm tones (teal family + soft pastels)
+  var TILE_COLORS = [
+    '#2ec5b6', '#3dd6c8', '#55b8d0', '#7ec8c8',
+    '#5faaaa', '#4db8b8', '#3ec4b0', '#6ecec0',
+    '#50c0a8', '#2ebab0', '#40ccc0', '#60c8a8',
+    '#48b8b0', '#38c0a8', '#68c8b8', '#2ec0b0'
+  ];
+
+  // juice state
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+
+  // game state
+  var phase = 'title'; // title | play | over | cta
+  var tiles = [];
+  var dragging = null;      // { idx, ox, oy }
+  var score = 0;
+  var snapsLeft = 0;
+  var runStartTs = 0;
+  var overAt = 0, ctaAt = 0;
+  var calmStep = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('stg_best') || 0; } catch (_) {}
+
+  // bot state
+  var botRunsDone = 0;
+  var botTarget = null; // { idx, phase: 'lift'|'move'|'drop', progress }
+  var botDoneFlags = 0; // tiles snapped this bot run
+
+  // demo state
+  var demoPhase = 0;   // 0=idle 1=playing 2=settling 3=deepening 4=resolving 5=cta
+  var demoPauseT = 0;
+  var demoCurrentTile = -1;
+  var demoLiftProgress = 0;
+  var demoMoveProgress = 0;
+  var demoDropDone = false;
+  var demoSnapped = 0;
+  var demoStartTs = 0;
+  var demoPauseFrames = 0;
+
+  function ghostPos(col, row) {
+    return {
+      x: GRID_X + col * (TILE_SIZE + GAP),
+      y: GRID_Y + row * (TILE_SIZE + GAP)
+    };
+  }
+
+  function initTiles() {
+    tiles = [];
+    // scatter positions seeded
+    var positions = [];
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        positions.push({ col: c, row: r });
+      }
+    }
+    // shuffle
+    for (var i = positions.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = positions[i]; positions[i] = positions[j]; positions[j] = tmp;
+    }
+
+    for (var k = 0; k < positions.length; k++) {
+      var p = positions[k];
+      var gp = ghostPos(p.col, p.row);
+      // scatter to random spot avoiding the grid area
+      var sx, sy;
+      var attempt = 0;
+      do {
+        sx = 30 + rng() * (W - 90);
+        sy = 80 + rng() * (H - 180);
+        attempt++;
+      } while (attempt < 20 && Math.abs(sx - gp.x) < TILE_SIZE * 1.5 && Math.abs(sy - gp.y) < TILE_SIZE * 1.5);
+
+      tiles.push({
+        col: p.col,
+        row: p.row,
+        x: sx,
+        y: sy,
+        color: TILE_COLORS[k % TILE_COLORS.length],
+        snapped: false,
+        glimmer: 0,    // 0..1 glimmer animation
+        glimmerT: 0,
+        floatPhase: rng() * Math.PI * 2,
+        floatSpeed: 0.6 + rng() * 0.4
+      });
+    }
+    score = 0;
+    snapsLeft = ROWS * COLS;
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function snapTile(idx) {
+    var t = tiles[idx];
+    var gp = ghostPos(t.col, t.row);
+    t.x = gp.x; t.y = gp.y;
+    t.snapped = true;
+    t.glimmer = 1; t.glimmerT = 0;
+    snapsLeft--;
+    score++;
+    calmStep++;
+    if (window.J) J.calm(calmStep);
+    hitStop = 3; zoom = 1.015;
+    flash('✓', TEAL, 28, gp.x + TILE_SIZE / 2, gp.y + TILE_SIZE / 2);
+    if (window.LOOP) LOOP.emit('tile_snapped', { n: score, remaining: snapsLeft });
+    if (snapsLeft === 0) {
+      // all snapped — run complete
+      if (window.J) setTimeout(function () { J.calm(calmStep + 3); }, 300);
+      setTimeout(gameOver, 500);
+    }
+  }
+
+  function trySnap(idx) {
+    var t = tiles[idx];
+    if (t.snapped) return;
+    var gp = ghostPos(t.col, t.row);
+    var dx = (t.x + TILE_SIZE / 2) - (gp.x + TILE_SIZE / 2);
+    var dy = (t.y + TILE_SIZE / 2) - (gp.y + TILE_SIZE / 2);
+    if (Math.sqrt(dx * dx + dy * dy) < SNAP_DIST) {
+      snapTile(idx);
+      return true;
+    }
+    return false;
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (score > best) {
+      best = score;
+      try { localStorage.setItem('stg_best', String(best)); } catch (_) {}
+    }
+    if (DEMO) {
+      window.__demoScore = score;
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    rng = mulberry32(SEED + botRunsDone * 17 + 3);
+    dragging = null;
+    flashes = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    calmStep = 0;
+    botTarget = null;
+    botDoneFlags = 0;
+    initTiles();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size, x, y) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0,
+                   x: x || W / 2, y: y || H / 2 });
+  }
+
+  // --- input (human) ---
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, px, py) {
+    return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+  }
+
+  var pointerDown = false;
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale;
+    var py = (e.clientY - r.top) / scale;
+    if (inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { initTiles(); startRun(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'tiles' }); return;
+      }
+      resetRun(); return;
+    }
+    if (phase !== 'play') return;
+    // pick up a tile
+    for (var i = tiles.length - 1; i >= 0; i--) {
+      var t = tiles[i];
+      if (t.snapped) continue;
+      if (px >= t.x && px <= t.x + TILE_SIZE && py >= t.y && py <= t.y + TILE_SIZE) {
+        dragging = { idx: i, ox: px - t.x, oy: py - t.y };
+        break;
+      }
+    }
+    pointerDown = true;
+  });
+
+  window.addEventListener('pointermove', function (e) {
+    if (DEMO || BOT || !dragging) return;
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale;
+    var py = (e.clientY - r.top) / scale;
+    var t = tiles[dragging.idx];
+    t.x = px - dragging.ox;
+    t.y = py - dragging.oy;
+  });
+
+  window.addEventListener('pointerup', function () {
+    if (DEMO || BOT || !dragging) return;
+    trySnap(dragging.idx);
+    dragging = null;
+    pointerDown = false;
+  });
+
+  // --- BOT autopilot ---
+  // Bot picks up tiles one by one, moves them toward ghost, drops them.
+  // Imperfect: sometimes misses the snap zone, needs a second attempt.
+  // After K snaps it goes passive so the remaining tiles stay scattered
+  // and we can call gameOver manually (or — since all tiles must snap for
+  // natural game_over — we force gameOver after a timeout).
+  var BOT_SNAP_LIMIT = Math.floor(ROWS * COLS * 0.75); // snap 75% then time out
+  var botLiftX = 0, botLiftY = 0, botTargetX = 0, botTargetY = 0;
+  var botProgress = 0; // 0..1 for current move
+  var botWait = 0;     // frames to pause before next action
+  var botPassive = false;
+  var botPassiveT = 0;
+  var botMissed = false; // whether current tile was intentionally missed
+
+  function botAutopilot() {
+    if (phase !== 'play') return;
+    if (botPassive) {
+      botPassiveT++;
+      // after ~2s of passive, call game_over (tiles not all snapped = incomplete)
+      if (botPassiveT > 120) {
+        gameOver();
+      }
+      return;
+    }
+    if (botWait > 0) { botWait--; return; }
+
+    if (dragging === null) {
+      // find a tile to pick up
+      var candidates = tiles.filter(function (t, i) { return !t.snapped; });
+      if (candidates.length === 0) return; // natural game_over fires from snapTile
+      // pick by random seeded
+      var pick = candidates[Math.floor(rng() * candidates.length)];
+      var pickIdx = tiles.indexOf(pick);
+      dragging = { idx: pickIdx, ox: TILE_SIZE / 2, oy: TILE_SIZE / 2 };
+      // compute target: ghost pos + small error
+      var gp = ghostPos(pick.col, pick.row);
+      var err = (rng() - 0.5) * 30; // imperfect
+      botMissed = Math.abs(err) > SNAP_DIST - 2;
+      botTargetX = gp.x + (botMissed ? (rng() > 0.5 ? 28 : -28) : (rng() - 0.5) * 10);
+      botTargetY = gp.y + (botMissed ? (rng() > 0.5 ? 28 : -28) : (rng() - 0.5) * 10);
+      botLiftX = pick.x;
+      botLiftY = pick.y;
+      botProgress = 0;
+      botWait = 8;
+    } else {
+      // move tile toward target
+      botProgress = Math.min(1, botProgress + 0.04);
+      var ease = botProgress < 0.5 ? 2 * botProgress * botProgress : 1 - 2 * (1 - botProgress) * (1 - botProgress);
+      var t = tiles[dragging.idx];
+      t.x = botLiftX + (botTargetX - botLiftX) * ease;
+      t.y = botLiftY + (botTargetY - botLiftY) * ease;
+
+      if (botProgress >= 1) {
+        // "release"
+        var snapped = trySnap(dragging.idx);
+        dragging = null;
+        botProgress = 0;
+        botDoneFlags++;
+        botWait = 20 + Math.floor(rng() * 20);
+        if (!snapped && botMissed) {
+          // retry: pick same tile again immediately (handled next frame)
+          botWait = 10;
+        }
+        // after snap limit, go passive so game_over can fire
+        if (botDoneFlags >= BOT_SNAP_LIMIT) {
+          botPassive = true;
+          botPassiveT = 0;
+          dragging = null;
+        }
+      }
+    }
+  }
+
+  // --- DEMO autopilot ---
+  // calm arc: settle → deepen → resolve → soft CTA
+  // 16s total play:
+  //   0-4s:   slowly snap first few tiles (settle)
+  //   4-8s:   pace quickens, snap middle tiles (deepen)
+  //   8-14s:  steady satisfying snaps (resolve)
+  //   14-16s: last few tiles, then all done → game_over → CTA
+  var demoTileQueue = [];
+  var demoLiftX = 0, demoLiftY = 0, demoTargX = 0, demoTargY = 0;
+  var demoMoveT = 0, demoMoveDur = 1.0; // seconds
+  var demoPauseFrames2 = 0;
+  var demoState = 'idle'; // idle | lifting | moving | settling | done
+
+  function buildDemoQueue() {
+    // visit all 16 tiles in a calm order (row by row with small hesitations)
+    demoTileQueue = [];
+    for (var r2 = 0; r2 < ROWS; r2++) {
+      for (var c2 = 0; c2 < COLS; c2++) {
+        // find tile with this target
+        for (var ii = 0; ii < tiles.length; ii++) {
+          if (tiles[ii].col === c2 && tiles[ii].row === r2) {
+            demoTileQueue.push(ii);
+            break;
+          }
+        }
+      }
+    }
+    demoCurrentTile = -1;
+    demoState = 'idle';
+    demoPauseFrames2 = 45; // initial pause (settle moment)
+  }
+
+  var demoSpeeds = [1.8, 1.5, 1.2, 1.0, 0.9, 0.85, 0.8, 0.78, 0.75, 0.72, 0.7, 0.68, 0.66, 0.65, 0.64, 0.62];
+
+  function demoAutopilot(dt) {
+    if (phase !== 'play') return;
+    if (demoState === 'done') return;
+
+    if (demoPauseFrames2 > 0) {
+      demoPauseFrames2 -= dt;
+      return;
+    }
+
+    if (demoState === 'idle') {
+      // pick next tile from queue
+      if (demoTileQueue.length === 0) {
+        demoState = 'done';
+        return;
+      }
+      demoCurrentTile = demoTileQueue.shift();
+      var ct = tiles[demoCurrentTile];
+      if (ct.snapped) { demoState = 'idle'; return; }
+      demoLiftX = ct.x; demoLiftY = ct.y;
+      var gp2 = ghostPos(ct.col, ct.row);
+      demoTargX = gp2.x; demoTargY = gp2.y;
+      demoMoveT = 0;
+      var spd = demoSpeeds[Math.min(demoSnapped, demoSpeeds.length - 1)];
+      demoMoveDur = spd * 60; // in frames
+      dragging = { idx: demoCurrentTile, ox: TILE_SIZE / 2, oy: TILE_SIZE / 2 };
+      demoState = 'moving';
+    } else if (demoState === 'moving') {
+      demoMoveT = Math.min(demoMoveDur, demoMoveT + dt);
+      var prog = demoMoveT / demoMoveDur;
+      var eased = prog < 0.5 ? 2 * prog * prog : 1 - 2 * (1 - prog) * (1 - prog);
+      var tt = tiles[demoCurrentTile];
+      tt.x = demoLiftX + (demoTargX - demoLiftX) * eased;
+      tt.y = demoLiftY + (demoTargY - demoLiftY) * eased;
+      if (demoMoveT >= demoMoveDur) {
+        // snap it
+        snapTile(demoCurrentTile);
+        dragging = null;
+        demoSnapped++;
+        demoState = 'idle';
+        // pause between tiles (longer at start, shorter as pace builds)
+        var pauseFrames = demoSnapped < 4 ? 40 : demoSnapped < 10 ? 22 : 14;
+        demoPauseFrames2 = pauseFrames + (rng() - 0.5) * 10;
+      }
+    }
+  }
+
+  // --- render ---
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // decay juice
+    if (hitStop > 0) { hitStop -= dt; }
+    else {
+      // autopilots run when not hitStopped
+      if (BOT) botAutopilot();
+      if (DEMO) demoAutopilot(dt);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.1 * dt;
+
+    // floating tiles animation
+    for (var i = 0; i < tiles.length; i++) {
+      var t = tiles[i];
+      if (!t.snapped && dragging && dragging.idx === i) continue;
+      if (!t.snapped) {
+        // gentle float
+        t.floatPhase += t.floatSpeed * 0.025 * dt;
+      }
+      if (t.glimmer > 0) {
+        t.glimmerT += dt;
+        t.glimmer = Math.max(0, 1 - t.glimmerT / 35);
+      }
+    }
+
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    if (phase === 'play' || phase === 'over' || phase === 'cta') {
+      // draw ghost outlines
+      for (var r = 0; r < ROWS; r++) {
+        for (var c = 0; c < COLS; c++) {
+          var gx = GRID_X + c * (TILE_SIZE + GAP);
+          var gy = GRID_Y + r * (TILE_SIZE + GAP);
+          cx.save();
+          cx.strokeStyle = 'rgba(46,197,182,0.2)';
+          cx.lineWidth = 1.5;
+          cx.beginPath();
+          if (cx.roundRect) cx.roundRect(gx, gy, TILE_SIZE, TILE_SIZE, 6);
+          else cx.rect(gx, gy, TILE_SIZE, TILE_SIZE);
+          cx.stroke();
+          cx.restore();
+        }
+      }
+
+      // draw tiles (snapped first, then loose, then dragging on top)
+      var drawOrder = [];
+      for (var ii = 0; ii < tiles.length; ii++) {
+        if (tiles[ii].snapped) drawOrder.unshift(ii);
+        else if (!dragging || dragging.idx !== ii) drawOrder.push(ii);
+        else drawOrder.push(ii); // dragging last
+      }
+      // sort: snapped bottom, dragging top
+      drawOrder.sort(function (a, b) {
+        var sa = tiles[a].snapped ? -1 : 0;
+        var sb = tiles[b].snapped ? -1 : 0;
+        var da = (dragging && dragging.idx === a) ? 1 : 0;
+        var db = (dragging && dragging.idx === b) ? 1 : 0;
+        return (sa - sb) || (da - db);
+      });
+
+      for (var di = 0; di < drawOrder.length; di++) {
+        var idx = drawOrder[di];
+        var tile = tiles[idx];
+        var isDragging = dragging && dragging.idx === idx;
+        var tx = tile.x;
+        var ty = tile.y;
+        if (!tile.snapped && !isDragging) {
+          ty += Math.sin(tile.floatPhase) * 3;
+        }
+
+        cx.save();
+        if (isDragging) {
+          // lifted shadow
+          cx.shadowColor = 'rgba(46,197,182,0.35)';
+          cx.shadowBlur = 18;
+          cx.globalAlpha = 0.95;
+        } else if (tile.snapped) {
+          cx.globalAlpha = 1;
+        } else {
+          cx.globalAlpha = 0.88;
+        }
+
+        // tile body
+        cx.fillStyle = tile.color;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(tx, ty, TILE_SIZE, TILE_SIZE, 6);
+        else cx.rect(tx, ty, TILE_SIZE, TILE_SIZE);
+        cx.fill();
+
+        // glimmer overlay
+        if (tile.glimmer > 0) {
+          cx.globalAlpha = tile.glimmer * 0.5;
+          cx.fillStyle = '#fff';
+          cx.beginPath();
+          if (cx.roundRect) cx.roundRect(tx, ty, TILE_SIZE, TILE_SIZE, 6);
+          else cx.rect(tx, ty, TILE_SIZE, TILE_SIZE);
+          cx.fill();
+          // sheen line
+          cx.globalAlpha = tile.glimmer * 0.7;
+          cx.strokeStyle = '#fff';
+          cx.lineWidth = 1.5;
+          cx.beginPath();
+          cx.moveTo(tx + 8, ty + 4);
+          cx.lineTo(tx + TILE_SIZE - 8, ty + 4);
+          cx.stroke();
+        }
+        cx.restore();
+      }
+
+      // score indicator (tiles snapped / total)
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' / ' + (ROWS * COLS), W / 2, 66);
+
+      cx.fillStyle = 'rgba(46,197,182,0.5)';
+      cx.font = '500 11px -apple-system, Helvetica, Arial';
+      cx.fillText('tiles placed', W / 2, 83);
+    }
+
+    // floating texts
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 35);
+      cx.save();
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + (fl.size) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.7);
+      cx.restore();
+      if (fl.t > 35) flashes.splice(k, 1);
+    }
+
+    // title screen
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 40px -apple-system, Helvetica, Arial';
+      cx.fillText('SNAP TO GRID', W / 2, 280);
+      cx.fillStyle = 'rgba(46,197,182,0.85)';
+      cx.font = '600 17px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 500);
+      cx.globalAlpha = pulse;
+      cx.fillText('TAP TO BEGIN', W / 2, 326);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('drag each tile to its place', W / 2, 356);
+    }
+
+    // game over overlay
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '800 36px -apple-system, Helvetica, Arial';
+      cx.fillText('COMPLETE', W / 2, 296);
+      cx.fillStyle = '#fff';
+      cx.font = '600 20px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' tiles placed', W / 2, 336);
+      if (!DEMO && !BOT) {
+        cx.fillStyle = TEAL;
+        cx.font = '600 14px -apple-system, Helvetica, Arial';
+        var pulse2 = 0.65 + 0.35 * Math.sin(now / 380);
+        cx.globalAlpha = pulse2;
+        cx.fillText('TAP — PLAY AGAIN', W / 2, 380);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(46,197,182,0.12)';
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = TEAL;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (phase === 'cta') {
+      var tCta = (now - ctaAt) / 1000, easeCta = Math.min(1, tCta * 2.5);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * easeCta) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = easeCta;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 42px -apple-system, Helvetica, Arial';
+      cx.fillText('SNAP TO GRID', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.65)';
+      cx.font = '500 17px -apple-system, Helvetica, Arial';
+      cx.fillText('find your place in the chaos', W / 2, 332);
+      var pulse3 = 0.75 + 0.25 * Math.sin(now / 350);
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = easeCta * pulse3;
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 400);
+      cx.globalAlpha = easeCta;
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // --- init ---
+  function newGame() {
+    rng = mulberry32(SEED);
+    dragging = null; flashes = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    calmStep = 0;
+    botRunsDone = 0; botTarget = null; botDoneFlags = 0;
+    botPassive = false; botPassiveT = 0;
+    demoSnapped = 0; demoState = 'idle'; demoPauseFrames2 = 45;
+    demoTileQueue = [];
+    demoCurrentTile = -1;
+
+    initTiles();
+
+    if (DEMO) {
+      buildDemoQueue();
+      demoStartTs = performance.now();
+      startRun();
+      return;
+    }
+    if (BOT) {
+      startRun();
+      return;
+    }
+    phase = 'title';
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

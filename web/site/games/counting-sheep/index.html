@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Counting Sheep — Tilt</title>
+<!--
+  LOOP / attention-architecture — Counting Sheep
+  Circuits: 02-novelty, 07-timing, 06-zeigarnik
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7        scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'counting-sheep';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // --- Game constants ---
+  var TOTAL_SHEEP = 12;      // finite loop — the ritual ends
+  var FENCE_Y = 500;
+  var FENCE_X_MID = W / 2;
+
+  // Sky darkness: starts soft night-blue, deepens to full black over TOTAL_SHEEP
+  function skyColor(counted) {
+    // from #1a2035 (soft midnight) to #000008 (deep dark) then pure black at end
+    var t = counted / TOTAL_SHEEP;
+    var r = Math.round(26 * (1 - t));
+    var g = Math.round(32 * (1 - t));
+    var b = Math.round(53 * (1 - t) + 8 * t);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  // Sheep speed: starts moderate, slows with each count (calming)
+  function sheepSpeed(counted) {
+    return 1.6 - counted * 0.08;   // from 1.6 → 0.64 at sheep 12
+  }
+
+  // --- State ---
+  var state, flashes, runStartTs;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var botRunsDone = 0;
+  var ctaAt = 0;
+
+  // Sheep arc: jump over fence (cosine arc from left to right)
+  // Each sheep walks from left offscreen, arcs over the fence, walks off right
+  function makeSheep(counted) {
+    var spd = sheepSpeed(counted);
+    return {
+      x: -60,
+      progress: 0,    // 0 → 1 across screen
+      speed: spd,
+      counted: false,
+      bobPhase: rng() * Math.PI * 2,
+      woolShade: Math.round(200 + rng() * 40),  // slight variation
+      tapped: false
+    };
+  }
+
+  function newGame() {
+    state = {
+      phase: 'title',   // title | play | resolve | cta
+      counted: 0,
+      sheep: null,
+      sheepIdx: 0,
+      waitForNext: false,
+      waitTimer: 0,
+      fadeBlack: 0,      // 0→1 at end
+      overAt: 0,
+      score: 0
+    };
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    if (DEMO) {
+      setTimeout(startRun, 400);
+      return;
+    }
+    if (BOT) { startRun(); }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.counted = 0;
+    state.sheepIdx = 0;
+    state.sheep = makeSheep(0);
+    state.waitForNext = false;
+    state.waitTimer = 0;
+    state.fadeBlack = 0;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function countSheep() {
+    var s = state.sheep;
+    if (!s || s.tapped || state.phase !== 'play') return;
+    // Only countable while sheep is in the leap arc zone (roughly 30%-70% progress)
+    if (s.progress < 0.15 || s.progress > 0.85) return;  // missed window
+    s.tapped = true;
+    state.counted++;
+    state.score = state.counted;
+    var step = state.counted;
+    if (window.J) J.calm(step);
+    hitStop = 3;
+    zoom = 1.015;
+    flash(state.counted + ' 🐑', TEAL, 38);
+    if (window.LOOP) LOOP.emit('sheep_counted', { n: state.counted });
+    // Sheep finishes its arc, then next sheep spawns
+  }
+
+  function missedSheep() {
+    // Sheep passed without being tapped
+    if (window.LOOP) LOOP.emit('near_miss', { n: state.sheep ? state.sheepIdx : 0 });
+    flash('missed...', 'rgba(180,180,200,0.8)', 28);
+    shakeAmt = 1.5;
+  }
+
+  function spawnNextSheep() {
+    state.sheepIdx++;
+    if (state.sheepIdx >= TOTAL_SHEEP) {
+      // All sheep done — check if we counted them all
+      endSequence();
+      return;
+    }
+    // Brief pause before next sheep
+    state.waitForNext = true;
+    state.waitTimer = state.counted > 0 ? 90 - state.counted * 4 : 80;  // pace quickens slightly at first then slows
+    if (state.waitTimer < 40) state.waitTimer = 40;
+  }
+
+  function endSequence() {
+    state.phase = 'resolve';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (window.J) J.calm(state.score);
+    // Fade to black over ~2s
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 3200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 1200);
+    }
+  }
+
+  function resetRun() {
+    state.counted = 0;
+    state.sheepIdx = 0;
+    state.sheep = makeSheep(0);
+    state.waitForNext = false;
+    state.waitTimer = 0;
+    state.fadeBlack = 0;
+    state.phase = 'play';
+    flashes = [];
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('restart', {});
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // --- Input ---
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 120, y: 500, w: 240, h: 44 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { countSheep(); return; }
+    if (state.phase === 'resolve' && performance.now() - state.overAt > 500) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'sheep counted' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // --- Demo / Bot autopilot ---
+  // Demo: tap each sheep with realistic hesitation
+  var demoTapDone = false;
+  var demoHesitation = 0;
+  // Hesitation delays per sheep (frames) — varied for human feel
+  var demoWaits = [18, 22, 14, 28, 16, 20, 12, 25, 15, 19, 16, 22];
+
+  function autopilot(dt) {
+    if (state.phase !== 'play') return;
+    var s = state.sheep;
+    if (!s || s.tapped || state.waitForNext) return;
+
+    if (DEMO) {
+      // Tap when sheep is mid-arc (around 45-55% progress), with hesitation
+      var targetProgress = 0.42 + (rng() - 0.5) * 0.08;
+      if (s.progress >= targetProgress && !demoTapDone) {
+        if (demoHesitation <= 0) {
+          demoTapDone = true;
+          countSheep();
+        } else {
+          demoHesitation -= dt;
+        }
+      }
+    } else if (BOT) {
+      // Imperfect bot: sometimes misses (15% chance), slightly off timing
+      var botTarget = 0.38 + rng() * 0.25;
+      var botMiss = rng() < 0.18;  // bot misses some sheep so game_over eventually fires
+      if (s.progress >= botTarget && !botMiss) {
+        countSheep();
+      }
+      // If botMiss: sheep passes untapped, spawnNextSheep handles it
+    }
+  }
+
+  // --- Drawing helpers ---
+
+  function drawSky(counted) {
+    var col = skyColor(counted);
+    cx.fillStyle = col;
+    cx.fillRect(0, 0, W, H);
+    // Stars — fade in as sky darkens
+    var starAlpha = Math.min(1, counted / 4) * 0.7;
+    if (starAlpha > 0.05) {
+      cx.globalAlpha = starAlpha;
+      cx.fillStyle = '#ffffff';
+      // Draw static stars using seeded positions
+      var starRng = mulberry32(999);
+      for (var i = 0; i < 40; i++) {
+        var sx = starRng() * W;
+        var sy = starRng() * (FENCE_Y - 80);
+        var sr = 0.7 + starRng() * 1.1;
+        cx.beginPath();
+        cx.arc(sx, sy, sr, 0, Math.PI * 2);
+        cx.fill();
+      }
+      cx.globalAlpha = 1;
+    }
+    // Moon
+    var moonAlpha = Math.min(1, counted / 3) * 0.9;
+    if (moonAlpha > 0.05) {
+      cx.globalAlpha = moonAlpha;
+      cx.fillStyle = '#f5e8c0';
+      cx.beginPath();
+      cx.arc(W - 80, 90, 28, 0, Math.PI * 2);
+      cx.fill();
+      // Moon crescent cutout
+      cx.fillStyle = skyColor(Math.max(0, counted - 0.5));
+      cx.beginPath();
+      cx.arc(W - 68, 84, 24, 0, Math.PI * 2);
+      cx.fill();
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawField() {
+    // Ground below fence
+    var g = cx.createLinearGradient(0, FENCE_Y, 0, H);
+    g.addColorStop(0, '#1a3322');
+    g.addColorStop(1, '#0e1f14');
+    cx.fillStyle = g;
+    cx.fillRect(0, FENCE_Y, W, H - FENCE_Y);
+    // Rolling hills
+    cx.fillStyle = '#1e3d29';
+    cx.beginPath();
+    cx.moveTo(0, FENCE_Y + 30);
+    cx.bezierCurveTo(80, FENCE_Y - 10, 160, FENCE_Y + 50, 280, FENCE_Y + 20);
+    cx.bezierCurveTo(340, FENCE_Y + 5, 380, FENCE_Y + 40, W, FENCE_Y + 25);
+    cx.lineTo(W, H); cx.lineTo(0, H);
+    cx.closePath();
+    cx.fill();
+  }
+
+  function drawFence(now) {
+    // Wooden fence posts along the center
+    var posts = 9;
+    var spacing = W / (posts - 1);
+    cx.strokeStyle = '#c8a96e';
+    cx.lineWidth = 3;
+    for (var i = 0; i < posts; i++) {
+      var fx = i * spacing;
+      cx.strokeStyle = '#b89458';
+      cx.lineWidth = 4;
+      cx.beginPath();
+      cx.moveTo(fx, FENCE_Y - 50);
+      cx.lineTo(fx, FENCE_Y + 20);
+      cx.stroke();
+      // Post cap
+      cx.fillStyle = '#c8a96e';
+      cx.fillRect(fx - 4, FENCE_Y - 55, 8, 8);
+    }
+    // Top rail
+    cx.strokeStyle = '#c8a96e';
+    cx.lineWidth = 5;
+    cx.beginPath();
+    cx.moveTo(0, FENCE_Y - 28);
+    cx.lineTo(W, FENCE_Y - 28);
+    cx.stroke();
+    // Bottom rail
+    cx.lineWidth = 4;
+    cx.beginPath();
+    cx.moveTo(0, FENCE_Y - 10);
+    cx.lineTo(W, FENCE_Y - 10);
+    cx.stroke();
+  }
+
+  // Sheep: a fluffy oval body + head, 4 legs, ears
+  function drawSheep(x, y, woolShade, tapped, progress, bobPhase, now) {
+    var bodyW = 44, bodyH = 28;
+    var alpha = 1;
+    // Fade in at left edge, fade out at right edge
+    if (progress < 0.08) alpha = progress / 0.08;
+    if (progress > 0.88) alpha = (1 - progress) / 0.12;
+    cx.globalAlpha = Math.max(0, alpha);
+
+    // slight bob
+    var bob = Math.sin(bobPhase + now / 300) * 2;
+    var ry = y + bob;
+
+    // Shadow on ground
+    cx.fillStyle = 'rgba(0,0,0,0.18)';
+    cx.beginPath();
+    cx.ellipse(x, FENCE_Y + 15, bodyW * 0.6, 5, 0, 0, Math.PI * 2);
+    cx.fill();
+
+    // Legs
+    cx.strokeStyle = '#888';
+    cx.lineWidth = 3;
+    cx.lineCap = 'round';
+    var legOffsets = [-12, -4, 4, 12];
+    for (var i = 0; i < 4; i++) {
+      var lx = x + legOffsets[i];
+      cx.beginPath();
+      cx.moveTo(lx, ry + bodyH / 2 - 2);
+      cx.lineTo(lx, ry + bodyH / 2 + 14);
+      cx.stroke();
+      // Hoof
+      cx.fillStyle = '#555';
+      cx.beginPath();
+      cx.ellipse(lx, ry + bodyH / 2 + 16, 3, 2.5, 0, 0, Math.PI * 2);
+      cx.fill();
+    }
+
+    // Wool body — fluffy circles
+    var shade = woolShade;
+    var woolColor = tapped ? 'rgb(' + Math.round(shade * 0.85) + ',' + Math.round(shade * 0.92) + ',' + shade + ')' : 'rgb(' + shade + ',' + shade + ',' + shade + ')';
+    var puffs = [
+      [0, 0, 19], [-14, 3, 15], [14, 3, 15],
+      [-9, -8, 13], [9, -8, 13], [0, -11, 12]
+    ];
+    for (var p = 0; p < puffs.length; p++) {
+      cx.fillStyle = woolColor;
+      cx.beginPath();
+      cx.arc(x + puffs[p][0], ry + puffs[p][1], puffs[p][2], 0, Math.PI * 2);
+      cx.fill();
+    }
+
+    // Head (right side, looking forward)
+    var headX = x + bodyW / 2 - 2;
+    var headY = ry - 4;
+    cx.fillStyle = '#c8c8c0';
+    cx.beginPath();
+    cx.ellipse(headX, headY, 12, 10, 0.2, 0, Math.PI * 2);
+    cx.fill();
+    // Eye
+    cx.fillStyle = '#333';
+    cx.beginPath();
+    cx.arc(headX + 4, headY - 2, 2.5, 0, Math.PI * 2);
+    cx.fill();
+    cx.fillStyle = 'rgba(255,255,255,0.8)';
+    cx.beginPath();
+    cx.arc(headX + 4.8, headY - 2.6, 0.9, 0, Math.PI * 2);
+    cx.fill();
+    // Ear
+    cx.fillStyle = '#c0a090';
+    cx.beginPath();
+    cx.ellipse(headX - 2, headY - 9, 4, 6, -0.5, 0, Math.PI * 2);
+    cx.fill();
+    // Nose
+    cx.fillStyle = '#d8a090';
+    cx.beginPath();
+    cx.ellipse(headX + 9, headY + 2, 4, 3, 0, 0, Math.PI * 2);
+    cx.fill();
+
+    // If tapped — small star puff
+    if (tapped) {
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = 0.7 * alpha;
+      cx.font = '18px -apple-system';
+      cx.textAlign = 'center';
+      cx.fillText('✦', x, ry - 30);
+    }
+
+    cx.globalAlpha = 1;
+  }
+
+  // Sheep jump arc — cosine curve over the fence
+  // progress 0→1 maps to x:-60→W+60, y: arc peak at FENCE_Y-80
+  function sheepPosFromProgress(progress) {
+    var x = -60 + progress * (W + 120);
+    var arcT = Math.sin(progress * Math.PI);  // 0 at edges, 1 at middle
+    var y = FENCE_Y - arcT * 110 - 20;  // arc peak about 110px above fence
+    return { x: x, y: y };
+  }
+
+  // --- Counter display ---
+  function drawCounter(counted, now) {
+    // Sheep counter — calm zeigarnik progress dots at top
+    var dotR = 7, dotSpacing = 22;
+    var totalW = (TOTAL_SHEEP - 1) * dotSpacing + dotR * 2;
+    var startX = (W - totalW) / 2 + dotR;
+    var dotY = 60;
+    for (var i = 0; i < TOTAL_SHEEP; i++) {
+      var dx = startX + i * dotSpacing;
+      if (i < counted) {
+        // Counted — teal filled
+        cx.fillStyle = TEAL;
+        cx.globalAlpha = 0.9;
+        cx.beginPath();
+        cx.arc(dx, dotY, dotR, 0, Math.PI * 2);
+        cx.fill();
+      } else if (i === counted) {
+        // Current — pulsing outline
+        var pulse = 0.5 + 0.5 * Math.sin(now / 400);
+        cx.strokeStyle = 'rgba(46,197,182,' + (0.4 + 0.4 * pulse) + ')';
+        cx.lineWidth = 2;
+        cx.beginPath();
+        cx.arc(dx, dotY, dotR, 0, Math.PI * 2);
+        cx.stroke();
+      } else {
+        // Future — dim
+        cx.fillStyle = 'rgba(255,255,255,0.12)';
+        cx.globalAlpha = 1;
+        cx.beginPath();
+        cx.arc(dx, dotY, dotR - 1, 0, Math.PI * 2);
+        cx.fill();
+      }
+    }
+    cx.globalAlpha = 1;
+
+    // Count text
+    if (counted > 0) {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(46,197,182,0.85)';
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText(counted + ' / ' + TOTAL_SHEEP, W / 2, 95);
+    }
+  }
+
+  // --- Main loop ---
+  var last = performance.now();
+  var demoPrepared = false;
+  // Demo: set up hesitations at start
+  var demoSheepHesitations = [18, 22, 14, 28, 16, 20, 12, 25, 15, 19, 16, 22];
+  var demoCurrentHesitation = 0;
+  var demoCurrSheepIdx = -1;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    if (state.phase === 'play') {
+      var s = state.sheep;
+
+      if (!state.waitForNext && s) {
+        // Advance sheep
+        if (hitStop > 0) {
+          hitStop -= dt;
+        } else {
+          s.progress += (s.speed / W) * (W + 120) / 60 * dt;
+          if (s.progress > 1.0) {
+            // Sheep left without being tapped
+            if (!s.tapped) missedSheep();
+            spawnNextSheep();
+          } else {
+            autopilot(dt);
+          }
+        }
+      } else if (state.waitForNext) {
+        state.waitTimer -= dt;
+        if (state.waitTimer <= 0) {
+          state.waitForNext = false;
+          state.sheep = makeSheep(state.counted);
+          // Demo: reset tap flag and set hesitation for next sheep
+          demoTapDone = false;
+          if (DEMO) {
+            var hIdx = Math.min(state.sheepIdx, demoSheepHesitations.length - 1);
+            demoHesitation = demoSheepHesitations[hIdx];
+          }
+        }
+      }
+
+      // Fade to dark as counted increases (gradual)
+      state.fadeBlack = 0; // handled in skyColor
+    }
+
+    if (state.phase === 'resolve') {
+      // Fade black over time
+      var elapsed = (now - state.overAt) / 1000;
+      state.fadeBlack = Math.min(1, elapsed / 2.0);
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy2 = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy2);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.88, dt);
+    zoom += (1 - zoom) * 0.1 * dt;
+
+    // Background sky
+    drawSky(state.counted);
+
+    // Field
+    drawField();
+
+    // Fence
+    drawFence(now);
+
+    // Sheep
+    if (state.phase === 'play' && state.sheep && !state.waitForNext) {
+      var s2 = state.sheep;
+      var pos = sheepPosFromProgress(s2.progress);
+      drawSheep(pos.x, pos.y, s2.woolShade, s2.tapped, s2.progress, s2.bobPhase, now);
+    }
+
+    // Counter dots + count
+    if (state.phase === 'play' || state.phase === 'resolve') {
+      drawCounter(state.counted, now);
+    }
+
+    // Tap hint on first sheep
+    if (state.phase === 'play' && state.sheepIdx === 0 && state.counted === 0 && !DEMO && !BOT) {
+      var hintAlpha = 0.5 + 0.4 * Math.sin(now / 500);
+      cx.globalAlpha = hintAlpha;
+      cx.fillStyle = 'rgba(255,255,255,0.8)';
+      cx.textAlign = 'center';
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('tap as each sheep leaps', W / 2, 140);
+      cx.globalAlpha = 1;
+    }
+
+    // Flashes (floating reward text)
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, FENCE_Y - 120 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // Title screen
+    if (state.phase === 'title') {
+      cx.fillStyle = 'rgba(11,13,18,0.72)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 42px -apple-system, Helvetica, Arial';
+      cx.fillText('COUNTING SHEEP', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '400 17px -apple-system, Helvetica, Arial';
+      cx.fillText('tap as each sheep leaps the fence', W / 2, 330);
+      var p2 = 0.55 + 0.45 * Math.sin(now / 420);
+      cx.globalAlpha = p2;
+      cx.fillStyle = TEAL;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to begin', W / 2, 378);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.28)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('count all ' + TOTAL_SHEEP + ' and the field goes dark', W / 2, 412);
+    }
+
+    // Resolve screen (all sheep passed)
+    if (state.phase === 'resolve') {
+      // Fade-to-black overlay grows
+      cx.fillStyle = 'rgba(0,0,4,' + state.fadeBlack * 0.92 + ')';
+      cx.fillRect(0, 0, W, H);
+
+      var resolveAlpha = Math.min(1, (now - state.overAt) / 800);
+      cx.globalAlpha = resolveAlpha;
+      cx.textAlign = 'center';
+
+      if (state.counted >= TOTAL_SHEEP) {
+        // Perfect — calm completion
+        cx.fillStyle = TEAL;
+        cx.font = '700 28px -apple-system, Helvetica, Arial';
+        cx.fillText('all ' + TOTAL_SHEEP + ' counted', W / 2, 290);
+        cx.fillStyle = 'rgba(255,255,255,0.75)';
+        cx.font = '400 17px -apple-system, Helvetica, Arial';
+        cx.fillText('the field is quiet now', W / 2, 325);
+        if (window.J) { /* played earlier */ }
+      } else {
+        cx.fillStyle = GOLD;
+        cx.font = '700 26px -apple-system, Helvetica, Arial';
+        cx.fillText(state.counted + ' sheep counted', W / 2, 290);
+        cx.fillStyle = 'rgba(255,255,255,0.6)';
+        cx.font = '400 16px -apple-system, Helvetica, Arial';
+        cx.fillText((TOTAL_SHEEP - state.counted) + ' slipped past', W / 2, 322);
+      }
+
+      if (!DEMO && !BOT) {
+        var p3 = 0.6 + 0.4 * Math.sin(now / 380);
+        cx.globalAlpha = resolveAlpha * p3;
+        cx.fillStyle = 'rgba(255,255,255,0.7)';
+        cx.font = '600 15px -apple-system, Helvetica, Arial';
+        cx.fillText('tap to try again', W / 2, 370);
+        cx.globalAlpha = resolveAlpha;
+        // Share pill
+        cx.fillStyle = 'rgba(46,197,182,0.14)';
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) { cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 22); }
+        else { cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h); }
+        cx.fill(); cx.stroke();
+        cx.fillStyle = TEAL;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ CHALLENGE A FRIEND', W / 2, SHARE_R.y + 27);
+      }
+      cx.globalAlpha = 1;
+    }
+
+    // Demo CTA card — calm invitation
+    if (state.phase === 'cta') {
+      cx.fillStyle = 'rgba(0,0,4,0.88)';
+      cx.fillRect(0, 0, W, H);
+      var t = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t * 1.8);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '700 36px -apple-system, Helvetica, Arial';
+      cx.fillText('COUNTING SHEEP', W / 2, 280);
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '400 18px -apple-system, Helvetica, Arial';
+      cx.fillText('count all ' + TOTAL_SHEEP + '. the field goes dark.', W / 2, 320);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '400 14px -apple-system, Helvetica, Arial';
+      cx.fillText((window.__demoScore || TOTAL_SHEEP) + ' counted', W / 2, 352);
+      var p4 = 0.7 + 0.3 * Math.sin(now / 350);
+      cx.globalAlpha = ease * p4;
+      cx.fillStyle = TEAL;
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 415);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 446);
+      cx.globalAlpha = 1;
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // Init demo hesitation
+  if (DEMO) {
+    demoHesitation = demoSheepHesitations[0];
+    demoTapDone = false;
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Verified Chase — Tilt</title>
+<!--
+  LOOP / attention-architecture — Verified Chase
+  Conditioned path: the verified blue-check gesture (Instagram/TikTok). The
+  player's thumb already knows this move — the game IS that move.
+  Circuits: 03 social (badge aspiration), 06 Zeigarnik (one more account),
+            08 investment (criteria you build up in order).
+  Modes (query params):
+    ?demo=1&seed=7        scripted run for clip capture (challenge → human-feeling
+                          play with hesitation → near-fail + save → REJECTED → CTA),
+                          sets window.__demoDone when finished
+    ?bot=1&runs=3&seed=5  imperfect autoplay for traffic simulation, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?dare=N               incoming challenge
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'verified-chase';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12', BLUE = '#1d9bf0';
+  var WRONG_PENALTY = 80;   // frames shaved off the review window on a bad tap
+
+  // criteria that earn the blue check (canonical order = the "right order")
+  var CRIT = [
+    { g: '📷', l: 'Profile Pic' },
+    { g: '📝', l: 'Bio' },
+    { g: '📬', l: 'Posts' },
+    { g: '🔗', l: 'Link' },
+    { g: '🎥', l: 'Reels' },
+    { g: '👥', l: 'Followers' }
+  ];
+  // distractors: look tappable, will get you flagged (the "fake" social path)
+  var DIST = [
+    { g: '🤖', l: 'Bot Followers' },
+    { g: '❌', l: 'Flagged Post' },
+    { g: '🚫', l: 'Spam Link' },
+    { g: '💀', l: 'Fake Account' }
+  ];
+  function nCrit(k) { return Math.min(3 + (k - 1), 4); }
+  function nDist(k) { return Math.min(k - 1, 3); }
+  function windowFrames(k) { return Math.max(200, 340 - (k - 1) * 28); }
+
+  var state, flashes, runStartTs, best = 0;
+  var hitStop = 0, zoom = 1, dareBeaten = false, shakeAmt = 0, challengeAt = 0, ctaAt = 0;
+  try { best = +localStorage.getItem('vc_best') || 0; } catch (_) {}
+
+  function pctTop(score) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 5)))); }
+
+  function newGame() {
+    state = {
+      phase: 'title',          // title | challenge | play | over | cta
+      round: 1, score: 0, combo: 0,
+      window: 0, windowMax: 1,
+      order: [], slots: [], next: 0, pool: [],
+      roundPause: false, cleanRound: true, verifiedStamp: 0, overAt: 0
+    };
+    flashes = []; dareBeaten = false;
+    if (DEMO) {
+      demoPlan = buildDemoPlan(); demoIdx = 0; demoWait = demoPlan[0].wait;
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { botRunsDone = 0; botWait = 24; startRun(); }
+  }
+
+  // ---- round setup ----
+  function buildRound() {
+    var k = state.round, nc = nCrit(k), nd = nDist(k), i;
+    state.order = []; for (i = 0; i < nc; i++) state.order.push(i);   // canonical order
+    state.slots = []; for (i = 0; i < nc; i++) state.slots.push(false);
+    state.next = 0;
+    state.cleanRound = true;
+    var pool = [];
+    for (i = 0; i < nc; i++) pool.push({ type: 'crit', ci: i });
+    for (i = 0; i < nd; i++) pool.push({ type: 'dist', ci: i % DIST.length });
+    for (i = pool.length - 1; i > 0; i--) { var j = Math.floor(rng() * (i + 1)); var t = pool[i]; pool[i] = pool[j]; pool[j] = t; }
+    // grid layout in the pool area
+    var n = pool.length, cols = n <= 4 ? 2 : 3, gap = 12, x0 = 20, x1 = 385, aw = x1 - x0;
+    var tw = (aw - (cols - 1) * gap) / cols, rows = Math.ceil(n / cols), th = 86, vgap = 12;
+    var totalH = rows * th + (rows - 1) * vgap, y0 = 200 + Math.max(0, (370 - totalH) / 2);
+    for (i = 0; i < n; i++) {
+      var r = Math.floor(i / cols), c = i % cols;
+      var def = pool[i].type === 'crit' ? CRIT[pool[i].ci] : DIST[pool[i].ci];
+      pool[i].x = x0 + c * (tw + gap); pool[i].y = y0 + r * (th + vgap);
+      pool[i].w = tw; pool[i].h = th;
+      pool[i].alive = true; pool[i].anim = 0;
+      pool[i].g = def.g; pool[i].l = def.l;
+    }
+    state.pool = pool;
+    state.window = state.windowMax = windowFrames(k);
+    state.roundPause = false;
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    buildRound();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- core interaction ----
+  function selectTile(tile) {
+    if (!tile || !tile.alive || state.phase !== 'play' || state.roundPause) return;
+    if (tile.type === 'crit' && tile.ci === state.order[state.next]) {
+      // CORRECT — criterion met, in order
+      tile.alive = false; tile.anim = 12;
+      state.slots[state.next] = true;
+      state.next++;
+      state.combo++;
+      var frac = state.window / state.windowMax;
+      if (window.J) { J.hit(state.combo); J.tension(1 - frac); }
+      if (window.LOOP) LOOP.emit('criterion_met', { n: state.next, round: state.round });
+      if (state.next >= state.order.length) roundComplete();
+    } else {
+      // WRONG — distractor, or right criterion out of order → flagged
+      state.cleanRound = false;
+      state.combo = 0;
+      state.window -= WRONG_PENALTY;
+      shakeAmt = 6;
+      tile.anim = -10;
+      flash('FLAGGED', VERM, 34);
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('wrong_tap', { round: state.round });
+      if (state.window <= 0) { state.window = 0; gameOver(); }
+    }
+  }
+
+  function roundComplete() {
+    state.roundPause = true;
+    state.score++;
+    var frac = state.window / state.windowMax;
+    if (frac < 0.22) {
+      flash('SO CLOSE!', GOLD, 38);
+      if (window.LOOP) LOOP.emit('near_miss', { round: state.round, frac: +frac.toFixed(2) });
+      if (window.J) J.near();
+    }
+    flash('VERIFIED', BLUE, 52);
+    hitStop = 5; zoom = 1.03; shakeAmt = 3;
+    state.verifiedStamp = 22;
+    if (window.J) { J.fanfare(); if (state.cleanRound) J.gold(); }
+    if (window.LOOP) LOOP.emit('verified', { score: state.score, round: state.round, clean: state.cleanRound });
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true; flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+    setTimeout(function () { state.round++; buildRound(); }, 750);
+  }
+
+  function gameOver() {
+    if (state.phase === 'over') return;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 10; zoom = 1.04;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) { J.death(Math.min(0.3 + state.score / 8, 1)); J.tension(0); if (newBest) setTimeout(function () { J.fanfare(); }, 450); }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('vc_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) setTimeout(function () {
+      state.phase = 'cta'; ctaAt = performance.now();
+      setTimeout(function () { window.__demoDone = true; }, 3600);
+    }, 2800);
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) window.__botDone = true;
+      else setTimeout(resetRun, 900);
+    }
+  }
+
+  function resetRun() {
+    state.round = 1; state.score = 0; state.combo = 0; dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 44, y: 8, w: 36, h: 36 };
+  var SHARE_R = { x: W / 2 - 125, y: 472, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function inRect(t, x, y) { return x >= t.x && x <= t.x + t.w && y >= t.y && y <= t.y + t.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;                 // scripted modes ignore human taps
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play' && !state.roundPause && x !== undefined) {
+      for (var i = 0; i < state.pool.length; i++) {
+        var t = state.pool[i];
+        if (t.alive && inRect(t, x, y)) { selectTile(t); return; }
+      }
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'criteria' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') { e.preventDefault(); tap(); }
+  });
+
+  // ---- demo / bot autopilots ----
+  // demo script: a list of {wait, act} where wait = hesitation frames BEFORE the
+  // action. 'next' taps the next required criterion in order; 'distractor' taps a
+  // fake → flagged → review rejected (the spectacle). Hesitation keeps it human.
+  var DEMO_TARGET = 4;   // score the challenge card dares; demo ends at this score then fails
+  function buildDemoPlan() {
+    var p = [];
+    function round(k, dawdleLast) {
+      var n = nCrit(k);
+      for (var i = 0; i < n; i++) {
+        var w = [28, 24, 36, 30][i % 4];
+        if (dawdleLast && i === n - 1) w = 140;  // near-fail: dawdle until the window is nearly closed, then the save
+        p.push({ wait: w, act: 'next' });
+      }
+    }
+    // arc: 2 clean verifications → near-fail + save at round 3 (~60% in) → one more clean →
+    // the real fail (greedy fake tap) shortly after, while the review is closing.
+    round(1); round(2); round(3, true); round(4);
+    p.push({ wait: 160, act: 'distractor' });   // round 5: review closing, flagged tap → REJECTED
+    return p;
+  }
+  var demoPlan = [], demoIdx = 0, demoWait = 0;
+  var botRunsDone = 0, botWait = 24;
+
+  function selectNextTile() {
+    var need = state.order[state.next];
+    for (var i = 0; i < state.pool.length; i++)
+      if (state.pool[i].alive && state.pool[i].type === 'crit' && state.pool[i].ci === need) return state.pool[i];
+    return null;
+  }
+  function selectWrongTile() {
+    for (var i = 0; i < state.pool.length; i++)
+      if (state.pool[i].alive && state.pool[i].type === 'dist') return state.pool[i];
+    for (i = 0; i < state.pool.length; i++)
+      if (state.pool[i].alive && state.pool[i].type === 'crit') return state.pool[i];
+    return null;
+  }
+  function autopilot() {
+    if (state.phase !== 'play' || state.roundPause) return;
+    if (DEMO) {
+      if (demoIdx >= demoPlan.length) return;
+      if (demoWait > 0) { demoWait -= 1; return; }
+      var step = demoPlan[demoIdx];
+      if (step.act === 'next') selectTile(selectNextTile());
+      else if (step.act === 'distractor') selectTile(selectWrongTile());
+      demoIdx++;
+      demoWait = demoIdx < demoPlan.length ? demoPlan[demoIdx].wait : 0;
+    } else if (BOT) {
+      if (botWait > 0) { botWait -= 1; return; }
+      // panic when the review is closing → blunders into a flag (guarantees termination)
+      var frac = state.window / state.windowMax;
+      if (frac < 0.30 || rng() < 0.10) selectTile(selectWrongTile());
+      else selectTile(selectNextTile());
+      botWait = 16 + Math.floor(rng() * 14);
+    }
+  }
+
+  // ---- render helpers ----
+  function barColor(f) { return f > 0.5 ? TEAL : f > 0.25 ? GOLD : VERM; }
+  function rr(x, y, w, h, r) { if (cx.roundRect) cx.roundRect(x, y, w, h, r); else cx.rect(x, y, w, h); }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // sim: hit-stop freezes the window + autopilot (the impact "bites"), but always decays
+    if (hitStop > 0) hitStop -= dt;
+    else if (state.phase === 'play' && !state.roundPause) {
+      state.window -= dt;
+      if (state.window <= 0) { state.window = 0; gameOver(); }
+      autopilot();
+    }
+    if (state.verifiedStamp > 0) state.verifiedStamp -= dt;
+
+    // juice transforms: decaying shake + zoom-pulse (wrap the whole frame draw)
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(29,155,240,0.06)'); bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- review window bar (the closing timer) ----
+    cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+    cx.fillStyle = 'rgba(255,255,255,0.42)'; cx.font = '700 10px Menlo, monospace';
+    cx.fillText('REVIEW CLOSING', W / 2, 24);
+    var trackX = 20, trackW = 365, trackY = 32, trackH = 12;
+    cx.fillStyle = 'rgba(255,255,255,0.08)'; rr(trackX, trackY, trackW, trackH, 6); cx.fill();
+    if (state.phase === 'play' || state.phase === 'over') {
+      var frac = Math.max(0, state.window / state.windowMax);
+      cx.fillStyle = barColor(frac);
+      rr(trackX, trackY, Math.max(0, trackW * frac), trackH, 6); cx.fill();
+      if (frac < 0.25 && state.phase === 'play') {   // pulsing alarm when about to close
+        cx.globalAlpha = 0.25 + 0.25 * Math.sin(now / 90);
+        cx.fillStyle = VERM; rr(trackX, trackY, trackW, trackH, 6); cx.fill();
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // ---- score + best ----
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'left';
+      cx.fillStyle = BLUE; cx.font = '900 26px -apple-system, Helvetica, Arial';
+      cx.fillText('✓ ' + state.score, 20, 78);
+      cx.textAlign = 'right';
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W - 20, 78);
+      // incoming dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.textAlign = 'center';
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 100);
+      }
+    }
+
+    // ---- checklist slots (the required order) ----
+    if (state.phase === 'play') {
+      var nc = state.order.length, sw = (365 - (nc - 1) * 8) / nc, sy = 112, sh = 54;
+      for (var i = 0; i < nc; i++) {
+        var sxp = 20 + i * (sw + 8);
+        var filled = state.slots[i], isNext = i === state.next && !state.roundPause;
+        cx.fillStyle = filled ? 'rgba(46,197,182,0.22)' : isNext ? 'rgba(242,177,52,0.10)' : '#141821';
+        rr(sxp, sy, sw, sh, 9); cx.fill();
+        cx.lineWidth = isNext ? 2 : 1.2;
+        cx.strokeStyle = filled ? TEAL : isNext ? GOLD : 'rgba(255,255,255,0.12)';
+        if (isNext) { cx.globalAlpha = 0.55 + 0.45 * Math.sin(now / 180); }
+        rr(sxp + 0.5, sy + 0.5, sw - 1, sh - 1, 9); cx.stroke();
+        cx.globalAlpha = 1;
+        cx.textAlign = 'center'; cx.textBaseline = 'middle';
+        cx.globalAlpha = filled ? 1 : isNext ? 0.95 : 0.4;
+        cx.font = '26px -apple-system, Helvetica, Arial';
+        cx.fillText(CRIT[state.order[i]].g, sxp + sw / 2, sy + sh / 2 - 4);
+        cx.globalAlpha = 1;
+        cx.textBaseline = 'alphabetic';
+        if (filled) {   // blue check stamp on the filled slot
+          cx.fillStyle = BLUE; cx.font = '900 16px -apple-system, Helvetica, Arial';
+          cx.fillText('✓', sxp + sw - 12, sy + 16);
+        }
+        cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '700 9px Menlo, monospace';
+        cx.fillText(String(i + 1), sxp + 10, sy + 14);
+      }
+    }
+
+    // ---- pool tiles ----
+    if (state.phase === 'play') {
+      for (var pi = 0; pi < state.pool.length; pi++) {
+        var t = state.pool[pi];
+        if (!t.alive) continue;
+        if (t.anim > 0) t.anim -= dt; else if (t.anim < 0) t.anim += dt;
+        var pop = t.anim > 0 ? 1 + t.anim * 0.025 : 1;
+        var fl = t.anim > 0 ? t.anim / 12 : t.anim < 0 ? -t.anim / 10 : 0;
+        cx.save();
+        cx.translate(t.x + t.w / 2, t.y + t.h / 2);
+        cx.scale(pop, pop);
+        cx.translate(-(t.x + t.w / 2), -(t.y + t.h / 2));
+        cx.fillStyle = '#151922'; rr(t.x, t.y, t.w, t.h, 10); cx.fill();
+        cx.lineWidth = 1; cx.strokeStyle = 'rgba(255,255,255,0.08)';
+        rr(t.x + 0.5, t.y + 0.5, t.w - 1, t.h - 1, 10); cx.stroke();
+        if (fl > 0) { cx.globalAlpha = fl; cx.fillStyle = t.anim > 0 ? TEAL : VERM; rr(t.x, t.y, t.w, t.h, 10); cx.fill(); cx.globalAlpha = 1; }
+        cx.textAlign = 'center'; cx.textBaseline = 'middle';
+        cx.font = '30px -apple-system, Helvetica, Arial';
+        cx.fillText(t.g, t.x + t.w / 2, t.y + t.h / 2 - 8);
+        cx.textBaseline = 'alphabetic';
+        cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 10px -apple-system, Helvetica, Arial';
+        cx.fillText(t.l, t.x + t.w / 2, t.y + t.h - 14);
+        cx.restore();
+      }
+      // combo + hint
+      cx.textAlign = 'center';
+      if (state.combo > 1) {
+        cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+        cx.fillText('×' + state.combo, W / 2, 605);
+      }
+      cx.fillStyle = 'rgba(255,255,255,0.32)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('tap the criteria in order — avoid the fakes', W / 2, 638);
+    }
+
+    // ---- verified stamp (the payoff frame) ----
+    if (state.verifiedStamp > 0) {
+      var vs = state.verifiedStamp, a = Math.min(1, vs / 8), sc = 1 + (22 - vs) * 0.02;
+      cx.save();
+      cx.globalAlpha = a; cx.translate(W / 2, 330); cx.scale(sc, sc);
+      cx.strokeStyle = BLUE; cx.lineWidth = 7; cx.beginPath(); cx.arc(0, 0, 46, 0, 2 * Math.PI); cx.stroke();
+      cx.globalAlpha = 0.18 * a; cx.fillStyle = BLUE; cx.beginPath(); cx.arc(0, 0, 46, 0, 2 * Math.PI); cx.fill();
+      cx.globalAlpha = a; cx.strokeStyle = BLUE; cx.lineWidth = 9; cx.lineCap = 'round'; cx.lineJoin = 'round';
+      cx.beginPath(); cx.moveTo(-20, 2); cx.lineTo(-5, 18); cx.lineTo(24, -18); cx.stroke();
+      cx.restore();
+    }
+
+    // ---- flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 250 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // ---- title ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('VERIFIED CHASE', W / 2, 300);
+      cx.fillStyle = BLUE; cx.font = '900 70px -apple-system, Helvetica, Arial';
+      cx.fillText('✓', W / 2, 380);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO VERIFY', W / 2, 430); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('earn the blue check. don’t get flagged.', W / 2, 458);
+    }
+
+    // ---- challenge card (demo beat 1) ----
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText(String(DEMO_TARGET), W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // ---- game over ----
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('REJECTED.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' verified', W / 2, 345);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('faster than ' + (100 - pt) + '% of accounts', W / 2, 414);
+      if (!DEMO && !BOT) {
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)'; cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath(); rr(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23); cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — TRY AGAIN', W / 2, 545);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // ---- demo CTA card ----
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('VERIFIED CHASE', W / 2, 300);
+      cx.fillStyle = BLUE; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('✓', W / 2, 350);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('you got ' + (window.__demoScore || DEMO_TARGET) + ' blue checks. your move.', W / 2, 388);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || DEMO_TARGET), W / 2, 440);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 470);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.textBaseline = 'middle';
+      cx.globalAlpha = 0.5; cx.font = '16px -apple-system, Helvetica, Arial'; cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + MUTE_R.h / 2);
+      cx.globalAlpha = 1; cx.textBaseline = 'alphabetic';
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Story Peace — Tilt</title>
+<!--
+  LOOP / attention-architecture — Story Peace
+  Circuits: 01-soft-rpe, 05-ease, 07-timing, 08-garden.
+  Conditioned path: the story viewer-list check. The game is watching without checking.
+  Modes:
+    ?demo=1&seed=7        scripted calm watch → soft CTA, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autopilot, N runs, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'story-peace';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134', VERM = '#e8502e';
+  // calm palette: teal, soft gold, muted blue-greens
+  var FRAMES = [
+    { name: 'arrive', top: '#0f1a1f', bot: '#1a2e35', accent: TEAL, word: 'arrive' },
+    { name: 'breathe', top: '#13262b', bot: '#0d2026', accent: '#7dd3c0', word: 'breathe' },
+    { name: 'let go', top: '#16232a', bot: '#1c2f36', accent: '#a8d5e5', word: 'let go' },
+    { name: 'here', top: '#0f1f24', bot: '#162a30', accent: TEAL, word: 'here' },
+    { name: 'quiet', top: '#1a252c', bot: '#111a20', accent: '#c4b5a0', word: 'quiet' },
+    { name: 'open', top: '#142229', bot: '#1b2e35', accent: GOLD, word: 'open' },
+    { name: 'soften', top: '#18252c', bot: '#0f1a20', accent: '#9ee8df', word: 'soften' },
+    { name: 'remain', top: '#101d23', bot: '#172a31', accent: TEAL, word: 'remain' },
+    { name: 'rest', top: '#1b252b', bot: '#122028', accent: '#b8d4d1', word: 'rest' },
+    { name: 'release', top: '#132028', bot: '#1a2b32', accent: '#d4c5a9', word: 'release' },
+    { name: 'settle', top: '#16242a', bot: '#0e1920', accent: TEAL, word: 'settle' },
+    { name: 'peace', top: '#0b0d12', bot: '#121b20', accent: GOLD, word: 'peace' }
+  ];
+  var FRAME_DUR = 1.35;   // seconds per frame
+  var FADE_DUR = 0.55;    // crossfade length
+  var HOLD_END = 1.20;    // hold on final frame before completion
+  var TOTAL_DUR = (FRAMES.length - 1) * FRAME_DUR + HOLD_END; // ~16.05s
+
+  var state, runStartTs, storyT, best = 0, dareBeaten = false;
+  var zoom = 1, breathe = 0, floats = [];
+  var lastFrameIdx = -1, ctaAt = 0;
+  var botRunsDone = 0, botNextCheck = null;
+
+  try { best = +localStorage.getItem('sp_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      score: 0,
+      overAt: 0,
+      completed: false
+    };
+    storyT = 0; lastFrameIdx = -1; dareBeaten = false; zoom = 1; floats = [];
+    botNextCheck = null;
+    if (DEMO || BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.score = 0;
+    state.completed = false;
+    storyT = 0; lastFrameIdx = -1; floats = [];
+    botNextCheck = null;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    if (window.J) J.calm(0);
+  }
+
+  function scoreFor(t) { return Math.min(999, Math.floor(t * 10)); }
+
+  function pctTop(score) {
+    // synthetic calm percentile
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 90))));
+  }
+
+  function completeStory() {
+    state.phase = 'over';
+    state.completed = true;
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.calm(3);
+    float('STORY PEACE', GOLD, 42);
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      if (window.J) J.calm(4);
+      SHARE.beaten(state.score);
+    }
+    if (state.score > best) {
+      best = state.score;
+      try { localStorage.setItem('sp_best', String(best)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), completed: true });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 1200);
+    }
+    if (BOT) finishBotRun();
+  }
+
+  function checkViewers() {
+    if (state.phase !== 'play') return;
+    state.phase = 'over';
+    state.completed = false;
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.calm(1);
+    float('viewer list', 'rgba(255,255,255,0.7)', 26);
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), completed: false });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 1200);
+    }
+    if (BOT) finishBotRun();
+  }
+
+  function finishBotRun() {
+    botRunsDone++;
+    if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+    else { setTimeout(resetRun, 900); }
+  }
+
+  function resetRun() {
+    state.phase = 'title';
+    state.score = 0; state.completed = false;
+    storyT = 0; lastFrameIdx = -1; floats = []; dareBeaten = false;
+    botNextCheck = null;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function float(txt, color, size) {
+    floats.push({ txt: txt, color: color, size: size, t: 0, y: H / 2 + 40 });
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 546, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;                 // scripted modes ignore human input
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { checkViewers(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'peace' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilot ----
+  function autopilot(dt) {
+    if (state.phase !== 'play') return;
+    if (BOT) {
+      if (botNextCheck === null) {
+        // schedule an "urge" moment within the story, not too early/late
+        botNextCheck = 1.0 + rng() * Math.max(1, TOTAL_DUR - 3.0);
+      }
+      if (storyT >= botNextCheck) {
+        // imperfect: sometimes the bot slips and checks; often it just hesitates (near-miss)
+        if (rng() < 0.35) {
+          checkViewers();
+        } else {
+          if (window.LOOP) LOOP.emit('near_miss', { t: +storyT.toFixed(2) });
+        }
+        botNextCheck = null;
+      }
+    }
+  }
+
+  // ---- render helpers ----
+  function bgGradient(top, bot) {
+    var g = cx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, top); g.addColorStop(1, bot);
+    return g;
+  }
+
+  function softCircle(x, y, r, color, alpha) {
+    var g = cx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, color); g.addColorStop(1, 'rgba(0,0,0,0)');
+    cx.save(); cx.globalAlpha = alpha; cx.fillStyle = g;
+    cx.beginPath(); cx.arc(x, y, r, 0, Math.PI * 2); cx.fill(); cx.restore();
+  }
+
+  function drawFrame(i, alpha) {
+    var f = FRAMES[i]; if (!f) return;
+    cx.save(); cx.globalAlpha = alpha;
+    cx.fillStyle = bgGradient(f.top, f.bot); cx.fillRect(0, 0, W, H);
+
+    var t = (storyT % FRAME_DUR) / FRAME_DUR;
+    var slow = storyT * 0.4;
+
+    // per-frame calm motif
+    if (i % 6 === 0) { // sunrise / moonrise circle
+      var cy = H * 0.45 + Math.sin(slow + i) * 16;
+      softCircle(W / 2, cy, 90 + i * 3, f.accent, 0.18);
+      softCircle(W / 2, cy, 44, f.accent, 0.35);
+    } else if (i % 6 === 1) { // breath rings
+      for (var k = 0; k < 4; k++) {
+        var rr = 30 + k * 55 + Math.sin(slow * 1.2 + k) * 10;
+        cx.strokeStyle = f.accent; cx.lineWidth = 1.2; cx.globalAlpha = 0.10 + k * 0.04;
+        cx.beginPath(); cx.arc(W / 2, H / 2, rr, 0, Math.PI * 2); cx.stroke();
+      }
+    } else if (i % 6 === 2) { // mountain / water layers
+      cx.fillStyle = f.accent; cx.globalAlpha = 0.08;
+      for (var m = 0; m < 5; m++) {
+        var yb = H - 90 - m * 70 + Math.sin(slow + m * 0.7) * 8;
+        cx.beginPath(); cx.moveTo(0, H);
+        for (var xx = 0; xx <= W; xx += 20) {
+          cx.lineTo(xx, yb + Math.sin(xx * 0.02 + slow + m) * 14);
+        }
+        cx.lineTo(W, H); cx.fill();
+      }
+    } else if (i % 6 === 3) { // vertical garden / bamboo
+      cx.fillStyle = f.accent; cx.globalAlpha = 0.12;
+      for (var b = 0; b < 9; b++) {
+        var bx = 30 + b * 44 + Math.sin(slow + b) * 4;
+        var bh = 160 + Math.sin(b * 0.9) * 90;
+        var by = H - bh - 40;
+        cx.fillRect(bx - 2, by, 4, bh);
+      }
+    } else if (i % 6 === 4) { // sand garden lines
+      cx.strokeStyle = f.accent; cx.lineWidth = 1; cx.globalAlpha = 0.14;
+      for (var s = 0; s < 7; s++) {
+        var yy = H * 0.42 + s * 34 + Math.sin(slow + s) * 6;
+        cx.beginPath();
+        for (var xx = 0; xx <= W; xx += 12) {
+          var yy2 = yy + Math.sin(xx * 0.04 + slow + s * 0.5) * 7;
+          if (xx === 0) cx.moveTo(xx, yy2); else cx.lineTo(xx, yy2);
+        }
+        cx.stroke();
+      }
+    } else { // stars / particles
+      cx.fillStyle = f.accent; cx.globalAlpha = 0.30;
+      for (var p = 0; p < 24; p++) {
+        var px = ((p * 53 + i * 17) % W);
+        var py = ((p * 31 + i * 11) % (H - 180)) + 80;
+        var pr = 1.2 + Math.sin(slow + p) * 0.4;
+        cx.beginPath(); cx.arc(px, py, Math.max(0.4, pr), 0, Math.PI * 2); cx.fill();
+      }
+    }
+
+    // centered word
+    cx.globalAlpha = alpha * (0.55 + 0.25 * Math.sin(slow));
+    cx.fillStyle = '#fff';
+    cx.font = '300 38px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.fillText(f.word, W / 2, H / 2 + 12);
+
+    cx.restore();
+  }
+
+  function drawViewerPrompt(alpha) {
+    // the conditioned pull: a subtle swipe-up / viewer-list indicator
+    var y = H - 54 + Math.sin(performance.now() / 500) * 3;
+    cx.save(); cx.globalAlpha = alpha * 0.35;
+    cx.strokeStyle = '#fff'; cx.lineWidth = 1.5;
+    cx.beginPath();
+    cx.moveTo(W / 2 - 10, y - 4);
+    cx.lineTo(W / 2, y + 5);
+    cx.lineTo(W / 2 + 10, y - 4);
+    cx.stroke();
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.font = '600 11px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.fillText('swipe up for viewers', W / 2, y + 22);
+    cx.restore();
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = (now - last) / 1000; last = now;
+
+    if (state.phase === 'play') {
+      storyT += dt;
+      state.score = scoreFor(storyT);
+
+      var frameIdx = Math.min(FRAMES.length - 1, Math.floor(storyT / FRAME_DUR));
+      if (frameIdx !== lastFrameIdx) {
+        lastFrameIdx = frameIdx;
+        zoom = 1.008;
+        if (frameIdx > 0) float('+10', TEAL, 22);
+        if (window.LOOP) LOOP.emit('story_progress', { frame: frameIdx, t: +storyT.toFixed(2) });
+        if (window.J) J.calm(frameIdx % 4);
+      }
+
+      if (storyT >= TOTAL_DUR) { completeStory(); }
+      else { autopilot(dt); }
+    }
+
+    // decay zoom
+    zoom += (1 - zoom) * 0.12;
+    breathe += dt * 0.6;
+
+    // juice transforms: calm — slow breathing + micro zoom on frame changes
+    cx.save();
+    var tx = Math.sin(breathe) * 0.6;
+    var ty = Math.cos(breathe * 0.7) * 0.6;
+    cx.translate(W / 2 + tx, H / 2 + ty);
+    cx.scale(zoom, zoom);
+    cx.translate(-W / 2, -H / 2);
+
+    // draw story frames with crossfade
+    if (state.phase === 'play' || state.phase === 'over') {
+      var idx = Math.min(FRAMES.length - 1, Math.floor(storyT / FRAME_DUR));
+      var local = storyT - idx * FRAME_DUR;
+      var nextAlpha = Math.min(1, local / FADE_DUR);
+      drawFrame(idx, 1);
+      if (idx + 1 < FRAMES.length) drawFrame(idx + 1, nextAlpha);
+    } else {
+      // title / cta background
+      cx.fillStyle = INK; cx.fillRect(0, 0, W, H);
+      var g = cx.createLinearGradient(0, 0, 0, H);
+      g.addColorStop(0, 'rgba(46,197,182,0.06)'); g.addColorStop(1, 'rgba(242,177,52,0.05)');
+      cx.fillStyle = g; cx.fillRect(0, 0, W, H);
+    }
+
+    // viewer prompt during play
+    if (state.phase === 'play') drawViewerPrompt(1);
+
+    // floats
+    for (var k = floats.length - 1; k >= 0; k--) {
+      var fl = floats[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 2.0);
+      cx.save(); cx.globalAlpha = a;
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 4) + 'px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText(fl.txt, W / 2, fl.y - fl.t * 28);
+      cx.restore();
+      if (fl.t > 2.0) floats.splice(k, 1);
+    }
+
+    // score / best
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 52px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 88);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('PEACE · BEST ' + best, W / 2, 116);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 144);
+      }
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('STORY PEACE', W / 2, 280);
+      cx.fillStyle = TEAL; cx.font = '700 17px -apple-system, Helvetica, Arial';
+      var pulse = 0.55 + 0.45 * Math.sin(now / 450);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO BEGIN', W / 2, 330); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('the story plays. your thumb doesn’t check.', W / 2, 360);
+      cx.fillStyle = 'rgba(255,255,255,0.28)'; cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('last ' + Math.round(TOTAL_DUR) + 's. any tap = checking viewers.', W / 2, 386);
+    }
+
+    // game over card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.50)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      if (state.completed) {
+        cx.fillStyle = TEAL; cx.font = '900 34px -apple-system, Helvetica, Arial';
+        cx.fillText('PEACE KEPT', W / 2, 290);
+        cx.fillStyle = '#fff'; cx.font = '800 24px -apple-system, Helvetica, Arial';
+        cx.fillText(state.score + ' peace seconds', W / 2, 334);
+        var pt = pctTop(state.score);
+        cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+        cx.fillText('TOP ' + pt + '% TODAY', W / 2, 376);
+        cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+        cx.fillText('calmer than ' + (100 - pt) + '% of viewers', W / 2, 400);
+      } else {
+        cx.fillStyle = 'rgba(255,255,255,0.85)'; cx.font = '900 34px -apple-system, Helvetica, Arial';
+        cx.fillText('YOU CHECKED', W / 2, 290);
+        cx.fillStyle = '#fff'; cx.font = '800 22px -apple-system, Helvetica, Arial';
+        cx.fillText(state.score + ' peace seconds', W / 2, 334);
+        cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+        cx.fillText('the viewer list won that one.', W / 2, 364);
+      }
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 300);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText(state.completed ? 'TAP — WATCH AGAIN' : 'TAP — TRY AGAIN', W / 2, 446);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card — soft invitation
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.70 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('STORY PEACE', W / 2, 286);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('one story. no viewer list. just peace.', W / 2, 324);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 260);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 388);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.60)'; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ GROW YOURS', W / 2, 422);
+      cx.fillStyle = GOLD; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 456);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

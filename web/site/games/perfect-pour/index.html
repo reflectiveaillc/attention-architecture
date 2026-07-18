@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Perfect Pour — Tilt</title>
+<!--
+  LOOP / attention-architecture — Perfect Pour
+  Circuits: 01-rpe (variable reward per pour), 04-loss (the run you'll lose), 07-timing.
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip — challenge card → play → near-fail → fail → CTA
+    ?bot=1&runs=N&seed=M  imperfect autopilot, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'perfect-pour';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // Seeded RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- Game layout constants ----
+  var VESSEL_X = W / 2;
+  var VESSEL_Y = 340;          // top of vessel
+  var VESSEL_W = 110;
+  var VESSEL_H = 240;          // total interior height
+  var VESSEL_THICK = 8;
+  var SPOUT_X = W / 2 - 60;   // bottle spout x (pours from left-ish)
+  var SPOUT_Y = 160;
+
+  // ---- State ----
+  var state, flashes, hitStop, shakeAmt, zoom;
+  var best = 0;                // best score (runs survived)
+  var bestAccuracy = 0;        // PB: closest fill % to target (0-100)
+  try { best = +localStorage.getItem('pp_best') || 0; } catch (_) {}
+  try { bestAccuracy = +localStorage.getItem('pp_best_acc') || 0; } catch (_) {}
+
+  var runStartTs = 0, dareBeaten = false;
+
+  // Bot/demo state
+  var botRunsDone = 0;
+  var ctaAt = 0;
+
+  // Input state
+  var isHolding = false;
+
+  // ---- Pour constants ----
+  var PERFECT_ZONE = 0.04;   // ±4% of target = perfect
+  var NEAR_ZONE    = 0.10;   // ±10% = near miss
+  var FILL_SPEED   = 0.18;   // fill units per frame (fraction of vessel height per 16ms)
+  var DRAIN_SPEED  = 0.06;   // when not holding, liquid stays (no drain — hold-and-release mechanic)
+  // Actually: fill rises while held, stop and judge on release. Overflow = auto lose.
+  // Underpour (release below UNDERPOUR threshold) = also a fail.
+  var UNDERPOUR_MIN = 0.25;  // must fill at least 25% or it's too low
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      round: 0,
+      score: 0,              // rounds survived
+      fill: 0,               // current fill 0..1
+      target: 0,             // target fill line 0..1
+      overAt: 0,
+      result: null,          // 'perfect'|'near'|'ok'|'over'|'under'
+      accuracy: 0,           // |fill - target| distance for last round
+      fillSpeed: FILL_SPEED,
+      pourStarted: false,
+    };
+    flashes = [];
+    hitStop = 0;
+    shakeAmt = 0;
+    zoom = 1;
+    dareBeaten = false;
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      setTimeout(function () { startRun(); }, 1250);
+      return;
+    }
+    if (BOT) {
+      startRun();
+    }
+  }
+
+  function pickTarget() {
+    // target fill between 0.40 and 0.90, varies per round
+    return 0.40 + rng() * 0.50;
+  }
+
+  function startRound() {
+    state.fill = 0;
+    state.pourStarted = false;
+    state.result = null;
+    state.target = pickTarget();
+    // speed ramps slightly each round
+    state.fillSpeed = FILL_SPEED + state.round * 0.008;
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.round = 0;
+    state.score = 0;
+    runStartTs = Date.now();
+    startRound();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function releasePour() {
+    var fill = state.fill;
+    var target = state.target;
+    var diff = Math.abs(fill - target);
+
+    if (fill > 1.0) {
+      // Overpour — already handled in update
+      return;
+    }
+    if (fill < UNDERPOUR_MIN) {
+      // Underpour — too little
+      endGame('under', diff);
+      return;
+    }
+
+    var perfect = diff <= PERFECT_ZONE;
+    var near    = diff <= NEAR_ZONE;
+
+    state.accuracy = diff;
+    if (perfect) {
+      state.result = 'perfect';
+      hitStop = 5; zoom = 1.03;
+      flash('PERFECT', TEAL, 48);
+      if (window.J) { J.perfect(state.score + 1); J.tension(Math.min((state.score + 1) / 6, 1)); }
+      advanceRound();
+    } else if (near) {
+      state.result = 'near';
+      shakeAmt = 4;
+      flash('SO CLOSE!', VERM, 38);
+      if (window.J) { J.near(); }
+      if (window.LOOP) LOOP.emit('near_miss', { round: state.round, diff: +diff.toFixed(3) });
+      advanceRound();
+    } else if (fill >= target) {
+      // Overpour but fill < 1.0 — still a fail if too far over (> NEAR_ZONE above target)
+      endGame('over', diff);
+    } else {
+      // Underpoured but above minimum — also a fail (too far under target)
+      endGame('under', diff);
+    }
+  }
+
+  function advanceRound() {
+    state.round++;
+    state.score++;
+    if (window.J) J.hit(state.score);
+
+    // Check dare beaten
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+
+    if (window.LOOP) LOOP.emit('round_complete', { round: state.round, diff: +state.accuracy.toFixed(3), result: state.result });
+
+    // Brief pause showing result, then next round
+    state.phase = 'round_result';
+    setTimeout(function () {
+      if (state.phase === 'round_result') {
+        state.phase = 'play';
+        startRound();
+      }
+    }, 600);
+  }
+
+  function endGame(reason, diff) {
+    state.result = reason;
+    state.accuracy = diff || 0;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 10;
+    if (window.J) J.death(Math.min(0.3 + state.score / 8, 1));
+
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (newBest) {
+      best = state.score;
+      try { localStorage.setItem('pp_best', String(best)); } catch (_) {}
+    }
+    // Track accuracy PB (lower diff = better; track as score for PB display)
+    var accScore = Math.round((1 - Math.min(diff, 1)) * 100); // 100 = perfect
+    if (accScore > bestAccuracy) {
+      bestAccuracy = accScore;
+      try { localStorage.setItem('pp_best_acc', String(bestAccuracy)); } catch (_) {}
+    }
+
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (newBest && window.J) setTimeout(function () { J.fanfare(); }, 450);
+
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.score = 0;
+    state.round = 0;
+    flashes = [];
+    isHolding = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 4))));
+  }
+
+  // ---- Input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function onDown(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') {
+      isHolding = true;
+      state.pourStarted = true;
+      if (window.J) J.tension(0.1);
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'rounds' });
+        return;
+      }
+      if (window.LOOP) LOOP.emit('restart', {});
+      resetRun();
+    }
+  }
+
+  function onUp(x, y) {
+    if (DEMO || BOT) return;
+    if (!isHolding) return;
+    isHolding = false;
+    if (state.phase === 'play' && state.pourStarted) {
+      releasePour();
+    }
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    onDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    onUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointerup', function () { if (isHolding) { isHolding = false; if (state.phase === 'play' && state.pourStarted) releasePour(); } });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') onDown(); });
+  window.addEventListener('keyup',   function (e) { if (e.code === 'Space') onUp(); });
+
+  // ---- Demo/Bot autopilots ----
+  // Demo script: array of desired release fill fractions (0..1)
+  // 0=perfect, +/- = variation. 'miss' type built in.
+  var demoScript = [
+    { target_offset: 0.02 },   // round 0: slightly over — ok
+    { target_offset: -0.03 },  // round 1: slightly under — ok
+    { target_offset: 0.08 },   // round 2: near miss over
+    { target_offset: -0.001 }, // round 3: nearly perfect — save!
+    { target_offset: 0.22 },   // round 4: overpour — FAIL
+  ];
+  var demoIdx = 0;
+  // Hesitation waits (in frames at ~60fps) before starting to pour
+  var demoHoldWaits = [55, 42, 68, 90, 38]; // variable hesitation
+  var demoHoldFrames = 0;     // frames holding before release
+  var demoHolding = false;
+  var demoWaitFrames = 0;     // pre-hold hesitation frames remaining
+  var demoStarted = false;
+
+  function demoPourFrames(roundTarget, releaseOffset) {
+    // How many frames to hold to reach fill = roundTarget + releaseOffset
+    var releaseFill = Math.max(0.01, Math.min(1.05, roundTarget + releaseOffset));
+    return Math.ceil(releaseFill / state.fillSpeed);
+  }
+
+  var botHolding = false;
+  var botReleaseFrame = 0;
+  var botFrame = 0;
+  var botPreWait = 0;
+
+  function autopilot() {
+    if (!state || state.phase !== 'play') return;
+
+    if (DEMO) {
+      if (!demoStarted) {
+        demoWaitFrames = demoHoldWaits[Math.min(demoIdx, demoHoldWaits.length - 1)] || 40;
+        demoStarted = true;
+        demoHolding = false;
+      }
+      if (!demoHolding) {
+        if (demoWaitFrames > 0) { demoWaitFrames--; return; }
+        // Start holding
+        demoHolding = true;
+        var step = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+        demoHoldFrames = demoPourFrames(state.target, step.target_offset);
+        return;
+      }
+      // Currently holding
+      if (demoHoldFrames > 0) {
+        demoHoldFrames--;
+        if (!state.pourStarted) { state.pourStarted = true; }
+        return;
+      }
+      // Release
+      demoHolding = false;
+      demoStarted = false;
+      demoIdx++;
+      releasePour();
+
+    } else if (BOT) {
+      if (botPreWait > 0) { botPreWait--; return; }
+      if (!botHolding) {
+        botHolding = true;
+        // Random error offset ±0.15
+        var err = (rng() - 0.5) * 0.30;
+        botReleaseFrame = demoPourFrames(state.target, err);
+        botFrame = 0;
+        if (!state.pourStarted) state.pourStarted = true;
+        return;
+      }
+      botFrame++;
+      if (botFrame >= botReleaseFrame) {
+        botHolding = false;
+        botPreWait = Math.floor(rng() * 30 + 20);
+        releasePour();
+      }
+    }
+  }
+
+  // ---- Render helpers ----
+  function drawVessel(fillFrac, targetFrac, result, phase) {
+    var vx = VESSEL_X - VESSEL_W / 2 - VESSEL_THICK;
+    var vy = VESSEL_Y;
+    var vw = VESSEL_W + VESSEL_THICK * 2;
+    var vh = VESSEL_H + VESSEL_THICK;
+
+    // Glass vessel background
+    cx.fillStyle = 'rgba(255,255,255,0.04)';
+    cx.beginPath();
+    cx.rect(vx, vy, vw, vh);
+    cx.fill();
+
+    // Liquid fill
+    var fillH = Math.min(fillFrac, 1.05) * VESSEL_H;
+    var fillY = vy + VESSEL_H - fillH;
+
+    var liquidColor;
+    if (result === 'over' || result === 'under') {
+      liquidColor = VERM;
+    } else if (result === 'perfect') {
+      liquidColor = TEAL;
+    } else if (result === 'near') {
+      liquidColor = GOLD;
+    } else {
+      // Neutral pour color — amber beer / cocktail feel
+      var t = Math.min(fillFrac / (targetFrac || 0.6), 1);
+      liquidColor = 'hsl(' + Math.round(38 + t * 20) + ',85%,52%)';
+    }
+
+    if (fillH > 0) {
+      // Liquid body
+      cx.fillStyle = liquidColor;
+      cx.globalAlpha = 0.82;
+      cx.fillRect(VESSEL_X - VESSEL_W / 2, Math.max(fillY, vy), VESSEL_W, Math.min(fillH, VESSEL_H));
+      cx.globalAlpha = 1;
+
+      // Surface shimmer
+      cx.fillStyle = 'rgba(255,255,255,0.18)';
+      cx.fillRect(VESSEL_X - VESSEL_W / 2, Math.max(fillY, vy), VESSEL_W, 3);
+    }
+
+    // Target line
+    var targetY = vy + VESSEL_H - targetFrac * VESSEL_H;
+    cx.strokeStyle = GOLD;
+    cx.lineWidth = 2.5;
+    cx.setLineDash([8, 5]);
+    cx.beginPath();
+    cx.moveTo(VESSEL_X - VESSEL_W / 2 - 2, targetY);
+    cx.lineTo(VESSEL_X + VESSEL_W / 2 + 2, targetY);
+    cx.stroke();
+    cx.setLineDash([]);
+
+    // Target label
+    cx.textAlign = 'right';
+    cx.fillStyle = GOLD;
+    cx.font = '600 11px Menlo, monospace';
+    cx.fillText(Math.round(targetFrac * 100) + '%', VESSEL_X - VESSEL_W / 2 - 6, targetY + 4);
+
+    // Glass walls (left, right, bottom)
+    cx.strokeStyle = 'rgba(255,255,255,0.22)';
+    cx.lineWidth = VESSEL_THICK;
+    cx.beginPath();
+    // left wall
+    cx.moveTo(VESSEL_X - VESSEL_W / 2, vy);
+    cx.lineTo(VESSEL_X - VESSEL_W / 2, vy + VESSEL_H + VESSEL_THICK / 2);
+    // bottom
+    cx.lineTo(VESSEL_X + VESSEL_W / 2, vy + VESSEL_H + VESSEL_THICK / 2);
+    // right wall
+    cx.lineTo(VESSEL_X + VESSEL_W / 2, vy);
+    cx.stroke();
+  }
+
+  function drawBottle(pouring, fillFrac) {
+    // Simple bottle shape pouring from upper-left
+    var bx = SPOUT_X, by = SPOUT_Y;
+
+    // Bottle body
+    cx.save();
+    cx.translate(bx, by);
+    cx.rotate(-0.6);  // tilted to pour
+
+    // Body
+    cx.fillStyle = 'rgba(120,180,140,0.6)';
+    cx.beginPath();
+    cx.roundRect ? cx.roundRect(-12, -50, 24, 70, 4) : cx.rect(-12, -50, 24, 70);
+    cx.fill();
+
+    // Neck
+    cx.fillStyle = 'rgba(120,180,140,0.5)';
+    cx.fillRect(-6, -80, 12, 32);
+
+    // Cap/opening
+    cx.fillStyle = 'rgba(255,255,255,0.3)';
+    cx.fillRect(-5, -84, 10, 6);
+
+    cx.restore();
+
+    // Pour stream (visible when holding)
+    if (pouring) {
+      // Spout exit point (after rotation)
+      var streamX = bx + 14;
+      var streamY = by - 28;
+      var vesselTopX = VESSEL_X;
+      var vesselTopY = VESSEL_Y;
+
+      cx.save();
+      cx.globalAlpha = 0.75;
+      var grad = cx.createLinearGradient(streamX, streamY, vesselTopX, vesselTopY);
+      grad.addColorStop(0, 'rgba(255,200,60,0.9)');
+      grad.addColorStop(1, 'rgba(255,170,30,0.4)');
+      cx.strokeStyle = grad;
+      cx.lineWidth = 5 + fillFrac * 2;
+      cx.lineCap = 'round';
+      cx.beginPath();
+      cx.moveTo(streamX, streamY);
+      // bezier arc into vessel
+      cx.bezierCurveTo(
+        streamX + 30, streamY + 60,
+        vesselTopX - 20, vesselTopY - 30,
+        vesselTopX - VESSEL_W / 4, vesselTopY + 5
+      );
+      cx.stroke();
+      cx.restore();
+    }
+  }
+
+  function drawFillPct(fill, target) {
+    // Current fill percentage display
+    var pct = Math.round(fill * 100);
+    var diff = Math.abs(fill - target);
+    var color = diff < PERFECT_ZONE ? TEAL : diff < NEAR_ZONE ? GOLD : 'rgba(255,255,255,0.85)';
+
+    cx.textAlign = 'center';
+    cx.fillStyle = color;
+    cx.font = '900 52px -apple-system, Helvetica, Arial';
+    cx.fillText(pct + '%', W / 2, 120);
+
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + best + ' rounds', W / 2, 140);
+  }
+
+  function drawRoundBadge(round) {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '700 13px Menlo, monospace';
+    cx.fillText('ROUND ' + (round + 1), W / 2, 632);
+  }
+
+  function drawHoldPrompt(pouring) {
+    cx.textAlign = 'center';
+    var msg = pouring ? 'RELEASE TO STOP POUR' : 'HOLD TO POUR';
+    var pulse = 0.5 + 0.5 * Math.sin(performance.now() / 350);
+    cx.globalAlpha = pouring ? 0.9 : (0.5 + 0.5 * pulse);
+    cx.fillStyle = pouring ? VERM : 'rgba(255,255,255,0.7)';
+    cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText(msg, W / 2, 670);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- Main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Update fill while holding (or demo/bot autopilot)
+    if ((isHolding || demoHolding || botHolding) && state.phase === 'play' && state.pourStarted) {
+      state.fill += state.fillSpeed * dt;
+      if (state.fill > 1.0) {
+        state.fill = 1.0;
+        // Overpour auto-fail
+        isHolding = false; demoHolding = false; botHolding = false;
+        endGame('over', Math.abs(state.fill - state.target));
+      } else {
+        if (window.J) J.tension(Math.min(state.fill / (state.target || 0.6), 1));
+      }
+    }
+
+    // Juice: decay hit-stop and shake
+    if (hitStop > 0) hitStop -= dt;
+    else if (state.phase === 'play') autopilot();
+
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.84, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // Background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(242,177,52,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.05)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- TITLE ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('PERFECT POUR', W / 2, 280);
+      cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillText('TAP TO START', W / 2, 330);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('hold to pour · release on the line', W / 2, 360);
+    }
+
+    // ---- CHALLENGE card (demo beat 1) ----
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('4', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // ---- PLAY / ROUND_RESULT ----
+    if (state.phase === 'play' || state.phase === 'round_result') {
+      var activePouring = (isHolding || demoHolding || botHolding) && state.pourStarted;
+      drawVessel(state.fill, state.target, state.result, state.phase);
+      drawBottle(activePouring, state.fill);
+      drawFillPct(state.fill, state.target);
+      drawRoundBadge(state.round);
+      if (!DEMO && !BOT) drawHoldPrompt(activePouring);
+
+      // Dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.textAlign = 'center';
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 160);
+      }
+
+      // Round result flash overlay
+      if (state.phase === 'round_result' && state.result) {
+        cx.textAlign = 'center';
+        var rLabel = state.result === 'perfect' ? 'PERFECT!' : state.result === 'near' ? 'SO CLOSE' : 'NAILED IT';
+        var rColor = state.result === 'perfect' ? TEAL : state.result === 'near' ? GOLD : '#fff';
+        cx.fillStyle = rColor;
+        cx.font = '900 36px -apple-system, Helvetica, Arial';
+        cx.globalAlpha = 0.92;
+        cx.fillText(rLabel, W / 2, 200);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // ---- GAME OVER ----
+    if (state.phase === 'over') {
+      // Still render vessel frozen
+      drawVessel(state.fill, state.target, state.result, 'over');
+      drawFillPct(state.fill, state.target);
+      drawRoundBadge(state.round);
+
+      cx.fillStyle = 'rgba(11,13,18,0.60)';
+      cx.fillRect(0, 0, W, H);
+
+      cx.textAlign = 'center';
+      var overMsg = state.result === 'over' ? 'OVERPOURED.' : 'UNDERPOURED.';
+      cx.fillStyle = VERM;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText(overMsg, W / 2, 295);
+
+      cx.fillStyle = '#fff';
+      cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' rounds', W / 2, 338);
+
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 382);
+
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 405);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE POUR', W / 2, 458);
+        cx.globalAlpha = 1;
+
+        // Share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- DEMO CTA ----
+    if (state.phase === 'cta') {
+      drawVessel(state.fill, state.target, state.result, 'cta');
+
+      var t = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.80 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('PERFECT POUR', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.72)';
+      cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('they got ' + (window.__demoScore || 4) + ' rounds. your move.', W / 2, 336);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM;
+      cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 4), W / 2, 404);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 438);
+      cx.globalAlpha = 1;
+    }
+
+    // Floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

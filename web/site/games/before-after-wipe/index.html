@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Before After Wipe — Tilt</title>
+<!--
+  LOOP / attention-architecture — Before After Wipe
+  Conditioned path: the before/after transformation wipe. The thumb already
+  knows this move from Instagram/TikTok — the game IS that move.
+  Circuits: 01 RPE (variable payoff per reveal), 06 Zeigarnik (one more wipe),
+            05 ease (the gesture is already learned).
+  Modes (query params):
+    ?demo=1&seed=7        scripted run for clip capture (challenge card → human
+                          reveals w/ hesitation → sliver save → miss → CTA),
+                          sets window.__demoDone when finished
+    ?bot=1&runs=3&seed=5  imperfect autoplay for traffic simulation, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'before-after-wipe';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+  function clamp01(v) { return Math.max(0.02, Math.min(0.98, v)); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var IMG = { x: 24, y: 128, w: 357, h: 388 };
+  var PERFECT_D = 0.30, SLIVER_D = 0.82;
+  var R_PERFECT = 20, R_GOOD = 14, R_SLIVER = 8;
+
+  var state, flashes, shakeAmt = 0, zoom = 1, hitStop = 0, dareBeaten = false, challengeAt = 0;
+  var wipePos = 0.06, prevWipe = 0.06, sweepPaused = false, dragging = false;
+  var runStartTs, best = 0;
+  try { best = +localStorage.getItem('baw_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',          // title | challenge | play | reveal | over | cta
+      score: 0, combo: 0, level: 0,
+      scene: Math.floor(rng() * SCENES),
+      zoneCenter: 0.3 + rng() * 0.4,
+      zoneW: 0.18, speed: 0.010,
+      overAt: 0, revealT: 0, lastAdd: 0, missSide: ''
+    };
+    flashes = []; shakeAmt = 0; zoom = 1; hitStop = 0; dareBeaten = false;
+    wipePos = 0.06; prevWipe = 0.06; sweepPaused = false; dragging = false;
+    if (DEMO) {
+      // mirror-neuron beat 1: prime the competitive frame
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      demoIdx = 0; demoWait = 30;
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function pctTop(s) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 30)))); }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function nextLevel() {
+    state.level++;
+    state.scene = (state.scene + 1) % SCENES;
+    state.zoneCenter = clamp01(0.3 + rng() * 0.4);
+    state.zoneW = Math.max(0.06, 0.18 - state.score * 0.0014);
+    state.speed = 0.010 + state.score * 0.00035;
+    wipePos = 0.06; prevWipe = 0.06; state.dir = 1; state.revealT = 0;
+    sweepPaused = false;
+    state.phase = 'play';
+  }
+
+  function commit() {
+    if (state.phase !== 'play') return;
+    var zMin = state.zoneCenter - state.zoneW / 2, zMax = state.zoneCenter + state.zoneW / 2;
+    if (wipePos >= zMin && wipePos <= zMax) {
+      var d = Math.abs(wipePos - state.zoneCenter) / (state.zoneW / 2); // 0..1
+      var perfect = d < PERFECT_D, sliver = d > SLIVER_D;
+      var add = perfect ? R_PERFECT : sliver ? R_SLIVER : R_GOOD;
+      state.lastAdd = add;
+      state.score += add;
+      if (perfect || (!sliver)) state.combo++; else state.combo = 0;
+      if (window.J) {
+        if (perfect) J.perfect(state.combo);
+        else if (sliver) J.near();
+        else J.hit(state.combo);
+        J.tension(Math.min(state.score / 120, 1));
+      }
+      if (perfect) { hitStop = 4; zoom = 1.03; }
+      if (sliver) shakeAmt = 5;
+      if (perfect) flash('PERFECT', TEAL, 44);
+      else if (sliver) { flash('SO CLOSE!', VERM, 38); if (window.LOOP) LOOP.emit('near_miss', { n: state.level, d: +d.toFixed(3) }); }
+      else flash('+' + add, GOLD, 30);
+      // dare check (human only)
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 40);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score);
+      }
+      if (window.LOOP) LOOP.emit('reveal', { score: state.score, perfect: perfect, sliver: sliver, level: state.level });
+      state.phase = 'reveal'; state.revealT = 0;
+    } else {
+      state.missSide = wipePos > zMax ? 'over' : 'under';
+      gameOver();
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 9;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) { J.death(Math.min(0.3 + state.score / 120, 1)); if (newBest) setTimeout(function () { J.fanfare(); }, 450); }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('baw_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    flash(state.missSide === 'over' ? 'OVERSHOT' : 'TEASE', VERM, 40);
+    if (DEMO) setTimeout(function () {
+      state.phase = 'cta'; ctaAt = performance.now();
+      setTimeout(function () { window.__demoDone = true; }, 3600);
+    }, 2800);
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 900);
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.combo = 0; state.level = 0;
+    state.scene = Math.floor(rng() * SCENES);
+    state.zoneCenter = 0.3 + rng() * 0.4;
+    state.zoneW = 0.18; state.speed = 0.010;
+    wipePos = 0.06; prevWipe = 0.06; state.dir = 1; dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 478, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function pp(e) { var r = cv.getBoundingClientRect(); return { x: (e.clientX - r.left) / scale, y: (e.clientY - r.top) / scale }; }
+
+  function tapDown(x, y) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') {
+      var wipeX = IMG.x + wipePos * IMG.w, ky = IMG.y + 18;
+      if (Math.abs(x - wipeX) < 24 && Math.abs(y - ky) < 24) {
+        dragging = true; sweepPaused = true; wipePos = clamp01((x - IMG.x) / IMG.w);
+      } else { commit(); }
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (inR(SHARE_R, x, y) && window.SHARE) { SHARE.send({ score: state.score, unit: '%' }); return; }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) { var p = pp(e); tapDown(p.x, p.y); });
+  window.addEventListener('pointermove', function (e) { if (dragging) { var p = pp(e); wipePos = clamp01((p.x - IMG.x) / IMG.w); } });
+  window.addEventListener('pointerup', function () { if (dragging) { dragging = false; sweepPaused = false; commit(); } });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' && !DEMO && !BOT) {
+      if (state.phase === 'title') startRun();
+      else if (state.phase === 'play') commit();
+      else if (state.phase === 'over' && performance.now() - state.overAt > 350) resetRun();
+    }
+  });
+
+  // ---- demo / bot autopilots ----
+  // demo script: commit targets expressed as offset from zone center in
+  // zone-halfwidths (d-target). 0.1≈perfect, -0.35≈good, 0.9≈sliver save
+  // (lands at the zone edge — reads as over, but saves), 0.05≈perfect, then
+  // the real miss (overshoot past the zone). Hesitation (demoWait) keeps it
+  // human, never robotic. Final score = 20+14+8+20 = 62.
+  var demoScript = [0.1, -0.35, 0.9, 0.05, 'miss'], demoIdx = 0, demoWait = 30;
+  var demoWaits = [28, 36, 52, 30, 24];
+  var botRunsDone = 0, botTarget = null;
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    var zMin = state.zoneCenter - state.zoneW / 2, zMax = state.zoneCenter + state.zoneW / 2;
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      var want = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      if (want === 'miss') {
+        if (wipePos > zMax + 0.05 || wipePos < zMin - 0.05) { demoIdx++; demoWait = 24; commit(); }
+        return;
+      }
+      var target = state.zoneCenter + want * (state.zoneW / 2);
+      if ((prevWipe - target) * (wipePos - target) <= 0) {
+        commit();
+        demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 28;
+        demoIdx++;
+      }
+    } else if (BOT) {
+      if (botTarget === null) botTarget = clamp01(state.zoneCenter + gauss() * 0.12);
+      if ((prevWipe - botTarget) * (wipePos - botTarget) <= 0) { botTarget = null; commit(); }
+    }
+  }
+
+  // ---- scenes: before (drab) / after (vibrant) ----
+  var SCENES = 4;
+  function sceneDawn(x, y, w, h, fx, after) {
+    var g = cx.createLinearGradient(0, y, 0, y + h);
+    if (after) { g.addColorStop(0, '#1a2a3a'); g.addColorStop(0.5, TEAL); g.addColorStop(0.8, VERM); g.addColorStop(1, GOLD); }
+    else { g.addColorStop(0, '#0d1117'); g.addColorStop(1, '#1a1f28'); }
+    cx.fillStyle = g; cx.fillRect(x, y, w, h);
+    cx.fillStyle = after ? 'rgba(11,13,18,0.5)' : 'rgba(11,13,18,0.82)';
+    cx.fillRect(x, y + h * 0.66, w, h * 0.34);
+    var sx = x + fx * w, sy = y + h * 0.5, r = h * 0.16;
+    if (after) {
+      var rg = cx.createRadialGradient(sx, sy, 2, sx, sy, r * 2.4);
+      rg.addColorStop(0, '#fff6d8'); rg.addColorStop(0.4, GOLD); rg.addColorStop(1, 'rgba(242,177,52,0)');
+      cx.fillStyle = rg; cx.beginPath(); cx.arc(sx, sy, r * 2.4, 0, 7); cx.fill();
+      cx.fillStyle = '#fff6d8'; cx.beginPath(); cx.arc(sx, sy, r, 0, 7); cx.fill();
+    } else {
+      cx.strokeStyle = 'rgba(242,177,52,0.25)'; cx.lineWidth = 2; cx.beginPath(); cx.arc(sx, sy, r, 0, 7); cx.stroke();
+    }
+  }
+  function sceneNeon(x, y, w, h, fx, after) {
+    cx.fillStyle = after ? '#0a1018' : '#0d1117'; cx.fillRect(x, y, w, h);
+    var n = 5, bw = w / n;
+    for (var i = 0; i < n; i++) {
+      var bx = x + i * bw, bh = h * (0.36 + (i % 3) * 0.12), by = y + h - bh;
+      cx.fillStyle = after ? '#11161f' : '#181c24'; cx.fillRect(bx + 1, by, bw - 2, bh);
+      if (after) {
+        for (var wy = by + 6; wy < y + h - 6; wy += 8) {
+          for (var wx = bx + 3; wx < bx + bw - 5; wx += 7) {
+            if (((wx + wy + i) | 0) % 3 === 0) { cx.fillStyle = (i % 2 ? TEAL : GOLD); cx.globalAlpha = 0.8; cx.fillRect(wx, wy, 3, 4); cx.globalAlpha = 1; }
+          }
+        }
+      }
+    }
+    var sx = x + fx * w, sy = y + h * 0.3;
+    if (after) {
+      cx.shadowColor = VERM; cx.shadowBlur = 18; cx.fillStyle = VERM; cx.fillRect(sx - 13, sy - 3, 26, 6);
+      cx.shadowBlur = 0; cx.fillStyle = GOLD; cx.fillRect(sx - 3, sy + 4, 6, 11);
+    } else { cx.strokeStyle = 'rgba(232,80,46,0.3)'; cx.lineWidth = 1.5; cx.strokeRect(sx - 13, sy - 3, 26, 6); }
+  }
+  function sceneBloom(x, y, w, h, fx, after) {
+    cx.fillStyle = after ? '#10211d' : '#0d1117'; cx.fillRect(x, y, w, h);
+    cx.strokeStyle = after ? '#3a4a3f' : '#1f2622'; cx.lineWidth = 3;
+    cx.beginPath(); cx.moveTo(x, y + h); cx.lineTo(x + w * 0.4, y + h * 0.4); cx.lineTo(x + w * 0.7, y + h * 0.6); cx.lineTo(x + w, y + h * 0.2); cx.stroke();
+    cx.beginPath(); cx.moveTo(x + w * 0.4, y + h * 0.4); cx.lineTo(x + w * 0.2, y + h * 0.15); cx.stroke();
+    var cols = [TEAL, '#ff7ab0', GOLD];
+    for (var i = 0; i < 14; i++) {
+      var bx = x + ((i * 37) % w), by = y + h * 0.2 + ((i * 53) % (h * 0.5));
+      cx.fillStyle = after ? cols[i % 3] : 'rgba(60,70,65,0.4)';
+      cx.beginPath(); cx.arc(bx, by, after ? 4 : 2.5, 0, 7); cx.fill();
+    }
+    var sxb = x + fx * w, syb = y + h * 0.45;
+    if (after) {
+      for (var p = 0; p < 6; p++) { cx.fillStyle = p % 2 ? '#ff7ab0' : TEAL; cx.beginPath(); cx.arc(sxb + Math.cos(p) * 8, syb + Math.sin(p) * 8, 7, 0, 7); cx.fill(); }
+      cx.fillStyle = GOLD; cx.beginPath(); cx.arc(sxb, syb, 5, 0, 7); cx.fill();
+    } else { cx.strokeStyle = 'rgba(255,122,176,0.3)'; cx.lineWidth = 1.5; cx.beginPath(); cx.arc(sxb, syb, 12, 0, 7); cx.stroke(); }
+  }
+  function sceneGold(x, y, w, h, fx, after, t) {
+    cx.fillStyle = after ? '#1a140a' : '#0d1117'; cx.fillRect(x, y, w, h);
+    var cxn = x + w / 2, cy = y + h / 2, r = h * 0.3;
+    if (after) {
+      var rg = cx.createRadialGradient(cxn - r * 0.3, cy - r * 0.3, r * 0.1, cxn, cy, r);
+      rg.addColorStop(0, '#fff3c0'); rg.addColorStop(0.5, GOLD); rg.addColorStop(1, '#a8761a');
+      cx.fillStyle = rg; cx.beginPath(); cx.arc(cxn, cy, r, 0, 7); cx.fill();
+      cx.strokeStyle = 'rgba(242,177,52,0.5)'; cx.lineWidth = 2;
+      for (var a = 0; a < 8; a++) { var ang = a * Math.PI / 4 + t * 0.0008;
+        cx.beginPath(); cx.moveTo(cxn + Math.cos(ang) * r * 1.1, cy + Math.sin(ang) * r * 1.1); cx.lineTo(cxn + Math.cos(ang) * r * 1.5, cy + Math.sin(ang) * r * 1.5); cx.stroke(); }
+    } else {
+      cx.fillStyle = '#2a2620'; cx.beginPath(); cx.arc(cxn, cy, r, 0, 7); cx.fill();
+      cx.strokeStyle = 'rgba(242,177,52,0.2)'; cx.lineWidth = 1.5; cx.stroke();
+    }
+  }
+  function drawScene(s, x, y, w, h, fx, after, t) {
+    if (s === 0) sceneDawn(x, y, w, h, fx, after);
+    else if (s === 1) sceneNeon(x, y, w, h, fx, after);
+    else if (s === 2) sceneBloom(x, y, w, h, fx, after);
+    else sceneGold(x, y, w, h, fx, after, t);
+  }
+
+  // ---- render ----
+  var ctaAt = 0, last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // reveal animation (success payoff): wipe eases to fully-revealed
+    if (state.phase === 'reveal') {
+      state.revealT += dt;
+      wipePos += (1 - wipePos) * 0.18 * dt;
+      if (wipePos > 0.985 || state.revealT > 40) nextLevel();
+    }
+
+    // sweep (frozen during hit-stop — the impact "bites")
+    if (hitStop > 0) hitStop -= dt;
+    else if (state.phase === 'play' && !sweepPaused) {
+      prevWipe = wipePos;
+      state.dir = state.dir || 1;
+      wipePos += state.speed * state.dir * dt;
+      if (wipePos > 0.94) { wipePos = 0.94; state.dir = -1; }
+      if (wipePos < 0.06) { wipePos = 0.06; state.dir = 1; }
+      autopilot();
+    }
+
+    // juice transforms: decaying shake + zoom-pulse
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sxs = (Math.random() - 0.5) * shakeAmt, sys = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sxs, H / 2 + sys); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)'); bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- the before/after card ----
+    if (state.phase !== 'title' && state.phase !== 'challenge') {
+      cx.fillStyle = '#000'; cx.fillRect(IMG.x - 2, IMG.y - 2, IMG.w + 4, IMG.h + 4);
+      // AFTER (full)
+      drawScene(state.scene, IMG.x, IMG.y, IMG.w, IMG.h, state.zoneCenter, true, now);
+      // BEFORE (clipped to the un-revealed side, right of the wipe)
+      var wipeX = IMG.x + wipePos * IMG.w;
+      cx.save();
+      cx.beginPath(); cx.rect(wipeX, IMG.y, (IMG.x + IMG.w) - wipeX, IMG.h); cx.clip();
+      drawScene(state.scene, IMG.x, IMG.y, IMG.w, IMG.h, state.zoneCenter, false, now);
+      cx.restore();
+      // frame
+      cx.strokeStyle = 'rgba(255,255,255,0.08)'; cx.lineWidth = 1; cx.strokeRect(IMG.x, IMG.y, IMG.w, IMG.h);
+      // target reveal zone band (only while playing)
+      if (state.phase === 'play') {
+        var zX0 = IMG.x + (state.zoneCenter - state.zoneW / 2) * IMG.w, zX1 = IMG.x + (state.zoneCenter + state.zoneW / 2) * IMG.w;
+        cx.fillStyle = 'rgba(242,177,52,0.10)'; cx.fillRect(zX0, IMG.y, zX1 - zX0, IMG.h);
+        cx.strokeStyle = 'rgba(242,177,52,0.55)'; cx.setLineDash([6, 6]); cx.lineWidth = 1.5;
+        cx.beginPath(); cx.moveTo(zX0, IMG.y); cx.lineTo(zX0, IMG.y + IMG.h); cx.moveTo(zX1, IMG.y); cx.lineTo(zX1, IMG.y + IMG.h); cx.stroke();
+        cx.setLineDash([]);
+        // focal center tick
+        cx.strokeStyle = 'rgba(242,177,52,0.7)'; cx.lineWidth = 1;
+        cx.beginPath(); cx.moveTo(IMG.x + state.zoneCenter * IMG.w, IMG.y + 4); cx.lineTo(IMG.x + state.zoneCenter * IMG.w, IMG.y + IMG.h - 4); cx.stroke();
+      }
+      // wipe line + knob
+      cx.strokeStyle = VERM; cx.lineWidth = 3; cx.beginPath(); cx.moveTo(wipeX, IMG.y); cx.lineTo(wipeX, IMG.y + IMG.h); cx.stroke();
+      cx.fillStyle = '#fff'; cx.beginPath(); cx.arc(wipeX, IMG.y + 18, 15, 0, 7); cx.fill();
+      cx.strokeStyle = VERM; cx.lineWidth = 2; cx.beginPath();
+      cx.moveTo(wipeX - 5, IMG.y + 18); cx.lineTo(wipeX - 9, IMG.y + 14); cx.moveTo(wipeX - 5, IMG.y + 18); cx.lineTo(wipeX - 9, IMG.y + 22);
+      cx.moveTo(wipeX + 5, IMG.y + 18); cx.lineTo(wipeX + 9, IMG.y + 14); cx.moveTo(wipeX + 5, IMG.y + 18); cx.lineTo(wipeX + 9, IMG.y + 22);
+      cx.stroke();
+      // reveal payoff glow on the focal
+      if (state.phase === 'reveal') {
+        var gx = IMG.x + state.zoneCenter * IMG.w, gy = IMG.y + IMG.h * 0.5;
+        var rg = cx.createRadialGradient(gx, gy, 2, gx, gy, IMG.w * 0.5);
+        rg.addColorStop(0, 'rgba(255,255,255,' + (0.35 * Math.max(0, 1 - state.revealT / 30)) + ')');
+        rg.addColorStop(1, 'rgba(255,255,255,0)');
+        cx.fillStyle = rg; cx.fillRect(IMG.x, IMG.y, IMG.w, IMG.h);
+      }
+
+      // header: score
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = 'rgba(255,255,255,0.92)'; cx.font = '800 56px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + '%', W / 2, 70);
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best + '%', W / 2, 92);
+      // combo
+      if (state.combo > 1) {
+        var cs = 18 + Math.min(state.combo, 8) * 1.6;
+        cx.fillStyle = TEAL; cx.font = '900 ' + cs + 'px -apple-system, Helvetica, Arial';
+        cx.fillText('×' + state.combo, W / 2, 114);
+      }
+      // incoming dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD; cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + '%' + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 118);
+      }
+      // play hint
+      if (state.phase === 'play') {
+        var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+        cx.globalAlpha = pulse; cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '700 14px -apple-system, Helvetica, Arial';
+        cx.fillText('tap to lock the wipe', W / 2, IMG.y + IMG.h + 30); cx.globalAlpha = 1;
+      }
+    }
+
+    // challenge card (demo beat 1)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 92px -apple-system, Helvetica, Arial';
+      cx.fillText('62%', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top wipe", W / 2, 430);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = fl.color; cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 240 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('BEFORE AFTER WIPE', W / 2, 280);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var p1 = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = p1; cx.fillText('TAP TO REVEAL', W / 2, 330); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('wipe to the gold. land the transformation.', W / 2, 360);
+    }
+
+    // game over
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText(state.missSide === 'over' ? 'OVERSHOT.' : 'MISSED IT.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 30px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + '%', W / 2, 348);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE WIPE', W / 2, 456); cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)'; cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('BEFORE AFTER WIPE', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they hit ' + (window.__demoScore || 62) + '%. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3; cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 62) + '%', W / 2, 410);
+      cx.globalAlpha = ease; cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442); cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.globalAlpha = 0.5; cx.font = '16px -apple-system, Helvetica, Arial'; cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26); cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

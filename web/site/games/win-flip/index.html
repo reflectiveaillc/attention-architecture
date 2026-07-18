@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Win Flip — Tilt</title>
+<!--
+  LOOP / attention-architecture — Win Flip
+  Circuits: 02-novelty (rule flips), 01-rpe (variable reward), 05-ease (simple tap)
+  Engine: viral
+  Mechanic: tap game with inverted win conditions every 5 seconds
+  Modes:
+    ?demo=1&seed=7        mirror-neuron demo clip, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect bot, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'win-flip';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- Rule definitions ----
+  // Rules: FAST = tap as many times as possible in window
+  //        SLOW = tap slowly (< 1 tap per second; extra taps penalize)
+  //        WAIT = don't tap at all during window
+  //        GREEN = tap only when target is green
+  var RULES = ['FAST', 'SLOW', 'WAIT', 'GREEN'];
+  var RULE_LABELS = {
+    FAST: 'TAP FAST',
+    SLOW: 'TAP SLOW',
+    WAIT: "DON'T TAP",
+    GREEN: 'TAP GREEN'
+  };
+  var RULE_DESCS = {
+    FAST: 'more taps = more points',
+    SLOW: 'one slow tap scores',
+    WAIT: 'survive without tapping',
+    GREEN: 'tap only when it glows green'
+  };
+  var RULE_COLORS = {
+    FAST: VERM,
+    SLOW: TEAL,
+    WAIT: GOLD,
+    GREEN: '#4ecb71'
+  };
+  var PHASE_DURATION = 5.0; // seconds per rule
+
+  // ---- Game state ----
+  var state, flashes, hitStop, zoom, shakeAmt, dareBeaten;
+  var runStartTs, best = 0;
+  try { best = +localStorage.getItem('wf_best') || 0; } catch (_) {}
+
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function newGame() {
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    state = {
+      phase: 'title',       // title | challenge | play | over | cta
+      score: 0,
+      overAt: 0,
+      // rule state
+      ruleIdx: 0,
+      rule: RULES[0],
+      ruleTimer: PHASE_DURATION,  // seconds remaining in current rule
+      tapCount: 0,               // taps in current rule window
+      lastTapTime: 0,            // for SLOW tracking
+      // GREEN rule: target is green for random intervals
+      targetGreen: false,
+      greenTimer: 0,
+      greenDuration: 0,
+      offTimer: 0,
+      // pulse display
+      pulseAmt: 0,
+      combo: 0,
+      failReason: ''
+    };
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { startRun(); return; }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.score = 0;
+    state.ruleIdx = 0;
+    state.rule = RULES[0];
+    state.ruleTimer = PHASE_DURATION;
+    state.tapCount = 0;
+    state.lastTapTime = -999;
+    resetGreenTimer();
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function resetGreenTimer() {
+    // green appears for 0.6–1.2s, then off for 0.8–1.8s
+    if (state.rule === 'GREEN') {
+      state.targetGreen = false;
+      state.offTimer = 0.8 + rng() * 1.0;
+      state.greenTimer = 0;
+      state.greenDuration = 0.6 + rng() * 0.6;
+    }
+  }
+
+  function nextRule() {
+    // pick next rule that's different from current (guarantee flip)
+    var prev = state.ruleIdx;
+    var candidates = [];
+    for (var i = 0; i < RULES.length; i++) {
+      if (i !== prev) candidates.push(i);
+    }
+    state.ruleIdx = candidates[Math.floor(rng() * candidates.length)];
+    state.rule = RULES[state.ruleIdx];
+    state.ruleTimer = PHASE_DURATION;
+    state.tapCount = 0;
+    state.lastTapTime = state.now || -999;
+    resetGreenTimer();
+    // show FLIP notification
+    flash('RULES FLIPPED!', GOLD, 32);
+    if (window.J) J.gold();
+    if (window.LOOP) LOOP.emit('rule_flip', { rule: state.rule, score: state.score });
+  }
+
+  function evaluateRule() {
+    // Called when a rule window ends — determine if player passed or failed
+    var passed = false;
+    switch (state.rule) {
+      case 'FAST':
+        // Need at least 3 taps to score; more = better
+        if (state.tapCount >= 3) {
+          passed = true;
+          var bonus = Math.min(state.tapCount - 2, 8);
+          awardPoints(bonus, state.tapCount >= 8 ? 'TURBO' : null);
+        } else {
+          failGame('too slow');
+        }
+        break;
+      case 'SLOW':
+        // Exactly 1 tap (or 0 taps) — any 2+ taps = fail
+        if (state.tapCount === 1) {
+          passed = true;
+          awardPoints(3, 'SLOW PLAY');
+        } else if (state.tapCount === 0) {
+          // missed entirely — fail gently (no tap = fail for SLOW too)
+          failGame('no tap');
+        } else {
+          failGame('too fast');
+        }
+        break;
+      case 'WAIT':
+        // 0 taps = pass; any tap = fail
+        if (state.tapCount === 0) {
+          passed = true;
+          awardPoints(4, 'IRON WILL');
+        } else {
+          // already failed via tapDuringWait
+        }
+        break;
+      case 'GREEN':
+        // survive the window without tapping off-green
+        // the rule failure is handled live in tapAction
+        if (state.phase === 'play') {
+          passed = true;
+          awardPoints(3, state.tapCount > 0 ? 'GREEN TAPS' : 'SURVIVED');
+        }
+        break;
+    }
+    return passed;
+  }
+
+  function awardPoints(pts, label) {
+    state.score += pts;
+    state.combo++;
+    if (window.J) {
+      if (label === 'IRON WILL' || label === 'TURBO') J.perfect(state.combo);
+      else J.hit(state.combo);
+      J.tension(Math.min(state.score / 30, 1));
+    }
+    if (pts >= 4) { hitStop = 4; zoom = 1.03; }
+    if (label) flash('+' + pts + ' ' + label, TEAL, 34);
+    else flash('+' + pts, TEAL, 30);
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+    if (window.LOOP) LOOP.emit('rule_passed', { rule: state.rule, pts: pts, score: state.score });
+  }
+
+  function tapAction(now) {
+    // Called on each user tap during play
+    if (state.phase !== 'play') return;
+    state.tapCount++;
+    state.lastTapTime = now;
+    state.pulseAmt = 1;
+
+    switch (state.rule) {
+      case 'FAST':
+        if (window.J) J.hit(state.tapCount);
+        flash('+' + state.tapCount, 'rgba(255,255,255,0.7)', 22);
+        break;
+      case 'SLOW':
+        if (state.tapCount > 1) {
+          // immediate fail
+          failGame('too fast');
+        } else {
+          if (window.J) J.hit(1);
+        }
+        break;
+      case 'WAIT':
+        // any tap = instant fail
+        failGame('broke the silence');
+        break;
+      case 'GREEN':
+        if (state.targetGreen) {
+          if (window.J) J.hit(state.tapCount);
+          flash('GREEN!', '#4ecb71', 28);
+        } else {
+          failGame('wrong color');
+        }
+        break;
+    }
+  }
+
+  function failGame(reason) {
+    if (state.phase !== 'play') return;
+    state.failReason = reason;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + state.score / 30, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('wf_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 900);
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.combo = 0; state.phase = 'title';
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0;
+    state.ruleIdx = 0; state.rule = RULES[0]; state.ruleTimer = PHASE_DURATION;
+    state.tapCount = 0; state.lastTapTime = -999; state.failReason = '';
+    resetGreenTimer();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 12))));
+  }
+
+  // ---- Input ----
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { tapAction(performance.now() / 1000); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'flips' }); return;
+      }
+      resetRun(); return;
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- Demo / Bot autopilots ----
+  // Demo script: sequence of actions for each rule phase
+  // Formatted as arrays of {rule, action} entries per phase
+  // 'pass' = perform the winning action
+  // 'fail' = perform the failing action
+  // Demo arc: 3 solid passes → near-fail (WAIT rule, tap near end then stop just before) → pass → WAIT fail
+  var demoPhases = [
+    { rule: 'FAST', action: 'pass', tapsTarget: 7 },     // FAST: tap 7 times → solid score
+    { rule: 'SLOW', action: 'pass' },                     // SLOW: 1 slow tap
+    { rule: 'WAIT', action: 'pass' },                     // WAIT: survive (near-miss hesitation added visually)
+    { rule: 'GREEN', action: 'pass' },                    // GREEN: tap on green
+    { rule: 'FAST', action: 'pass', tapsTarget: 9 },     // FAST: tap more → tension
+    { rule: 'WAIT', action: 'fail' }                      // WAIT: tap → game over (the real fail)
+  ];
+  var demoPhaseIdx = 0;
+  var demoTapTimer = 0;
+  var demoTapsThisPhase = 0;
+  var demoWait = 0;     // generic wait timer (in seconds)
+  var demoHesitated = false;  // for near-fail effect
+  var botRunsDone = 0;
+  var botActionTimer = 0;
+  var botTapsThisPhase = 0;
+  var botPassedOnce = false;
+
+  function demoPilot(dt, nowSec) {
+    if (state.phase !== 'play') return;
+
+    var ph = demoPhases[Math.min(demoPhaseIdx, demoPhases.length - 1)];
+
+    // If current game rule doesn't match expected demo phase rule, skip (wait for flip)
+    if (state.rule !== ph.rule) return;
+
+    demoTapTimer -= dt;
+
+    switch (ph.rule) {
+      case 'FAST':
+        // Tap at ~1.4–1.8 taps/sec, human-feeling
+        if (demoTapsThisPhase < (ph.tapsTarget || 7)) {
+          if (demoTapTimer <= 0) {
+            tapAction(nowSec);
+            demoTapsThisPhase++;
+            demoTapTimer = 0.55 + rng() * 0.3;
+          }
+        }
+        break;
+
+      case 'SLOW':
+        // One tap around 2.5s into the window (very human timing)
+        if (!demoHesitated && state.ruleTimer < (PHASE_DURATION - 2.4) && demoTapsThisPhase === 0) {
+          // hesitate a little more
+          if (demoTapTimer <= 0) {
+            tapAction(nowSec);
+            demoTapsThisPhase++;
+            demoHesitated = true;
+          } else if (demoTapTimer > 999) {
+            demoTapTimer = 0.4 + rng() * 0.3;
+          }
+        }
+        break;
+
+      case 'WAIT':
+        if (ph.action === 'fail') {
+          // Near the end of WAIT window, suddenly tap (the real death)
+          if (state.ruleTimer < 1.2 && !demoHesitated) {
+            demoHesitated = true;
+            demoTapTimer = 0.4 + rng() * 0.3;
+          }
+          if (demoHesitated && demoTapTimer <= 0 && demoTapsThisPhase === 0) {
+            tapAction(nowSec);
+            demoTapsThisPhase++;
+          }
+        }
+        // pass: do nothing
+        break;
+
+      case 'GREEN':
+        // Tap once when green
+        if (state.targetGreen && demoTapsThisPhase === 0 && demoTapTimer <= 0) {
+          tapAction(nowSec);
+          demoTapsThisPhase++;
+        } else if (demoTapTimer > 999) {
+          demoTapTimer = 0.1;
+        }
+        break;
+    }
+  }
+
+  function botPilot(dt) {
+    if (state.phase !== 'play') return;
+    botActionTimer -= dt;
+    if (botActionTimer > 0) return;
+
+    switch (state.rule) {
+      case 'FAST':
+        // tap at moderate pace (sometimes miss the minimum)
+        if (botTapsThisPhase < 4 + Math.floor(rng() * 5)) {
+          tapAction(performance.now() / 1000);
+          botTapsThisPhase++;
+          botActionTimer = 0.4 + rng() * 0.5;
+        }
+        break;
+      case 'SLOW':
+        // tap once after about 2 seconds
+        if (botTapsThisPhase === 0 && state.ruleTimer < PHASE_DURATION - 1.8) {
+          tapAction(performance.now() / 1000);
+          botTapsThisPhase++;
+          botActionTimer = 0.5;
+        }
+        break;
+      case 'WAIT':
+        // mostly wait, but occasionally misfire (makes bot lose eventually)
+        if (rng() < 0.015 && state.ruleTimer < 2.0) {
+          tapAction(performance.now() / 1000);
+          botTapsThisPhase++;
+        }
+        botActionTimer = 0.2;
+        break;
+      case 'GREEN':
+        // tap when green, sometimes miss or tap wrong
+        if (state.targetGreen && rng() > 0.3) {
+          tapAction(performance.now() / 1000);
+          botTapsThisPhase++;
+          botActionTimer = 0.3;
+        } else if (!state.targetGreen && rng() < 0.08) {
+          tapAction(performance.now() / 1000);
+          botTapsThisPhase++;
+          botActionTimer = 0.3;
+        } else {
+          botActionTimer = 0.1;
+        }
+        break;
+    }
+  }
+
+  // ---- Render ----
+  var ctaAt = 0, challengeAt = 0, last = performance.now();
+  var prevRule = null;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 1000, 0.1); last = now;  // dt in seconds
+    var dtF = dt * 60; // normalized to 60fps for juice values
+    state.now = now / 1000;
+
+    // ---- Game sim ----
+    if (state.phase === 'play') {
+      // Update GREEN target timer
+      if (state.rule === 'GREEN') {
+        if (!state.targetGreen) {
+          state.offTimer -= dt;
+          if (state.offTimer <= 0) {
+            state.targetGreen = true;
+            state.greenTimer = state.greenDuration;
+          }
+        } else {
+          state.greenTimer -= dt;
+          if (state.greenTimer <= 0) {
+            state.targetGreen = false;
+            state.offTimer = 0.8 + rng() * 1.0;
+            state.greenDuration = 0.6 + rng() * 0.6;
+          }
+        }
+      }
+
+      // Tension riser
+      if (window.J) J.tension(Math.min(state.score / 30, 1));
+
+      // Timer countdown
+      if (hitStop > 0) {
+        hitStop -= dtF;
+      } else {
+        state.ruleTimer -= dt;
+
+        // Autopilots
+        if (DEMO) {
+          demoPilot(dt, now / 1000);
+        } else if (BOT) {
+          botPilot(dt);
+        }
+
+        if (state.ruleTimer <= 0) {
+          // Rule window ended — evaluate
+          var ok = evaluateRule();
+          if (ok || state.phase === 'play') {
+            // advance to next rule (or fail if evaluate already called failGame)
+            if (state.phase === 'play') {
+              // track demo phase progression
+              if (DEMO) {
+                demoPhaseIdx++;
+                demoTapsThisPhase = 0;
+                demoHesitated = false;
+                demoTapTimer = 0;
+                // Reset initial wait for SLOW rule
+              }
+              if (BOT) {
+                botTapsThisPhase = 0;
+                botActionTimer = 0;
+              }
+              nextRule();
+            }
+          }
+        }
+      }
+    }
+
+    // pulse decay
+    if (state.pulseAmt > 0) state.pulseAmt -= dtF * 0.08;
+
+    // ---- Draw ----
+    cx.save();
+    // juice transforms
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dtF); zoom += (1 - zoom) * 0.12 * dtF;
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ===== Title =====
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 52px -apple-system, Helvetica, Arial';
+      cx.fillText('WIN FLIP', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillText('TAP TO START', W / 2, 352);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('the rules flip. the winner switches. keep up.', W / 2, 390);
+    }
+
+    // ===== Challenge card =====
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('24', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top flips", W / 2, 432);
+    }
+
+    // ===== Play =====
+    if (state.phase === 'play') {
+      var rule = state.rule;
+      var ruleColor = RULE_COLORS[rule];
+      var timeLeft = Math.max(0, state.ruleTimer);
+      var timeFrac = timeLeft / PHASE_DURATION;
+
+      // Big rule label
+      cx.textAlign = 'center';
+      cx.fillStyle = ruleColor; cx.font = '900 54px -apple-system, Helvetica, Arial';
+      cx.fillText(RULE_LABELS[rule], W / 2, 160);
+
+      // Rule description
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText(RULE_DESCS[rule], W / 2, 190);
+
+      // Timer bar (full width, shrinks from right)
+      var barW = W - 60, barH = 8, barX = 30, barY = 210;
+      cx.fillStyle = 'rgba(255,255,255,0.12)';
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(barX, barY, barW, barH, 4); else cx.rect(barX, barY, barW, barH);
+      cx.fill();
+
+      // Timer fill — color changes to red when < 30%
+      var barColor = timeFrac < 0.3 ? VERM : ruleColor;
+      if (timeFrac > 0) {
+        cx.fillStyle = barColor;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(barX, barY, barW * timeFrac, barH, 4); else cx.rect(barX, barY, barW * timeFrac, barH);
+        cx.fill();
+      }
+
+      // Time remaining number
+      cx.fillStyle = timeFrac < 0.3 ? VERM : 'rgba(255,255,255,0.6)';
+      cx.font = '700 22px Menlo, monospace';
+      cx.fillText(timeLeft.toFixed(1), W / 2, barY + barH + 28);
+
+      // GREEN target circle
+      if (rule === 'GREEN') {
+        var circR = 70;
+        var circY = H / 2 + 20;
+        // Outer ring
+        cx.strokeStyle = state.targetGreen ? '#4ecb71' : 'rgba(255,255,255,0.15)';
+        cx.lineWidth = state.targetGreen ? 4 : 2;
+        cx.beginPath();
+        cx.arc(W / 2, circY, circR, 0, Math.PI * 2);
+        cx.stroke();
+        // Fill + glow
+        if (state.targetGreen) {
+          cx.fillStyle = 'rgba(78,203,113,0.18)';
+          cx.beginPath();
+          cx.arc(W / 2, circY, circR, 0, Math.PI * 2);
+          cx.fill();
+          cx.fillStyle = '#4ecb71';
+          cx.font = '900 28px -apple-system, Helvetica, Arial';
+          cx.fillText('TAP', W / 2, circY + 10);
+        } else {
+          cx.fillStyle = 'rgba(255,255,255,0.08)';
+          cx.beginPath();
+          cx.arc(W / 2, circY, circR, 0, Math.PI * 2);
+          cx.fill();
+          cx.fillStyle = 'rgba(255,255,255,0.2)';
+          cx.font = '700 20px -apple-system, Helvetica, Arial';
+          cx.fillText('WAIT', W / 2, circY + 8);
+        }
+      }
+
+      // WAIT: big "HOLD" visual
+      if (rule === 'WAIT') {
+        cx.fillStyle = 'rgba(242,177,52,0.08)';
+        cx.beginPath();
+        cx.arc(W / 2, H / 2 + 30, 90, 0, Math.PI * 2);
+        cx.fill();
+        cx.strokeStyle = GOLD;
+        cx.lineWidth = 3;
+        cx.beginPath();
+        cx.arc(W / 2, H / 2 + 30, 90, 0, Math.PI * 2);
+        cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '900 26px -apple-system, Helvetica, Arial';
+        cx.fillText('HOLD', W / 2, H / 2 + 38);
+        // tap count warning
+        if (state.tapCount > 0) {
+          cx.fillStyle = VERM; cx.font = '800 18px -apple-system, Helvetica, Arial';
+          cx.fillText('YOU TAPPED! ×' + state.tapCount, W / 2, H / 2 + 100);
+        }
+      }
+
+      // FAST: tap counter display
+      if (rule === 'FAST') {
+        cx.fillStyle = VERM; cx.font = '900 80px -apple-system, Helvetica, Arial';
+        cx.fillText(state.tapCount, W / 2, H / 2 + 55);
+        cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+        cx.fillText('taps', W / 2, H / 2 + 82);
+      }
+
+      // SLOW: single tap indicator
+      if (rule === 'SLOW') {
+        var slCircR = 60;
+        var tapDone = state.tapCount >= 1;
+        cx.strokeStyle = tapDone ? TEAL : 'rgba(255,255,255,0.3)';
+        cx.lineWidth = 3;
+        cx.beginPath(); cx.arc(W / 2, H / 2 + 30, slCircR, 0, Math.PI * 2); cx.stroke();
+        if (tapDone) {
+          cx.fillStyle = 'rgba(46,197,182,0.15)';
+          cx.beginPath(); cx.arc(W / 2, H / 2 + 30, slCircR, 0, Math.PI * 2); cx.fill();
+          cx.fillStyle = TEAL; cx.font = '900 22px -apple-system, Helvetica, Arial';
+          cx.fillText('DONE ✓', W / 2, H / 2 + 38);
+        } else {
+          cx.fillStyle = 'rgba(255,255,255,0.15)';
+          cx.font = '700 17px -apple-system, Helvetica, Arial';
+          cx.fillText('ONE TAP', W / 2, H / 2 + 38);
+        }
+      }
+
+      // Score display
+      cx.fillStyle = 'rgba(255,255,255,0.92)'; cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 88);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 110);
+
+      // Dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 132);
+      }
+
+      // Flip pulse on new rule
+      if (state.pulseAmt > 0) {
+        cx.strokeStyle = ruleColor;
+        cx.lineWidth = 2 + state.pulseAmt * 3;
+        cx.globalAlpha = state.pulseAmt * 0.4;
+        cx.strokeRect(4, 4, W - 8, H - 8);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // ===== Game Over =====
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('FLIPPED.', W / 2, 284);
+      cx.fillStyle = 'rgba(255,255,255,0.6)'; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText(state.failReason ? '(' + state.failReason + ')' : '', W / 2, 316);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' flips', W / 2, 352);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 398);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('the rules beat you. they always do.', W / 2, 422);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — FLIP IT BACK', W / 2, 462);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ===== Demo CTA =====
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 52px -apple-system, Helvetica, Arial';
+      cx.fillText('WIN FLIP', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('the rule changed. he lost. you won\'t.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 24), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 445);
+      cx.globalAlpha = 1;
+    }
+
+    // ===== Floating reward text =====
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dtF;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 240 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

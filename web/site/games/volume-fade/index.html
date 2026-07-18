@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Volume Fade — Tilt</title>
+<!--
+  LOOP / attention-architecture — Volume Fade (calm engine)
+  Circuits: 05-ease, 07-timing, 06-zeigarnik
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA card → __demoDone
+    ?bot=1&runs=N&seed=M  imperfect autopilot, N runs → __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'volume-fade';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // --- Game state ---
+  // phase: 'title' | 'play' | 'over' | 'cta'
+  // Mechanic: hold to fade volume (0→1 progress). Release → creep back up.
+  // Hold through to full silence (progress=1) → session closes (game_over, score = hold_ms).
+  // Score = milliseconds successfully held at each session end (meaningful number).
+
+  var state, runStartTs, best = 0;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  try { best = +localStorage.getItem('vf_best') || 0; } catch (_) {}
+
+  // Input: is player currently holding?
+  var holding = false;
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      wonRun: false,
+      // progress: 0=full volume, 1=full silence/black
+      progress: 0,
+      // how long player has successfully held (accumulates while holding)
+      holdTotal: 0,
+      score: 0,
+      overAt: 0,
+      // for visual: ambient ripple
+      rippleT: 0,
+      // calm step counter for J.calm
+      calmStep: 0
+    };
+    holding = false;
+    flashes = [];
+    if (DEMO) {
+      setTimeout(startRun, 400);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.progress = 0;
+    state.holdTotal = 0;
+    state.score = 0;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // Speeds are per-frame at 60fps (dt≈1). Full 0→1 hold at 60fps:
+  //   HOLD_SPEED: 1/(8s * 60fps) ≈ 0.00208 → ~8s of holding to reach silence
+  //   CREEP_SPEED: 1/(4s * 60fps) ≈ 0.00417 → ~4s to fully creep back up if you release at 1
+  var CREEP_SPEED = 0.0042;  // how fast it comes back when released
+  var HOLD_SPEED  = 0.0021;  // how fast progress advances when holding (~8s to full silence)
+  // Near-end threshold: if player releases with progress > 0.85, near_miss
+  var NEAR_END = 0.85;
+  // Win: reaching progress >= 1.0
+  var DONE_THRESH = 0.999;
+
+  var botRunsDone = 0;
+  // Bot state: imperfect hold pattern — hold for a random duration then release briefly, repeat
+  var botHoldTimer = 0, botReleaseTimer = 0, botIsHolding = false, botActionsLeft = 0;
+
+  function initBotRun() {
+    botActionsLeft = 6 + Math.floor(rng() * 4); // K actions then go passive to let lose-path fire
+    botHoldTimer = 0;
+    botReleaseTimer = 0;
+    botIsHolding = false;
+    botPassive = false;
+    botPassiveTriggered = false;
+  }
+
+  function autopilot(dt) {
+    if (state.phase !== 'play') return;
+    if (DEMO) {
+      demoAutopilot(dt);
+    } else if (BOT) {
+      botAutopilot(dt);
+    }
+  }
+
+  // --- DEMO autopilot ---
+  // Arc: settle (gentle hold ~3s) → deepen (sustained hold, progress climbs ~5s) →
+  //      resolve (full hold to silence, ~5s) → soft CTA
+  var demoPhase = 'settle';
+  var demoTimer = 0;
+
+  function demoAutopilot(dt) {
+    demoTimer += dt / 60; // convert frames to seconds approx
+    if (demoPhase === 'settle') {
+      // Gentle holds and releases to show mechanic — ~4s
+      var period = 1.8;
+      var cycle = (demoTimer % period) / period;
+      holding = cycle < 0.55; // hold ~55% of the time
+      if (demoTimer > 4.0) { demoPhase = 'deepen'; demoTimer = 0; }
+    } else if (demoPhase === 'deepen') {
+      // Sustained hold, let it build — ~5s
+      holding = true;
+      // one small release wobble at 2s to feel human
+      if (demoTimer > 2.0 && demoTimer < 2.4) holding = false;
+      if (demoTimer > 5.5) { demoPhase = 'resolve'; demoTimer = 0; }
+    } else if (demoPhase === 'resolve') {
+      // Hold all the way through to silence
+      holding = true;
+      // let the natural win (progress >= 1) trigger gameOver from the sim
+    }
+  }
+
+  // --- BOT autopilot ---
+  var botPassive = false; // true once K actions are spent
+  var botPassiveTriggered = false;
+  function botAutopilot(dt) {
+    if (botPassive) {
+      // Release held → progress drains back to 0
+      holding = false;
+      // Once progress is near 0, trigger game_over directly (don't wait for timeout)
+      if (!botPassiveTriggered && state.progress < 0.05) {
+        botPassiveTriggered = true;
+        setTimeout(function () { gameOver(false); }, 300);
+      }
+      return;
+    }
+    if (botActionsLeft <= 0) {
+      botPassive = true;
+      holding = false;
+      return;
+    }
+    if (botIsHolding) {
+      botHoldTimer -= dt / 60;
+      if (botHoldTimer <= 0) {
+        botIsHolding = false;
+        botReleaseTimer = 0.5 + rng() * 0.8;
+        botActionsLeft--;
+      }
+    } else {
+      botReleaseTimer -= dt / 60;
+      if (botReleaseTimer <= 0) {
+        botIsHolding = true;
+        botHoldTimer = 0.6 + rng() * 0.8; // short holds — never enough to win (would need 8s+ continuous)
+      }
+    }
+    holding = botIsHolding;
+  }
+
+  var MAX_RUN_TIME = 60; // seconds max before bot/demo run times out (loss for bot; should never fire for demo)
+
+  function gameOver(won) {
+    if (state.phase !== 'play') return;
+    state.phase = 'over';
+    state.wonRun = won;
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    // Score: milliseconds held total (always meaningful)
+    state.score = Math.max(1, Math.round(state.holdTotal * 1000));
+    if (won && window.J) { J.calm(state.calmStep); }
+    if (won) {
+      shakeAmt = 0; zoom = 1.04;
+      flash('SILENCE', TEAL, 42);
+    } else {
+      shakeAmt = 3;
+    }
+    var newBest = state.score > best;
+    if (newBest) { best = state.score; try { localStorage.setItem('vf_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), won: won });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.phase = 'play';
+    state.wonRun = false;
+    state.progress = 0;
+    state.holdTotal = 0;
+    state.score = 0;
+    holding = false;
+    flashes = [];
+    runStartTs = Date.now();
+    initBotRun();
+    if (window.LOOP) LOOP.emit('restart', {});
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // --- Input ---
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 130, y: 490, w: 260, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function onHoldStart(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { holding = true; return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'ms silence' }); return;
+      }
+      resetRun();
+    }
+  }
+  function onHoldEnd() {
+    if (DEMO || BOT) return;
+    holding = false;
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    onHoldStart((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', onHoldEnd);
+  cv.addEventListener('pointerleave', onHoldEnd);
+  cv.addEventListener('pointercancel', onHoldEnd);
+  window.addEventListener('pointerup', onHoldEnd);
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') { e.preventDefault(); onHoldStart(); }
+  });
+  window.addEventListener('keyup', function (e) {
+    if (e.code === 'Space') onHoldEnd();
+  });
+
+  // --- Render helpers ---
+  // Draw the volume/speaker icon with animated bars
+  // spX = center x, spY = center y, vol = current volume (1=loud, 0=silent), alpha = overall opacity
+  function drawSpeaker(spX, spY, vol, alpha) {
+    cx.globalAlpha = alpha;
+    cx.lineWidth = 2.5;
+    cx.lineCap = 'round';
+    // speaker body
+    var bx = spX - 22, by = spY - 16, bw = 14, bh = 32;
+    cx.beginPath();
+    cx.moveTo(bx + bw, by);
+    cx.lineTo(bx, by + 10);
+    cx.lineTo(bx - bw * 0.7, by + 10);
+    cx.lineTo(bx - bw * 0.7, by + bh - 10);
+    cx.lineTo(bx, by + bh - 10);
+    cx.lineTo(bx + bw, by + bh);
+    cx.closePath();
+    cx.fillStyle = 'rgba(46,197,182,' + (0.15 + vol * 0.25) + ')';
+    cx.fill();
+    cx.strokeStyle = TEAL;
+    cx.stroke();
+    // volume bars (3 arcs, fading based on vol)
+    var levels = [
+      { r: 28, minVol: 0.01 },
+      { r: 44, minVol: 0.35 },
+      { r: 60, minVol: 0.65 }
+    ];
+    for (var i = 0; i < levels.length; i++) {
+      var lv = levels[i];
+      var barAlpha = vol >= lv.minVol ? Math.min(1, (vol - lv.minVol) * 3) : 0;
+      if (barAlpha < 0.02) continue;
+      var spread = 0.55 + i * 0.12;
+      cx.globalAlpha = alpha * barAlpha;
+      cx.strokeStyle = TEAL;
+      cx.lineWidth = 2.5;
+      cx.beginPath();
+      cx.arc(spX - 8, spY, lv.r, -Math.PI / 2 - spread, -Math.PI / 2 + spread);
+      cx.stroke();
+    }
+    cx.globalAlpha = 1;
+  }
+
+  // Screen brightness overlay
+  function screenDim(progress) {
+    // progress 0 = bright, 1 = fully dimmed/black
+    var alpha = progress * 0.88;
+    cx.fillStyle = 'rgba(11,13,18,' + alpha + ')';
+    cx.fillRect(0, 0, W, H);
+  }
+
+  // Ambient waveform at bottom to show "audio playing"
+  function drawWave(now, vol, alpha) {
+    if (vol < 0.01) return;
+    cx.globalAlpha = alpha * vol * 0.6;
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 1.5;
+    cx.beginPath();
+    var y0 = H - 80;
+    var amp = 18 * vol;
+    for (var x = 0; x <= W; x += 2) {
+      var t = now / 600;
+      var y = y0 + Math.sin(x / 28 + t) * amp * 0.7
+                 + Math.sin(x / 14 - t * 1.3) * amp * 0.3;
+      if (x === 0) cx.moveTo(x, y); else cx.lineTo(x, y);
+    }
+    cx.stroke();
+    cx.globalAlpha = 1;
+  }
+
+  // Progress ring around center icon
+  function drawProgressRing(spX, spY, progress, r) {
+    // background ring
+    cx.strokeStyle = 'rgba(255,255,255,0.08)';
+    cx.lineWidth = 6;
+    cx.lineCap = 'butt';
+    cx.beginPath();
+    cx.arc(spX, spY, r, 0, Math.PI * 2);
+    cx.stroke();
+    // filled arc (how far we've faded)
+    if (progress > 0.001) {
+      var end = -Math.PI / 2 + progress * Math.PI * 2;
+      var g = cx.createLinearGradient(spX - r, spY, spX + r, spY);
+      g.addColorStop(0, TEAL);
+      g.addColorStop(1, GOLD);
+      cx.strokeStyle = g;
+      cx.lineWidth = 6;
+      cx.lineCap = 'round';
+      cx.beginPath();
+      cx.arc(spX, spY, r, -Math.PI / 2, end);
+      cx.stroke();
+    }
+  }
+
+  var ctaAt = 0, last = performance.now();
+  var nearMissEmitted = false;
+  var botRunStartTs = 0;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // --- sim update ---
+    if (state.phase === 'play') {
+      // run autopilot (populates 'holding' for demo/bot modes)
+      autopilot(dt);
+
+      // update progress
+      if (holding) {
+        state.progress = Math.min(1, state.progress + HOLD_SPEED * dt);
+        state.holdTotal += (dt / 60);
+        state.calmStep = Math.floor(state.progress * 8);
+        // calm sound periodically while holding
+        if (window.J && Math.floor(state.progress * 10) > Math.floor((state.progress - HOLD_SPEED * dt) * 10)) {
+          J.calm(state.calmStep);
+        }
+      } else {
+        // check near miss before creeping
+        if (state.progress > NEAR_END && !nearMissEmitted) {
+          nearMissEmitted = true;
+          flash('SO CLOSE', TEAL, 36);
+          if (window.LOOP) LOOP.emit('near_miss', { progress: +state.progress.toFixed(3) });
+        }
+        state.progress = Math.max(0, state.progress - CREEP_SPEED * dt);
+      }
+
+      // win condition
+      if (state.progress >= DONE_THRESH) {
+        nearMissEmitted = false;
+        gameOver(true);
+      }
+
+      // bot/demo: also enforce a max run time to ensure game_over fires
+      if ((BOT || DEMO) && runStartTs && (Date.now() - runStartTs) / 1000 > MAX_RUN_TIME) {
+        nearMissEmitted = false;
+        gameOver(false);
+      }
+
+      // reset near miss flag when progress drops back
+      if (state.progress < NEAR_END - 0.05) nearMissEmitted = false;
+
+      // juice: hit-stop decays
+      if (hitStop > 0) hitStop -= dt;
+      state.rippleT += dt * 0.8;
+    }
+
+    // --- draw ---
+    cx.save();
+
+    // shake + zoom-pulse
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.88, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // bg — full ink
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // Ambient glow teal gradient that fades with progress
+    var vol = 1 - state.progress;
+    var glowAlpha = vol * 0.12;
+    var bg = cx.createRadialGradient(W / 2, H / 2, 40, W / 2, H / 2, H * 0.6);
+    bg.addColorStop(0, 'rgba(46,197,182,' + (glowAlpha * 2) + ')');
+    bg.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    var phase = state.phase;
+
+    if (phase === 'title') {
+      // Title screen
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '800 44px -apple-system, Helvetica, Arial';
+      cx.fillText('VOLUME FADE', W / 2, 280);
+      cx.fillStyle = TEAL;
+      cx.font = '600 17px -apple-system, Helvetica, Arial';
+      var pulse = 0.5 + 0.5 * Math.sin(now / 600);
+      cx.globalAlpha = 0.6 + 0.4 * pulse;
+      cx.fillText('HOLD TO SILENCE', W / 2, 330);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('let it go quiet', W / 2, 362);
+      // draw idle speaker
+      drawSpeaker(W / 2 + 30, 440, 0.9, 0.6);
+    }
+
+    if (phase === 'play' || phase === 'over') {
+      // Waveform (audio indicator)
+      drawWave(now, vol, 1);
+
+      // dim overlay matching progress
+      screenDim(state.progress);
+
+      // Central speaker icon
+      var speakerAlpha = 0.7 + vol * 0.3;
+      drawSpeaker(W / 2 + 30, H / 2 - 20, vol, speakerAlpha);
+
+      // Progress ring
+      drawProgressRing(W / 2, H / 2 - 20, state.progress, 90);
+
+      // Hold instruction / feedback
+      if (phase === 'play') {
+        cx.textAlign = 'center';
+        if (holding) {
+          var pct = Math.round(state.progress * 100);
+          cx.fillStyle = TEAL;
+          cx.font = '700 15px -apple-system, Helvetica, Arial';
+          cx.globalAlpha = 0.8;
+          cx.fillText(pct + '% faded', W / 2, H / 2 + 90);
+          cx.globalAlpha = 1;
+        } else {
+          cx.fillStyle = 'rgba(255,255,255,0.35)';
+          cx.font = '600 14px -apple-system, Helvetica, Arial';
+          var holdPulse = 0.4 + 0.6 * Math.sin(now / 500);
+          cx.globalAlpha = holdPulse;
+          cx.fillText('hold to fade', W / 2, H / 2 + 90);
+          cx.globalAlpha = 1;
+        }
+
+        // Dare banner
+        if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+          cx.fillStyle = GOLD;
+          cx.font = '700 14px -apple-system, Helvetica, Arial';
+          cx.fillText('BEAT ' + SHARE.dare + 'ms' + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 150);
+        }
+      }
+    }
+
+    if (phase === 'over') {
+      // Over overlay
+      cx.fillStyle = 'rgba(11,13,18,0.5)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = state.wonRun ? TEAL : 'rgba(255,255,255,0.7)';
+      cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText(state.wonRun ? 'SILENCE' : 'TOO SOON', W / 2, 300);
+      cx.fillStyle = '#fff';
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      var scoreStr = state.score >= 1000 ? (state.score / 1000).toFixed(1) + 's held' : state.score + 'ms held';
+      cx.fillText(scoreStr, W / 2, 345);
+      cx.fillStyle = GOLD;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST: ' + (best >= 1000 ? (best / 1000).toFixed(1) + 's' : best + 'ms'), W / 2, 378);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 400);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('hold to try again', W / 2, 440);
+        cx.globalAlpha = 1;
+        // share zone
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // CTA card (demo only)
+    if (phase === 'cta') {
+      var t2 = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t2 * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.88 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 42px -apple-system, Helvetica, Arial';
+      cx.fillText('VOLUME FADE', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.65)';
+      cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('fade the thing that kept you up', W / 2, 334);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 300);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // Floating reward flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 50);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // init bot run timing
+  if (BOT) initBotRun();
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

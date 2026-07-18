@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Marker Stop — Tilt</title>
+<!--
+  LOOP / attention-architecture — Marker Stop
+  Circuits: 01-rpe (variable reward), 05-ease (conditioning from IG/TikTok progress bars),
+            07-timing (stop-the-marker tension).
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N&seed=M  imperfect autoplay, sets window.__botDone
+    ?dare=N          incoming challenge banner
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'marker-stop';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = Math.max(1, +qs.get('runs') || 3);
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // Track layout
+  var TRACK_X = 40, TRACK_W = W - 80, TRACK_Y = 360, TRACK_H = 36;
+  var ZONE_FRAC_START = 0.36;  // initial zone width as fraction of track
+  var ZONE_MIN_FRAC   = 0.06;  // minimum zone width fraction
+
+  var state, flashes, hitStop, zoom, shakeAmt, dareBeaten;
+  var botRunsDone = 0, best = 0;
+  try { best = +localStorage.getItem('ms_best') || 0; } catch (_) {}
+
+  // ---- game state ----
+  function newGame() {
+    rng = mulberry32(SEED);   // reset RNG every game for reproducibility
+    state = {
+      phase: 'title',   // title | challenge | play | over | cta
+      level: 0,
+      score: 0,
+      marker: { x: TRACK_X, dir: 1, speed: 3.5 },
+      zoneL: 0, zoneR: 0,        // zone absolute x coords on track
+      overAt: 0,
+      runStart: 0
+    };
+    hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    flashes = [];
+    setupLevel();
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1300);
+      return;
+    }
+    if (BOT) { startRun(); return; }
+    // human: show title
+  }
+
+  function setupLevel() {
+    var lvl = state.level;
+    var frac = Math.max(ZONE_MIN_FRAC, ZONE_FRAC_START - lvl * 0.028);
+    var zoneW = Math.round(frac * TRACK_W);
+    // randomize zone position each level (seeded)
+    var margin = 4;
+    var minL = TRACK_X + margin;
+    var maxL = TRACK_X + TRACK_W - zoneW - margin;
+    state.zoneL = Math.round(minL + rng() * (maxL - minL));
+    state.zoneR = state.zoneL + zoneW;
+    // place marker at edge, direction toward zone
+    state.marker.x = TRACK_X;
+    state.marker.dir = 1;
+    state.marker.speed = 3.5 + lvl * 0.28;
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.runStart = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    // tension rises as level climbs
+    if (window.J) J.tension(Math.min(state.level / 12, 1));
+  }
+
+  function stopMarker() {
+    var mx = state.marker.x;
+    var inside = (mx >= state.zoneL && mx <= state.zoneR);
+    var ratio   = 0;
+    if (inside) {
+      var half = (state.zoneL + state.zoneR) / 2;
+      var halfW = (state.zoneR - state.zoneL) / 2;
+      ratio = 1 - Math.abs(mx - half) / halfW;   // 0..1, 1 = dead center
+    }
+
+    if (!inside) {
+      // MISS
+      shakeAmt = 9;
+      flash('MISS', VERM, 52);
+      if (window.J) J.death(Math.min(0.3 + state.level / 15, 1));
+      gameOver();
+      return;
+    }
+
+    var perfect = ratio >= 0.80;
+    var near    = ratio >= 0.50 && ratio < 0.80;
+    var pctScore = Math.round(ratio * 100);
+
+    // juice
+    if (perfect) {
+      hitStop = 5; zoom = 1.03; shakeAmt = 2;
+      flash('PERFECT', TEAL, 46);
+      if (window.J) J.perfect(state.level + 1);
+      if (window.J) J.gold();
+    } else if (near) {
+      shakeAmt = 3;
+      flash('+' + pctScore + '%', GOLD, 38);
+      if (window.J) J.hit(state.level + 1);
+    } else {
+      shakeAmt = 5;
+      flash('SO CLOSE', VERM, 40);
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { level: state.level, ratio: +ratio.toFixed(3) });
+    }
+
+    state.score += pctScore;
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score >= SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+
+    if (window.LOOP) LOOP.emit('marker_stop', { level: state.level, ratio: +ratio.toFixed(3), pct: pctScore, perfect: perfect });
+
+    state.level++;
+    setupLevel();
+    // tension climbs
+    if (window.J) J.tension(Math.min(state.level / 12, 1));
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - state.runStart) / 1000;
+    var newBest = state.score > best;
+    if (newBest) { best = state.score; try { localStorage.setItem('ms_best', String(best)); } catch(_){} }
+    if (window.J) { if (newBest) setTimeout(function(){ J.fanfare(); }, 450); }
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 700);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.level = 0; state.score = 0; flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    rng = mulberry32(SEED + botRunsDone * 97);
+    setupLevel();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  function pctTop(score) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 420)))); }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { stopMarker(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: '%' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- DEMO script ----
+  // mirror-neuron arc: challenge card → early ease-in → near-fail (sliver) → recovery → fail
+  // demoScript entries: target ratio 0..1 ('miss' = deliberate miss)
+  var demoScript = [0.72, 0.88, 0.65, 0.55, 0.92, 0.38, 'miss'];
+  var demoWaits  = [38, 28, 44, 58, 30, 52, 22];   // frames of hesitation before each move
+  var demoIdx = 0, demoWait = 40;
+  var challengeAt = 0, ctaAt = 0;
+
+  // ---- BOT autopilot ----
+  var botTarget = null;
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    var mx = state.marker.x;
+    var speed = state.marker.speed * state.marker.dir;
+
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      var want = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      if (want === 'miss') {
+        // wait until marker is clearly outside zone before stopping
+        if (mx > state.zoneR + 20 || mx < state.zoneL - 20) {
+          demoIdx++;
+          demoWait = 20;
+          stopMarker();
+        }
+        return;
+      }
+      // target a specific ratio inside zone
+      var half = (state.zoneL + state.zoneR) / 2;
+      var halfW = (state.zoneR - state.zoneL) / 2;
+      var targetX = half + (1 - want) * halfW * (rng() > 0.5 ? 1 : -1);
+      targetX = Math.max(state.zoneL, Math.min(state.zoneR, targetX));
+      if (Math.abs(mx - targetX) <= Math.abs(speed) * 0.7) {
+        stopMarker();
+        demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 30;
+        demoIdx++;
+      }
+    } else if (BOT) {
+      // imperfect bot: sometimes hits inside, sometimes misses
+      if (botTarget === null) {
+        var isLastLevel = (state.level >= 5 + botRunsDone * 2);
+        if (isLastLevel) {
+          // deliberate miss to end run
+          botTarget = state.zoneR + 30 + rng() * 20;
+        } else {
+          // aim for zone center with error
+          var center = (state.zoneL + state.zoneR) / 2;
+          var err = gauss() * 18;
+          botTarget = center + err;
+        }
+      }
+      if (Math.abs(mx - botTarget) <= Math.abs(speed) * 0.8) {
+        botTarget = null;
+        stopMarker();
+      }
+    }
+  }
+
+  // ---- render helpers ----
+  function drawTrack(now) {
+    var lvl = state.level;
+    // track bar background
+    ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    roundRect(TRACK_X, TRACK_Y - TRACK_H / 2, TRACK_W, TRACK_H, 8);
+    ctx.fill();
+
+    // zone highlight
+    var zoneW = state.zoneR - state.zoneL;
+    var pulse = 0.85 + 0.15 * Math.sin(now / 180);
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = TEAL;
+    roundRect(state.zoneL, TRACK_Y - TRACK_H / 2 + 3, zoneW, TRACK_H - 6, 6);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // zone center line
+    var zCenter = (state.zoneL + state.zoneR) / 2;
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(zCenter, TRACK_Y - TRACK_H / 2 + 6); ctx.lineTo(zCenter, TRACK_Y + TRACK_H / 2 - 6); ctx.stroke();
+
+    // PERFECT label above zone
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(255,255,255,0.45)';
+    ctx.font = '500 10px Menlo, monospace';
+    ctx.fillText('PERFECT', zCenter, TRACK_Y - TRACK_H / 2 - 5);
+
+    // marker
+    if (state.phase === 'play') {
+      var mx = state.marker.x;
+      var mh = TRACK_H + 14;
+      // glow
+      ctx.shadowColor = VERM; ctx.shadowBlur = 14;
+      ctx.fillStyle = VERM;
+      roundRect(mx - 4, TRACK_Y - mh / 2, 8, mh, 4);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      // needle tip
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(mx, TRACK_Y, 4, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // progress pips below track
+    var pipTotal = demoScript.length - 1;   // max expected levels for visual
+    if (DEMO) pipTotal = demoScript.length - 1;
+    else pipTotal = Math.max(8, state.level + 2);
+    var pipW = 8, pipGap = 5, pipRow = Math.min(pipTotal, 16);
+    var totalW = pipRow * (pipW + pipGap) - pipGap;
+    var px = W / 2 - totalW / 2;
+    for (var i = 0; i < pipRow; i++) {
+      ctx.fillStyle = i < state.level ? TEAL : (i === state.level ? GOLD : 'rgba(255,255,255,0.15)');
+      roundRect(px + i * (pipW + pipGap), TRACK_Y + TRACK_H / 2 + 12, pipW, 5, 3);
+      ctx.fill();
+    }
+  }
+
+  function roundRect(x, y, w, h, r) {
+    if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+    else { ctx.beginPath(); ctx.rect(x, y, w, h); }
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  ctaAt = 0; challengeAt = 0;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // marker movement (ping-pong)
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else if (state.phase === 'play') {
+      var m = state.marker;
+      m.x += m.speed * m.dir * dt;
+      var tEnd = TRACK_X + TRACK_W;
+      if (m.x >= tEnd) { m.x = tEnd; m.dir = -1; }
+      if (m.x <= TRACK_X) { m.x = TRACK_X; m.dir = 1; }
+      autopilot();
+    }
+
+    // juice decay
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // canvas transform
+    ctx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      ctx.translate(W / 2 + sx, H / 2 + sy); ctx.scale(zoom, zoom); ctx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    ctx.fillStyle = INK; ctx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+
+    // ---- title ----
+    if (state.phase === 'title') {
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff'; ctx.font = '900 48px -apple-system, Helvetica, Arial';
+      ctx.fillText('MARKER STOP', W / 2, 270);
+      ctx.fillStyle = TEAL; ctx.font = '700 15px -apple-system, Helvetica, Arial';
+      ctx.fillText('stop it in the zone', W / 2, 306);
+      var pulse = 0.55 + 0.45 * Math.sin(now / 320);
+      ctx.globalAlpha = pulse; ctx.fillStyle = VERM; ctx.font = '800 20px -apple-system, Helvetica, Arial';
+      ctx.fillText('TAP TO START', W / 2, 380); ctx.globalAlpha = 1;
+      // draw a static preview track
+      ctx.fillStyle = 'rgba(255,255,255,0.07)';
+      roundRect(TRACK_X, TRACK_Y - TRACK_H / 2, TRACK_W, TRACK_H, 8); ctx.fill();
+      ctx.fillStyle = TEAL; ctx.globalAlpha = 0.6;
+      roundRect(TRACK_X + 100, TRACK_Y - TRACK_H / 2 + 3, 80, TRACK_H - 6, 6); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // ---- challenge card (demo beat 1) ----
+    if (state.phase === 'challenge') {
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.font = '800 16px Menlo, monospace';
+      ctx.fillText('SCORE TO BEAT', W / 2, 290);
+      ctx.fillStyle = GOLD; ctx.font = '900 88px -apple-system, Helvetica, Arial';
+      ctx.fillText('640', W / 2, 392);
+      ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.font = '600 13px -apple-system, Helvetica, Arial';
+      ctx.fillText("today's top score", W / 2, 426);
+    }
+
+    // ---- play ----
+    if (state.phase === 'play' || state.phase === 'over') {
+      // score
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(255,255,255,0.92)';
+      ctx.font = '800 68px -apple-system, Helvetica, Arial';
+      ctx.fillText(state.score + '%', W / 2, 110);
+      ctx.fillStyle = 'rgba(255,255,255,0.38)';
+      ctx.font = '600 13px -apple-system, Helvetica, Arial';
+      ctx.fillText('BEST ' + best + '%', W / 2, 136);
+
+      // level label
+      ctx.fillStyle = GOLD; ctx.font = '700 14px Menlo, monospace';
+      ctx.fillText('LVL ' + (state.level + 1), W / 2, 168);
+
+      // zone width label
+      var zW = state.zoneR - state.zoneL;
+      var pct = Math.round((zW / TRACK_W) * 100);
+      ctx.fillStyle = 'rgba(255,255,255,0.28)'; ctx.font = '500 11px Menlo, monospace';
+      ctx.fillText('ZONE ' + pct + '%', W / 2, 188);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        ctx.fillStyle = dareBeaten ? TEAL : GOLD;
+        ctx.font = '800 15px -apple-system, Helvetica, Arial';
+        ctx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + '%' + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 218);
+      }
+
+      // track
+      if (state.phase === 'play') drawTrack(now);
+    }
+
+    // ---- game over card ----
+    if (state.phase === 'over') {
+      ctx.fillStyle = 'rgba(11,13,18,0.6)'; ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = VERM; ctx.font = '900 40px -apple-system, Helvetica, Arial';
+      ctx.fillText('MISSED.', W / 2, 290);
+      ctx.fillStyle = '#fff'; ctx.font = '800 28px -apple-system, Helvetica, Arial';
+      ctx.fillText(state.score + '%', W / 2, 338);
+      var pt = pctTop(state.score);
+      ctx.fillStyle = GOLD; ctx.font = '900 22px -apple-system, Helvetica, Arial';
+      ctx.fillText('TOP ' + pt + '% TODAY', W / 2, 382);
+      ctx.fillStyle = 'rgba(255,255,255,0.52)'; ctx.font = '600 13px -apple-system, Helvetica, Arial';
+      ctx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 406);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        ctx.globalAlpha = p2; ctx.fillStyle = TEAL;
+        ctx.font = '700 17px -apple-system, Helvetica, Arial';
+        ctx.fillText('TAP — TRY AGAIN', W / 2, 452); ctx.globalAlpha = 1;
+        // share pill
+        ctx.fillStyle = 'rgba(242,177,52,0.14)';
+        ctx.strokeStyle = GOLD; ctx.lineWidth = 1.5;
+        roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23); ctx.fill(); ctx.stroke();
+        ctx.fillStyle = GOLD; ctx.font = '800 16px -apple-system, Helvetica, Arial';
+        ctx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- demo CTA card ----
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.4);
+      ctx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = ease; ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff'; ctx.font = '900 44px -apple-system, Helvetica, Arial';
+      ctx.fillText('MARKER STOP', W / 2, 292);
+      ctx.fillStyle = 'rgba(255,255,255,0.72)'; ctx.font = '700 20px -apple-system, Helvetica, Arial';
+      ctx.fillText('they scored ' + (window.__demoScore || 640) + '%. your turn.', W / 2, 334);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 250);
+      ctx.fillStyle = VERM; ctx.globalAlpha = ease * p3;
+      ctx.font = '900 32px -apple-system, Helvetica, Arial';
+      ctx.fillText('BEAT ' + (window.__demoScore || 640) + '%', W / 2, 404);
+      ctx.globalAlpha = ease;
+      ctx.fillStyle = TEAL; ctx.font = '700 16px -apple-system, Helvetica, Arial';
+      ctx.fillText('link in bio', W / 2, 440);
+      ctx.globalAlpha = 1;
+    }
+
+    // ---- floating flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 42);
+      ctx.globalAlpha = a; ctx.textAlign = 'center';
+      ctx.fillStyle = fl.color;
+      ctx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      ctx.fillText(fl.txt, W / 2, 240 - fl.t * 0.7);
+      ctx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      ctx.textAlign = 'center'; ctx.globalAlpha = 0.48;
+      ctx.font = '16px -apple-system, Helvetica, Arial';
+      ctx.fillStyle = '#fff';
+      ctx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

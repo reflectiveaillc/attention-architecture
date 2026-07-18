@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Tag Everyone — Tilt</title>
+<!--
+  LOOP / attention-architecture — Tag Everyone
+  Circuits: 06-zeigarnik (incomplete post compulsion), 03-social, 01-rpe
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N    imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'tag-everyone';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ─── game constants ───────────────────────────────────────────────
+  var BASE_FACES   = 4;      // faces in round 1
+  var FACES_PER_RD = 2;      // added each round
+  var MAX_ROUNDS   = 8;
+  var TIMER_BASE   = 5200;   // ms for round 1
+  var TIMER_PER    = 400;    // extra ms per extra face
+  var FACE_R       = 22;     // tap radius
+  var TAG_R        = 30;     // tag ring radius (visual)
+
+  // ─── state ────────────────────────────────────────────────────────
+  var state, flashes, best = 0;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var dareBeaten = false;
+  var runStartTs;
+  try { best = +localStorage.getItem('te_best') || 0; } catch (_) {}
+
+  // ─── face data generation ─────────────────────────────────────────
+  // Each "photo" is a set of faces at random positions on a portrait grid.
+  // We avoid the corners (rounded photo), keep faces inside safe area.
+  function genFaces(count) {
+    var faces = [];
+    var margin = 54, safeW = W - margin * 2, safeH = 380;
+    var topOff = 200;
+    var maxTries = 80;
+    for (var i = 0; i < count; i++) {
+      var tries = 0, ok = false, x, y;
+      while (!ok && tries < maxTries) {
+        x = margin + rng() * safeW;
+        y = topOff + rng() * safeH;
+        ok = true;
+        for (var j = 0; j < faces.length; j++) {
+          var dx = x - faces[j].x, dy = y - faces[j].y;
+          if (Math.sqrt(dx*dx + dy*dy) < FACE_R * 2.8) { ok = false; break; }
+        }
+        tries++;
+      }
+      // hue for skin tone variety
+      var hues = [22, 30, 18, 35, 14];
+      faces.push({ x: x, y: y, hue: hues[i % hues.length], tagged: false, tagAnim: 0 });
+    }
+    return faces;
+  }
+
+  // ─── round setup ─────────────────────────────────────────────────
+  function startRound() {
+    var count = BASE_FACES + (state.round - 1) * FACES_PER_RD;
+    var timerMs = TIMER_BASE + (count - BASE_FACES) * TIMER_PER;
+    state.faces = genFaces(count);
+    state.timerMs = timerMs;
+    state.timerLeft = timerMs;
+    state.tagged = 0;
+    state.phase = 'play';
+    if (window.LOOP) LOOP.emit('play_start', { round: state.round, seed: SEED });
+    runStartTs = Date.now();
+  }
+
+  function newGame() {
+    state = {
+      phase: 'title',   // title | challenge | play | over | cta
+      round: 1,
+      score: 0,
+      overAt: 0,
+      faces: [],
+      timerMs: 0,
+      timerLeft: 0,
+      tagged: 0,
+      totalFaces: 0,
+      missedFaces: 0
+    };
+    flashes = [];
+    dareBeaten = false;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(function () { startRound(); }, 1250);
+      return;
+    }
+    if (BOT) { startRound(); return; }
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 6))));
+  }
+
+  // ─── tag a face ──────────────────────────────────────────────────
+  function tryTag(px, py) {
+    if (state.phase !== 'play') return false;
+    var tagged = false;
+    for (var i = 0; i < state.faces.length; i++) {
+      var f = state.faces[i];
+      if (f.tagged) continue;
+      var dx = px - f.x, dy = py - f.y;
+      if (Math.sqrt(dx*dx+dy*dy) <= FACE_R + 8) {
+        f.tagged = true;
+        f.tagAnim = 1;
+        state.tagged++;
+        state.score++;
+        tagged = true;
+        var isAll = state.tagged === state.faces.length;
+        var combo = state.tagged;
+        if (window.J) {
+          if (isAll) { J.perfect(combo); hitStop = 5; zoom = 1.03; }
+          else { J.hit(combo); }
+          J.tension(Math.min(state.tagged / state.faces.length, 0.9));
+        }
+        if (isAll) { flash('ALL TAGGED!', TEAL, 42); hitStop = 6; zoom = 1.04; shakeAmt = 2; }
+        else { flash('+1', GOLD, 28); }
+        if (window.LOOP) LOOP.emit('face_tagged', { n: state.tagged, total: state.faces.length, round: state.round });
+
+        // dare check
+        if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+          dareBeaten = true;
+          flash('DARE BEATEN', TEAL, 42);
+          if (window.J) J.fanfare();
+          SHARE.beaten(state.score);
+        }
+        break;
+      }
+    }
+    return tagged;
+  }
+
+  function roundEnd(missed) {
+    // called when timer hits 0 or all tagged
+    var allGot = state.tagged === state.faces.length;
+    state.missedFaces = missed;
+    state.totalFaces = state.faces.length;
+    if (allGot && state.round < MAX_ROUNDS) {
+      // perfect round — advance
+      if (window.J) J.fanfare();
+      flash('POSTED! ✓', TEAL, 38);
+      setTimeout(function () {
+        state.round++;
+        startRound();
+      }, 900);
+    } else {
+      // missed some or max rounds done — game over
+      gameOver();
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 8;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + state.score / 30, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('te_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), round: state.round });
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { restartRun(); }, 800);
+    }
+  }
+
+  function restartRun() {
+    state.score = 0;
+    state.round = 1;
+    dareBeaten = false;
+    flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRound();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0, y: H / 2 - 60 });
+  }
+
+  // ─── input ───────────────────────────────────────────────────────
+  var MUTE_R  = { x: W - 46, y: 10,  w: 38, h: 38 };
+  var SHARE_R = { x: W/2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRound(); return; }
+    if (state.phase === 'play') { tryTag(px, py); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'tagged' }); return;
+      }
+      restartRun();
+    }
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(W/2, H/2); });
+
+  // ─── autopilot (demo + bot) ───────────────────────────────────────
+  // demo script: index into faces array in order, with hesitation timings
+  var demoFaceIdx = 0;
+  var demoWaits   = [55, 38, 28, 62, 30, 22, 45, 34, 25, 58, 20, 18, 40, 30, 26]; // beats of hesitation
+  var demoWait    = 0;
+  var demoNearMissPhase = false; // demo skips one face to create near-fail
+  var demoRoundsDone = 0;
+
+  var botFaceIdx    = 0;
+  var botWait       = 0;
+  var botRunsDone   = 0;
+  var botPassCount  = 0; // bot acts K actions then goes passive to trigger timeout
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    if (DEMO) demoPilot();
+    else if (BOT) botPilot();
+  }
+
+  function demoPilot() {
+    if (demoWait > 0) { demoWait--; return; }
+    var n = state.faces.length;
+    // near-fail at ~60%: on round 2, skip the last face to almost miss
+    if (demoRoundsDone === 1 && demoFaceIdx === n - 1 && !demoNearMissPhase) {
+      // fake-miss: wait for timer to drop to ~15% then tag
+      var ratio = state.timerLeft / state.timerMs;
+      if (ratio > 0.15) {
+        if (window.LOOP) LOOP.emit('near_miss', { ratio: +ratio.toFixed(3), round: state.round });
+        return; // just wait
+      }
+      // recovery: tag it just in time
+      demoNearMissPhase = true;
+      flash('SO CLOSE!', VERM, 38);
+      if (window.J) J.near();
+    }
+    // find next untagged face in script order
+    var tagged = false;
+    for (var i = demoFaceIdx; i < state.faces.length; i++) {
+      if (!state.faces[i].tagged) {
+        tryTag(state.faces[i].x, state.faces[i].y);
+        demoFaceIdx = i + 1;
+        demoWait = demoWaits[Math.min(demoFaceIdx, demoWaits.length - 1)] || 28;
+        tagged = true;
+        break;
+      }
+    }
+    if (!tagged) {
+      // all tagged for this round — reset for next
+      demoFaceIdx = 0; demoRoundsDone++;
+      demoNearMissPhase = false;
+      demoWait = 50;
+    }
+  }
+
+  function botPilot() {
+    if (botWait > 0) { botWait--; return; }
+    // Bot tags K faces then stops (let the timer expire → game_over)
+    var totalFaces = state.faces.length;
+    var limit = Math.ceil(totalFaces * 0.55); // tag ~55%, always miss some → game_over
+    if (botPassCount >= limit) return; // passive — let timer kill round
+    for (var i = botFaceIdx; i < state.faces.length; i++) {
+      if (!state.faces[i].tagged) {
+        // imperfect: add small random offset
+        var jx = (rng() - 0.5) * 14, jy = (rng() - 0.5) * 14;
+        tryTag(state.faces[i].x + jx, state.faces[i].y + jy);
+        botFaceIdx = i + 1;
+        botPassCount++;
+        botWait = 18 + Math.floor(rng() * 24);
+        return;
+      }
+    }
+    botFaceIdx = 0;
+  }
+
+  // ─── draw helpers ─────────────────────────────────────────────────
+  function drawFace(f, now) {
+    var x = f.x, y = f.y;
+    // glow ring (pulsing if untagged)
+    var pulse = 0.5 + 0.5 * Math.sin(now / 320 + x * 0.03);
+    if (!f.tagged) {
+      cx.save();
+      cx.beginPath(); cx.arc(x, y, FACE_R + 6, 0, Math.PI * 2);
+      cx.strokeStyle = 'rgba(242,177,52,' + (0.3 + 0.25 * pulse) + ')';
+      cx.lineWidth = 1.5; cx.stroke();
+      cx.restore();
+    }
+    // face circle
+    var g = cx.createRadialGradient(x - 4, y - 4, 2, x, y, FACE_R);
+    g.addColorStop(0, 'hsl(' + f.hue + ',62%,75%)');
+    g.addColorStop(1, 'hsl(' + f.hue + ',50%,56%)');
+    cx.beginPath(); cx.arc(x, y, FACE_R, 0, Math.PI * 2);
+    cx.fillStyle = g; cx.fill();
+    // simple cartoon eyes
+    cx.fillStyle = 'rgba(0,0,0,0.6)';
+    cx.beginPath(); cx.arc(x - 7, y - 4, 3.5, 0, Math.PI * 2); cx.fill();
+    cx.beginPath(); cx.arc(x + 7, y - 4, 3.5, 0, Math.PI * 2); cx.fill();
+    // smile
+    cx.beginPath(); cx.arc(x, y + 4, 8, 0.2, Math.PI - 0.2);
+    cx.strokeStyle = 'rgba(0,0,0,0.5)'; cx.lineWidth = 2; cx.stroke();
+
+    // tag anim: expanding ring
+    if (f.tagged) {
+      f.tagAnim = Math.min(f.tagAnim + 0.08, 1);
+      var r = TAG_R + (1 - f.tagAnim) * 18;
+      cx.beginPath(); cx.arc(x, y, r, 0, Math.PI * 2);
+      cx.strokeStyle = 'rgba(46,197,182,' + (1 - f.tagAnim * 0.7) + ')';
+      cx.lineWidth = 2.5; cx.stroke();
+      // tag label box
+      var boxW = 66, boxH = 20;
+      cx.fillStyle = 'rgba(46,197,182,0.9)';
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(x - boxW/2, y + FACE_R + 4, boxW, boxH, 4);
+      else cx.rect(x - boxW/2, y + FACE_R + 4, boxW, boxH);
+      cx.fill();
+      cx.fillStyle = INK;
+      cx.font = '700 10px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('@tagged', x, y + FACE_R + 16);
+    }
+  }
+
+  function drawPhoto(now) {
+    // photo background
+    var photoX = 20, photoY = 145, photoW = W - 40, photoH = 440;
+    cx.save();
+    cx.shadowColor = 'rgba(0,0,0,0.5)'; cx.shadowBlur = 20;
+    cx.fillStyle = '#1a1d26';
+    if (cx.roundRect) cx.roundRect(photoX, photoY, photoW, photoH, 12);
+    else cx.rect(photoX, photoY, photoW, photoH);
+    cx.fill();
+    cx.restore();
+    // subtle grain
+    cx.save();
+    cx.globalAlpha = 0.04;
+    for (var i = 0; i < 80; i++) {
+      var gx = photoX + rng() * photoW, gy = photoY + rng() * photoH;
+      cx.fillStyle = '#fff';
+      cx.fillRect(gx, gy, 1, 1);
+    }
+    cx.restore();
+  }
+
+  function drawTimer(now) {
+    var ratio = Math.max(0, state.timerLeft / state.timerMs);
+    var barW = W - 60, barX = 30, barY = 132, barH = 8;
+    // bg
+    cx.fillStyle = 'rgba(255,255,255,0.1)';
+    if (cx.roundRect) cx.roundRect(barX, barY, barW, barH, 4);
+    else cx.rect(barX, barY, barW, barH);
+    cx.fill();
+    // fill
+    var col = ratio > 0.4 ? TEAL : ratio > 0.2 ? GOLD : VERM;
+    cx.fillStyle = col;
+    if (cx.roundRect) cx.roundRect(barX, barY, barW * ratio, barH, 4);
+    else cx.rect(barX, barY, barW * ratio, barH);
+    cx.fill();
+    // tension sound when low
+    if (ratio < 0.3 && window.J) J.tension(1 - ratio * 3);
+  }
+
+  // ─── main loop ────────────────────────────────────────────────────
+  var challengeAt = 0, ctaAt = 0, last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // hit-stop: decay, then run autopilot
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      // timer countdown
+      if (state.phase === 'play') {
+        state.timerLeft -= dt * 16.667;
+        if (state.timerLeft <= 0) {
+          state.timerLeft = 0;
+          var missed = state.faces.length - state.tagged;
+          roundEnd(missed);
+        } else {
+          autopilot();
+        }
+      }
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W/2 + sx, H/2 + sy); cx.scale(zoom, zoom); cx.translate(-W/2, -H/2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // ─── background ───────────────────────────────────────────────
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bgG = cx.createLinearGradient(0, 0, 0, H);
+    bgG.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bgG.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bgG; cx.fillRect(0, 0, W, H);
+
+    // ─── UI header ────────────────────────────────────────────────
+    if (state.phase === 'play' || state.phase === 'over') {
+      // score / round
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 52px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W/2, 80);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('TAGGED  ·  ROUND ' + state.round + '/' + MAX_ROUNDS, W/2, 102);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W/2, 120);
+      }
+    }
+
+    // ─── challenge card ───────────────────────────────────────────
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 15px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W/2, 290);
+      cx.fillStyle = GOLD; cx.font = '900 88px -apple-system, Helvetica, Arial';
+      cx.fillText('18', W/2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top tagger", W/2, 420);
+    }
+
+    // ─── title ────────────────────────────────────────────────────
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('TAG EVERYONE', W/2, 270);
+      cx.fillStyle = 'rgba(255,255,255,0.6)'; cx.font = '500 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap every face before the upload timer', W/2, 308);
+      cx.fillStyle = VERM;
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W/2, 360);
+      cx.globalAlpha = 1;
+    }
+
+    // ─── play phase ───────────────────────────────────────────────
+    if (state.phase === 'play') {
+      drawTimer(now);
+      drawPhoto(now);
+      for (var i = 0; i < state.faces.length; i++) drawFace(state.faces[i], now);
+
+      // remaining counter inside photo
+      var left = state.faces.length - state.tagged;
+      if (left > 0) {
+        cx.textAlign = 'left';
+        cx.fillStyle = 'rgba(255,255,255,0.55)';
+        cx.font = '600 11px Menlo, monospace';
+        cx.fillText(left + ' untagged', 32, 598);
+      } else {
+        cx.textAlign = 'center';
+        cx.fillStyle = TEAL;
+        cx.font = '700 13px -apple-system, Helvetica, Arial';
+        cx.fillText('all tagged — uploading...', W/2, 598);
+      }
+    }
+
+    // ─── game over ────────────────────────────────────────────────
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.60)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('POST INCOMPLETE', W/2, 292);
+      cx.fillStyle = '#fff'; cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' tagged', W/2, 334);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W/2, 378);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of taggers', W/2, 400);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W/2, 448);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W/2, SHARE_R.y + 30);
+      }
+    }
+
+    // ─── demo CTA card ────────────────────────────────────────────
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.80 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('TAG EVERYONE', W/2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('she tagged ' + (window.__demoScore || 18) + '. your move.', W/2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 18), W/2, 404);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W/2, 436);
+      cx.globalAlpha = 1;
+    }
+
+    // ─── floating flash text ──────────────────────────────────────
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W/2, H/2 - 60 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // ─── mute toggle (human only) ─────────────────────────────────
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w/2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

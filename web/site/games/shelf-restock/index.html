@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Shelf Restock — Tilt</title>
+<!--
+  LOOP / attention-architecture — Shelf Restock (CALM engine, contract v2)
+  Circuits: 06 Zeigarnik, 08 investment, 05 ease.
+  Conditioned path: tap-to-place from ASMR restock videos.
+  Modes:
+    ?demo=1&seed=7        scripted calm arc ~16s → soft CTA, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'shelf-restock';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134';
+
+  // ---- shelf layout: 4 rows x 5 cols ----
+  var COLS = 5, ROWS = 4, TOTAL_SLOTS = 20;
+  var SLOT_W = 58, SLOT_H = 52, SLOT_GAP = 6;
+  var SHELF_X = (W - (COLS * SLOT_W + (COLS - 1) * SLOT_GAP)) / 2;
+  var SHELF_Y = 185;
+
+  // product color families (calm palette, no vermillion)
+  var FAMILIES = [
+    { hue: 168 }, { hue: 200 }, { hue: 230 }, { hue: 260 }, { hue: 142 }
+  ];
+
+  function slotX(col) { return SHELF_X + col * (SLOT_W + SLOT_GAP); }
+  function slotY(row) { return SHELF_Y + row * (SLOT_H + SLOT_GAP); }
+
+  // ---- game state ----
+  var slots = [];       // { col, row, family, filled, glow }
+  var products = [];    // { id, x, y, driftX, driftY, bobPhase, family, slot, ready, placed, scale, alpha }
+  var flashes = [];     // { txt, color, size, t }
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var phase = 'title';  // title | play | complete | over | cta
+  var score = 0, totalScore = 0, runStart = 0, ctaAt = 0;
+  var botRunsDone = 0, botTimer = 0;
+  var completeAt = 0;
+  var pidSeq = 0;
+
+  function buildShelf() {
+    slots = [];
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        slots.push({ col: c, row: r, family: c % FAMILIES.length, filled: false, glow: 0 });
+      }
+    }
+  }
+
+  function emptySlots() {
+    return slots.filter(function (s) { return !s.filled; });
+  }
+
+  // spawn one incoming product targeting a random empty slot
+  function spawnProduct() {
+    var open = emptySlots();
+    if (open.length === 0) return null;
+    // don't double-target slots that already have a live product heading there
+    var targeted = products
+      .filter(function (p) { return !p.placed; })
+      .map(function (p) { return p.slot; });
+    var free = open.filter(function (s) {
+      return !targeted.some(function (t) { return t === s; });
+    });
+    if (free.length === 0) free = open; // fallback
+    var slot = free[Math.floor(rng() * free.length)];
+
+    var fromLeft = rng() < 0.5;
+    var startX = fromLeft ? -35 : W + 35;
+    var startY = SHELF_Y + ROWS * (SLOT_H + SLOT_GAP) * 0.5 + (rng() - 0.5) * 60;
+    // rest position — spread products along bottom staging area
+    var idx = products.filter(function(p){ return !p.placed; }).length;
+    var driftX = 48 + (idx % 5) * 72 + (rng() - 0.5) * 20;
+    var driftY = 620 + (rng() - 0.5) * 30;
+    var p = {
+      id: pidSeq++,
+      x: startX, y: startY,
+      driftX: Math.min(W - 40, Math.max(40, driftX)),
+      driftY: driftY,
+      bobPhase: rng() * Math.PI * 2,
+      family: slot.family,
+      slot: slot,
+      ready: false,
+      placed: false,
+      scale: 1,
+      alpha: 0
+    };
+    products.push(p);
+    return p;
+  }
+
+  function startRun() {
+    buildShelf();
+    products = []; flashes = [];
+    score = 0; phase = 'play'; runStart = Date.now(); hitStop = 0;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    // spawn initial wave
+    for (var i = 0; i < 4; i++) spawnProduct();
+  }
+
+  // ---- place a product (close it into its slot) ----
+  function placeProduct(p) {
+    if (p.placed || !p.ready) return;
+    p.placed = true;
+    p.slot.filled = true;
+    p.slot.glow = 1;
+    score++;
+    totalScore++;
+    if (window.J) J.calm(score);
+    hitStop = 3;
+    zoom = 1.015;
+    flash('+1', TEAL, 22);
+    if (window.LOOP) LOOP.emit('item_placed', { n: score });
+
+    // spawn replacement so staging area stays stocked
+    var open = emptySlots();
+    if (open.length > 0 && phase === 'play') spawnProduct();
+
+    if (score >= TOTAL_SLOTS) {
+      doShelfComplete();
+    }
+  }
+
+  function doShelfComplete() {
+    phase = 'complete';
+    completeAt = performance.now();
+    hitStop = 8; zoom = 1.04; shakeAmt = 2;
+    flash('STOCKED!', TEAL, 38);
+    if (window.J) J.calm(score + 5);
+    var dur = (Date.now() - runStart) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        ctaAt = performance.now();
+        phase = 'cta';
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    } else if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () {
+          if (window.LOOP) LOOP.emit('restart', {});
+          startRun();
+        }, 700);
+      }
+    } else {
+      setTimeout(function () { phase = 'over'; }, 1600);
+    }
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 120, y: 490, w: 240, h: 44 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'over') {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: totalScore, unit: 'items' }); return;
+      }
+      if (window.LOOP) LOOP.emit('restart', {});
+      startRun(); return;
+    }
+    if (phase !== 'play') return;
+    // hit-test: find closest ready product
+    var best = null, bestDist = 52;
+    for (var i = 0; i < products.length; i++) {
+      var p = products[i];
+      if (p.placed || !p.ready) continue;
+      var dx = p.x - px, dy = p.y - py;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d < bestDist) { bestDist = d; best = p; }
+    }
+    if (best) placeProduct(best);
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(W / 2, 620); });
+
+  // ---- demo: use timeouts for reliable timing ----
+  // products reach "ready" state after ~500ms of drifting; actions spaced 600-900ms
+  function runDemoSequence() {
+    var delay = 500; // initial wait for first product to settle
+    // place 20 items over ~13s, then shelf glows, then CTA
+    var waits = [700, 680, 800, 650, 720, 700, 750, 680, 760, 640,
+                 700, 660, 720, 680, 740, 650, 700, 690, 720, 600];
+    for (var i = 0; i < 20; i++) {
+      (function(idx, d) {
+        setTimeout(function () {
+          if (phase !== 'play') return;
+          // make sure a product exists and is ready; if not, force-ready it
+          var ready = products.filter(function (p) { return !p.placed && p.ready; });
+          if (ready.length === 0) {
+            // force-ready the first unplaced product
+            var unplaced = products.filter(function (p) { return !p.placed; });
+            if (unplaced.length > 0) {
+              unplaced[0].ready = true;
+              unplaced[0].x = unplaced[0].driftX;
+              unplaced[0].y = unplaced[0].driftY;
+              unplaced[0].alpha = 1;
+              ready = [unplaced[0]];
+            } else {
+              // spawn emergency product
+              var ep = spawnProduct();
+              if (ep) {
+                ep.ready = true;
+                ep.x = ep.driftX;
+                ep.y = ep.driftY;
+                ep.alpha = 1;
+                ready = [ep];
+              }
+            }
+          }
+          if (ready.length > 0) placeProduct(ready[0]);
+        }, d);
+      })(i, delay);
+      delay += waits[i];
+    }
+  }
+
+  // ---- bot autopilot: frame-based ----
+  // BOT_INTERVAL in frames (dt units); bot places one product every ~45 frames
+  var BOT_INTERVAL = 45;
+
+  function botAutopilot(dt) {
+    if (!BOT || phase !== 'play') return;
+    botTimer += dt;
+    if (botTimer < BOT_INTERVAL) return;
+    botTimer = 0;
+    var ready = products.filter(function (p) { return !p.placed && p.ready; });
+    if (ready.length > 0) {
+      placeProduct(ready[0]);
+    } else {
+      // ensure products keep flowing
+      if (products.filter(function(p){ return !p.placed; }).length < 4) spawnProduct();
+    }
+  }
+
+  // ---- draw helpers ----
+  function drawShelfFrame() {
+    var sx = SHELF_X - 10, sy = SHELF_Y - 12;
+    var sw = COLS * (SLOT_W + SLOT_GAP) - SLOT_GAP + 20;
+    var sh = ROWS * (SLOT_H + SLOT_GAP) - SLOT_GAP + 22;
+    // back panel
+    cx.fillStyle = 'rgba(46,197,182,0.04)';
+    cx.strokeStyle = 'rgba(46,197,182,0.14)';
+    cx.lineWidth = 1.5;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(sx, sy, sw, sh, 8);
+    else cx.rect(sx, sy, sw, sh);
+    cx.fill(); cx.stroke();
+    // horizontal planks
+    for (var r = 0; r <= ROWS; r++) {
+      var ry = SHELF_Y - 12 + r * (SLOT_H + SLOT_GAP);
+      cx.fillStyle = 'rgba(46,197,182,0.09)';
+      cx.fillRect(sx, ry - 3, sw, 4);
+    }
+  }
+
+  function drawSlot(s) {
+    var x = slotX(s.col), y = slotY(s.row);
+    var fam = FAMILIES[s.family % FAMILIES.length];
+    cx.save();
+    // slot bg
+    cx.fillStyle = 'rgba(255,255,255,0.04)';
+    cx.strokeStyle = s.filled
+      ? 'hsl(' + fam.hue + ',58%,50%)'
+      : 'rgba(255,255,255,0.11)';
+    cx.lineWidth = 1.4;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(x, y, SLOT_W, SLOT_H, 5);
+    else cx.rect(x, y, SLOT_W, SLOT_H);
+    cx.fill(); cx.stroke();
+
+    if (!s.filled) {
+      // color hint dot at bottom center
+      cx.fillStyle = 'hsl(' + fam.hue + ',52%,50%)';
+      cx.globalAlpha = 0.65;
+      cx.beginPath();
+      cx.arc(x + SLOT_W / 2, y + SLOT_H - 9, 5, 0, Math.PI * 2);
+      cx.fill();
+      cx.globalAlpha = 1;
+    } else {
+      // filled product rendered inside slot
+      var cx2 = x + SLOT_W / 2, cy2 = y + SLOT_H / 2;
+      drawProductShape(cx2, cy2, fam.hue, 1);
+      // glow fade
+      if (s.glow > 0.01) {
+        var g = cx.createRadialGradient(cx2, cy2, 0, cx2, cy2, SLOT_W * 0.75);
+        g.addColorStop(0, 'hsla(' + fam.hue + ',70%,68%,' + (0.35 * s.glow) + ')');
+        g.addColorStop(1, 'hsla(' + fam.hue + ',70%,68%,0)');
+        cx.fillStyle = g;
+        cx.beginPath();
+        cx.arc(cx2, cy2, SLOT_W * 0.75, 0, Math.PI * 2);
+        cx.fill();
+        s.glow *= 0.94;
+      }
+    }
+    cx.restore();
+  }
+
+  function drawProductShape(cx2, cy2, hue, alpha) {
+    var pw = 34, ph = 38;
+    cx.globalAlpha = alpha;
+    // body
+    cx.fillStyle = 'hsl(' + hue + ',54%,52%)';
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(cx2 - pw / 2, cy2 - ph / 2, pw, ph, 5);
+    else cx.rect(cx2 - pw / 2, cy2 - ph / 2, pw, ph);
+    cx.fill();
+    // top highlight
+    cx.fillStyle = 'hsla(' + hue + ',80%,82%,0.26)';
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(cx2 - pw / 2, cy2 - ph / 2, pw, ph * 0.42, [5, 5, 0, 0]);
+    else cx.rect(cx2 - pw / 2, cy2 - ph / 2, pw, ph * 0.42);
+    cx.fill();
+    // label band
+    cx.fillStyle = 'hsl(' + hue + ',38%,36%)';
+    cx.fillRect(cx2 - pw / 2, cy2 + ph * 0.08, pw, ph * 0.28);
+    // label dot
+    cx.fillStyle = 'hsla(' + hue + ',60%,78%,0.7)';
+    cx.beginPath();
+    cx.arc(cx2, cy2 + ph * 0.08 + ph * 0.14, 4, 0, Math.PI * 2);
+    cx.fill();
+    cx.globalAlpha = 1;
+  }
+
+  function drawProduct(p, now) {
+    if (p.placed && p.scale < 0.05) return;
+    cx.save();
+    cx.translate(p.x, p.y);
+    cx.scale(p.scale, p.scale);
+    var fam = FAMILIES[p.family % FAMILIES.length];
+    drawProductShape(0, 0, fam.hue, p.alpha);
+    // tap hint ring on ready products (human only)
+    if (!DEMO && !BOT && p.ready && !p.placed && p.alpha > 0.7) {
+      var pulse = 0.3 + 0.3 * Math.sin(now / 320 + p.id);
+      cx.strokeStyle = 'hsl(' + fam.hue + ',60%,68%)';
+      cx.lineWidth = 1.5;
+      cx.globalAlpha = pulse;
+      cx.beginPath();
+      cx.arc(0, 0, 26, 0, Math.PI * 2);
+      cx.stroke();
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+  }
+
+  function drawShelfGlow(now) {
+    var t = (now - completeAt) / 1000;
+    var pulse = 0.5 + 0.5 * Math.sin(t * 2.8);
+    var sw = COLS * (SLOT_W + SLOT_GAP) - SLOT_GAP;
+    var sh = ROWS * (SLOT_H + SLOT_GAP) - SLOT_GAP;
+    var g = cx.createRadialGradient(W / 2, SHELF_Y + sh / 2, 0, W / 2, SHELF_Y + sh / 2, sw * 0.72);
+    g.addColorStop(0, 'rgba(46,197,182,' + (0.20 * pulse) + ')');
+    g.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = g;
+    cx.fillRect(SHELF_X - 20, SHELF_Y - 20, sw + 40, sh + 40);
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // hitStop decay
+    if (hitStop > 0) hitStop -= dt;
+
+    // update products
+    for (var i = products.length - 1; i >= 0; i--) {
+      var p = products[i];
+      if (p.placed) {
+        p.scale = Math.max(0, p.scale - 0.07 * dt);
+        p.alpha = Math.max(0, p.alpha - 0.07 * dt);
+        if (p.scale <= 0) { products.splice(i, 1); }
+        continue;
+      }
+      p.alpha = Math.min(1, p.alpha + 0.05 * dt);
+      if (!p.ready) {
+        // drift to staging position
+        var dx2 = p.driftX - p.x, dy2 = p.driftY - p.y;
+        p.x += dx2 * 0.08 * dt;
+        p.y += dy2 * 0.08 * dt;
+        if (Math.abs(dx2) < 4 && Math.abs(dy2) < 4) {
+          p.x = p.driftX; p.y = p.driftY;
+          p.ready = true;
+        }
+      } else {
+        // gentle bob
+        p.bobPhase += 0.035 * dt;
+        p.y = p.driftY + Math.sin(p.bobPhase) * 3;
+      }
+    }
+
+    // bot
+    if (BOT && hitStop <= 0) botAutopilot(dt);
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.84, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(0.6, 'rgba(157,140,255,0.03)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.04)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // shelf + slots
+    if (phase !== 'title') {
+      drawShelfFrame();
+      for (var si = 0; si < slots.length; si++) drawSlot(slots[si]);
+      if (phase === 'complete' || phase === 'cta') drawShelfGlow(now);
+    }
+
+    // incoming products (shown during play and complete glow)
+    if (phase === 'play' || phase === 'complete') {
+      for (var pi = 0; pi < products.length; pi++) drawProduct(products[pi], now);
+    }
+
+    // HUD score
+    if (phase === 'play' || phase === 'complete' || phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.82)';
+      cx.font = '800 52px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 88);
+      cx.fillStyle = 'rgba(255,255,255,0.32)';
+      cx.font = '600 11px -apple-system, Helvetica, Arial';
+      cx.fillText('ITEMS PLACED', W / 2, 107);
+    }
+
+    // title
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('SHELF RESTOCK', W / 2, 290);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 340);
+      cx.fillStyle = TEAL;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.globalAlpha = pulse;
+      cx.fillText('tap to place each item', W / 2, 332);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('stock the shelf. feel the click.', W / 2, 362);
+    }
+
+    // over screen
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.58)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '900 34px -apple-system, Helvetica, Arial';
+      cx.fillText('STOCKED.', W / 2, 440);
+      cx.fillStyle = '#fff';
+      cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText('all 20 placed', W / 2, 476);
+      var p2 = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.globalAlpha = p2;
+      cx.fillText('TAP — RESTOCK AGAIN', W / 2, 522);
+      cx.globalAlpha = 1;
+      if (!DEMO && !BOT) {
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 22);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 28);
+      }
+    }
+
+    // demo CTA card — calm soft invitation
+    if (phase === 'cta') {
+      var elapsed2 = (now - ctaAt) / 1000, ease = Math.min(1, elapsed2 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('SHELF RESTOCK', W / 2, 296);
+      cx.fillStyle = 'rgba(255,255,255,0.74)';
+      cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('every slot filled.', W / 2, 336);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 260);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 404);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.44)';
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 438);
+      cx.globalAlpha = 1;
+    }
+
+    // floating reward flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 36);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.28) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 150 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 36) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- init ----
+  if (DEMO) {
+    startRun();
+    // run demo sequence via timeouts — more reliable than frame-based timing
+    setTimeout(runDemoSequence, 50);
+  } else if (BOT) {
+    startRun();
+  }
+
+  requestAnimationFrame(frame);
+
+  // ---- demo sequence (timeout-driven, reliable) ----
+  function runDemoSequence() {
+    var waits = [800, 720, 850, 680, 760, 700, 780, 660, 740, 680,
+                 720, 690, 750, 700, 730, 660, 710, 680, 720, 640];
+    var delay = 400; // initial settle time before first action
+    for (var i = 0; i < 20; i++) {
+      (function(d) {
+        setTimeout(function () {
+          if (phase !== 'play') return;
+          var ready = products.filter(function (p) { return !p.placed && p.ready; });
+          if (ready.length === 0) {
+            // force-ready any unplaced product
+            var up = products.filter(function (p) { return !p.placed; });
+            if (up.length > 0) {
+              up[0].ready = true; up[0].x = up[0].driftX; up[0].y = up[0].driftY; up[0].alpha = 1;
+              ready = [up[0]];
+            } else {
+              var np = spawnProduct();
+              if (np) { np.ready = true; np.x = np.driftX; np.y = np.driftY; np.alpha = 1; ready = [np]; }
+            }
+          }
+          if (ready.length > 0) placeProduct(ready[0]);
+        }, d);
+      })(delay);
+      delay += waits[i];
+    }
+  }
+})();
+</script>
+</body>
+</html>

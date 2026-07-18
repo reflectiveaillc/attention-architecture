@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Grid Fill — Tilt</title>
+<!--
+  LOOP / attention-architecture — Grid Fill (calm completion ASMR)
+  Circuits: 06-zeigarnik, 08-investment, 05-ease.
+  Engine: calm. Sound: J.calm() only.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot N runs → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'grid-fill-perfect';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  /* --- seeded RNG --- */
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  /* --- canvas / fit --- */
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  /* --- palette --- */
+  var INK  = '#0b0d12';
+  var TEAL = '#2ec5b6';
+  var GOLD = '#f2b134';
+  var SOFT = '#4ecdc4';  // calm accent — no vermillion for calm engine
+
+  /* --- grid layout --- */
+  var CELL  = 48;                  // px per cell
+  var COLS  = 7;
+  var ROWS  = 7;
+  var GX    = Math.floor((W - COLS * CELL) / 2);   // grid origin x
+  var GY    = 140;                                  // grid origin y
+
+  /* --- piece definitions: arrays of [row,col] relative to anchor --- */
+  var PIECE_DEFS = [
+    // L-shape
+    [[0,0],[1,0],[2,0],[2,1]],
+    // S-shape
+    [[0,1],[0,2],[1,0],[1,1]],
+    // T-shape
+    [[0,0],[0,1],[0,2],[1,1]],
+    // straight-2
+    [[0,0],[0,1]],
+    // straight-3
+    [[0,0],[0,1],[0,2]],
+    // Z-shape
+    [[0,0],[0,1],[1,1],[1,2]],
+    // square
+    [[0,0],[0,1],[1,0],[1,1]],
+    // J-shape
+    [[0,0],[1,0],[2,0],[2,-1]],
+    // single
+    [[0,0]],
+    // corner
+    [[0,0],[0,1],[1,0]],
+  ];
+
+  /* ------------------------------------------------------------------ */
+  /* State                                                                */
+  /* ------------------------------------------------------------------ */
+  var grid;       // ROWS x COLS boolean (true = filled)
+  var pieces;     // array of tray pieces {cells, placed, trayX, trayY, color}
+  var dragging;   // {piece, snapRow, snapCol, valid, px, py}
+  var score;
+  var phase;      // 'play' | 'complete' | 'cta'
+  var runStartTs;
+  var flashes;
+  var hitStop, shakeAmt, zoom;
+  var glowT;      // glow animation timer on complete
+  var botRunsDone, botPhase, botWait, botPieceIdx;
+  var ctaAt;
+
+  /* --- MUTE / SHARE regions --- */
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 560, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  /* ------------------------------------------------------------------ */
+  /* Level generation                                                     */
+  /* ------------------------------------------------------------------ */
+
+  // Build a solvable puzzle: start with full grid, carve a shape,
+  // then record which piece-definitions were used (those become the tray).
+  function buildLevel() {
+    grid = [];
+    var r, c;
+    for (r = 0; r < ROWS; r++) { grid[r] = []; for (c = 0; c < COLS; c++) grid[r][c] = false; }
+
+    // carve a playfield shape (always leave some cells pre-filled so it looks irregular)
+    // We'll carve a cross-ish + random extra removed cells
+    var shape = buildShape();
+    for (r = 0; r < ROWS; r++) for (c = 0; c < COLS; c++) {
+      if (!shape[r][c]) grid[r][c] = true;   // cells outside shape are "walls" (pre-filled gray)
+    }
+
+    // Now place pieces into the empty shape cells to produce the solution
+    pieces = [];
+    var remaining = [];
+    for (r = 0; r < ROWS; r++) for (c = 0; c < COLS; c++) if (!grid[r][c]) remaining.push([r, c]);
+
+    // Greedily cover remaining cells with random piece defs
+    var usedCells = {}; // "r,c" => true (covered by a piece)
+    var solutionPieces = [];
+
+    var attempts = 0;
+    while (remaining.some(function(rc){ return !usedCells[rc[0]+','+rc[1]]; }) && attempts < 400) {
+      attempts++;
+      // pick an uncovered cell
+      var uncovered = remaining.filter(function(rc){ return !usedCells[rc[0]+','+rc[1]]; });
+      if (!uncovered.length) break;
+      var anchor = uncovered[Math.floor(rng() * uncovered.length)];
+      var ar = anchor[0], ac = anchor[1];
+
+      // try piece definitions in random order
+      var order = shuffle(PIECE_DEFS.map(function(_,i){ return i; }));
+      var placed = false;
+      for (var pi = 0; pi < order.length; pi++) {
+        var def = PIECE_DEFS[order[pi]];
+        // translate so that def[0] is at anchor
+        var dr = ar - def[0][0], dc = ac - def[0][1];
+        var cells = def.map(function(rc){ return [rc[0]+dr, rc[1]+dc]; });
+        // check all cells fit in shape and uncovered
+        var ok = cells.every(function(rc){
+          var key = rc[0]+','+rc[1];
+          return rc[0]>=0 && rc[0]<ROWS && rc[1]>=0 && rc[1]<COLS && !grid[rc[0]][rc[1]] && !usedCells[key];
+        });
+        if (ok) {
+          cells.forEach(function(rc){ usedCells[rc[0]+','+rc[1]] = true; });
+          solutionPieces.push({ cells: cells, defIdx: order[pi] });
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        // force cover single cell
+        usedCells[ar+','+ac] = true;
+        solutionPieces.push({ cells: [[ar,ac]], defIdx: 8 });
+      }
+    }
+
+    // Build tray pieces from solution (shuffled)
+    var colors = [TEAL, SOFT, '#74b9ff', '#a29bfe', '#55efc4', '#81ecec', GOLD];
+    var shuffledSol = shuffle(solutionPieces);
+    var TRAY_Y = GY + ROWS * CELL + 40;
+    var TRAY_PIECE_GAP = 10;
+    // lay out tray horizontally
+    var tx = 20;
+    pieces = shuffledSol.map(function(sp, i){
+      var colC = colors[i % colors.length];
+      // compute bounding box of piece
+      var minR = sp.cells[0][0], minC = sp.cells[0][1];
+      sp.cells.forEach(function(rc){ minR=Math.min(minR,rc[0]); minC=Math.min(minC,rc[1]); });
+      // normalize cells
+      var normCells = sp.cells.map(function(rc){ return [rc[0]-minR, rc[1]-minC]; });
+      var maxC = 0; normCells.forEach(function(rc){ maxC=Math.max(maxC,rc[1]); });
+      var pw = (maxC+1)*CELL;
+      var pieceX = tx;
+      tx += pw + TRAY_PIECE_GAP;
+      if (tx > W - 20) tx = 20; // wrap (shouldn't happen with small pieces)
+      return {
+        cells: normCells,             // relative cells
+        solutionRow: sp.cells[0][0] - (sp.cells[0][0] - minR), // unused
+        solutionCells: sp.cells,      // absolute solution position
+        color: colC,
+        placed: false,
+        trayX: pieceX,
+        trayY: TRAY_Y,
+        // current draw position (tray origin)
+        drawX: pieceX,
+        drawY: TRAY_Y,
+      };
+    });
+
+    // spread across rows if too wide
+    layoutTray();
+  }
+
+  function layoutTray() {
+    var TRAY_Y_BASE = GY + ROWS * CELL + 36;
+    var ROW_H = CELL + 6;
+    var tx = 18, ty = TRAY_Y_BASE, maxH = CELL;
+    pieces.forEach(function(p){
+      if (p.placed) return;
+      var maxC = 0; p.cells.forEach(function(rc){ maxC=Math.max(maxC,rc[1]); });
+      var pw = (maxC+1)*CELL + 10;
+      var maxRr = 0; p.cells.forEach(function(rc){ maxRr=Math.max(maxRr,rc[0]); });
+      var ph = (maxRr+1)*CELL;
+      if (tx + pw > W - 10) { tx = 18; ty += maxH + 6; maxH = CELL; }
+      p.trayX = tx; p.trayY = ty;
+      p.drawX = tx; p.drawY = ty;
+      tx += pw + 4;
+      maxH = Math.max(maxH, ph);
+    });
+  }
+
+  function buildShape() {
+    // Build a filled shape (ROWS x COLS boolean where true = part of puzzle)
+    var s = [];
+    var r, c;
+    for (r = 0; r < ROWS; r++) { s[r] = []; for (c = 0; c < COLS; c++) s[r][c] = false; }
+    // Fill a cross pattern then add random cells for irregular feel
+    // Center cross
+    for (r = 0; r < ROWS; r++) for (c = 0; c < COLS; c++) {
+      var inCenter = (r >= 1 && r <= ROWS-2) && (c >= 1 && c <= COLS-2);
+      var inCross  = (r >= 2 && r <= ROWS-3) || (c >= 2 && c <= COLS-3);
+      s[r][c] = inCenter || inCross;
+    }
+    // Randomly remove some edge cells to make it more irregular
+    var removals = Math.floor(3 + rng() * 5);
+    for (var i = 0; i < removals; i++) {
+      r = Math.floor(rng() * ROWS);
+      c = Math.floor(rng() * COLS);
+      if (s[r][c]) s[r][c] = false;
+    }
+    // Ensure at least 20 cells (playable)
+    var cnt = 0;
+    for (r = 0; r < ROWS; r++) for (c = 0; c < COLS; c++) if (s[r][c]) cnt++;
+    if (cnt < 20) {
+      // fill back center
+      for (r = 2; r <= ROWS-3; r++) for (c = 2; c <= COLS-3; c++) s[r][c] = true;
+    }
+    return s;
+  }
+
+  function shuffle(arr) {
+    var a = arr.slice();
+    for (var i = a.length-1; i > 0; i--) {
+      var j = Math.floor(rng() * (i+1));
+      var tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+    }
+    return a;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Game init                                                            */
+  /* ------------------------------------------------------------------ */
+  function newGame() {
+    rng = mulberry32(SEED);
+    buildLevel();
+    score      = 0;
+    phase      = 'play';
+    dragging   = null;
+    flashes    = [];
+    hitStop    = 0;
+    shakeAmt   = 0;
+    zoom       = 1;
+    glowT      = 0;
+    ctaAt      = 0;
+    botRunsDone = 0;
+    botPhase   = 'wait';
+    botWait    = 0;
+    botPieceIdx = 0;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Snap / placement logic                                               */
+  /* ------------------------------------------------------------------ */
+
+  // Convert canvas px to grid row/col (given the piece anchor at px,py)
+  function snapToGrid(px, py) {
+    var col = Math.round((px - GX) / CELL);
+    var row = Math.round((py - GY) / CELL);
+    return { row: row, col: col };
+  }
+
+  function canPlace(piece, row, col) {
+    return piece.cells.every(function(rc) {
+      var r = rc[0] + row, c = rc[1] + col;
+      return r >= 0 && r < ROWS && c >= 0 && c < COLS && !grid[r][c];
+    });
+  }
+
+  function placePiece(piece, row, col) {
+    piece.cells.forEach(function(rc) {
+      grid[rc[0] + row][rc[1] + col] = true;
+    });
+    piece.placed   = true;
+    piece.drawX    = GX + col * CELL;
+    piece.drawY    = GY + row * CELL;
+    score++;
+    if (window.J) J.calm(score);
+    hitStop  = 3;
+    zoom     = 1.015;
+    flash('+' + score, TEAL, 28);
+    if (window.LOOP) LOOP.emit('piece_placed', { score: score });
+
+    // check complete
+    var allFilled = true;
+    for (var r = 0; r < ROWS; r++) for (var c = 0; c < COLS; c++) {
+      // "wall" cells are pre-filled; only care that playable cells are all filled
+      // playable cells = those that were true in shape
+    }
+    // Check: all pieces placed
+    if (pieces.every(function(p){ return p.placed; })) {
+      onComplete();
+    }
+  }
+
+  function onComplete() {
+    phase = 'complete';
+    glowT = 0;
+    hitStop = 8;
+    zoom    = 1.04;
+    shakeAmt = 2;
+    if (window.J) J.calm(99);
+    var dur = (Date.now() - runStartTs) / 1000;
+    window.__demoScore = score;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function() {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function() { window.__demoDone = true; }, 3500);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function() { restartGame(); }, 900);
+      }
+    }
+  }
+
+  function restartGame() {
+    rng = mulberry32(SEED + botRunsDone * 17);
+    buildLevel();
+    score      = 0;
+    phase      = 'play';
+    dragging   = null;
+    flashes    = [];
+    hitStop    = 0;
+    shakeAmt   = 0;
+    zoom       = 1;
+    glowT      = 0;
+    botPhase   = 'wait';
+    botWait    = 30;
+    botPieceIdx = 0;
+    runStartTs  = Date.now();
+    if (window.LOOP) LOOP.emit('restart', {});
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED + botRunsDone * 17 });
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Input handling                                                       */
+  /* ------------------------------------------------------------------ */
+  var pointer = { down: false, px: 0, py: 0 };
+
+  function getPieceAt(px, py) {
+    for (var i = pieces.length - 1; i >= 0; i--) {
+      var p = pieces[i];
+      if (p.placed) continue;
+      if (p.cells.some(function(rc) {
+        var cx_ = p.drawX + rc[1]*CELL, cy_ = p.drawY + rc[0]*CELL;
+        return px >= cx_ && px <= cx_+CELL && py >= cy_ && py <= cy_+CELL;
+      })) return p;
+    }
+    return null;
+  }
+
+  function pointerDown(px, py) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'complete') {
+      if (inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'cells filled' });
+        return;
+      }
+      restartGame();
+      return;
+    }
+    if (phase !== 'play') return;
+    var p = getPieceAt(px, py);
+    if (p) {
+      dragging = { piece: p, offX: px - p.drawX, offY: py - p.drawY, valid: false, snapRow: 0, snapCol: 0 };
+    }
+  }
+
+  function pointerMove(px, py) {
+    if (!dragging) return;
+    var p = dragging.piece;
+    p.drawX = px - dragging.offX;
+    p.drawY = py - dragging.offY;
+    // snap attempt
+    var snap = snapToGrid(p.drawX, p.drawY);
+    dragging.snapRow = snap.row;
+    dragging.snapCol = snap.col;
+    dragging.valid   = canPlace(p, snap.row, snap.col);
+  }
+
+  function pointerUp(px, py) {
+    if (!dragging) return;
+    var p = dragging.piece;
+    if (dragging.valid) {
+      placePiece(p, dragging.snapRow, dragging.snapCol);
+    } else {
+      // snap back to tray
+      p.drawX = p.trayX;
+      p.drawY = p.trayY;
+    }
+    dragging = null;
+  }
+
+  cv.addEventListener('pointerdown', function(e) {
+    e.preventDefault();
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale, py = (e.clientY - r.top) / scale;
+    pointer.down = true; pointer.px = px; pointer.py = py;
+    pointerDown(px, py);
+  });
+  cv.addEventListener('pointermove', function(e) {
+    e.preventDefault();
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale, py = (e.clientY - r.top) / scale;
+    pointer.px = px; pointer.py = py;
+    if (pointer.down) pointerMove(px, py);
+  });
+  cv.addEventListener('pointerup', function(e) {
+    e.preventDefault();
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale, py = (e.clientY - r.top) / scale;
+    pointer.down = false;
+    pointerUp(px, py);
+  });
+  cv.addEventListener('pointercancel', function() {
+    if (dragging) {
+      dragging.piece.drawX = dragging.piece.trayX;
+      dragging.piece.drawY = dragging.piece.trayY;
+      dragging = null;
+    }
+    pointer.down = false;
+  });
+
+  /* ------------------------------------------------------------------ */
+  /* Autopilot (demo + bot)                                               */
+  /* ------------------------------------------------------------------ */
+
+  // Demo script: place pieces one by one with hesitation, calm pacing
+  var demoStep    = 0;
+  var demoWaiting = 0;
+  var demoState   = 'idle'; // 'idle'|'moving'|'dropping'
+
+  // For demo: animated piece movement toward solution position
+  var demoCurrent = null; // { piece, targetX, targetY, targetRow, targetCol, progress }
+
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+    if (hitStop > 0) return;
+
+    if (DEMO) {
+      demoPilot(dt);
+    } else if (BOT) {
+      botPilot(dt);
+    }
+  }
+
+  function getUnplacedPiece(idx) {
+    var cnt = 0;
+    for (var i = 0; i < pieces.length; i++) {
+      if (!pieces[i].placed) {
+        if (cnt === idx) return pieces[i];
+        cnt++;
+      }
+    }
+    return null;
+  }
+
+  // DEMO: calm, human-feeling animation
+  var demoWaits = [40, 52, 35, 48, 38, 44, 50, 36, 42, 55, 38]; // frames between each piece
+
+  function demoPilot(dt) {
+    if (demoCurrent) {
+      // animate piece toward target
+      demoCurrent.progress += dt * 0.045;
+      if (demoCurrent.progress >= 1) {
+        demoCurrent.progress = 1;
+        demoCurrent.piece.drawX = demoCurrent.targetX;
+        demoCurrent.piece.drawY = demoCurrent.targetY;
+        // place it
+        placePiece(demoCurrent.piece, demoCurrent.targetRow, demoCurrent.targetCol);
+        demoCurrent = null;
+        demoWaiting = demoWaits[Math.min(demoStep, demoWaits.length-1)];
+        demoStep++;
+      } else {
+        var t = demoCurrent.progress;
+        var ease = 1 - Math.pow(1-t, 3);
+        demoCurrent.piece.drawX = demoCurrent.startX + (demoCurrent.targetX - demoCurrent.startX) * ease;
+        demoCurrent.piece.drawY = demoCurrent.startY + (demoCurrent.targetY - demoCurrent.startY) * ease;
+        // update snap indicator
+        dragging = { piece: demoCurrent.piece, offX: 0, offY: 0,
+          snapRow: demoCurrent.targetRow, snapCol: demoCurrent.targetCol, valid: true };
+      }
+    } else {
+      demoWaiting -= dt;
+      if (demoWaiting <= 0) {
+        dragging = null;
+        var p = getUnplacedPiece(0);
+        if (!p) return;
+        // find solution position for this piece
+        var sol = p.solutionCells;
+        var minR = sol[0][0], minC = sol[0][1];
+        sol.forEach(function(rc){ minR=Math.min(minR,rc[0]); minC=Math.min(minC,rc[1]); });
+        var tRow = minR, tCol = minC;
+        var targetX = GX + tCol * CELL;
+        var targetY = GY + tRow * CELL;
+        demoCurrent = {
+          piece: p,
+          startX: p.drawX, startY: p.drawY,
+          targetX: targetX, targetY: targetY,
+          targetRow: tRow, targetCol: tCol,
+          progress: 0
+        };
+        dragging = { piece: p, offX: 0, offY: 0, snapRow: tRow, snapCol: tCol, valid: true };
+      }
+    }
+  }
+
+  // BOT: similar but faster, must complete all pieces so game_over fires
+  var botWaitCount = 60;
+  function botPilot(dt) {
+    if (demoCurrent) {
+      demoCurrent.progress += dt * 0.08;
+      if (demoCurrent.progress >= 1) {
+        demoCurrent.piece.drawX = demoCurrent.targetX;
+        demoCurrent.piece.drawY = demoCurrent.targetY;
+        placePiece(demoCurrent.piece, demoCurrent.targetRow, demoCurrent.targetCol);
+        demoCurrent = null;
+        botWaitCount = 18 + Math.floor(rng() * 24);
+      } else {
+        var t = demoCurrent.progress;
+        var ease = 1 - Math.pow(1-t, 2);
+        demoCurrent.piece.drawX = demoCurrent.startX + (demoCurrent.targetX - demoCurrent.startX) * ease;
+        demoCurrent.piece.drawY = demoCurrent.startY + (demoCurrent.targetY - demoCurrent.startY) * ease;
+        dragging = { piece: demoCurrent.piece, offX: 0, offY: 0,
+          snapRow: demoCurrent.targetRow, snapCol: demoCurrent.targetCol, valid: true };
+      }
+    } else {
+      botWaitCount -= dt;
+      if (botWaitCount <= 0) {
+        dragging = null;
+        var p = getUnplacedPiece(0);
+        if (!p) return;
+        var sol = p.solutionCells;
+        var minR = sol[0][0], minC = sol[0][1];
+        sol.forEach(function(rc){ minR=Math.min(minR,rc[0]); minC=Math.min(minC,rc[1]); });
+        demoCurrent = {
+          piece: p,
+          startX: p.drawX, startY: p.drawY,
+          targetX: GX + minC*CELL, targetY: GY + minR*CELL,
+          targetRow: minR, targetCol: minC,
+          progress: 0
+        };
+        dragging = { piece: p, offX: 0, offY: 0, snapRow: minR, snapCol: minC, valid: true };
+      }
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Render                                                               */
+  /* ------------------------------------------------------------------ */
+
+  function roundRect(x, y, w, h, r) {
+    if (cx.roundRect) { cx.beginPath(); cx.roundRect(x, y, w, h, r); }
+    else { cx.beginPath(); cx.rect(x, y, w, h); }
+  }
+
+  function drawCell(x, y, color, alpha) {
+    cx.globalAlpha = alpha !== undefined ? alpha : 1;
+    cx.fillStyle   = color;
+    roundRect(x+2, y+2, CELL-4, CELL-4, 6);
+    cx.fill();
+    // subtle highlight
+    cx.globalAlpha = (alpha !== undefined ? alpha : 1) * 0.25;
+    cx.fillStyle = 'rgba(255,255,255,1)';
+    roundRect(x+4, y+4, CELL-8, 8, 3);
+    cx.fill();
+    cx.globalAlpha = 1;
+  }
+
+  function drawPieceCells(piece, ox, oy, alpha, ghost) {
+    piece.cells.forEach(function(rc) {
+      var cx_ = ox + rc[1]*CELL, cy_ = oy + rc[0]*CELL;
+      if (ghost) {
+        cx.globalAlpha = 0.28;
+        cx.fillStyle = piece.color;
+        roundRect(cx_+2, cy_+2, CELL-4, CELL-4, 6);
+        cx.fill();
+        cx.globalAlpha = 1;
+      } else {
+        drawCell(cx_, cy_, piece.color, alpha);
+      }
+    });
+  }
+
+  var last = performance.now();
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // juice decay
+    if (hitStop > 0) hitStop -= dt;
+    else autopilot(dt);
+
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.1 * dt;
+    if (phase === 'complete') glowT += dt;
+
+    /* --- canvas transform for juice --- */
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random()-0.5)*shakeAmt, sy = (Math.random()-0.5)*shakeAmt;
+      cx.translate(W/2+sx, H/2+sy); cx.scale(zoom, zoom); cx.translate(-W/2, -H/2);
+    }
+
+    /* --- background --- */
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W+40, H+40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.02)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    /* --- grid background --- */
+    var gridW = COLS * CELL, gridH = ROWS * CELL;
+    cx.fillStyle = 'rgba(255,255,255,0.04)';
+    roundRect(GX-4, GY-4, gridW+8, gridH+8, 10);
+    cx.fill();
+
+    /* --- grid cells --- */
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        var cx_ = GX + c*CELL, cy_ = GY + r*CELL;
+        if (grid[r][c]) {
+          // check if this was a wall (never part of shape) — draw as darker filler
+          // We'll color placed cells by piece; here fill already-placed = teal glow on complete
+          var isWall = !isPlayableCell(r, c);
+          if (isWall) {
+            cx.globalAlpha = 0.18;
+            cx.fillStyle = '#ffffff';
+            roundRect(cx_+2, cy_+2, CELL-4, CELL-4, 6);
+            cx.fill();
+            cx.globalAlpha = 1;
+          }
+          // placed piece cells drawn via pieces loop below
+        } else {
+          // empty cell — draw grid slot
+          cx.strokeStyle = 'rgba(255,255,255,0.10)';
+          cx.lineWidth   = 1;
+          roundRect(cx_+2, cy_+2, CELL-4, CELL-4, 6);
+          cx.stroke();
+        }
+      }
+    }
+
+    /* --- placed pieces --- */
+    pieces.forEach(function(p) {
+      if (!p.placed) return;
+      var glow = phase === 'complete' ? (0.7 + 0.3*Math.sin(glowT*0.15 + 0)) : 1;
+      drawPieceCells(p, p.drawX, p.drawY, glow);
+    });
+
+    /* --- snap ghost --- */
+    if (dragging && dragging.valid) {
+      var p = dragging.piece;
+      var gx_ = GX + dragging.snapCol*CELL, gy_ = GY + dragging.snapRow*CELL;
+      drawPieceCells(p, gx_, gy_, 0, true);
+    }
+
+    /* --- dragging piece (on top) --- */
+    if (dragging) {
+      var dp = dragging.piece;
+      cx.save();
+      cx.shadowColor = dp.color; cx.shadowBlur = 12;
+      drawPieceCells(dp, dp.drawX, dp.drawY, 0.92);
+      cx.restore();
+    }
+
+    /* --- tray pieces (unplaced, not being dragged) --- */
+    pieces.forEach(function(p) {
+      if (p.placed) return;
+      if (dragging && dragging.piece === p) return;
+      drawPieceCells(p, p.drawX, p.drawY, 0.9);
+    });
+
+    /* --- completion glow overlay --- */
+    if (phase === 'complete') {
+      var t_glow = Math.min(glowT / 30, 1);
+      var brightness = Math.max(0, 1 - (glowT - 30)/60);
+      cx.globalAlpha = t_glow * 0.18 * (0.5 + 0.5*Math.sin(glowT*0.12));
+      cx.fillStyle = TEAL;
+      cx.fillRect(GX, GY, gridW, gridH);
+      cx.globalAlpha = 1;
+    }
+
+    /* --- HUD: score / title --- */
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.font = '900 38px -apple-system, Helvetica, Arial';
+    cx.fillText('GRID FILL', W/2, 52);
+    cx.fillStyle = 'rgba(255,255,255,0.38)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('drag pieces — fill every space', W/2, 74);
+
+    // pieces counter
+    var remaining_ = pieces.filter(function(p){ return !p.placed; }).length;
+    var total_ = pieces.length;
+    cx.fillStyle = TEAL;
+    cx.font = '700 14px -apple-system, Helvetica, Arial';
+    cx.fillText(remaining_ + ' left  ·  ' + (total_ - remaining_) + '/' + total_ + ' placed', W/2, 100);
+
+    /* --- complete overlay --- */
+    if (phase === 'complete' || phase === 'cta') {
+      var fadeT = Math.min(glowT / 20, 1);
+      cx.fillStyle = 'rgba(11,13,18,' + (fadeT * 0.55) + ')';
+      cx.fillRect(0, 0, W, H);
+
+      cx.globalAlpha = fadeT;
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('COMPLETE', W/2, 296);
+
+      cx.fillStyle = 'rgba(255,255,255,0.8)';
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' pieces · perfectly filled', W/2, 340);
+
+      if (!DEMO && !BOT) {
+        // share zone
+        var p2 = 0.65 + 0.35*Math.sin(now/320);
+        cx.globalAlpha = fadeT * p2;
+        cx.fillStyle = 'rgba(46,197,182,0.12)';
+        roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        cx.fill();
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        cx.stroke();
+        cx.fillStyle = TEAL;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W/2, SHARE_R.y + 30);
+        cx.globalAlpha = fadeT;
+
+        // tap to retry
+        cx.fillStyle = 'rgba(255,255,255,0.45)';
+        cx.font = '600 13px -apple-system, Helvetica, Arial';
+        cx.fillText('tap to play again', W/2, 614);
+      }
+      cx.globalAlpha = 1;
+    }
+
+    /* --- CTA card (demo only) --- */
+    if (phase === 'cta') {
+      var t_cta = (now - ctaAt)/1000;
+      var ease  = Math.min(1, t_cta * 2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82*ease) + ')';
+      cx.fillRect(0, 0, W, H);
+
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('GRID FILL', W/2, 298);
+
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('every space. perfectly placed.', W/2, 338);
+
+      var p3 = 0.72 + 0.28*Math.sin(now/300);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W/2, 408);
+
+      cx.globalAlpha = ease * 0.6;
+      cx.fillStyle = TEAL;
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W/2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    /* --- floating flashes --- */
+    for (var k = flashes.length-1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t/38);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + (fl.size + fl.t*0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W/2, GY - 10 - fl.t*0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    /* --- mute toggle (human only) --- */
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w/2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+  }
+
+  /* Helper: is (r,c) a playable cell (part of the puzzle shape, not a wall) */
+  function isPlayableCell(r, c) {
+    return pieces.some(function(p) {
+      return p.solutionCells.some(function(sc){ return sc[0]===r && sc[1]===c; });
+    });
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

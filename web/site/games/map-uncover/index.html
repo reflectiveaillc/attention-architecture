@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Map Uncover — Tilt</title>
+<!--
+  LOOP / attention-architecture — Map Uncover
+  Circuits: 01 RPE (variable rewards per reveal), 06 Zeigarnik (just one more spot),
+            02 novelty (each landmark is a new reveal).
+  Modes:
+    ?demo=1&seed=7        scripted run for clip capture, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay for traffic, sets window.__botDone
+    ?dare=N               incoming challenge score
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'map-uncover';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+  function randRange(lo, hi) { return lo + rng() * (hi - lo); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var LANDMARK_COUNT = 18, START_ENERGY = 100, MAX_RADIUS = 95, MIN_RADIUS = 38;
+  var PAD = 48;
+
+  var state, runStartTs, best = 0, landmarks, target, flashlight;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false, challengeAt = 0, ctaAt = 0;
+  var flashes = [], particles = [], botRunsDone = 0, botTarget = null, nearMissCd = 0, overReason = 'dead';
+  try { best = +localStorage.getItem('mu_best') || 0; } catch (_) {}
+
+  function makeLandmark(isTarget) {
+    var x = randRange(PAD, W - PAD), y = randRange(120, H - PAD - 40);
+    return {
+      x: x, y: y,
+      revealed: false,
+      type: isTarget ? 'target' : (rng() < 0.55 ? 'dot' : 'pin'),
+      color: isTarget ? GOLD : (rng() < 0.5 ? TEAL : '#7ce0ff'),
+      label: isTarget ? 'MARKED' : String.fromCharCode(65 + Math.floor(rng() * 26)),
+      pulse: rng() * Math.PI * 2
+    };
+  }
+
+  function generateMap() {
+    landmarks = [];
+    for (var i = 0; i < LANDMARK_COUNT; i++) landmarks.push(makeLandmark(false));
+    target = makeLandmark(true);
+    // keep target away from the start flashlight position
+    var startX = W / 2, startY = H / 2 + 90;
+    var safety = 160;
+    var attempts = 0;
+    while (attempts < 200 && Math.hypot(target.x - startX, target.y - startY) < safety) {
+      target.x = randRange(PAD, W - PAD); target.y = randRange(120, H - PAD - 40);
+      attempts++;
+    }
+    // separate landmarks from each other a little
+    for (var k = 0; k < landmarks.length; k++) {
+      var L = landmarks[k];
+      for (var j = 0; j < k; j++) {
+        var M = landmarks[j];
+        if (Math.hypot(L.x - M.x, L.y - M.y) < 34) {
+          L.x = randRange(PAD, W - PAD); L.y = randRange(120, H - PAD - 40);
+          j = -1;
+        }
+      }
+    }
+  }
+
+  function newGame() {
+    generateMap();
+    state = {
+      phase: 'title', // title | challenge | play | over | cta
+      score: 0,
+      energy: START_ENERGY,
+      combo: 0,
+      overAt: 0
+    };
+    flashlight = { x: W / 2, y: H / 2 + 90, tx: W / 2, ty: H / 2 + 90 };
+    flashes = []; particles = []; dareBeaten = false; botTarget = null;
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      buildDemoPath();
+      setTimeout(startRun, 1200);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 8))));
+  }
+
+  function reveal(L, isTarget) {
+    if (L.revealed) return false;
+    L.revealed = true;
+    state.score++;
+    state.energy = Math.min(START_ENERGY, state.energy + (isTarget ? 25 : 10));
+    state.combo++;
+    if (window.J) {
+      if (isTarget) J.fanfare();
+      else J.hit(state.combo);
+      J.tension(Math.min(1, 1 - state.energy / START_ENERGY));
+    }
+    hitStop = isTarget ? 10 : 3;
+    zoom = isTarget ? 1.04 : 1.015;
+    flash(isTarget ? 'FOUND IT!' : '+' + (isTarget ? 25 : 10), isTarget ? GOLD : TEAL, isTarget ? 52 : 34);
+    for (var i = 0; i < 10; i++) {
+      particles.push({
+        x: L.x, y: L.y,
+        vx: (rng() - 0.5) * 6, vy: (rng() - 0.5) * 6,
+        life: 1, color: L.color
+      });
+    }
+    if (window.LOOP) LOOP.emit('spot_revealed', { n: state.score, energy: +state.energy.toFixed(1), isTarget: isTarget });
+    return true;
+  }
+
+  function gameOver(reason) {
+    overReason = reason;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = reason === 'dead' ? 10 : 6;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.death(reason === 'dead' ? Math.min(0.35 + state.score / 25, 1) : 0.25);
+      if (newBest || reason === 'found') setTimeout(function () { if (window.J) J.fanfare(); }, 350);
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('mu_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), reason: reason });
+    if (DEMO) setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+      setTimeout(function () { window.__demoDone = true; }, 3600); }, 2800);
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 900);
+    }
+  }
+
+  function resetRun() {
+    generateMap();
+    state.score = 0; state.energy = START_ENERGY; state.combo = 0; state.phase = 'play';
+    flashlight.x = W / 2; flashlight.y = H / 2 + 90; flashlight.tx = W / 2; flashlight.ty = H / 2 + 90;
+    flashes = []; particles = []; botTarget = null; dareBeaten = false; nearMissCd = 0; overReason = 'dead';
+    if (window.LOOP) LOOP.emit('restart', {});
+    runStartTs = Date.now();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 510, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function screenToGame(ex, ey) {
+    var r = cv.getBoundingClientRect();
+    return { x: (ex - r.left) / scale, y: (ey - r.top) / scale };
+  }
+
+  function pointerDown(ex, ey) {
+    if (DEMO || BOT) return;
+    var p = screenToGame(ex, ey);
+    if (inR(MUTE_R, p.x, p.y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (inR(SHARE_R, p.x, p.y) && window.SHARE) { SHARE.send({ score: state.score, unit: 'spots' }); return; }
+      resetRun();
+    }
+  }
+
+  function pointerMove(ex, ey) {
+    if (DEMO || BOT) return;
+    if (state.phase !== 'play') return;
+    var p = screenToGame(ex, ey);
+    flashlight.tx = Math.max(PAD - 20, Math.min(W - PAD + 20, p.x));
+    flashlight.ty = Math.max(100, Math.min(H - PAD, p.y));
+  }
+
+  window.addEventListener('pointerdown', function (e) { pointerDown(e.clientX, e.clientY); });
+  window.addEventListener('pointermove', function (e) { pointerMove(e.clientX, e.clientY); });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') { if (state.phase === 'title') startRun(); else if (state.phase === 'over') resetRun(); } });
+
+  // ---- demo / bot autopilots ----
+  var demoPath = [], demoIdx = 0, demoWait = 0, demoWaits = [];
+
+  function buildDemoPath() {
+    // scripted waypoints for the flashlight: reveal some landmarks, hesitate, near-miss target,
+    // recover on a landmark, then drain out before finding target.
+    demoPath = [];
+    var revealedOrder = [];
+    // pick 4 non-target landmarks to script in
+    var pool = landmarks.slice().sort(function () { return rng() - 0.5; }).slice(0, 4);
+    // target is placed far; make sure a couple scripted points create a near-miss at target
+    for (var i = 0; i < pool.length; i++) revealedOrder.push({ x: pool[i].x, y: pool[i].y, pause: i === 1 ? 55 : 0 });
+    // near-miss: pass close to target without overlapping
+    var missAngle = rng() * Math.PI * 2;
+    var missR = 105; // just outside flashlight radius
+    revealedOrder.push({ x: target.x + Math.cos(missAngle) * missR, y: target.y + Math.sin(missAngle) * missR, pause: 70 });
+    // recovery: find another landmark, but keep it away from target so the demo doesn't accidentally win
+    var recover = landmarks.slice().filter(function (L) {
+      return Math.hypot(L.x - target.x, L.y - target.y) > MAX_RADIUS * 1.35;
+    }).sort(function (a, b) {
+      return Math.hypot(a.x - flashlight.x, a.y - flashlight.y) - Math.hypot(b.x - flashlight.x, b.y - flashlight.y);
+    })[0];
+    if (!recover) recover = landmarks.slice().sort(function (a, b) {
+      return Math.hypot(b.x - target.x, b.y - target.y) - Math.hypot(a.x - target.x, a.y - target.y);
+    })[0];
+    revealedOrder.push({ x: recover.x, y: recover.y, pause: 0 });
+    // wander away from target and let battery die
+    var wander = [];
+    for (var k = 0; k < 5; k++) {
+      wander.push({ x: randRange(PAD, W - PAD), y: randRange(120, H - PAD - 40), pause: 0 });
+    }
+    demoPath = revealedOrder.concat(wander);
+    demoWaits = [30, 26, 44, 38, 55, 34, 28, 30, 24, 22];
+    demoIdx = 0; demoWait = 0;
+  }
+
+  function flashlightRadius() {
+    return MIN_RADIUS + (MAX_RADIUS - MIN_RADIUS) * (state.energy / START_ENERGY);
+  }
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    var speed = 5.5, r = flashlightRadius();
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      var wp = demoPath[Math.min(demoIdx, demoPath.length - 1)];
+      flashlight.tx = wp.x; flashlight.ty = wp.y;
+      var dist = Math.hypot(flashlight.x - wp.x, flashlight.y - wp.y);
+      if (dist <= speed * 1.2) {
+        demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 26;
+        demoIdx++;
+      }
+    } else if (BOT) {
+      // bot: head toward nearest unrevealed landmark with Gaussian error, until energy dies
+      if (botTarget === null || (landmarks[botTarget] && landmarks[botTarget].revealed)) {
+        var bestIdx = -1, bestD = Infinity;
+        for (var i = 0; i < landmarks.length; i++) {
+          if (landmarks[i].revealed) continue;
+          var d = Math.hypot(landmarks[i].x - flashlight.x, landmarks[i].y - flashlight.y);
+          if (d < bestD) { bestD = d; bestIdx = i; }
+        }
+        botTarget = bestIdx;
+      }
+      if (botTarget >= 0) {
+        var L = landmarks[botTarget];
+        var err = gauss() * 14;
+        var ang = Math.atan2(L.y - flashlight.y, L.x - flashlight.x) + err * 0.02;
+        flashlight.tx = flashlight.x + Math.cos(ang) * speed * 1.5;
+        flashlight.ty = flashlight.y + Math.sin(ang) * speed * 1.5;
+      }
+    }
+  }
+
+  // ---- render helpers ----
+  function drawLandmark(L) {
+    cx.save();
+    cx.translate(L.x, L.y);
+    var glow = L.type === 'target' ? 16 : 8;
+    var grd = cx.createRadialGradient(0, 0, 2, 0, 0, glow);
+    grd.addColorStop(0, L.color); grd.addColorStop(1, 'rgba(0,0,0,0)');
+    cx.fillStyle = grd; cx.globalAlpha = 0.35; cx.beginPath(); cx.arc(0, 0, glow, 0, Math.PI * 2); cx.fill(); cx.globalAlpha = 1;
+    if (L.type === 'pin') {
+      cx.fillStyle = L.color;
+      cx.beginPath();
+      cx.moveTo(0, -10); cx.arc(0, -6, 5, 0, Math.PI * 2); cx.lineTo(0, 8);
+      cx.closePath(); cx.fill();
+    } else if (L.type === 'target') {
+      var t = performance.now() / 300 + L.pulse;
+      cx.strokeStyle = L.color; cx.lineWidth = 2.5;
+      cx.beginPath(); cx.arc(0, 0, 7 + Math.sin(t * 2) * 2, 0, Math.PI * 2); cx.stroke();
+      cx.beginPath();
+      for (var i = 0; i < 4; i++) {
+        var a = t + i * Math.PI / 2;
+        cx.moveTo(Math.cos(a) * 12, Math.sin(a) * 12);
+        cx.lineTo(Math.cos(a) * 18, Math.sin(a) * 18);
+      }
+      cx.stroke();
+      cx.fillStyle = '#fff'; cx.font = '700 10px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center'; cx.fillText('X', 0, 4);
+    } else {
+      cx.fillStyle = L.color;
+      cx.beginPath(); cx.arc(0, 0, 5, 0, Math.PI * 2); cx.fill();
+    }
+    cx.restore();
+  }
+
+  function drawMapBase() {
+    // subtle grid / map texture
+    cx.strokeStyle = 'rgba(46,197,182,0.08)'; cx.lineWidth = 1;
+    for (var x = 30; x < W; x += 45) { cx.beginPath(); cx.moveTo(x, 0); cx.lineTo(x, H); cx.stroke(); }
+    for (var y = 30; y < H; y += 45) { cx.beginPath(); cx.moveTo(0, y); cx.lineTo(W, y); cx.stroke(); }
+    // faint continent-like blobs
+    cx.fillStyle = 'rgba(46,197,182,0.04)';
+    cx.beginPath(); cx.arc(110, 220, 90, 0, Math.PI * 2); cx.fill();
+    cx.beginPath(); cx.arc(300, 520, 120, 0, Math.PI * 2); cx.fill();
+    cx.beginPath(); cx.arc(260, 180, 60, 0, Math.PI * 2); cx.fill();
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // sim update
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') {
+      state.energy -= 0.32 * dt;
+      if (state.energy <= 0) { state.energy = 0; gameOver('dead'); }
+      else {
+        flashlight.x += (flashlight.tx - flashlight.x) * 0.18 * dt;
+        flashlight.y += (flashlight.ty - flashlight.y) * 0.18 * dt;
+        var rad = flashlightRadius();
+        // reveal checks
+        for (var i = 0; i < landmarks.length; i++) {
+          var L = landmarks[i];
+          if (!L.revealed && Math.hypot(L.x - flashlight.x, L.y - flashlight.y) < rad - 4) {
+            reveal(L, false);
+          }
+        }
+        if (!target.revealed && Math.hypot(target.x - flashlight.x, target.y - flashlight.y) < rad - 4) {
+          reveal(target, true);
+          gameOver('found');
+        }
+        // near-miss: flashlight skims the target without revealing it
+        if (nearMissCd > 0) nearMissCd -= dt;
+        if (!target.revealed && state.energy > 5 && nearMissCd <= 0) {
+          var td = Math.hypot(target.x - flashlight.x, target.y - flashlight.y);
+          if (td > rad - 4 && td < rad * 1.45) {
+            nearMissCd = 60;
+            flash('SO CLOSE', VERM, 34);
+            shakeAmt = 4;
+            if (window.J) J.near();
+            if (window.LOOP) LOOP.emit('near_miss', { distance: +td.toFixed(1), energy: +state.energy.toFixed(1) });
+          }
+        }
+        autopilot();
+      }
+    }
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    drawMapBase();
+
+    // fog + revealed landmarks visible everywhere once found
+    for (var i = 0; i < landmarks.length; i++) {
+      if (landmarks[i].revealed) drawLandmark(landmarks[i]);
+    }
+    if (target.revealed) drawLandmark(target);
+
+    // flashlight reveal mask: draw a radial gradient so only inside the beam is bright
+    var rad = flashlightRadius();
+    var beam = cx.createRadialGradient(flashlight.x, flashlight.y, 0, flashlight.x, flashlight.y, rad);
+    beam.addColorStop(0, 'rgba(11,13,18,0)');
+    beam.addColorStop(0.78, 'rgba(11,13,18,0)');
+    beam.addColorStop(1, 'rgba(11,13,18,0.96)');
+    cx.fillStyle = beam; cx.fillRect(0, 0, W, H);
+
+    // inside beam, draw unrevealed landmarks dimly
+    cx.save();
+    cx.beginPath(); cx.arc(flashlight.x, flashlight.y, rad, 0, Math.PI * 2); cx.clip();
+    for (var j = 0; j < landmarks.length; j++) {
+      if (!landmarks[j].revealed) {
+        cx.globalAlpha = 0.22;
+        drawLandmark(landmarks[j]);
+        cx.globalAlpha = 1;
+      }
+    }
+    if (!target.revealed) {
+      cx.globalAlpha = 0.18;
+      drawLandmark(target);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    // flashlight rim
+    cx.strokeStyle = 'rgba(255,255,255,0.25)'; cx.lineWidth = 2;
+    cx.beginPath(); cx.arc(flashlight.x, flashlight.y, rad, 0, Math.PI * 2); cx.stroke();
+    cx.fillStyle = 'rgba(255,255,255,0.08)'; cx.beginPath(); cx.arc(flashlight.x, flashlight.y, rad * 0.92, 0, Math.PI * 2); cx.fill();
+
+    // particles
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pt = particles[p];
+      pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.life -= 0.025 * dt;
+      cx.globalAlpha = Math.max(0, pt.life);
+      cx.fillStyle = pt.color;
+      cx.beginPath(); cx.arc(pt.x, pt.y, 2.5, 0, Math.PI * 2); cx.fill();
+      cx.globalAlpha = 1;
+      if (pt.life <= 0) particles.splice(p, 1);
+    }
+
+    // top HUD
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'left';
+      cx.fillStyle = '#fff'; cx.font = '800 44px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, 24, 78);
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('SPOTS', 24, 96);
+      // battery bar
+      var bx = 110, by = 54, bw = 170, bh = 12;
+      cx.fillStyle = 'rgba(255,255,255,0.12)'; cx.fillRect(bx, by, bw, bh);
+      var ecol = state.energy > 50 ? TEAL : (state.energy > 20 ? GOLD : VERM);
+      cx.fillStyle = ecol; cx.fillRect(bx, by, bw * (state.energy / START_ENERGY), bh);
+      cx.strokeStyle = 'rgba(255,255,255,0.25)'; cx.lineWidth = 1; cx.strokeRect(bx, by, bw, bh);
+      cx.textAlign = 'right';
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '700 12px -apple-system, Helvetica, Arial';
+      cx.fillText(Math.round(state.energy) + '%', bx + bw, 48);
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.textAlign = 'center';
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 124);
+      }
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 260 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // title card
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('MAP UNCOVER', W / 2, 270);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('DRAG THE LIGHT', W / 2, 320); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('find the marked spot before the light dies', W / 2, 350);
+    }
+
+    // challenge card
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('17', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // game over card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = overReason === 'found' ? GOLD : VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText(overReason === 'found' ? 'MARKED FOUND!' : 'LIGHT DIED.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' spots found', W / 2, 345);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 470);
+        cx.globalAlpha = 1;
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('MAP UNCOVER', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('she found ' + (window.__demoScore || 17) + ' spots. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 17), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

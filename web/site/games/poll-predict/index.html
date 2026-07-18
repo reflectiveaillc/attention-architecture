@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Poll Predict — Tilt</title>
+<!--
+  LOOP / attention-architecture — Poll Predict
+  Circuits: 03-social (story poll conditioned path), 01-rpe (variable reward),
+            02-novelty (new polls each round)
+  Engine: viral (participation-comment-bait)
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron run → __demoDone
+    ?bot=1&runs=N    imperfect autopilot N runs → __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'poll-predict';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var WHITE = '#ffffff';
+
+  // Poll questions: [question, optionA, optionB, winner 0=A 1=B, pct of winner]
+  var POLLS = [
+    ['Which do you check first?',   'Notifications', 'DMs',           1, 61],
+    ['Which hits harder?',          'Ghosted',       'Left on seen',  0, 58],
+    ['Better spend?',               'Coffee daily',  'Gym monthly',   1, 54],
+    ['More addictive?',             'Stories',       'Reels',         1, 67],
+    ['Real answer —',               'Dogs',          'Cats',          0, 71],
+    ['First thing you open?',       'Instagram',     'TikTok',        0, 53],
+    ['Harder to quit?',             'Scrolling',     'Snoozing',      0, 62],
+    ['Which flex is bigger?',       'Followers',     'Views',         1, 56],
+    ['Post or lurk?',               'I post',        'I lurk',        1, 69],
+    ['Late-night villain?',         'Feed',          'YouTube',       0, 55],
+    ['More satisfying?',            'Like bomb',     'New follower',  1, 58],
+    ['Algorithm check?',            'Watch time',    'Comments',      0, 64],
+    ['Which drains you more?',      'FOMO',          'Drama',         0, 52],
+    ['Better for brain rot?',       'TikTok',        'Shorts',        0, 60],
+    ['Closer to truth?',            'Nobody cares',  'Everyone sees', 1, 57]
+  ];
+
+  // State
+  var state, flashes, runStartTs, best = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  var botRunsDone = 0;
+  try { best = +localStorage.getItem('pp_best') || 0; } catch (_) {}
+
+  // Poll state per round
+  var currentPoll = null;   // {q, a, b, winner, pct}
+  var pollTimer = 0;        // frames remaining (countdown)
+  var POLL_DURATION = 180;  // frames (~3s at 60fps)
+  var barProgress = 0;      // 0..1 animated bar (winner side creep)
+  var pollResult = null;    // null | 'correct' | 'wrong'
+  var resultTimer = 0;
+  var RESULT_DURATION = 90;
+  var pollsThisRun = 0;
+  var pollQueue = [];
+
+  function buildPollQueue() {
+    // Shuffle a copy of POLLS for this run
+    var arr = POLLS.slice();
+    for (var i = arr.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+    }
+    pollQueue = arr;
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 7))));
+  }
+
+  function newGame() {
+    state = {
+      phase: 'title',   // title | challenge | play | result | over | cta
+      score: 0, streak: 0, overAt: 0
+    };
+    flashes = []; dareBeaten = false; pollsThisRun = 0;
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    buildPollQueue();
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    nextPoll();
+  }
+
+  function nextPoll() {
+    if (pollQueue.length === 0) buildPollQueue();
+    var p = pollQueue.shift();
+    currentPoll = { q: p[0], a: p[1], b: p[2], winner: p[3], pct: p[4] };
+    // Start bar at 50/50 and creep toward winner
+    barProgress = 0.5;
+    pollTimer = POLL_DURATION + Math.floor(rng() * 30); // slight variance
+    pollResult = null;
+    resultTimer = 0;
+  }
+
+  function choose(side) {
+    // side: 0=A, 1=B
+    if (state.phase !== 'play' || pollResult !== null) return;
+    var correct = (side === currentPoll.winner);
+    pollResult = correct ? 'correct' : 'wrong';
+    resultTimer = RESULT_DURATION;
+    pollsThisRun++;
+
+    if (correct) {
+      state.score++;
+      state.streak++;
+      if (state.streak >= 3 && window.J) {
+        J.perfect(state.streak);
+        hitStop = 5; zoom = 1.025;
+        flash('🔥 ×' + state.streak + ' STREAK', GOLD, 36);
+      } else {
+        if (window.J) J.hit(state.streak);
+        flash('CORRECT!', TEAL, 34);
+      }
+      if (window.J) J.tension(Math.min(state.streak / 8, 1));
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 40);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score);
+      }
+      if (window.LOOP) LOOP.emit('poll_correct', { streak: state.streak, score: state.score });
+    } else {
+      // Wrong pick — lose streak, play is over (streak = 0 → game over)
+      if (window.J) J.near();
+      flash('WRONG PICK', VERM, 34);
+      if (window.LOOP) LOOP.emit('near_miss', { n: state.score, streak: state.streak });
+      state.streak = 0;
+      // After showing result, end game
+      setTimeout(gameOver, (RESULT_DURATION / 60) * 1000 + 300);
+    }
+  }
+
+  function timeUp() {
+    // Ran out of time — miss
+    if (state.phase !== 'play' || pollResult !== null) return;
+    pollResult = 'timeout';
+    resultTimer = RESULT_DURATION;
+    pollsThisRun++;
+    if (window.J) J.near();
+    flash('TOO SLOW', VERM, 34);
+    state.streak = 0;
+    if (window.LOOP) LOOP.emit('near_miss', { n: state.score, type: 'timeout' });
+    setTimeout(gameOver, (RESULT_DURATION / 60) * 1000 + 300);
+  }
+
+  function gameOver() {
+    if (state.phase === 'over' || state.phase === 'cta') return;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 8;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + state.score / 12, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (newBest) { best = state.score; try { localStorage.setItem('pp_best', String(best)); } catch (_) {} }
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 900);
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.streak = 0; flashes = []; pollsThisRun = 0;
+    dareBeaten = false; pollResult = null;
+    buildPollQueue();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- Input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  var BTN_A   = { x: 20,       y: 490, w: 170, h: 72 };
+  var BTN_B   = { x: 215,      y: 490, w: 170, h: 72 };
+
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play' && pollResult === null) {
+      if (x !== undefined && inR(BTN_A, x, y)) { choose(0); return; }
+      if (x !== undefined && inR(BTN_B, x, y)) { choose(1); return; }
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'streak' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'ArrowLeft' || e.code === 'KeyA') tap(BTN_A.x + 1, BTN_A.y + 1);
+    if (e.code === 'ArrowRight' || e.code === 'KeyD') tap(BTN_B.x + 1, BTN_B.y + 1);
+    if (e.code === 'Space') tap();
+  });
+
+  // ---- Demo / Bot autopilot ----
+  // Demo script: which option to pick each round (0=A, 1=B, 'timeout'=run out)
+  // Arc: correct → correct → correct (hesitate) → near-fail (wrong!) → game over
+  // Actually: correct 4 times building streak, then wrong (the real fail)
+  var demoScript   = [1, 0, 1, 0, 'wrong'];  // last one picks the wrong answer
+  var demoWaits    = [60, 50, 80, 45, 55];    // hesitation frames per pick
+  var demoIdx = 0, demoWait = 40;
+  var botTickFrames = 0;
+
+  function autopilot() {
+    if (state.phase !== 'play' || pollResult !== null || !currentPoll) return;
+
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      var act = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      if (act === 'wrong') {
+        // deliberately pick the losing option
+        choose(1 - currentPoll.winner);
+      } else {
+        choose(act);
+      }
+      demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 50;
+      demoIdx++;
+    } else if (BOT) {
+      // Bot: picks mostly correct but occasionally wrong, ensuring it eventually loses
+      botTickFrames++;
+      // Wait a bit before picking (simulate reaction time)
+      if (botTickFrames < 55 + Math.floor(rng() * 40)) return;
+      botTickFrames = 0;
+      // After enough rounds, make a wrong pick to trigger game over
+      var wrongChance = pollsThisRun >= 3 ? 0.45 : 0.15;
+      if (rng() < wrongChance) {
+        choose(1 - currentPoll.winner);  // wrong pick → game over
+      } else {
+        choose(currentPoll.winner);
+      }
+    }
+  }
+
+  // ---- Render ----
+  var ctaAt = 0, last = performance.now();
+
+  function roundRect(x, y, w, h, r) {
+    if (cx.roundRect) { cx.roundRect(x, y, w, h, r); }
+    else {
+      cx.moveTo(x + r, y);
+      cx.lineTo(x + w - r, y); cx.quadraticCurveTo(x + w, y, x + w, y + r);
+      cx.lineTo(x + w, y + h - r); cx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      cx.lineTo(x + r, y + h); cx.quadraticCurveTo(x, y + h, x, y + h - r);
+      cx.lineTo(x, y + r); cx.quadraticCurveTo(x, y, x + r, y);
+      cx.closePath();
+    }
+  }
+
+  function drawPollCard(now) {
+    if (!currentPoll) return;
+    var p = currentPoll;
+
+    // Card background
+    cx.fillStyle = 'rgba(255,255,255,0.05)';
+    cx.beginPath(); roundRect(20, 110, W - 40, 370, 18); cx.fill();
+    cx.strokeStyle = 'rgba(255,255,255,0.12)'; cx.lineWidth = 1;
+    cx.beginPath(); roundRect(20, 110, W - 40, 370, 18); cx.stroke();
+
+    // "STORY POLL" label
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL; cx.font = '700 11px Menlo, monospace';
+    cx.fillText('STORY POLL', W / 2, 138);
+
+    // Question
+    cx.fillStyle = WHITE; cx.font = '800 22px -apple-system, Helvetica, Arial';
+    cx.fillText(p.q, W / 2, 178);
+
+    // Timer bar
+    var timerFrac = Math.max(0, pollTimer / POLL_DURATION);
+    var barY = 196, barH = 5;
+    cx.fillStyle = 'rgba(255,255,255,0.12)';
+    cx.beginPath(); roundRect(40, barY, W - 80, barH, 2); cx.fill();
+    var tc = timerFrac > 0.4 ? TEAL : timerFrac > 0.2 ? GOLD : VERM;
+    cx.fillStyle = tc;
+    cx.beginPath(); roundRect(40, barY, (W - 80) * timerFrac, barH, 2); cx.fill();
+
+    // Results bar (only show after vote or when pollResult is set)
+    if (pollResult !== null) {
+      var barY2 = 216, barH2 = 28;
+      // Background
+      cx.fillStyle = 'rgba(255,255,255,0.08)';
+      cx.beginPath(); roundRect(40, barY2, W - 80, barH2, 14); cx.fill();
+      // Winning side fill
+      var winnerPct = currentPoll.pct / 100;
+      var barW = Math.max(0.05, Math.min(0.95, barProgress)) * (W - 80);
+      if (currentPoll.winner === 0) {
+        cx.fillStyle = pollResult === 'correct' ? TEAL : 'rgba(232,80,46,0.5)';
+        cx.beginPath(); roundRect(40, barY2, barW, barH2, 14); cx.fill();
+      } else {
+        cx.fillStyle = pollResult === 'correct' ? TEAL : 'rgba(232,80,46,0.5)';
+        cx.beginPath(); roundRect(40 + (W - 80) - barW, barY2, barW, barH2, 14); cx.fill();
+      }
+      // Pct labels
+      cx.textAlign = 'left'; cx.fillStyle = WHITE; cx.font = '700 11px Menlo, monospace';
+      var pctA = currentPoll.winner === 0 ? currentPoll.pct : (100 - currentPoll.pct);
+      var pctB = 100 - pctA;
+      cx.fillText(pctA + '%', 46, barY2 + 19);
+      cx.textAlign = 'right'; cx.fillText(pctB + '%', W - 46, barY2 + 19);
+      cx.textAlign = 'center';
+    }
+
+    // Option buttons
+    var btnTop = 270;
+    var btnH = 80;
+    var picked = null; // which side did they pick (via demo/bot tracking — we track it separately)
+
+    // Option A
+    var aActive = (pollResult !== null && currentPoll.winner === 0);
+    var aWrong  = (pollResult !== null && currentPoll.winner === 1 && pollResult !== 'timeout');
+    cx.fillStyle = aActive ? 'rgba(46,197,182,0.22)' : aWrong ? 'rgba(232,80,46,0.15)' : 'rgba(255,255,255,0.07)';
+    cx.beginPath(); roundRect(30, btnTop, (W - 75) / 2, btnH, 14); cx.fill();
+    cx.strokeStyle = aActive ? TEAL : aWrong ? VERM : 'rgba(255,255,255,0.18)';
+    cx.lineWidth = aActive ? 2 : 1;
+    cx.beginPath(); roundRect(30, btnTop, (W - 75) / 2, btnH, 14); cx.stroke();
+    cx.textAlign = 'center';
+    cx.fillStyle = aActive ? TEAL : WHITE;
+    cx.font = '700 16px -apple-system, Helvetica, Arial';
+    var aLabel = p.a.length > 12 ? p.a.slice(0, 12) + '…' : p.a;
+    cx.fillText(aLabel, 30 + (W - 75) / 4, btnTop + btnH / 2 + 6);
+
+    // Option B
+    var bActive = (pollResult !== null && currentPoll.winner === 1);
+    var bWrong  = (pollResult !== null && currentPoll.winner === 0 && pollResult !== 'timeout');
+    var bX = 30 + (W - 75) / 2 + 15;
+    cx.fillStyle = bActive ? 'rgba(46,197,182,0.22)' : bWrong ? 'rgba(232,80,46,0.15)' : 'rgba(255,255,255,0.07)';
+    cx.beginPath(); roundRect(bX, btnTop, (W - 75) / 2, btnH, 14); cx.fill();
+    cx.strokeStyle = bActive ? TEAL : bWrong ? VERM : 'rgba(255,255,255,0.18)';
+    cx.lineWidth = bActive ? 2 : 1;
+    cx.beginPath(); roundRect(bX, btnTop, (W - 75) / 2, btnH, 14); cx.stroke();
+    cx.fillStyle = bActive ? TEAL : WHITE;
+    var bLabel = p.b.length > 12 ? p.b.slice(0, 12) + '…' : p.b;
+    cx.fillText(bLabel, bX + (W - 75) / 4, btnTop + btnH / 2 + 6);
+
+    // "VS" divider
+    cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '800 13px -apple-system, Helvetica, Arial';
+    cx.fillText('vs', W / 2, btnTop + btnH / 2 + 5);
+
+    // Tap prompt (only when waiting)
+    if (pollResult === null && !DEMO && !BOT) {
+      var pulse = 0.5 + 0.5 * Math.sin(now / 300);
+      cx.globalAlpha = 0.4 + 0.3 * pulse;
+      cx.fillStyle = WHITE; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP YOUR PICK', W / 2, btnTop + btnH + 22);
+      cx.globalAlpha = 1;
+    }
+
+    // Result overlay label
+    if (pollResult !== null) {
+      var label = pollResult === 'correct' ? 'YOU CALLED IT' : pollResult === 'timeout' ? 'TIME\'S UP' : 'CROWD SAYS NO';
+      cx.fillStyle = pollResult === 'correct' ? TEAL : VERM;
+      cx.font = '900 20px -apple-system, Helvetica, Arial';
+      cx.fillText(label, W / 2, btnTop + btnH + 26);
+    }
+  }
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Update poll timer
+    if (state.phase === 'play' && pollResult === null) {
+      pollTimer -= dt;
+      if (pollTimer <= 0) timeUp();
+      // Creep bar toward 50/50 initially then toward winner after vote
+      // (subtle live bar animation while waiting)
+      var targetBar = 0.5 + (currentPoll ? (currentPoll.winner === 0 ? 0.02 : -0.02) * ((POLL_DURATION - pollTimer) / POLL_DURATION) : 0);
+      barProgress += (targetBar - barProgress) * 0.02 * dt;
+      // Run autopilot
+      if (hitStop > 0) { hitStop -= dt; } else { autopilot(); }
+    }
+    if (state.phase === 'play' && pollResult !== null) {
+      // Animate bar toward real result
+      var targetFull = currentPoll.winner === 0 ? currentPoll.pct / 100 : (100 - currentPoll.pct) / 100;
+      barProgress += (targetFull - barProgress) * 0.08 * dt;
+      resultTimer -= dt;
+      if (resultTimer <= 0 && pollResult === 'correct') {
+        // move to next poll
+        pollResult = null;
+        nextPoll();
+      }
+    }
+
+    // Juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // Score + streak display
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 56px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 80);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 103);
+      if (state.streak >= 2) {
+        cx.fillStyle = GOLD;
+        cx.font = '700 14px -apple-system, Helvetica, Arial';
+        cx.fillText('🔥 ' + state.streak + ' in a row', W / 2, 126);
+      }
+      // Dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 148);
+      }
+    }
+
+    // Title screen
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = WHITE; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('POLL PREDICT', W / 2, 280);
+      cx.fillStyle = TEAL; cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('pick the winning side', W / 2, 316);
+      cx.fillStyle = VERM; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO START', W / 2, 370); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.28)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('streak ends on one wrong pick', W / 2, 398);
+    }
+
+    // Challenge card (demo beat 1)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 15px Menlo, monospace';
+      cx.fillText('STREAK TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('4', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.32)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 432);
+    }
+
+    // Play phase: poll card
+    if (state.phase === 'play') {
+      drawPollCard(now);
+    }
+
+    // Floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 620 - fl.t * 1.2);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // Game over screen
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('WRONG PICK.', W / 2, 290);
+      cx.fillStyle = WHITE; cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' correct', W / 2, 334);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 378);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of predictors', W / 2, 402);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 448); cx.globalAlpha = 1;
+        // Share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23); cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // Demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = WHITE; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('POLL PREDICT', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.72)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('they called ' + (window.__demoScore || 4) + '. can you top that?', W / 2, 334);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 4), W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432); cx.globalAlpha = 1;
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial'; cx.fillStyle = WHITE;
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

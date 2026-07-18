@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Percentile Chase — Tilt</title>
+<!--
+  LOOP / attention-architecture — Percentile Chase
+  Circuits: 01 RPE, 03 social, 06 Zeigarnik.
+  Modes:
+    ?demo=1&seed=7        scripted viral clip, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay traffic sim, sets window.__botDone
+    ?dare=<score>         incoming challenge from SHARE
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'percentile-chase';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+  var DEMO_TARGET = 84;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function rand(min, max) { return min + (max - min) * rng(); }
+  function randInt(min, max) { return Math.floor(rand(min, max + 1)); }
+  function choose(arr) { return arr[Math.floor(rng() * arr.length)]; }
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134';
+  var LANE_X = [90, W / 2, 315];
+  var PLAYER_Y = 540;
+  var RUN_S = BOT ? 15 : 90;
+
+  var state, tokens, floats, runStartTs, runStartPerf, challengeAt = 0, ctaAt = 0;
+  var hitStop = 0, shakeAmt = 0, zoom = 1, dareBeaten = false;
+  var spawnTimer = 0, best = 0;
+  var demoSpawnedDrop = false;
+  try { best = +localStorage.getItem('pc_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      player: { lane: 1, x: LANE_X[1], pct: 0, combo: 0 },
+      score: 0, maxPct: 0, timeLeft: RUN_S, crossed90: false,
+      overAt: 0
+    };
+    tokens = []; floats = [];
+    spawnTimer = 0; dareBeaten = false;
+    demoSpawnedDrop = false;
+    if (DEMO) {
+      state.phase = 'challenge';
+      state.player.pct = 35;
+      state.maxPct = 35;
+      challengeAt = performance.now();
+      setTimeout(startRun, 1200);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    runStartPerf = performance.now();
+    state.player.pct = DEMO ? 35 : 0;
+    state.player.combo = 0;
+    state.maxPct = DEMO ? 35 : 0;
+    state.timeLeft = RUN_S;
+    state.crossed90 = false;
+    spawnTimer = 0;
+    if (BOT) botActionCount = 0;
+    if (DEMO) {
+      for (var i = 0; i < 3; i++) {
+        var lane = (i + 1) % 3;
+        tokens.push({ lane: lane, x: LANE_X[lane], y: -120 - i * 110, type: 'boost', vy: rand(3, 4.5), w: 38, h: 38, rot: 0, collected: false, near: false });
+      }
+    }
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, 100 - score));
+  }
+
+  function spawnToken() {
+    var r = rng();
+    var type = r < 0.55 ? 'boost' : (r < 0.85 ? 'drop' : 'gold');
+    var lane = randInt(0, 2);
+    var vy = rand(2.8, 4.2) + state.player.pct * 0.018;
+    tokens.push({
+      lane: lane, x: LANE_X[lane], y: -60,
+      type: type, vy: vy,
+      w: type === 'gold' ? 46 : 38, h: type === 'gold' ? 46 : 38,
+      rot: 0, collected: false, near: false
+    });
+    if (window.LOOP) LOOP.emit('token_spawn', { type: type, lane: lane });
+  }
+
+  function collect(t) {
+    t.collected = true;
+    var p = state.player;
+    if (t.type === 'boost') {
+      var gain = 3.2 * (1 + Math.min(p.combo, 10) * 0.12) * (DEMO ? 2.2 : 1);
+      p.pct = Math.min(99, p.pct + gain);
+      p.combo++;
+      if (p.combo >= 5 && window.J) J.perfect(p.combo);
+      else if (window.J) J.hit(p.combo);
+      if (p.combo % 5 === 0) { hitStop = 4; zoom = 1.03; }
+      flash('+' + Math.round(gain) + '%', TEAL, 32);
+      if (window.LOOP) LOOP.emit('token_collected', { type: 'boost', pct: Math.round(p.pct), combo: p.combo });
+    } else if (t.type === 'gold') {
+      var gg = (8 + Math.min(p.combo, 10) * 0.5) * (DEMO ? 2 : 1);
+      p.pct = Math.min(99, p.pct + gg);
+      p.combo = Math.max(p.combo, 5) + 1;
+      hitStop = 6; zoom = 1.05; shakeAmt = 3;
+      flash('GOLD!', GOLD, 42);
+      if (window.J) { J.gold(); J.hit(p.combo); }
+      if (window.LOOP) LOOP.emit('token_collected', { type: 'gold', pct: Math.round(p.pct), combo: p.combo });
+    }
+    if (p.pct > state.maxPct) state.maxPct = p.pct;
+    checkCross90();
+  }
+
+  function hitDrop(t) {
+    t.collected = true;
+    var p = state.player;
+    var before = p.pct;
+    p.pct = Math.max(0, p.pct - 15);
+    p.combo = 0;
+    shakeAmt = 10; zoom = 0.97;
+    flash('−15%', VERM, 40);
+    if (window.J) J.death(Math.min(0.25 + before / 99, 1));
+    if (window.LOOP) LOOP.emit('hazard_hit', { pct_before: Math.round(before), pct_after: Math.round(p.pct) });
+    if (DEMO && demoPhase === 'fail' && state.phase === 'play') setTimeout(gameOver, 180);
+  }
+
+  function checkCross90() {
+    var p = state.player;
+    if (!state.crossed90 && p.pct >= 90) {
+      state.crossed90 = true;
+      flash('TOP 10%', GOLD, 48);
+      if (window.J) J.fanfare();
+      if (window.LOOP) LOOP.emit('percentile_crossed', { pct: 90 });
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    state.score = Math.floor(state.maxPct);
+    var dur = Math.min(RUN_S, (Date.now() - runStartTs) / 1000);
+    var newBest = state.score > best;
+    if (newBest) { best = state.score; try { localStorage.setItem('pc_best', String(best)); } catch (_) {} }
+    if (DEMO) { state.score = DEMO_TARGET; window.__demoScore = DEMO_TARGET; }
+    if (window.J) { J.death(Math.min(0.3 + state.score / 99, 1)); if (newBest || state.score >= 90) setTimeout(function () { J.fanfare(); }, 400); }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+      setTimeout(function () { window.__demoDone = true; }, 3500); }, 2200);
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) window.__botDone = true;
+      else setTimeout(resetRun, 800);
+    }
+  }
+
+  function resetRun() {
+    state.player = { lane: 1, x: LANE_X[1], pct: 0, combo: 0 };
+    state.score = 0; state.maxPct = 0; state.timeLeft = RUN_S; state.crossed90 = false;
+    tokens = []; floats = []; spawnTimer = 0; dareBeaten = false;
+    demoSpawnedDrop = false; botActionCount = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { floats.push({ txt: txt, color: color, size: size, t: 0, x: W / 2, y: PLAYER_Y - 60 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') {
+      if (x === undefined) return;
+      if (x < W / 2) state.player.lane = Math.max(0, state.player.lane - 1);
+      else state.player.lane = Math.min(2, state.player.lane + 1);
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: '%' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  var botRunsDone = 0, botActionCount = 0;
+  var demoWait = 0, demoPhase = 'build', demoNextAt = 0;
+  var demoWaits = [26, 34, 22, 40, 30, 48, 28, 36, 20, 44, 32, 38, 24, 42];
+  var demoIdx = 0;
+
+  function nearestThreat() {
+    var p = state.player, bestT = null, bestD = 1e9;
+    for (var i = 0; i < tokens.length; i++) {
+      var t = tokens[i];
+      if (t.collected) continue;
+      var d = t.y - PLAYER_Y;
+      if (d > -80 && d < bestD) { bestD = d; bestT = t; }
+    }
+    return bestT;
+  }
+
+  function safestLane() {
+    var danger = [0, 0, 0];
+    for (var i = 0; i < tokens.length; i++) {
+      var t = tokens[i];
+      if (t.collected) continue;
+      var d = Math.abs(t.y - PLAYER_Y);
+      if (d < 160) danger[t.lane] += t.type === 'drop' ? 4 : 1;
+    }
+    var safe = [0, 1, 2].sort(function (a, b) { return danger[a] - danger[b]; });
+    return safe[0];
+  }
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    var p = state.player;
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      var now = performance.now();
+      var elapsed = (now - runStartPerf) / 1000;
+      var wantLane = p.lane;
+
+      if (demoPhase === 'build') {
+        if (elapsed > 5.5 && p.pct >= 60) { demoPhase = 'falter'; demoNextAt = now + 1200; }
+        else {
+          var t = nearestThreat();
+          if (t && t.type !== 'drop' && Math.abs(t.y - PLAYER_Y) < 180) wantLane = t.lane;
+          else wantLane = safestLane();
+        }
+      }
+
+      if (demoPhase === 'falter') {
+        // near-fail + recovery: deliberately drift to break combo, then chase
+        if (now < demoNextAt) wantLane = (p.lane + 2) % 3; // opposite lane
+        else {
+          var tt = nearestThreat();
+          if (tt && tt.type !== 'drop' && Math.abs(tt.y - PLAYER_Y) < 200) wantLane = tt.lane;
+          else wantLane = safestLane();
+          if (now > demoNextAt + 1000) { demoPhase = 'climb'; }
+        }
+      }
+
+      if (demoPhase === 'climb') {
+        if (elapsed > 11.5 && p.pct >= 80) { demoPhase = 'fail'; demoNextAt = now + 400; }
+        else {
+          var t2 = nearestThreat();
+          if (t2 && t2.type !== 'drop' && Math.abs(t2.y - PLAYER_Y) < 180) wantLane = t2.lane;
+          else wantLane = safestLane();
+        }
+      }
+
+      if (demoPhase === 'fail') {
+        // hold lane so the scripted drop connects
+        wantLane = p.lane;
+      }
+
+      if (wantLane !== p.lane) {
+        p.lane = wantLane;
+        demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 30;
+        demoIdx++;
+      }
+    } else if (BOT) {
+      // go passive after K actions so the timer runs out (lose-path)
+      var BOT_K = 25;
+      if (botActionCount >= BOT_K) return; // passive — timer drains, game ends naturally
+      var bt = nearestThreat();
+      var targetLane = p.lane;
+      if (bt && bt.type === 'drop' && Math.abs(bt.y - PLAYER_Y) < 140) {
+        // ~18% chance to blunder into the drop instead of dodging
+        if (rng() < 0.18) targetLane = bt.lane;
+        else targetLane = safestLane();
+      } else if (bt && bt.type !== 'drop' && Math.abs(bt.y - PLAYER_Y) < 180) {
+        // ~18% chance to miss the boost
+        if (rng() < 0.82) targetLane = bt.lane;
+      }
+      if (targetLane !== p.lane) {
+        p.lane = targetLane;
+        botActionCount++;
+      }
+    }
+  }
+
+  // ---- render helpers ----
+  function drawArrow(x, y, s, color, up) {
+    cx.save();
+    cx.translate(x, y);
+    if (!up) cx.scale(1, -1);
+    cx.fillStyle = color;
+    cx.beginPath();
+    cx.moveTo(0, -s * 0.65);
+    cx.lineTo(s * 0.5, s * 0.25);
+    cx.lineTo(s * 0.22, s * 0.25);
+    cx.lineTo(s * 0.22, s * 0.65);
+    cx.lineTo(-s * 0.22, s * 0.65);
+    cx.lineTo(-s * 0.22, s * 0.25);
+    cx.lineTo(-s * 0.5, s * 0.25);
+    cx.closePath();
+    cx.fill();
+    cx.restore();
+  }
+
+  function drawToken(t) {
+    var glow = t.type === 'gold' ? 14 : 8;
+    var g = cx.createRadialGradient(t.x, t.y, 2, t.x, t.y, t.w / 2 + glow);
+    if (t.type === 'boost') {
+      g.addColorStop(0, 'rgba(46,197,182,0.35)'); g.addColorStop(1, 'rgba(46,197,182,0)');
+    } else if (t.type === 'drop') {
+      g.addColorStop(0, 'rgba(232,80,46,0.35)'); g.addColorStop(1, 'rgba(232,80,46,0)');
+    } else {
+      g.addColorStop(0, 'rgba(242,177,52,0.45)'); g.addColorStop(1, 'rgba(242,177,52,0)');
+    }
+    cx.fillStyle = g; cx.beginPath(); cx.arc(t.x, t.y, t.w / 2 + glow, 0, Math.PI * 2); cx.fill();
+    if (t.type === 'gold') {
+      cx.fillStyle = GOLD;
+      cx.beginPath();
+      for (var i = 0; i < 5; i++) {
+        var ang = (i * 2 * Math.PI / 5) - Math.PI / 2;
+        var px = t.x + Math.cos(ang) * (t.w / 2);
+        var py = t.y + Math.sin(ang) * (t.w / 2);
+        if (i === 0) cx.moveTo(px, py); else cx.lineTo(px, py);
+        ang = ((i + 0.5) * 2 * Math.PI / 5) - Math.PI / 2;
+        px = t.x + Math.cos(ang) * (t.w / 5);
+        py = t.y + Math.sin(ang) * (t.w / 5);
+        cx.lineTo(px, py);
+      }
+      cx.closePath(); cx.fill();
+      cx.fillStyle = INK; cx.font = '800 12px -apple-system, Helvetica, Arial'; cx.textAlign = 'center';
+      cx.fillText('+', t.x, t.y + 4);
+    } else {
+      drawArrow(t.x, t.y, t.w / 2, t.type === 'boost' ? TEAL : VERM, t.type === 'boost');
+    }
+  }
+
+  function drawPlayer() {
+    var p = state.player;
+    var g = cx.createRadialGradient(p.x, PLAYER_Y, 4, p.x, PLAYER_Y, 34);
+    g.addColorStop(0, 'rgba(255,255,255,0.95)'); g.addColorStop(0.4, 'rgba(46,197,182,0.55)'); g.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = g; cx.beginPath(); cx.arc(p.x, PLAYER_Y, 34, 0, Math.PI * 2); cx.fill();
+    cx.fillStyle = '#fff'; cx.beginPath(); cx.arc(p.x, PLAYER_Y, 10, 0, Math.PI * 2); cx.fill();
+    cx.strokeStyle = TEAL; cx.lineWidth = 2;
+    cx.beginPath(); cx.arc(p.x, PLAYER_Y, 16 + Math.sin(performance.now() / 180) * 2, 0, Math.PI * 2); cx.stroke();
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // simulation
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') {
+      var p = state.player;
+      // smooth lane movement
+      p.x += (LANE_X[p.lane] - p.x) * 0.22 * dt;
+      // percentile drain (gravity — harder to stay at the top)
+      var drain = 0.18 + p.pct * 0.006;
+      p.pct = Math.max(0, p.pct - drain * dt / 60);
+      if (p.pct > state.maxPct) state.maxPct = p.pct;
+
+      // timer
+      state.timeLeft -= (16.667 * dt) / 1000;
+      if (state.timeLeft <= 0) { state.timeLeft = 0; gameOver(); }
+
+      // spawn
+      spawnTimer -= dt;
+      if (spawnTimer <= 0) {
+        spawnToken();
+        spawnTimer = rand(26, 50) - Math.min(12, p.pct * 0.1);
+      }
+
+      // demo fail: guarantee a drop hits the player lane, then end the run
+      if (DEMO && demoPhase === 'fail' && !demoSpawnedDrop && now - demoNextAt > 250) {
+        tokens.push({ lane: p.lane, x: LANE_X[p.lane], y: -50, type: 'drop', vy: 7, w: 38, h: 38, rot: 0, collected: false, near: false });
+        demoSpawnedDrop = true;
+      }
+      if (DEMO && demoPhase === 'fail' && now - demoNextAt > 1800 && state.phase === 'play') gameOver();
+
+      // update tokens / collisions / near-misses
+      for (var i = tokens.length - 1; i >= 0; i--) {
+        var t = tokens[i];
+        t.y += t.vy * dt;
+        if (t.collected) { if (t.y > H + 60) tokens.splice(i, 1); continue; }
+        var dy = t.y - PLAYER_Y;
+        if (t.lane === p.lane && Math.abs(dy) < 28 && !t.collected) {
+          if (t.type === 'drop') hitDrop(t);
+          else collect(t);
+        }
+        // near miss: token in adjacent lane passes close
+        if (!t.collected && !t.near && Math.abs(dy) < 34 && Math.abs(t.lane - p.lane) === 1) {
+          t.near = true;
+          if (window.J) J.near();
+          if (window.LOOP) LOOP.emit('near_miss', { type: t.type, lane: t.lane });
+        }
+        if (t.y > H + 60) {
+          // missed a boost = combo reset (but not a drop)
+          if (t.type !== 'drop' && t.lane === p.lane && !t.collected && p.combo > 0) {
+            p.combo = 0;
+            flash('LOST IT', VERM, 28);
+            if (window.LOOP) LOOP.emit('combo_lost', { at: Math.round(p.pct) });
+          }
+          tokens.splice(i, 1);
+        }
+      }
+
+      // dare banner check
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && Math.floor(state.maxPct) > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score);
+      }
+
+      // demo / bot input
+      autopilot();
+
+      // tension riser scales with percentile height
+      if (window.J) J.tension(Math.min(p.pct / 95, 1));
+    }
+
+    // juice decay
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.1 * dt;
+
+    // draw
+    cx.save();
+    if (shakeAmt > 0.2 || zoom !== 1) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // lanes
+    cx.strokeStyle = 'rgba(255,255,255,0.06)'; cx.lineWidth = 2;
+    for (var i = 0; i < 3; i++) {
+      cx.beginPath(); cx.moveTo(LANE_X[i], 0); cx.lineTo(LANE_X[i], H); cx.stroke();
+    }
+
+    // percentile meter (right rail)
+    var mTop = 90, mH = 540;
+    cx.strokeStyle = 'rgba(255,255,255,0.12)'; cx.lineWidth = 4;
+    cx.beginPath(); cx.moveTo(W - 22, mTop); cx.lineTo(W - 22, mTop + mH); cx.stroke();
+    var fillH = (state.player.pct / 100) * mH;
+    var mg = cx.createLinearGradient(W - 22, mTop + mH - fillH, W - 22, mTop + mH);
+    mg.addColorStop(0, TEAL); mg.addColorStop(0.6, GOLD); mg.addColorStop(1, VERM);
+    cx.strokeStyle = mg; cx.lineWidth = 4;
+    cx.beginPath(); cx.moveTo(W - 22, mTop + mH - fillH); cx.lineTo(W - 22, mTop + mH); cx.stroke();
+    cx.textAlign = 'right'; cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '700 11px Menlo, monospace';
+    cx.fillText('0%', W - 32, mTop + mH + 12);
+    cx.fillText('50%', W - 32, mTop + mH / 2 + 4);
+    cx.fillText('99%', W - 32, mTop + 10);
+
+    // player and tokens
+    for (i = 0; i < tokens.length; i++) drawToken(tokens[i]);
+    drawPlayer();
+
+    // top HUD
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 56px -apple-system, Helvetica, Arial';
+    cx.fillText(Math.floor(state.player.pct) + '%', W / 2, 86);
+    cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '700 13px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + best + '%', W / 2, 112);
+
+    // combo
+    if (state.player.combo > 1) {
+      cx.fillStyle = GOLD; cx.font = '900 ' + (18 + Math.min(state.player.combo, 12) * 1.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText('×' + state.player.combo, W / 2, 145);
+    }
+
+    // timer bar
+    var barW = 280, ratio = Math.max(0, state.timeLeft / RUN_S);
+    cx.fillStyle = 'rgba(255,255,255,0.12)'; cx.fillRect((W - barW) / 2, 160, barW, 6);
+    var tg = cx.createLinearGradient((W - barW) / 2, 0, (W + barW) / 2, 0);
+    tg.addColorStop(0, TEAL); tg.addColorStop(0.5, GOLD); tg.addColorStop(1, VERM);
+    cx.fillStyle = tg; cx.fillRect((W - barW) / 2, 160, barW * ratio, 6);
+
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 196);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('PERCENTILE CHASE', W / 2, 280);
+      cx.fillStyle = TEAL; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP LEFT / RIGHT TO DODGE & CLIMB', W / 2, 330); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('90 seconds. top 10% unlocks the dare.', W / 2, 360);
+    }
+
+    // challenge card (demo)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText(String(DEMO_TARGET), W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // floating text
+    for (var k = floats.length - 1; k >= 0; k--) {
+      var fl = floats[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.35) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 1.2);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) floats.splice(k, 1);
+    }
+
+    // game over card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText(DEMO ? 'FELL BACK.' : 'TIME\'S UP.', W / 2, 295);
+      cx.fillStyle = '#fff'; cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + '% REACHED', W / 2, 340);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 26px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 388);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + state.score + '% of players', W / 2, 414);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE RUN', W / 2, 460);
+        cx.globalAlpha = 1;
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('PERCENTILE CHASE', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('he hit ' + (window.__demoScore || DEMO_TARGET) + '%. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || DEMO_TARGET), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

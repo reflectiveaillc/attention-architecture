@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Rank Roulette — Tilt</title>
+<!--
+  LOOP / attention-architecture — Rank Roulette
+  Circuits: 01-rpe (variable reward roulette), 04-loss (one chance, no retry),
+            02-novelty (unknown multiplier outcome).
+  Mechanic: choose a target score → tap to stop a spinning multiplier →
+            beat your bet to upgrade the dare link; miss = honest result, no retry.
+  Engine: viral.
+  Modes:
+    ?demo=1&seed=7   mirror-neuron arc: challenge card → near-fail → fail → CTA
+    ?bot=1&runs=N    imperfect autopilot, sets window.__botDone
+    ?dare=<n>        incoming challenge — shows "BEAT <n>" banner
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'rank-roulette';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  // The roulette wheel has labeled slots with multipliers.
+  // Player first picks a "bet score" (target), then taps to stop the wheel.
+  // If landed multiplier * roll >= bet → win (dare upgraded); else → loss.
+
+  var SLOTS = [
+    { label: '×0.5',  mult: 0.5,  color: VERM  },
+    { label: '×1',    mult: 1.0,  color: '#888' },
+    { label: '×1.5',  mult: 1.5,  color: TEAL   },
+    { label: '×2',    mult: 2.0,  color: GOLD   },
+    { label: '×3',    mult: 3.0,  color: VERM   },
+    { label: '×1',    mult: 1.0,  color: '#888' },
+    { label: '×0.5',  mult: 0.5,  color: VERM  },
+    { label: '×2',    mult: 2.0,  color: GOLD   },
+    { label: 'BUST',  mult: 0.0,  color: VERM   },
+    { label: '×1.5',  mult: 1.5,  color: TEAL   },
+    { label: '×4',    mult: 4.0,  color: GOLD   },
+    { label: '×1',    mult: 1.0,  color: '#888' },
+  ];
+  var N_SLOTS = SLOTS.length;
+  var WHEEL_R = 140; // radius of wheel
+
+  // phases: title | bet | spin | result | cta
+  var phase, betScore, wheelAngle, wheelSpeed, spinTarget, spinDecay;
+  var resultMult, resultLabel, resultColor, finalScore;
+  var dareBeaten = false;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  var runStartTs;
+  var botRunsDone = 0;
+  var ctaAt = 0, resultAt = 0;
+
+  // bet options the player scrolls through before tapping to lock
+  var BET_OPTIONS = [10, 20, 30, 50, 75, 100, 150, 200];
+  var betIdx = 2; // default to 30
+
+  // base roll: a number 10-40 that forms the "raw score" before multiplier
+  var baseRoll = 0;
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 35))));
+  }
+
+  function newGame() {
+    phase = 'title';
+    betIdx = 2;
+    betScore = BET_OPTIONS[betIdx];
+    wheelAngle = 0;
+    wheelSpeed = 0;
+    spinTarget = -1;
+    spinDecay = 0;
+    resultMult = null;
+    finalScore = 0;
+    dareBeaten = false;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    flashes = [];
+    baseRoll = 0;
+
+    if (DEMO) {
+      // Demo: skip title, go straight to challenge card
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(function () {
+        // after challenge card, start bet phase briefly then auto-spin
+        phase = 'bet';
+        betIdx = 3; betScore = BET_OPTIONS[betIdx]; // bet 50
+        baseRoll = 28; // will yield ~42 base which is close to bet
+        setTimeout(function () {
+          startSpin();
+        }, 800);
+      }, 1300);
+      return;
+    }
+    if (BOT) {
+      phase = 'bet';
+      betIdx = Math.floor(rng() * BET_OPTIONS.length);
+      betScore = BET_OPTIONS[betIdx];
+      baseRoll = 15 + Math.floor(rng() * 30);
+      setTimeout(startSpin, 300);
+    }
+  }
+
+  var challengeAt = 0;
+
+  function startSpin() {
+    if (phase === 'result' || phase === 'cta') return;
+    phase = 'spin';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+
+    // spin fast, then decay to a deterministic landing slot
+    wheelSpeed = 18 + rng() * 8; // degrees per frame initial
+    spinDecay  = 0.972 + rng() * 0.012;
+
+    // pick landing slot — in DEMO we force near-fail then fail on second spin
+    if (DEMO) {
+      // Demo first spin: lands on ×1.5 (close but just under bet of 50 with base 28 → 42 < 50)
+      // We set spinTarget to slot index 2 (×1.5)
+      spinTarget = 2; // ×1.5 → 28*1.5 = 42 < 50 → NEAR-FAIL
+    } else {
+      spinTarget = Math.floor(rng() * N_SLOTS);
+    }
+
+    if (window.J) J.tension(0.4);
+  }
+
+  // Compute the angle at which a given slot index is at the "pointer" (top of wheel)
+  function slotAngleAt(idx) {
+    // Each slot spans 360/N_SLOTS degrees. Slot 0 center is at 0 degrees from top.
+    return (idx / N_SLOTS) * 360;
+  }
+
+  function getSlotAtAngle(angle) {
+    // normalize angle
+    var a = ((angle % 360) + 360) % 360;
+    var idx = Math.floor(a / (360 / N_SLOTS));
+    return idx % N_SLOTS;
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function resolveResult(slotIdx) {
+    var slot = SLOTS[slotIdx];
+    resultMult  = slot.mult;
+    resultLabel = slot.label;
+    resultColor = slot.color;
+
+    if (baseRoll === 0) baseRoll = 15 + Math.floor(rng() * 25);
+    finalScore = Math.round(baseRoll * resultMult);
+
+    var won = finalScore >= betScore && resultMult > 0;
+    var dur = (Date.now() - runStartTs) / 1000;
+
+    if (window.J) {
+      if (resultMult === 0)       J.death(1.0);
+      else if (resultMult >= 3.0) { hitStop = 5; zoom = 1.04; J.gold(); J.fanfare(); }
+      else if (resultMult >= 2.0) { hitStop = 3; zoom = 1.02; J.perfect(2); }
+      else if (won)               J.hit(2);
+      else                        { J.near(); shakeAmt = 6; }
+    }
+
+    if (resultMult === 0)       { flash('BUST!', VERM, 54); shakeAmt = 10; }
+    else if (resultMult >= 3.0) flash('JACKPOT!', GOLD, 50);
+    else if (resultMult >= 2.0) flash('BIG WIN!', TEAL, 46);
+    else if (!won)              flash('SO CLOSE', GOLD, 38);
+
+    // Dare handling
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && finalScore > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(finalScore);
+    }
+
+    if (window.LOOP) LOOP.emit('game_over', { score: finalScore, dur_s: +dur.toFixed(1) });
+    if (window.LOOP) LOOP.emit('spin_result', { mult: resultMult, base: baseRoll, final: finalScore, won: won });
+
+    if (DEMO) {
+      window.__demoScore = finalScore;
+    }
+
+    phase = 'result';
+    resultAt = performance.now();
+
+    if (DEMO) {
+      // show result ~2.2s then go to CTA
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2300);
+    }
+
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetBotRun(); }, 800);
+      }
+    }
+  }
+
+  function resetBotRun() {
+    phase = 'bet';
+    betIdx = Math.floor(rng() * BET_OPTIONS.length);
+    betScore = BET_OPTIONS[betIdx];
+    baseRoll = 15 + Math.floor(rng() * 30);
+    wheelAngle = 0;
+    wheelSpeed = 0;
+    flashes = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    if (window.LOOP) LOOP.emit('restart', {});
+    setTimeout(startSpin, 300);
+  }
+
+  // ---- Input ----
+  var MUTE_R  = { x: W - 46, y: 10,  w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 550, w: 250, h: 46 };
+  var BET_UP_R   = { x: W / 2 + 60, y: 370, w: 50, h: 50 };
+  var BET_DOWN_R = { x: W / 2 - 110, y: 370, w: 50, h: 50 };
+
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+
+    if (phase === 'title') {
+      phase = 'bet';
+      betIdx = 2; betScore = BET_OPTIONS[betIdx];
+      baseRoll = 15 + Math.floor(rng() * 30);
+      return;
+    }
+    if (phase === 'bet') {
+      if (x !== undefined && inR(BET_UP_R, x, y)) {
+        betIdx = Math.min(BET_OPTIONS.length - 1, betIdx + 1);
+        betScore = BET_OPTIONS[betIdx];
+        if (window.J) J.hit(1);
+        return;
+      }
+      if (x !== undefined && inR(BET_DOWN_R, x, y)) {
+        betIdx = Math.max(0, betIdx - 1);
+        betScore = BET_OPTIONS[betIdx];
+        if (window.J) J.hit(1);
+        return;
+      }
+      // Tap anywhere else to spin
+      startSpin();
+      return;
+    }
+    if (phase === 'spin') {
+      // STOP the wheel now — the player's thumb tap is the drop
+      // Instantly find current slot and resolve
+      spinDecay = 0.0; // slam to stop
+      return;
+    }
+    if (phase === 'result' && performance.now() - resultAt > 400) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: finalScore, unit: 'pts' });
+        return;
+      }
+      // restart
+      phase = 'bet';
+      betIdx = 2; betScore = BET_OPTIONS[betIdx];
+      baseRoll = 15 + Math.floor(rng() * 30);
+      wheelAngle = 0; wheelSpeed = 0; flashes = [];
+      hitStop = 0; shakeAmt = 0; zoom = 1;
+      if (window.LOOP) LOOP.emit('restart', {});
+      return;
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- Demo / Bot autopilots ----
+  // Demo script: after spin starts, we let it run and the decay lands us on spinTarget
+  // Bot: just lets the decay land naturally
+
+  var demoPhase2Done = false; // track if demo second spin triggered
+  var demoStopped = false;
+
+  function autopilot(now) {
+    if (DEMO) {
+      if (phase === 'spin') {
+        // Let the physics run — the spin will decay and auto-resolve
+        // We don't need to force-tap in demo; decay handles it
+      }
+    }
+    // BOT: nothing extra needed — decay handles resolution
+  }
+
+  // ---- Render ----
+  var last = performance.now();
+
+  function drawWheel(cx, cx_, cy, angle) {
+    var sliceAngle = (2 * Math.PI) / N_SLOTS;
+    cx.save();
+    cx.translate(cx_, cy);
+
+    // outer ring
+    cx.beginPath();
+    cx.arc(0, 0, WHEEL_R + 8, 0, 2 * Math.PI);
+    cx.fillStyle = 'rgba(255,255,255,0.06)';
+    cx.fill();
+
+    for (var i = 0; i < N_SLOTS; i++) {
+      var startA = angle + i * sliceAngle - Math.PI / 2;
+      var endA   = startA + sliceAngle;
+      var slot   = SLOTS[i];
+      cx.beginPath();
+      cx.moveTo(0, 0);
+      cx.arc(0, 0, WHEEL_R, startA, endA);
+      cx.closePath();
+      cx.fillStyle = slot.mult === 0 ? '#3a0a06' : (slot.mult >= 3 ? '#1a1400' : '#111318');
+      cx.fill();
+      cx.strokeStyle = 'rgba(255,255,255,0.1)';
+      cx.lineWidth = 1;
+      cx.stroke();
+
+      // label
+      var midA = startA + sliceAngle / 2;
+      var tx = Math.cos(midA) * (WHEEL_R * 0.68);
+      var ty = Math.sin(midA) * (WHEEL_R * 0.68);
+      cx.save();
+      cx.translate(tx, ty);
+      cx.rotate(midA + Math.PI / 2);
+      cx.textAlign = 'center';
+      cx.textBaseline = 'middle';
+      cx.fillStyle = slot.color;
+      cx.font = '900 13px -apple-system, Helvetica, Arial';
+      cx.fillText(slot.label, 0, 0);
+      cx.restore();
+    }
+
+    // center hub
+    cx.beginPath();
+    cx.arc(0, 0, 20, 0, 2 * Math.PI);
+    cx.fillStyle = INK;
+    cx.fill();
+    cx.strokeStyle = 'rgba(255,255,255,0.2)';
+    cx.lineWidth = 2;
+    cx.stroke();
+
+    cx.restore();
+
+    // pointer at top
+    var px = cx_, py = cy - WHEEL_R - 14;
+    cx.beginPath();
+    cx.moveTo(px, py);
+    cx.lineTo(px - 10, py - 20);
+    cx.lineTo(px + 10, py - 20);
+    cx.closePath();
+    cx.fillStyle = GOLD;
+    cx.fill();
+  }
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // ---- physics ----
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      autopilot(now);
+
+      if (phase === 'spin') {
+        wheelAngle += wheelSpeed * dt;
+        wheelSpeed *= Math.pow(spinDecay, dt);
+
+        // Tension riser
+        if (window.J) {
+          var t = Math.min(1, (18 - Math.max(0, wheelSpeed)) / 18);
+          J.tension(t);
+        }
+
+        // When speed drops below threshold, snap to spinTarget and resolve
+        if (wheelSpeed < 0.5) {
+          // Snap wheel to land spinTarget at pointer
+          // pointer = top = -90 deg from center = angle offset such that slot sits at top
+          var targetAngleRad = -((spinTarget / N_SLOTS) * 2 * Math.PI);
+          // normalize current angle
+          var curRad = (wheelAngle * Math.PI / 180);
+          // just snap
+          wheelAngle = targetAngleRad * 180 / Math.PI;
+          wheelSpeed = 0;
+
+          // Emit near_miss if multiplier is close but under
+          if (window.LOOP) {
+            var lSlot = SLOTS[spinTarget];
+            var rawResult = baseRoll * lSlot.mult;
+            if (rawResult < betScore && rawResult > betScore * 0.85 && lSlot.mult > 0) {
+              LOOP.emit('near_miss', { base: baseRoll, mult: lSlot.mult, result: rawResult, bet: betScore });
+              if (window.J) J.near();
+            }
+          }
+
+          resolveResult(spinTarget);
+        }
+      }
+    }
+
+    // juice
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.84, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(242,177,52,0.04)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- draw phases ----
+    cx.textAlign = 'center';
+
+    if (phase === 'title') {
+      cx.fillStyle = '#fff';
+      cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('RANK ROULETTE', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('one spin. one score. no retry.', W / 2, 300);
+
+      // Animated wheel preview
+      drawWheel(cx, W / 2, 460, (now / 2000) * Math.PI * 2);
+
+      var pulse = 0.6 + 0.4 * Math.sin(now / 350);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO PLAY', W / 2, 660);
+      cx.globalAlpha = 1;
+    }
+
+    if (phase === 'challenge') {
+      // Demo beat 1: challenge card
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 270);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('42', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 420);
+    }
+
+    if (phase === 'bet') {
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '700 14px Menlo, monospace';
+      cx.fillText('SET YOUR BET', W / 2, 130);
+
+      cx.fillStyle = '#fff';
+      cx.font = '900 76px -apple-system, Helvetica, Arial';
+      cx.fillText(betScore, W / 2, 220);
+
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('target score to beat', W / 2, 248);
+
+      if (!DEMO && !BOT) {
+        // +/- buttons
+        cx.fillStyle = 'rgba(242,177,52,0.15)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(BET_DOWN_R.x, BET_DOWN_R.y, BET_DOWN_R.w, BET_DOWN_R.h, 12);
+        else cx.rect(BET_DOWN_R.x, BET_DOWN_R.y, BET_DOWN_R.w, BET_DOWN_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '900 28px -apple-system, Helvetica, Arial';
+        cx.fillText('−', BET_DOWN_R.x + BET_DOWN_R.w / 2, BET_DOWN_R.y + 36);
+
+        cx.fillStyle = 'rgba(242,177,52,0.15)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(BET_UP_R.x, BET_UP_R.y, BET_UP_R.w, BET_UP_R.h, 12);
+        else cx.rect(BET_UP_R.x, BET_UP_R.y, BET_UP_R.w, BET_UP_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '900 28px -apple-system, Helvetica, Arial';
+        cx.fillText('+', BET_UP_R.x + BET_UP_R.w / 2, BET_UP_R.y + 36);
+      }
+
+      // Wheel preview (slow spin)
+      drawWheel(cx, W / 2, 520, (now / 3000) * Math.PI * 2);
+
+      // CTA
+      var pulse2 = 0.65 + 0.35 * Math.sin(now / 300);
+      cx.globalAlpha = pulse2;
+      cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP ANYWHERE TO SPIN', W / 2, 680);
+      cx.globalAlpha = 1;
+
+      // Dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText('BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 108);
+      }
+    }
+
+    if (phase === 'spin') {
+      // Tension: how close to stopping?
+      var spinProgress = Math.min(1, (18 - Math.max(0, wheelSpeed)) / 18);
+
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '700 14px Menlo, monospace';
+      cx.fillText('SPINNING…', W / 2, 100);
+
+      cx.fillStyle = GOLD;
+      cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('BET: ' + betScore, W / 2, 148);
+
+      drawWheel(cx, W / 2, 430, (wheelAngle * Math.PI / 180));
+
+      // Speed indicator
+      var speedFrac = Math.min(1, wheelSpeed / 26);
+      cx.fillStyle = 'rgba(255,255,255,0.15)';
+      cx.fillRect(W / 2 - 80, 620, 160, 6);
+      cx.fillStyle = speedFrac > 0.6 ? VERM : (speedFrac > 0.3 ? GOLD : TEAL);
+      cx.fillRect(W / 2 - 80, 620, 160 * speedFrac, 6);
+
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 12px Menlo, monospace';
+      cx.fillText(spinProgress > 0.8 ? 'almost…' : 'spinning', W / 2, 646);
+
+      // Dare banner during spin
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare, W / 2, 76);
+      }
+    }
+
+    if (phase === 'result') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+
+      // Show wheel frozen at result
+      drawWheel(cx, W / 2, 300, (wheelAngle * Math.PI / 180));
+
+      // Result overlay
+      var won = finalScore >= betScore && resultMult > 0;
+      cx.fillStyle = won ? TEAL : VERM;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText(won ? 'YOU WIN' : 'NOPE', W / 2, 500);
+
+      cx.fillStyle = '#fff';
+      cx.font = '900 60px -apple-system, Helvetica, Arial';
+      cx.fillText(finalScore + ' pts', W / 2, 558);
+
+      cx.fillStyle = resultColor;
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText(resultLabel + ' × ' + baseRoll + ' = ' + finalScore, W / 2, 588);
+
+      var pt = pctTop(finalScore);
+      cx.fillStyle = GOLD;
+      cx.font = '900 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 618);
+
+      if (!DEMO && !BOT) {
+        // Share button
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W / 2, SHARE_R.y + 30
+        );
+
+        // tap to restart
+        var pr = 0.6 + 0.4 * Math.sin(now / 300);
+        cx.globalAlpha = pr;
+        cx.fillStyle = 'rgba(255,255,255,0.45)';
+        cx.font = '600 13px -apple-system, Helvetica, Arial';
+        cx.fillText('tap anywhere to spin again', W / 2, 612);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    if (phase === 'cta') {
+      // Demo CTA card
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+
+      drawWheel(cx, W / 2, 300, wheelAngle * Math.PI / 180);
+
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('RANK ROULETTE', W / 2, 510);
+
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they scored ' + (window.__demoScore || 42) + '. your move.', W / 2, 548);
+
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM;
+      cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 42), W / 2, 600);
+
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 630);
+
+      cx.globalAlpha = 1;
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 200 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

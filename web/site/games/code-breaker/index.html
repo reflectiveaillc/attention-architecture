@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Code Breaker — Tilt</title>
+<!--
+  LOOP / attention-architecture — Code Breaker
+  Circuits: 06 Zeigarnik (one more digit), 01 RPE (variable word reveals).
+  Conditioned path: tap digits to decode a message, the final word flips the clue.
+  Modes:
+    ?demo=1&seed=7        scripted mirror-neuron run, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay for traffic sim, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'code-breaker';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || (DEMO ? 7 : (BOT ? 5 : 42));
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134';
+  var MAX_ATTEMPTS = 8;
+  var SLOT_W = 72, SLOT_H = 74, KEY_W = 78, KEY_H = 64, KEY_GAP = 12;
+  var KEY_Y0 = 462, KEY_X0 = (W - (3 * KEY_W + 2 * KEY_GAP)) / 2;
+  var SLOT_X0 = (W - (4 * SLOT_W + 3 * 10)) / 2;
+
+  var state, runStartTs, best = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  var challengeAt = 0, ctaAt = 0, overAt = 0;
+  var flashes = [];
+  try { best = +localStorage.getItem('cb_best') || 0; } catch (_) {}
+
+  var WORD_POOLS = [
+    ['THE', 'YOUR', 'THIS', 'NO'],
+    ['LAST', 'SECRET', 'NEXT', 'WINNING'],
+    ['WORD', 'CODE', 'MOVE', 'DIGIT'],
+    ['CHANGES', 'UNLOCKS', 'REVEALS', 'WINS']
+  ];
+
+  function pickWord(slot) {
+    var pool = WORD_POOLS[slot];
+    return pool[Math.floor(rng() * pool.length)];
+  }
+
+  function newGame() {
+    var digits = [0,1,2,3,4,5,6,7,8,9];
+    // Fisher-Yates with seeded rng
+    for (var i = digits.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = digits[i]; digits[i] = digits[j]; digits[j] = tmp;
+    }
+    var code = digits.slice(0, 4);
+    var words = [pickWord(0), pickWord(1), pickWord(2), pickWord(3)];
+    state = {
+      phase: 'title',
+      code: code,
+      words: words,
+      revealed: [false, false, false, false],
+      locked: [null, null, null, null],
+      attempts: MAX_ATTEMPTS,
+      current: [],
+      history: [],
+      score: 0,
+      solved: false
+    };
+    flashes = []; dareBeaten = false;
+    if (DEMO) {
+      buildDemoScript();
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1200);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    state.current = [];
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function scoreFor(revealedCount, attemptsLeft, solved) {
+    var base = revealedCount * 1000;
+    var leftover = attemptsLeft * 100;
+    return solved ? base + leftover + 500 : base;
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 1500))));
+  }
+
+  function submitGuess() {
+    if (state.phase !== 'play' || state.current.length !== 4) return;
+    var guess = state.current.slice();
+    var correctPositions = 0, nearPositions = 0;
+    var newlyRevealed = [];
+    for (var i = 0; i < 4; i++) {
+      if (guess[i] === state.code[i]) {
+        correctPositions++;
+        if (!state.revealed[i]) {
+          state.revealed[i] = true;
+          state.locked[i] = guess[i];
+          newlyRevealed.push(i);
+        }
+      } else if (state.code.indexOf(guess[i]) >= 0) {
+        nearPositions++;
+      }
+    }
+    state.attempts--;
+    state.history.push({ guess: guess, correct: correctPositions, near: nearPositions });
+
+    // juice / sound
+    if (newlyRevealed.length > 0) {
+      if (window.J) {
+        if (newlyRevealed.length === 4) J.perfect(1);
+        else J.hit(newlyRevealed.length);
+      }
+      hitStop = newlyRevealed.length === 4 ? 6 : 4;
+      zoom = newlyRevealed.length >= 2 ? 1.03 : 1.015;
+      for (var k = 0; k < newlyRevealed.length; k++) {
+        flash('+' + state.words[newlyRevealed[k]], TEAL, 40);
+      }
+      if (window.LOOP) {
+        for (var kk = 0; kk < newlyRevealed.length; kk++) {
+          LOOP.emit('word_revealed', { slot: newlyRevealed[kk], word: state.words[newlyRevealed[kk]] });
+        }
+      }
+    }
+    if (nearPositions > 0 && correctPositions === 0 && newlyRevealed.length === 0) {
+      if (window.J) J.near();
+      flash('SO CLOSE', VERM, 36);
+      if (window.LOOP) LOOP.emit('near_miss', { guess: guess.join(''), near: nearPositions });
+    }
+    if (correctPositions === 0 && nearPositions === 0 && newlyRevealed.length === 0) {
+      shakeAmt = 3;
+    }
+    if (window.J) J.tension(Math.min(1, 1 - state.attempts / MAX_ATTEMPTS));
+
+    state.current = [];
+
+    if (state.revealed.every(Boolean)) {
+      state.solved = true;
+      state.score = scoreFor(4, state.attempts, true);
+      flash('CRACKED!', GOLD, 52);
+      if (window.J) { J.fanfare(); J.tension(0); }
+      hitStop = 8; zoom = 1.04;
+      gameOver();
+      return;
+    }
+
+    if (state.attempts <= 0) {
+      state.score = scoreFor(state.revealed.filter(Boolean).length, 0, false);
+      gameOver();
+      return;
+    }
+
+    if (window.LOOP) LOOP.emit('guess_submit', { guess: guess.join(''), correct: correctPositions, near: nearPositions, attempts_left: state.attempts });
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    overAt = performance.now();
+    shakeAmt = state.solved ? 2 : 8;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (newBest) { best = state.score; try { localStorage.setItem('cb_best', String(best)); } catch (_) {} }
+    if (window.J) {
+      if (!state.solved) J.death(Math.min(0.4 + state.score / 5000, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+      J.tension(0);
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), solved: state.solved });
+    if (DEMO) {
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 900);
+    }
+  }
+
+  function resetRun() {
+    var digits = [0,1,2,3,4,5,6,7,8,9];
+    for (var i = digits.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = digits[i]; digits[i] = digits[j]; digits[j] = tmp;
+    }
+    state.code = digits.slice(0, 4);
+    state.words = [pickWord(0), pickWord(1), pickWord(2), pickWord(3)];
+    state.revealed = [false, false, false, false];
+    state.locked = [null, null, null, null];
+    state.attempts = MAX_ATTEMPTS;
+    state.current = [];
+    state.history = [];
+    state.score = 0;
+    state.solved = false;
+    flashes = [];
+    dareBeaten = false;
+    botTried = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- demo script builder ----
+  var demoScript = [], demoWaits = [], demoStep = 0, demoSub = 0, demoWait = 0;
+  function codeSet() { return state.code.reduce(function (s, d) { s[d] = true; return s; }, {}); }
+  function firstNotIn(set) { for (var d = 0; d <= 9; d++) if (!set[d]) return d; return 0; }
+  function digitNotIn(set, avoid, used) {
+    var opts = [];
+    for (var d = 0; d <= 9; d++) if (!set[d] && d !== avoid && (!used || used.indexOf(d) < 0)) opts.push(d);
+    return opts.length ? opts[Math.floor(rng() * opts.length)] : 0;
+  }
+  function buildDemoScript() {
+    var set = codeSet();
+    var used1 = [];
+    var allWrong = firstNotIn(set);
+    used1.push(allWrong);
+    // guess 1: completely wrong
+    var g1 = [allWrong, digitNotIn(set, allWrong, used1), digitNotIn(set, allWrong, used1), digitNotIn(set, allWrong, used1)];
+    // guess 2: one code digit in wrong slot (near-miss)
+    var nearDigit = state.code[1];
+    var used2 = [];
+    var g2 = [nearDigit, digitNotIn(set, nearDigit, used2), digitNotIn(set, nearDigit, used2), digitNotIn(set, nearDigit, used2)];
+    // guess 3 & 4: wrong
+    var used3 = [], used4 = [];
+    var g3 = [digitNotIn(set, undefined, used3), digitNotIn(set, undefined, used3), digitNotIn(set, undefined, used3), digitNotIn(set, undefined, used3)];
+    var g4 = [digitNotIn(set, undefined, used4), digitNotIn(set, undefined, used4), digitNotIn(set, undefined, used4), digitNotIn(set, undefined, used4)];
+    // recovery guess 5: 2 correct positions, 2 wrong
+    var used5 = [];
+    var g5 = [state.code[0], state.code[1], digitNotIn(set, undefined, used5), digitNotIn(set, undefined, used5)];
+    // guess 6: wrong (tension, 2 left)
+    var used6 = [];
+    var g6 = [digitNotIn(set, undefined, used6), digitNotIn(set, undefined, used6), digitNotIn(set, undefined, used6), digitNotIn(set, undefined, used6)];
+    // guess 7: wrong (near-fail, 1 left)
+    var used7 = [];
+    var g7 = [digitNotIn(set, undefined, used7), digitNotIn(set, undefined, used7), digitNotIn(set, undefined, used7), digitNotIn(set, undefined, used7)];
+    // guess 8: fail (0 left)
+    var used8 = [];
+    var g8 = [digitNotIn(set, undefined, used8), digitNotIn(set, undefined, used8), digitNotIn(set, undefined, used8), digitNotIn(set, undefined, used8)];
+    demoScript = [g1, g2, g3, g4, g5, g6, g7, g8];
+    // varied human hesitation per key + submit (keeps total demo ~20s)
+    demoWaits = [
+      [30, 18, 24, 16, 24],
+      [22, 20, 28, 14, 26],
+      [32, 18, 22, 24, 22],
+      [18, 22, 26, 20, 28],
+      [40, 16, 20, 14, 22], // recovery: tense pause then quick
+      [26, 20, 24, 18, 20],
+      [22, 18, 22, 16, 18],
+      [20, 16, 20, 14, 16]  // final fail
+    ];
+    demoStep = 0; demoSub = 0; demoWait = demoWaits[0][0];
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 520, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function keyAt(x, y) {
+    // keypad rows: 1 2 3 / 4 5 6 / 7 8 9 / DEL 0 ENTER
+    for (var row = 0; row < 3; row++) {
+      for (var col = 0; col < 3; col++) {
+        var kx = KEY_X0 + col * (KEY_W + KEY_GAP);
+        var ky = KEY_Y0 + row * (KEY_H + 10);
+        if (inR({ x: kx, y: ky, w: KEY_W, h: KEY_H }, x, y)) return String(1 + col + row * 3);
+      }
+    }
+    var y4 = KEY_Y0 + 3 * (KEY_H + 10);
+    if (inR({ x: KEY_X0, y: y4, w: KEY_W, h: KEY_H }, x, y)) return 'DEL';
+    if (inR({ x: KEY_X0 + KEY_W + KEY_GAP, y: y4, w: KEY_W, h: KEY_H }, x, y)) return '0';
+    if (inR({ x: KEY_X0 + 2 * (KEY_W + KEY_GAP), y: y4, w: KEY_W, h: KEY_H }, x, y)) return 'ENT';
+    return null;
+  }
+
+  function tapKey(key) {
+    if (state.phase !== 'play') return;
+    if (key === 'DEL') { if (state.current.length > 0) state.current.pop(); return; }
+    if (key === 'ENT') { submitGuess(); return; }
+    if (state.current.length < 4) state.current.push(+key);
+  }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title' || state.phase === 'challenge') { startRun(); return; }
+    if (state.phase === 'play') {
+      var k = keyAt(x, y);
+      if (k) tapKey(k);
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'digits' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (DEMO || BOT) return;
+    if (e.code === 'Space') { if (state.phase === 'title' || state.phase === 'challenge') startRun(); }
+    if (e.key >= '0' && e.key <= '9') tapKey(e.key);
+    if (e.key === 'Backspace') tapKey('DEL');
+    if (e.key === 'Enter') tapKey('ENT');
+  });
+
+  // ---- demo / bot autopilots ----
+  var botRunsDone = 0;
+  var botTried = [];
+  function botGuess() {
+    var out;
+    do {
+      out = [];
+      var digits = [0,1,2,3,4,5,6,7,8,9];
+      for (var i = digits.length - 1; i > 0; i--) {
+        var j = Math.floor(rng() * (i + 1));
+        var tmp = digits[i]; digits[i] = digits[j]; digits[j] = tmp;
+      }
+      out = digits.slice(0, 4);
+    } while (botTried.indexOf(out.join('')) >= 0);
+    botTried.push(out.join(''));
+    return out;
+  }
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      if (demoStep >= demoScript.length) return;
+      var guess = demoScript[demoStep];
+      if (demoSub < 4) {
+        state.current.push(guess[demoSub]);
+        if (window.J && demoSub === 0) J.hit(1); // subtle click on first digit
+        demoSub++;
+        demoWait = demoWaits[demoStep][demoSub] || 0;
+      } else {
+        submitGuess();
+        demoStep++;
+        demoSub = 0;
+        if (demoStep < demoScript.length) demoWait = demoWaits[demoStep][0];
+      }
+    } else if (BOT) {
+      if (state.current.length === 0) {
+        var bg = botGuess();
+        state.current = bg;
+      }
+      if (state.current.length === 4) submitGuess();
+    }
+  }
+
+  // ---- render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    if (hitStop > 0) hitStop -= dt;
+    else if (state.phase === 'play') autopilot();
+
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)'); bg.addColorStop(1, 'rgba(232,80,46,0.08)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // title / header
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 38px -apple-system, Helvetica, Arial';
+    cx.fillText('CODE BREAKER', W / 2, 60);
+
+    // word slots
+    var slotY = 128;
+    for (var i = 0; i < 4; i++) {
+      var sx = SLOT_X0 + i * (SLOT_W + 10);
+      cx.fillStyle = state.revealed[i] ? 'rgba(46,197,182,0.18)' : 'rgba(255,255,255,0.06)';
+      cx.strokeStyle = state.revealed[i] ? TEAL : 'rgba(255,255,255,0.18)';
+      cx.lineWidth = 2;
+      roundRect(sx, slotY, SLOT_W, SLOT_H, 8);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = state.revealed[i] ? TEAL : 'rgba(255,255,255,0.25)';
+      cx.font = state.revealed[i] ? '800 22px -apple-system, Helvetica, Arial' : '800 30px -apple-system, Helvetica, Arial';
+      var label = state.revealed[i] ? state.words[i] : (state.locked[i] !== null ? state.locked[i] : '—');
+      cx.fillText(label, sx + SLOT_W / 2, slotY + (state.revealed[i] ? 34 : 46));
+      if (state.revealed[i]) {
+        cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '700 11px Menlo, monospace';
+        cx.fillText(state.locked[i], sx + SLOT_W / 2, slotY + 58);
+      }
+    }
+
+    // clue line
+    cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('CRACK THE CODE. READ THE MESSAGE.', W / 2, 236);
+
+    // attempts + current guess
+    cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText(state.attempts + ' GUESSES LEFT', W / 2, 284);
+
+    // current entry boxes
+    var curY = 310;
+    for (var ci = 0; ci < 4; ci++) {
+      var cx_ = SLOT_X0 + ci * (SLOT_W + 10);
+      cx.fillStyle = ci < state.current.length ? 'rgba(242,177,52,0.15)' : 'rgba(255,255,255,0.04)';
+      cx.strokeStyle = ci < state.current.length ? GOLD : 'rgba(255,255,255,0.12)';
+      cx.lineWidth = 2;
+      roundRect(cx_, curY, SLOT_W, 48, 6);
+      cx.fill(); cx.stroke();
+      if (ci < state.current.length) {
+        cx.fillStyle = GOLD; cx.font = '800 26px Menlo, monospace';
+        cx.fillText(state.current[ci], cx_ + SLOT_W / 2, curY + 34);
+      }
+    }
+
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 388);
+    }
+
+    // keypad
+    drawKeypad();
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // title card
+    if (state.phase === 'title') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('CODE BREAKER', W / 2, 300);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.globalAlpha = pulse; cx.fillText('TAP TO START', W / 2, 350); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('decode the message. the last word wins.', W / 2, 380);
+      cx.fillStyle = GOLD; cx.font = '800 20px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 420);
+    }
+
+    // challenge card (demo)
+    if (state.phase === 'challenge') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      var demoTarget = 2000;
+      cx.fillStyle = GOLD; cx.font = '900 80px -apple-system, Helvetica, Arial';
+      cx.fillText(String(demoTarget), W / 2, 395);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 425);
+    }
+
+    // game over card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = state.solved ? TEAL : VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText(state.solved ? 'CRACKED IT.' : 'LOCKED OUT.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' pts', W / 2, 345);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 470);
+        cx.globalAlpha = 1;
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('CODE BREAKER', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they scored ' + (window.__demoScore || 2000) + '. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 2000), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  function roundRect(x, y, w, h, r) {
+    cx.beginPath();
+    if (cx.roundRect) { cx.roundRect(x, y, w, h, r); return; }
+    var rr = Math.min(r, w / 2, h / 2);
+    cx.beginPath();
+    cx.moveTo(x + rr, y);
+    cx.arcTo(x + w, y, x + w, y + h, rr);
+    cx.arcTo(x + w, y + h, x, y + h, rr);
+    cx.arcTo(x, y + h, x, y, rr);
+    cx.arcTo(x, y, x + w, y, rr);
+    cx.closePath();
+  }
+
+  function drawKeypad() {
+    var labels = [['1','2','3'],['4','5','6'],['7','8','9']];
+    for (var row = 0; row < 3; row++) {
+      for (var col = 0; col < 3; col++) {
+        drawKey(KEY_X0 + col * (KEY_W + KEY_GAP), KEY_Y0 + row * (KEY_H + 10), KEY_W, KEY_H, labels[row][col]);
+      }
+    }
+    var y4 = KEY_Y0 + 3 * (KEY_H + 10);
+    drawKey(KEY_X0, y4, KEY_W, KEY_H, 'DEL', 12);
+    drawKey(KEY_X0 + KEY_W + KEY_GAP, y4, KEY_W, KEY_H, '0');
+    drawKey(KEY_X0 + 2 * (KEY_W + KEY_GAP), y4, KEY_W, KEY_H, 'ENTER', 11, VERM);
+  }
+
+  function drawKey(x, y, w, h, label, fontSize, accent) {
+    cx.fillStyle = accent ? 'rgba(232,80,46,0.18)' : 'rgba(255,255,255,0.07)';
+    cx.strokeStyle = accent ? 'rgba(232,80,46,0.5)' : 'rgba(255,255,255,0.15)';
+    cx.lineWidth = 1.5;
+    roundRect(x, y, w, h, 10);
+    cx.fill(); cx.stroke();
+    cx.textAlign = 'center'; cx.fillStyle = accent || '#fff';
+    cx.font = '800 ' + (fontSize || 22) + 'px -apple-system, Helvetica, Arial';
+    cx.fillText(label, x + w / 2, y + h / 2 + 8);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

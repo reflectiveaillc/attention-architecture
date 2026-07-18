@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Leaderboard Climb — Tilt</title>
+<!--
+  LOOP / attention-architecture — Leaderboard Climb
+  Conditioned path: leaderboard rank envy (Instagram/TikTok). The player's thumb
+  already knows this move — the game IS that move.
+  Circuits: 03 social (rank comparison), 01 RPE (climbing reward), 04 loss (the rank you'll lose).
+  Modes:
+    ?demo=1&seed=7        scripted run for clip capture, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay for traffic sim, sets window.__botDone
+    ?dare=<n>[&by=name]   incoming challenge
+    ?clip=ID&src=tiktok   attribution
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'leaderboard-climb';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var START_RANK = 50, MAX_ENERGY = 100;
+  var ENERGY_REGEN = 0.18;          // per frame dt=1
+  var COST_BASE = 6, COST_STEP = 0.55;
+  var HES_BASE = 92, HES_STEP = 1.35, HES_MIN = 24;
+  var RIVAL_WARN = 0.34;            // fraction where rival row starts glowing
+  var PASS_COST_BASE = 7, PASS_COST_STEP = 3, PASS_COST_MAX = 25;
+
+  var FIRST = ['alex','jordan','taylor','morgan','casey','riley','quinn','avery','skyler','dakota','reese','rowan','finley','jessie','marley','kendall','drew','ellis','sawyer','hayden','bailey','cameron','luca','micah','nico','remy','sage','shay','parker','kai','river','phoenix','teagan','sloan','emerson','wren','hollis','arden','lennox','blair'];
+  var LAST = ['x','vibes','lol','truth','daily','hour','feed','mood','club','hive','mode','wave','loop','byte','nova','echo','pulse','spark','drift','rise','cast','thread','grid','flux','apex','zone','snap','rush','peak','climb','rank','hunt','quest','dash','bolt','frost','beam','surf','tone','glitch'];
+
+  function nameAt(i) {
+    var f = FIRST[i % FIRST.length];
+    var li = Math.floor(i / FIRST.length) % LAST.length;
+    var suffix = Math.floor(i / (FIRST.length * LAST.length));
+    return f + '.' + LAST[li] + (suffix ? suffix : '');
+  }
+  function valueAt(i) {
+    var base = 98000 - i * 1850;
+    var jitter = Math.floor(((mulberry32(i * 374761 + SEED)() - 0.5) * 400));
+    return Math.max(100, base + jitter);
+  }
+  function avatarHue(i) { return Math.floor(mulberry32(i * 918273 + SEED)() * 360); }
+
+  var state, flashes, runStartTs, best = 0;
+  var hitStop = 0, zoom = 1, dareBeaten = false, shakeAmt = 0, challengeAt = 0, ctaAt = 0;
+  try { best = +localStorage.getItem('lc_best') || 0; } catch (_) {}
+
+  function pctTop(score) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 9)))); }
+  function costFor(score) { return Math.min(40, COST_BASE + score * COST_STEP); }
+  function maxHesFor(score) { return Math.max(HES_MIN, HES_BASE - score * HES_STEP); }
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      rank: START_RANK,
+      startRank: START_RANK,
+      energy: MAX_ENERGY,
+      hesitation: maxHesFor(0),
+      maxHes: maxHesFor(0),
+      score: 0,
+      combo: 0,
+      overAt: 0,
+      lastClimbAt: 0,
+      rivalFlash: 0,
+      passChain: 0,
+      failReason: 'fell'
+    };
+    flashes = []; dareBeaten = false;
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { botRunsDone = 0; startRun(); }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.rank = START_RANK;
+    state.energy = MAX_ENERGY;
+    state.hesitation = state.maxHes = maxHesFor(0);
+    state.score = 0;
+    state.combo = 0;
+    state.passChain = 0;
+    state.failReason = 'fell';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function climb() {
+    if (state.phase !== 'play') return;
+    var cost = costFor(state.score);
+    var canAfford = state.energy >= cost;
+    // humans can't overexert; autopilots may burn out for scripted spectacle
+    if (!canAfford && !DEMO && !BOT) {
+      flash('NEED ENERGY', VERM, 28);
+      shakeAmt = 2;
+      if (window.J) J.near();
+      return;
+    }
+    var wasClose = state.maxHes > 0 && state.hesitation <= state.maxHes * 0.18;
+    state.energy -= cost;
+    state.rank--;
+    state.score++;
+    state.combo++;
+    state.hesitation = state.maxHes = maxHesFor(state.score);
+    state.passChain = 0;
+    state.lastClimbAt = performance.now();
+    hitStop = 3; zoom = 1.025;
+    flash('+1 RANK', GOLD, 36);
+    if (window.J) { J.hit(state.combo); J.tension(Math.min(state.score / 25, 1)); }
+    if (window.LOOP) LOOP.emit('rank_climbed', { rank: state.rank, score: state.score, energy: Math.round(state.energy) });
+    if (wasClose) {
+      if (window.LOOP) LOOP.emit('near_miss', { score: state.score, hesitation_pct: 0.18 });
+      flash('SO CLOSE', TEAL, 32);
+    }
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+    if (!canAfford) {
+      state.failReason = 'burned';
+      flash('BURNED OUT', VERM, 40);
+      if (window.J) J.death(0.6);
+      gameOver();
+    }
+  }
+
+  function rivalPass() {
+    if (state.phase !== 'play') return;
+    var passCost = Math.min(PASS_COST_MAX, PASS_COST_BASE + state.passChain * PASS_COST_STEP);
+    state.energy -= passCost;
+    state.rank++;
+    state.score = Math.max(0, state.startRank - state.rank);
+    state.combo = 0;
+    state.passChain++;
+    state.hesitation = state.maxHes = maxHesFor(state.score);
+    state.rivalFlash = 12;
+    state.failReason = 'fell';
+    shakeAmt = 4 + Math.min(5, state.passChain);
+    flash('RE-PASSED', VERM, 32);
+    if (window.J) { J.near(); J.tension(Math.min(state.passChain / 6, 1)); }
+    if (window.LOOP) LOOP.emit('rank_dropped', { rank: state.rank, score: state.score, passes: state.passChain });
+    if (state.energy <= 0 || state.rank >= state.startRank || state.passChain >= 4) gameOver();
+  }
+
+  function gameOver() {
+    if (state.phase === 'over') return;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 11; zoom = 1.04;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) { J.death(Math.min(0.35 + state.score / 12, 1)); J.tension(0); if (newBest) setTimeout(function () { J.fanfare(); }, 450); }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('lc_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), reason: state.failReason });
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) window.__botDone = true;
+      else setTimeout(function () { resetRun(); }, 900);
+    }
+  }
+
+  function resetRun() {
+    state.rank = START_RANK; state.score = 0; state.combo = 0;
+    state.energy = MAX_ENERGY; state.hesitation = state.maxHes = maxHesFor(0);
+    state.passChain = 0; state.failReason = 'fell'; flashes = []; dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 508, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { climb(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'rank' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') { e.preventDefault(); tap(); } });
+
+  // ---- demo / bot autopilots ----
+  var DEMO_TARGET = 14;
+  // 15 climbs + scripted fail; the long wait at index 9 is the near-fail + recovery (~60%)
+  var demoPlan = [
+    { wait: 26, act: 'climb' }, { wait: 22, act: 'climb' }, { wait: 30, act: 'climb' },
+    { wait: 24, act: 'climb' }, { wait: 28, act: 'climb' }, { wait: 26, act: 'climb' },
+    { wait: 24, act: 'climb' }, { wait: 30, act: 'climb' }, { wait: 22, act: 'climb' },
+    { wait: 95, act: 'climb' }, // near-fail: hesitation drains close to zero, then save
+    { wait: 26, act: 'climb' }, { wait: 24, act: 'climb' }, { wait: 20, act: 'climb' },
+    { wait: 18, act: 'climb' }, { wait: 16, act: 'climb' },
+    { wait: 68, act: 'fail' }   // real fail: rival glows, then cut to over card
+  ];
+  var demoIdx = 0, demoWait = 0;
+  var botRunsDone = 0, botWait = 0;
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    if (DEMO) {
+      if (demoIdx >= demoPlan.length) return;
+      if (demoWait > 0) { demoWait--; return; }
+      var step = demoPlan[demoIdx];
+      if (step.act === 'climb') climb();
+      else if (step.act === 'fail') {
+        // spectacle: let the rival row glow for the wait, then game over
+        state.failReason = 'fell';
+        gameOver();
+      }
+      demoIdx++;
+      demoWait = demoIdx < demoPlan.length ? demoPlan[demoIdx].wait : 0;
+    } else if (BOT) {
+      if (botWait > 0) { botWait--; return; }
+      var frac = state.hesitation / state.maxHes;
+      var cost = costFor(state.score);
+      var panic = frac < 0.35 && state.energy >= cost;
+      if (panic) {
+        if (rng() < 0.10) { botWait = 10 + Math.floor(rng() * 12); return; } // hesitation blunder
+        climb();
+      }
+      botWait = 5 + Math.floor(rng() * 10);
+    }
+  }
+
+  // ---- render helpers ----
+  function barColor(f) { return f > 0.5 ? TEAL : f > 0.25 ? GOLD : VERM; }
+  function rr(x, y, w, h, r) { if (cx.roundRect) cx.roundRect(x, y, w, h, r); else cx.rect(x, y, w, h); }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // sim: hit-stop freezes the board but always decays; never gate autopilot without decay
+    if (hitStop > 0) hitStop -= dt;
+    else if (state.phase === 'play') {
+      state.energy = Math.min(MAX_ENERGY, state.energy + ENERGY_REGEN * dt);
+      state.hesitation -= dt;
+      if (state.hesitation <= 0) { state.hesitation = 0; rivalPass(); }
+      else autopilot();
+    }
+    if (state.rivalFlash > 0) state.rivalFlash -= dt;
+
+    // juice transforms: wrap the whole frame draw in save/restore
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(232,80,46,0.08)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // energy bar
+    var eFrac = state.energy / MAX_ENERGY;
+    cx.fillStyle = 'rgba(255,255,255,0.08)'; rr(20, 14, 365, 11, 6); cx.fill();
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.fillStyle = barColor(eFrac);
+      rr(20, 14, Math.max(0, 365 * eFrac), 11, 6); cx.fill();
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '700 9px Menlo, monospace';
+      cx.textAlign = 'center'; cx.fillText('ENERGY', W / 2, 24);
+    }
+
+    // header rank / score
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '700 12px Menlo, monospace';
+      cx.fillText('YOUR RANK', W / 2, 64);
+      cx.fillStyle = '#fff'; cx.font = '900 72px -apple-system, Helvetica, Arial';
+      cx.fillText('#' + state.rank, W / 2, 130);
+      cx.fillStyle = GOLD; cx.font = '800 18px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' RANKS CLIMBED', W / 2, 158);
+      cx.textAlign = 'right';
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W - 20, 64);
+      // incoming dare banner
+      cx.textAlign = 'center';
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 184);
+      }
+    }
+
+    // leaderboard rows
+    if (state.phase !== 'title' && state.phase !== 'challenge') {
+      var rowH = 54, gap = 6, centerY = 380, playerIdx = 5, rows = 9;
+      var topIdx = state.rank - playerIdx;
+      var rivalFrac = 1 - Math.min(1, state.hesitation / Math.max(state.maxHes * RIVAL_WARN, 0.001));
+      for (var i = 0; i < rows; i++) {
+        var rRank = topIdx + i;
+        if (rRank < 1) continue;
+        var isPlayer = (i === playerIdx);
+        var y = centerY + (i - playerIdx) * (rowH + gap);
+        if (y < 210 || y > H - 20) continue;
+        var rc = isPlayer ? 'rgba(242,177,52,0.16)' : (i === 6 && rivalFrac > 0 ? 'rgba(232,80,46,' + (0.08 + rivalFrac * 0.18) + ')' : 'rgba(255,255,255,0.04)');
+        cx.fillStyle = rc;
+        rr(18, y, 369, rowH, 10); cx.fill();
+        cx.lineWidth = isPlayer ? 2.2 : 1;
+        cx.strokeStyle = isPlayer ? GOLD : (i === 6 && rivalFrac > 0.5) ? VERM : 'rgba(255,255,255,0.08)';
+        if (isPlayer) cx.globalAlpha = 0.5 + 0.5 * Math.sin(now / 180);
+        rr(18.5, y + 0.5, 368, rowH - 1, 10); cx.stroke();
+        cx.globalAlpha = 1;
+
+        // rank number
+        cx.textAlign = 'left'; cx.textBaseline = 'middle';
+        cx.fillStyle = isPlayer ? GOLD : 'rgba(255,255,255,0.55)'; cx.font = '800 15px Menlo, monospace';
+        cx.fillText('#' + rRank, 34, y + rowH / 2);
+
+        // avatar
+        var hue = isPlayer ? 45 : avatarHue(rRank);
+        cx.beginPath(); cx.arc(98, y + rowH / 2, 16, 0, Math.PI * 2);
+        cx.fillStyle = 'hsl(' + hue + ',65%,55%)'; cx.fill();
+        cx.fillStyle = '#0b0d12'; cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText(isPlayer ? 'Y' : nameAt(rRank).charAt(0).toUpperCase(), 98, y + rowH / 2 + 1);
+
+        // name
+        cx.textAlign = 'left';
+        cx.fillStyle = isPlayer ? '#fff' : 'rgba(255,255,255,0.82)'; cx.font = (isPlayer ? '700' : '600') + ' 15px -apple-system, Helvetica, Arial';
+        cx.fillText(isPlayer ? 'YOU' : nameAt(rRank), 126, y + rowH / 2);
+
+        // value
+        cx.textAlign = 'right';
+        cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '600 12px Menlo, monospace';
+        cx.fillText(valueAt(rRank).toLocaleString(), 371, y + rowH / 2);
+
+        // rival closing-in bar on the row immediately below player
+        if (i === 6 && rivalFrac > 0) {
+          cx.fillStyle = VERM; cx.globalAlpha = 0.5 + 0.5 * Math.sin(now / 90);
+          rr(18, y + rowH - 4, 369 * rivalFrac, 4, 2); cx.fill();
+          cx.globalAlpha = 1;
+        }
+      }
+      cx.textBaseline = 'alphabetic';
+
+      // combo
+      if (state.phase === 'play' && state.combo > 2) {
+        cx.textAlign = 'center';
+        cx.fillStyle = TEAL; cx.font = '900 22px -apple-system, Helvetica, Arial';
+        cx.fillText('×' + state.combo, W / 2, 640);
+      }
+      // hint
+      if (state.phase === 'play') {
+        cx.textAlign = 'center';
+        cx.fillStyle = 'rgba(255,255,255,0.32)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+        cx.fillText('tap your row to climb — rivals re-pass if you wait', W / 2, 668);
+      }
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 250 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('LEADERBOARD', W / 2, 270);
+      cx.fillText('CLIMB', W / 2, 322);
+      var p1 = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.fillStyle = VERM; cx.globalAlpha = p1; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO CLIMB', W / 2, 380); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('tap your row. don\'t let them re-pass.', W / 2, 408);
+    }
+
+    // challenge card (demo beat 1)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText(String(DEMO_TARGET), W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // game over
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.58)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText(state.failReason === 'burned' ? 'BURNED OUT.' : 'FELL OFF.', W / 2, 290);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' ranks climbed', W / 2, 335);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 382);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('higher than ' + (100 - pt) + '% of players', W / 2, 406);
+      if (!DEMO && !BOT) {
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)'; cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath(); rr(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23); cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — CLIMB AGAIN', W / 2, 575);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('LEADERBOARD CLIMB', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they climbed ' + (window.__demoScore || DEMO_TARGET) + '. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || DEMO_TARGET), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.textBaseline = 'middle';
+      cx.globalAlpha = 0.5; cx.font = '16px -apple-system, Helvetica, Arial'; cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + MUTE_R.h / 2);
+      cx.globalAlpha = 1; cx.textBaseline = 'alphabetic';
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

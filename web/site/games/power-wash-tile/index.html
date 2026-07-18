@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Power Wash Tile — Tilt</title>
+<!--
+  LOOP / attention-architecture — Power Wash Tile
+  Circuits: 06-zeigarnik (the last corner), 05-ease (satisfying slow drag),
+            08-investment (the percent climbs, you keep going).
+  Engine: CALM — drag to clean, soft bells, completion bloom.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s -> soft CTA ("REACH IT") -> __demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, completes with __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'power-wash-tile';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = Math.max(1, +qs.get('runs') || 3);
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // --- TILE GRID (play area: x=0..W, y=PLAY_TOP..PLAY_TOP+PLAY_H) ---
+  var TILE_COLS = 9, TILE_ROWS = 13;
+  var PLAY_TOP = 70, PLAY_H = 580;
+  var TILE_W = W / TILE_COLS;                 // 45
+  var TILE_H = PLAY_H / TILE_ROWS;            // ~44.6
+
+  // Dirt grid: 0=clean, 1=fully dirty
+  var dirtMap = null;   // Float32Array length TILE_COLS*TILE_ROWS
+
+  function initDirt() {
+    dirtMap = new Float32Array(TILE_COLS * TILE_ROWS);
+    for (var i = 0; i < dirtMap.length; i++) {
+      dirtMap[i] = 0.72 + rng() * 0.28;
+    }
+  }
+
+  // Wash radius (canvas px) centered at (px,py)
+  function wash(px, py, radius) {
+    if (!dirtMap) return;
+    var tx = (px / W) * TILE_COLS;
+    var ty = ((py - PLAY_TOP) / PLAY_H) * TILE_ROWS;
+    var tr = (radius / TILE_W);
+    var ci0 = Math.max(0, Math.floor(tx - tr - 1));
+    var ci1 = Math.min(TILE_COLS - 1, Math.ceil(tx + tr + 1));
+    var ri0 = Math.max(0, Math.floor(ty - tr - 1));
+    var ri1 = Math.min(TILE_ROWS - 1, Math.ceil(ty + tr + 1));
+    for (var r = ri0; r <= ri1; r++) {
+      for (var c = ci0; c <= ci1; c++) {
+        var dx = (c + 0.5) - tx, dy = (r + 0.5) - ty;
+        var dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist > tr) continue;
+        var str = (1 - dist / tr);
+        var idx = r * TILE_COLS + c;
+        dirtMap[idx] = Math.max(0, dirtMap[idx] - str * 0.5);
+      }
+    }
+  }
+
+  function calcPct() {
+    if (!dirtMap) return 0;
+    var n = dirtMap.length, clean = 0;
+    for (var i = 0; i < n; i++) { if (dirtMap[i] < 0.12) clean++; }
+    return Math.round((clean / n) * 100);
+  }
+
+  // ---- State ----
+  var phase = 'title';  // 'title' | 'play' | 'bloom' | 'cta'
+  var pct = 0, prevPct = 0;
+  var runStartTs = 0;
+  var bloomAt = 0, ctaAt = 0;
+  var particles = [];
+  var flashes = [];
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var calmStep = 0;
+  var dragging = false;
+  var botRunsDone = 0;
+  // Bot cursor
+  var botX = W / 2, botY = PLAY_TOP + PLAY_H / 2;
+  var botTX = W / 2, botTY = PLAY_TOP + PLAY_H / 2;
+
+  function flashTxt(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 40, t: 0 });
+  }
+
+  function sprayParticles(px, py) {
+    for (var i = 0; i < 4; i++) {
+      var angle = -Math.PI / 2 + (rng() - 0.5) * 1.4;
+      var spd = 0.5 + rng() * 1.5;
+      particles.push({
+        x: px + (rng() - 0.5) * 10,
+        y: py,
+        vx: Math.cos(angle) * spd,
+        vy: Math.sin(angle) * spd,
+        r: 1.2 + rng() * 2,
+        a: 0.6 + rng() * 0.4,
+        life: 0
+      });
+    }
+  }
+
+  function checkMilestones(newPct) {
+    var milestones = [10, 25, 50, 75, 90, 95, 99];
+    for (var mi = 0; mi < milestones.length; mi++) {
+      if (prevPct < milestones[mi] && newPct >= milestones[mi]) {
+        calmStep++;
+        if (window.J) J.calm(calmStep);
+        if (milestones[mi] === 50) flashTxt('HALFWAY', TEAL, 36);
+        if (milestones[mi] === 90) flashTxt('ALMOST', GOLD, 38);
+        if (milestones[mi] === 99) flashTxt('ONE MORE PASS', TEAL, 32);
+        if (window.LOOP) LOOP.emit('milestone', { pct: milestones[mi] });
+      }
+    }
+    prevPct = newPct;
+  }
+
+  function doWash(px, py) {
+    if (phase !== 'play') return;
+    if (py < PLAY_TOP || py > PLAY_TOP + PLAY_H) return;
+    wash(px, py, 30);
+    sprayParticles(px, py);
+    var newPct = calcPct();
+    if (newPct !== pct) {
+      checkMilestones(newPct);
+      pct = newPct;
+    }
+    if (pct >= 100) triggerBloom();
+  }
+
+  function triggerBloom() {
+    if (phase === 'bloom' || phase === 'cta') return;
+    phase = 'bloom';
+    bloomAt = performance.now();
+    hitStop = 10; zoom = 1.03; shakeAmt = 2.5;
+    if (window.J) J.calm(10);
+    flashTxt('SPOTLESS!', TEAL, 54);
+    var dur = (Date.now() - runStartTs) / 1000;
+    window.__demoScore = Math.round(dur);
+    if (window.LOOP) LOOP.emit('game_over', { score: pct, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { startPlay(); }, 800);
+      }
+    }
+  }
+
+  function startPlay() {
+    phase = 'play';
+    pct = 0; prevPct = 0; calmStep = 0;
+    particles = []; flashes = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    dragging = false;
+    runStartTs = Date.now();
+    initDirt();
+    // Reset bot sweep
+    botX = 10; botY = PLAY_TOP + 5;
+    botTX = W - 10; botTY = PLAY_TOP + 5;
+    botSweepRow = 0; botSweepDir = 1; botSweepPass = 0;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- Bot autopilot — direct serpentine sweep (no target system) ----
+  // Moves continuously L-R across rows; 2 passes to ensure coverage.
+  var botSweepRow = 0, botSweepDir = 1, botSweepPass = 0;
+  var BOT_ROW_SPACING = 24;  // px between sweep rows
+  var BOT_SPD = 10;          // px/frame at dt=1
+
+  function autoBotStep(dt) {
+    if (phase !== 'play') return;
+    var numRows = Math.ceil(PLAY_H / BOT_ROW_SPACING) + 1;
+    var targetY = PLAY_TOP + botSweepRow * BOT_ROW_SPACING + (botSweepPass === 1 ? 12 : 0);
+    targetY = Math.min(PLAY_TOP + PLAY_H - 5, targetY);
+
+    // Move horizontally
+    botX += BOT_SPD * botSweepDir * dt;
+    // Lerp Y toward row
+    botY += (targetY - botY) * 0.25 * dt;
+
+    botX = Math.max(5, Math.min(W - 5, botX));
+    botY = Math.max(PLAY_TOP + 2, Math.min(PLAY_TOP + PLAY_H - 2, botY));
+
+    // Hit wall -> advance row
+    if (botSweepDir === 1 && botX >= W - 6) {
+      botSweepDir = -1; botSweepRow++;
+      if (botSweepRow >= numRows) {
+        if (botSweepPass < 1) {
+          botSweepPass++; botSweepRow = 0; botSweepDir = 1;
+          botX = 5; botY = PLAY_TOP + 5;
+        }
+        // else: all done, bloom should have triggered already
+      }
+    } else if (botSweepDir === -1 && botX <= 6) {
+      botSweepDir = 1; botSweepRow++;
+      if (botSweepRow >= numRows) {
+        if (botSweepPass < 1) {
+          botSweepPass++; botSweepRow = 0; botSweepDir = 1;
+          botX = 5; botY = PLAY_TOP + 5;
+        }
+      }
+    }
+    doWash(botX, botY);
+  }
+
+  // ---- Demo autopilot ----
+  // Arc: 0-3s settle/circle, 3-10s systematic sweeps, 10-14s last corner, 14-16s finish
+  var demoT = 0;
+
+  function autoDemoStep(dt) {
+    if (phase !== 'play') return;
+    demoT += dt / 60; // convert frames to seconds
+    var px, py;
+    if (demoT < 2.5) {
+      // Settle: warm up with a gentle circle
+      var ang = demoT * 1.5;
+      var rad = 60 + demoT * 20;
+      px = W / 2 + Math.cos(ang) * rad;
+      py = PLAY_TOP + PLAY_H / 2 + Math.sin(ang) * rad * 0.5;
+    } else if (demoT < 11) {
+      // Systematic horizontal sweeps
+      var t2 = (demoT - 2.5) / 8.5;
+      var rowF = t2 * TILE_ROWS;
+      var rowIdx = Math.floor(rowF);
+      var rowFrac = rowF - rowIdx;
+      py = PLAY_TOP + (rowIdx + 0.5) * TILE_H + Math.sin(demoT * 3) * 6;
+      px = rowIdx % 2 === 0 ? 15 + rowFrac * (W - 30) : (W - 15) - rowFrac * (W - 30);
+    } else if (demoT < 15) {
+      // The Zeigarnik corner: linger on bottom-right where dirt hides
+      var t3 = (demoT - 11) / 4;
+      px = W - 55 + Math.sin(t3 * Math.PI * 5) * 35;
+      py = PLAY_TOP + PLAY_H - 60 + Math.cos(t3 * Math.PI * 4) * 30;
+    } else {
+      // Final cleanup pass
+      px = 20 + (rng() - 0.5) * W * 0.9 + W / 2;
+      py = PLAY_TOP + rng() * PLAY_H;
+      px = Math.max(15, Math.min(W - 15, px));
+    }
+    py = Math.max(PLAY_TOP + 5, Math.min(PLAY_TOP + PLAY_H - 5, py));
+    px = Math.max(10, Math.min(W - 10, px));
+    doWash(px, py);
+  }
+
+  // ---- Input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  cv.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var rect = cv.getBoundingClientRect();
+    var mx = (e.clientX - rect.left) / scale, my = (e.clientY - rect.top) / scale;
+    if (window.J && inR(MUTE_R, mx, my)) { J.toggleMute(); return; }
+    if (phase === 'title') { startPlay(); return; }
+    if (phase === 'play') { dragging = true; doWash(mx, my); }
+    if (phase === 'bloom' && performance.now() - bloomAt > 500) { startPlay(); }
+  });
+  cv.addEventListener('pointermove', function (e) {
+    if (DEMO || BOT || !dragging || phase !== 'play') return;
+    var rect = cv.getBoundingClientRect();
+    var mx = (e.clientX - rect.left) / scale, my = (e.clientY - rect.top) / scale;
+    doWash(mx, my);
+  });
+  cv.addEventListener('pointerup', function () { dragging = false; });
+  cv.addEventListener('pointerleave', function () { dragging = false; });
+
+  // ---- Render helpers ----
+  // Grout color
+  var GROUT = 'rgba(180,195,210,0.55)';
+
+  function drawTileGrid() {
+    if (!dirtMap) return;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, PLAY_TOP, W, PLAY_H);
+    ctx.clip();
+
+    // 1) Clean base — soft blue-white tile
+    for (var r = 0; r < TILE_ROWS; r++) {
+      for (var c = 0; c < TILE_COLS; c++) {
+        var idx = r * TILE_COLS + c;
+        var tx = c * TILE_W, ty = PLAY_TOP + r * TILE_H;
+        var tw = TILE_W - 2, th = TILE_H - 2;
+
+        // clean tile
+        ctx.fillStyle = '#d0e2ef';
+        ctx.fillRect(tx + 1, ty + 1, tw, th);
+        // sheen
+        var g = ctx.createLinearGradient(tx, ty, tx, ty + th);
+        g.addColorStop(0, 'rgba(255,255,255,0.28)');
+        g.addColorStop(1, 'rgba(255,255,255,0.04)');
+        ctx.fillStyle = g;
+        ctx.fillRect(tx + 1, ty + 1, tw, th);
+
+        // 2) Dirt overlay per tile (alpha driven by dirtMap)
+        var dirt = dirtMap[idx];
+        if (dirt > 0.02) {
+          // Warm brown dirt layer
+          ctx.fillStyle = 'rgba(90,65,38,' + (dirt * 0.88).toFixed(3) + ')';
+          ctx.fillRect(tx + 1, ty + 1, tw, th);
+          // Darker grime spots (use tile-index-based deterministic positions)
+          var h1 = (c * 17 + r * 31) & 255;
+          var h2 = (c * 37 + r * 13) & 255;
+          var h3 = (c * 53 + r * 7)  & 255;
+          if (dirt > 0.3) {
+            ctx.fillStyle = 'rgba(55,35,15,' + (dirt * 0.5).toFixed(3) + ')';
+            ctx.beginPath();
+            ctx.arc(tx + 3 + (h1 % Math.max(1, Math.floor(tw) - 6)),
+                    ty + 3 + (h2 % Math.max(1, Math.floor(th) - 6)),
+                    2 + (h3 % 4), 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+      }
+    }
+
+    // Grout lines
+    ctx.strokeStyle = GROUT;
+    ctx.lineWidth = 2;
+    for (var gc = 0; gc <= TILE_COLS; gc++) {
+      ctx.beginPath();
+      ctx.moveTo(gc * TILE_W, PLAY_TOP);
+      ctx.lineTo(gc * TILE_W, PLAY_TOP + PLAY_H);
+      ctx.stroke();
+    }
+    for (var gr = 0; gr <= TILE_ROWS; gr++) {
+      ctx.beginPath();
+      ctx.moveTo(0, PLAY_TOP + gr * TILE_H);
+      ctx.lineTo(W, PLAY_TOP + gr * TILE_H);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // ---- Main loop ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // juice decay
+    if (hitStop > 0) { hitStop -= dt; }
+    else {
+      // autopilot runs only when not frozen
+      if (DEMO && phase === 'play') autoDemoStep(dt);
+      if (BOT  && phase === 'play') autoBotStep(dt);
+    }
+    shakeAmt *= Math.pow(0.87, dt);
+    zoom += (1 - zoom) * 0.1 * dt;
+
+    ctx.save();
+    // juice transforms
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (rng() - 0.5) * shakeAmt, sy = (rng() - 0.5) * shakeAmt;
+      ctx.translate(W / 2 + sx, H / 2 + sy);
+      ctx.scale(zoom, zoom);
+      ctx.translate(-W / 2, -H / 2);
+    }
+
+    // Background
+    ctx.fillStyle = INK;
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+
+    // ----- Title -----
+    if (phase === 'title') {
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff';
+      ctx.font = '900 42px -apple-system, Helvetica, Arial';
+      ctx.fillText('POWER WASH', W / 2, 300);
+      ctx.fillStyle = TEAL;
+      ctx.font = '900 42px -apple-system, Helvetica, Arial';
+      ctx.fillText('TILE', W / 2, 352);
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.font = '700 16px -apple-system, Helvetica, Arial';
+      var pulse = 0.55 + 0.45 * Math.sin(now / 420);
+      ctx.globalAlpha = pulse;
+      ctx.fillText('drag to clean', W / 2, 406);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = 'rgba(255,255,255,0.25)';
+      ctx.font = '600 12px Menlo, monospace';
+      ctx.fillText('the last corner always calls you back', W / 2, 446);
+    }
+
+    // ----- Play & Bloom -----
+    if (phase === 'play' || phase === 'bloom') {
+      drawTileGrid();
+
+      // Water spray particles
+      for (var pi = particles.length - 1; pi >= 0; pi--) {
+        var p = particles[pi];
+        p.life += dt;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.vy += 0.06 * dt;
+        var palpha = Math.max(0, p.a * (1 - p.life / 20));
+        if (palpha < 0.01) { particles.splice(pi, 1); continue; }
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, Math.max(0.3, p.r * (1 - p.life / 25)), 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(150,215,235,' + palpha.toFixed(2) + ')';
+        ctx.fill();
+      }
+
+      // HUD: percent
+      ctx.textAlign = 'right';
+      ctx.fillStyle = 'rgba(255,255,255,0.92)';
+      ctx.font = '900 30px -apple-system, Helvetica, Arial';
+      ctx.fillText(pct + '%', W - 12, 46);
+      ctx.font = '600 11px -apple-system, Helvetica, Arial';
+      ctx.fillStyle = 'rgba(255,255,255,0.42)';
+      ctx.fillText('CLEAN', W - 12, 60);
+
+      // Progress bar
+      var barY = PLAY_TOP + PLAY_H + 6, barH = 7;
+      ctx.fillStyle = 'rgba(255,255,255,0.08)';
+      ctx.fillRect(0, barY, W, barH);
+      if (pct > 0) {
+        var barG = ctx.createLinearGradient(0, barY, W * pct / 100, barY);
+        barG.addColorStop(0, '#2ec5b6');
+        barG.addColorStop(1, '#f2b134');
+        ctx.fillStyle = barG;
+        ctx.fillRect(0, barY, W * pct / 100, barH);
+      }
+    }
+
+    // Bloom overlay
+    if (phase === 'bloom') {
+      var bt = (now - bloomAt) / 1000;
+      var bEase = Math.min(1, bt * 1.6);
+      var bloomR = Math.max(1, Math.max(W, H) * bEase);
+      var bgr = ctx.createRadialGradient(W / 2, PLAY_TOP + PLAY_H / 2, 0,
+                                          W / 2, PLAY_TOP + PLAY_H / 2, bloomR);
+      bgr.addColorStop(0, 'rgba(46,197,182,' + (0.2 * bEase).toFixed(3) + ')');
+      bgr.addColorStop(0.5, 'rgba(46,197,182,' + (0.07 * bEase).toFixed(3) + ')');
+      bgr.addColorStop(1, 'rgba(46,197,182,0)');
+      ctx.fillStyle = bgr;
+      ctx.fillRect(0, 0, W, H);
+
+      if (bt > 0.6) {
+        var bFade = Math.min(1, (bt - 0.6) * 2.5);
+        ctx.save();
+        ctx.globalAlpha = bFade;
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#fff';
+        ctx.font = '900 50px -apple-system, Helvetica, Arial';
+        ctx.fillText('SPOTLESS', W / 2, 356);
+        ctx.fillStyle = 'rgba(255,255,255,0.6)';
+        ctx.font = '600 18px -apple-system, Helvetica, Arial';
+        ctx.fillText('every tile clean', W / 2, 396);
+        if (!DEMO && !BOT) {
+          var p2 = 0.6 + 0.4 * Math.sin(now / 360);
+          ctx.globalAlpha = bFade * p2;
+          ctx.fillStyle = TEAL;
+          ctx.font = '700 16px -apple-system, Helvetica, Arial';
+          ctx.fillText('tap to clean again', W / 2, 446);
+        }
+        ctx.restore();
+      }
+    }
+
+    // Demo CTA card
+    if (phase === 'cta') {
+      var ctaT = (now - ctaAt) / 1000;
+      var ctaE = Math.min(1, ctaT * 2.2);
+      ctx.fillStyle = 'rgba(11,13,18,' + (0.8 * ctaE).toFixed(3) + ')';
+      ctx.fillRect(0, 0, W, H);
+      ctx.save();
+      ctx.globalAlpha = ctaE;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff';
+      ctx.font = '900 42px -apple-system, Helvetica, Arial';
+      ctx.fillText('POWER WASH', W / 2, 296);
+      ctx.fillStyle = TEAL;
+      ctx.font = '900 42px -apple-system, Helvetica, Arial';
+      ctx.fillText('TILE', W / 2, 344);
+      ctx.fillStyle = 'rgba(255,255,255,0.68)';
+      ctx.font = '600 17px -apple-system, Helvetica, Arial';
+      ctx.fillText('how clean can you get it?', W / 2, 386);
+      var cp = 0.65 + 0.35 * Math.sin(now / 310);
+      ctx.globalAlpha = ctaE * cp;
+      ctx.fillStyle = TEAL;
+      ctx.font = '800 28px -apple-system, Helvetica, Arial';
+      ctx.fillText('REACH IT', W / 2, 442);
+      ctx.globalAlpha = ctaE * 0.7;
+      ctx.fillStyle = '#fff';
+      ctx.font = '600 14px -apple-system, Helvetica, Arial';
+      ctx.fillText('link in bio', W / 2, 474);
+      ctx.restore();
+    }
+
+    // Floating flashes
+    for (var fi = flashes.length - 1; fi >= 0; fi--) {
+      var fl = flashes[fi]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 48);
+      if (fa < 0.01) { flashes.splice(fi, 1); continue; }
+      ctx.save();
+      ctx.globalAlpha = fa;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = fl.color;
+      ctx.font = '900 ' + Math.round(fl.size + fl.t * 0.25) + 'px -apple-system, Helvetica, Arial';
+      ctx.fillText(fl.txt, W / 2, 260 - fl.t * 0.55);
+      ctx.restore();
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      ctx.textAlign = 'center';
+      ctx.globalAlpha = 0.5;
+      ctx.font = '16px -apple-system, Helvetica, Arial';
+      ctx.fillStyle = '#fff';
+      ctx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- Bootstrap ----
+  function newGame() {
+    phase = 'title';
+    pct = 0; prevPct = 0; calmStep = 0;
+    particles = []; flashes = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    dragging = false;
+    botRunsDone = 0;
+    demoT = 0;
+    if (DEMO || BOT) {
+      startPlay();
+    }
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

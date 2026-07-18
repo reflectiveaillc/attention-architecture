@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Big Smile — Tilt</title>
+<!--
+  LOOP / attention-architecture — Big Smile (FACE-CONTROL engine)
+  The player SMILES to grow a plant / fill a bloom meter. The wider the grin,
+  the faster the plant grows. Wilts when you stop smiling.
+  The webcam is composited into the canvas (corner PiP) so a single recording
+  captures BOTH the game and the forced maniacal grin — that recording is the
+  shareable clip (the whole point).
+  Tech: shared face-control.js (MediaPipe FaceLandmarker, FC.sig.smile) +
+        getUserMedia + MediaRecorder (canvas.captureStream → downloadable webm).
+  Conditioned path: reaction/challenge videos (TikTok/IG) — the algorithm already
+  farms funny-face content; this game MANUFACTURES forced grinning.
+  Modes: ?demo=1 / ?bot=1 run AUTO with simulated face (no camera, no MediaPipe).
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b1a0e; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:none;
+               font-family:-apple-system,'Helvetica Neue',Arial,sans-serif; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b1a0e; }
+  video { display:none; }
+  #ui { position:fixed; left:0; right:0; bottom:max(16px,env(safe-area-inset-bottom)); display:flex; gap:10px; justify-content:center; z-index:10; }
+  button { background:#12151d; color:#fff; border:1px solid rgba(255,255,255,.15); border-radius:99px;
+           padding:12px 20px; font-size:15px; font-weight:800; cursor:pointer; }
+  button.rec { background:#e8502e; border-color:#e8502e; }
+  button.rec.on { animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.55; } }
+  #perm { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; text-align:center; padding:24px; z-index:20; background:#0b1a0e; }
+  #perm h1 { font-size:34px; font-weight:900; margin:0; color:#fff; }
+  #perm p { color:rgba(255,255,255,.6); font-size:15px; max-width:320px; margin:0; }
+  #perm .big { background:#2ec97a; border-color:#2ec97a; color:#000; font-size:18px; padding:16px 28px; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="perm">
+  <h1>BIG SMILE</h1>
+  <p>GRIN as wide as you can to grow the plant. The bigger the smile, the faster it blooms. Stop smiling and it wilts. Your face rides in the corner — record it and share the damage.</p>
+  <button class="big" id="start">▶ ALLOW CAMERA &amp; PLAY</button>
+  <p style="font-size:12px;opacity:.5">camera stays on your device — nothing is uploaded</p>
+</div>
+<div id="ui" style="display:none">
+  <button id="rec" class="rec">● RECORD</button>
+</div>
+<script>window.LOOP_GAME = 'big-smile';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script src="../../js/face-control.js"></script>
+<script type="module">
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+  var AUTO = DEMO || BOT;   // no camera in scripted modes
+
+  function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio||1,2), scale=1;
+  function fit(){var s=Math.min(window.innerWidth/W,window.innerHeight/H);scale=s;cv.style.width=(W*s)+'px';cv.style.height=(H*s)+'px';cv.width=W*dpr;cv.height=H*dpr;cx.setTransform(dpr,0,0,dpr,0,0);}
+  window.addEventListener('resize',fit); fit();
+
+  // shared face-control library
+  var FC = window.FaceControl;
+
+  var GREEN='#2ec97a', LIME='#a8e063', GOLD='#f2b134', VERM='#e8502e', TEAL='#2ec5b6', INK='#0b1a0e';
+
+  // ---- tuning constants (face-forgiving: low threshold, slow wilt) ----
+  // SMILE_ON / SMILE_OFF: hysteresis thresholds. A natural grin (~0.15) triggers,
+  // only fully relaxing (~0.07) turns it off — so the control never flickers.
+  var SMILE_ON  = 0.15;   // trigger threshold (was 0.28 — too hard)
+  var SMILE_OFF = 0.07;   // release threshold (was 0.15 — too hair-trigger)
+  // Growth / wilt rates (per dt unit at 60fps ≈ 1 frame).
+  // GROW_BASE: minimum gain per frame while smiling (so any smile makes progress).
+  // GROW_EXTRA: extra gain proportional to smile intensity above threshold.
+  // WILT: slow wilt so brief lapses don't instantly punish.
+  var GROW_BASE  = 0.0025;  // steady gain even with a minimal smile
+  var GROW_EXTRA = 0.010;   // extra boost at max smile (total ~0.0125 at peak)
+  var WILT_RATE  = 0.0008;  // very slow wilt (was 0.0015 — half the punishment)
+
+  // ---- game state ----
+  var st, best=0, shakeAmt=0, dareBeaten=false;
+  try{best=+localStorage.getItem('bs_best')||0;}catch(_){}
+
+  var smileSmoothed=0, wasSmiling=false;
+  var runStartTs=0;
+  var botRunsDone=0, ctaAt=0;
+
+  // ---- test hook (for validate-game.mjs and auto-checks) ----
+  window.__st = function(){ return { st:st, smileSmoothed:smileSmoothed, SMILE_ON:SMILE_ON, SMILE_OFF:SMILE_OFF, wasSmiling:wasSmiling }; };
+
+  // Plant visual state
+  var stemH=0, leaves=[], bloomPetals=0, particles=[];
+
+  function newRun(){
+    st={phase:'ready', bloom:0, score:0, overAt:0, wilting:false, bloomFlash:0};
+    stemH=0; leaves=[]; bloomPetals=0; particles=[];
+    dareBeaten=false;
+    if(AUTO){ st.phase='play'; start(); }
+  }
+  function start(){
+    st.phase='play'; st.bloom=0; st.score=0; st.overAt=0; st.wilting=false; st.bloomFlash=0;
+    stemH=0; leaves=[]; bloomPetals=0; particles=[];
+    runStartTs=Date.now();
+    dareBeaten=false;
+    if(window.LOOP) LOOP.emit('play_start',{seed:SEED});
+  }
+
+  function milestoneReached(prev, now){
+    var steps=[0.2,0.4,0.6,0.8,1.0];
+    for(var i=0;i<steps.length;i++){
+      if(prev<steps[i] && now>=steps[i]) return steps[i];
+    }
+    return null;
+  }
+
+  function spawnParticle(x,y,color){
+    for(var i=0;i<6;i++){
+      var angle=rng()*Math.PI*2;
+      var speed=1.5+rng()*2.5;
+      particles.push({x:x,y:y,vx:Math.cos(angle)*speed,vy:Math.sin(angle)*speed-1,
+        life:1,color:color,r:2+rng()*3});
+    }
+  }
+
+  function gameOver(){
+    st.phase='over'; st.overAt=performance.now(); shakeAmt=8;
+    var dur=(Date.now()-runStartTs)/1000;
+    var nb=st.score>best; if(nb){best=st.score;try{localStorage.setItem('bs_best',String(best));}catch(_){}};
+    if(window.J){J.death(Math.min(0.3+st.score/5,1)); if(nb) setTimeout(function(){J.fanfare();},450);}
+    if(DEMO) window.__demoScore=st.score;
+    if(window.LOOP) LOOP.emit('game_over',{score:st.score,dur_s:+dur.toFixed(1)});
+    if(BOT){ botRunsDone++; if(botRunsDone>=BOT_RUNS) window.__botDone=true; else setTimeout(function(){newRun();},700); }
+    if(DEMO){ setTimeout(function(){ st.phase='cta'; ctaAt=performance.now(); setTimeout(function(){window.__demoDone=true;},3200); }, 1400); }
+  }
+
+  // ---- input: FACE ONLY. Tap/space ONLY restarts after a crash — never starts/grows.
+  // Growth is driven exclusively by FC.sig.smile. First smile auto-starts from 'ready'.
+  function tapRestart(){ if(AUTO) return; if(st.phase==='over'&&performance.now()-st.overAt>500) newRun(); }
+  window.addEventListener('keydown',function(e){ if(e.code==='Space'){e.preventDefault(); tapRestart();} });
+  cv.addEventListener('pointerdown', tapRestart);
+
+  // ---- camera start (shared FC lib) ----
+  async function startCamera(){
+    document.getElementById('perm').style.display='none';
+    document.getElementById('ui').style.display='flex';
+    await FC.start();
+    newRun();
+    requestAnimationFrame(frame);
+  }
+  document.getElementById('start').addEventListener('click', startCamera);
+
+  // ---- AUTO mode: simulated smile that drives the bloom ----
+  // Bot/demo: pulse smile on and off to fill meter in bursts,
+  // then give up (stop smiling) after demo cap so meter wilts → game over → CTA.
+  var autoCool=0, autoSmileOn=false, autoGiveUp=false;
+  var DEMO_CAP=5, BOT_CAP=3;
+
+  function autoUpdate(dt){
+    if(st.phase!=='play') return;
+    var giveUp = (DEMO && st.score>=DEMO_CAP) || (BOT && st.score>=(BOT_CAP+botRunsDone*2));
+    if(giveUp){
+      autoGiveUp=true;
+      autoSmileOn=false;
+      smileSmoothed += (0 - smileSmoothed)*0.08*dt;
+      return;
+    }
+    autoGiveUp=false;
+    autoCool-=dt;
+    if(autoCool<=0){
+      autoSmileOn=!autoSmileOn;
+      autoCool = autoSmileOn ? (18+rng()*12) : (8+rng()*6);
+    }
+    var target = autoSmileOn ? (0.75+rng()*0.2) : 0.05;
+    smileSmoothed += (target - smileSmoothed)*0.06*dt;
+  }
+
+  // ---- render loop ----
+  var last=performance.now();
+
+  var STEM_BASE_Y = H-100;
+  var STEM_MAX = 420;
+
+  function getStemTip(){
+    return { x: W/2, y: STEM_BASE_Y - stemH };
+  }
+
+  function drawStem(t){
+    if(stemH<=2) return;
+    var tip=getStemTip();
+    var sway=Math.sin(t/900)*4*(stemH/STEM_MAX);
+    cx.beginPath();
+    cx.moveTo(W/2, STEM_BASE_Y);
+    cx.bezierCurveTo(W/2+sway*0.5, STEM_BASE_Y-stemH*0.33,
+                     W/2-sway*0.5, STEM_BASE_Y-stemH*0.66,
+                     tip.x+sway,  tip.y);
+    cx.strokeStyle=GREEN; cx.lineWidth=8*(0.4+0.6*stemH/STEM_MAX); cx.lineJoin='round'; cx.lineCap='round';
+    cx.stroke();
+
+    for(var i=0;i<leaves.length;i++){
+      var lf=leaves[i];
+      var ly=STEM_BASE_Y-lf.pos*stemH;
+      var lx=W/2+sway*(lf.pos);
+      var side=lf.side;
+      cx.save();
+      cx.translate(lx,ly);
+      cx.rotate(side*(Math.PI/5)*(0.8+0.4*lf.grow));
+      cx.scale(lf.grow,lf.grow);
+      cx.beginPath();
+      cx.ellipse(side*18,0,18,9,0,0,Math.PI*2);
+      cx.fillStyle=LIME; cx.fill();
+      cx.restore();
+    }
+  }
+
+  function drawBloom(t, bloom, tip){
+    if(bloom<=0.05) return;
+    var sway=Math.sin(t/900)*4*(stemH/STEM_MAX);
+    var cx2=tip.x+sway, cy2=tip.y;
+    var r=20+bloom*40;
+    var nPetals=8;
+    for(var p=0;p<nPetals;p++){
+      var ang=(p/nPetals)*Math.PI*2 + t/2000;
+      var pr=r*0.85*(0.7+0.3*bloom);
+      var px2=cx2+Math.cos(ang)*pr, py2=cy2+Math.sin(ang)*pr;
+      cx.beginPath();
+      cx.ellipse(px2,py2,r*0.42*(0.5+0.5*bloom),r*0.22,ang,0,Math.PI*2);
+      var hue=Math.round(300+bloom*60);
+      cx.fillStyle='hsl('+hue+',90%,'+(60+bloom*20)+'%)';
+      cx.globalAlpha=0.7+0.3*bloom;
+      cx.fill();
+      cx.globalAlpha=1;
+    }
+    cx.beginPath();
+    cx.arc(cx2,cy2,r*0.32,0,Math.PI*2);
+    cx.fillStyle=GOLD; cx.fill();
+    if(bloom>0.95){
+      var sp=Math.sin(t/200)*0.5+0.5;
+      cx.beginPath(); cx.arc(cx2,cy2,r*0.18,0,Math.PI*2);
+      cx.fillStyle='rgba(255,255,255,'+sp+')'; cx.fill();
+    }
+  }
+
+  function frame(now){
+    var dt=Math.min((now-last)/16.667,3); last=now;
+
+    if(AUTO){
+      // AUTO drives simulated smile directly — does NOT go through FC
+      autoUpdate(dt);
+    } else {
+      // human mode: read FC.sig.smile (proven, self-calibrated)
+      FC.update(now);
+      // Slightly faster smoothing (0.55) so the control feels responsive, not laggy.
+      smileSmoothed += (FC.sig.smile - smileSmoothed)*0.55*dt;
+    }
+
+    if(smileSmoothed<0) smileSmoothed=0;
+    if(smileSmoothed>1) smileSmoothed=1;
+
+    // A smile is a naturally HELD gesture, so this game uses the lib's debounced
+    // gate (edge-on at a small rise above YOUR resting face, off on release) —
+    // a relaxed natural smile holds it, no strained grin needed.
+    var smilingNow = AUTO ? (wasSmiling ? smileSmoothed>SMILE_OFF : smileSmoothed>SMILE_ON) : FC.gate.smile;
+    wasSmiling = smilingNow;
+
+    // face-only: first smile auto-starts the game from ready (no tap needed)
+    if(!AUTO && st.phase==='ready' && smilingNow){ start(); }
+
+    if(st.phase==='play'){
+      var prevBloom=st.bloom;
+      var smiling = AUTO ? (smileSmoothed>0.2) : smilingNow;
+
+      if(smiling){
+        // Flat base growth + proportional boost: even a minimal smile grows steadily.
+        // Extra gain scales from 0 (at SMILE_ON) to GROW_EXTRA (at full smile).
+        var smileBase = AUTO ? 0.2 : SMILE_ON;
+        var extra = Math.min(Math.max(smileSmoothed - smileBase, 0) / (1 - smileBase), 1.0);
+        st.bloom += (GROW_BASE + extra*GROW_EXTRA)*dt;
+        st.wilting=false;
+      } else {
+        st.wilting=true;
+        st.bloom -= WILT_RATE*dt;
+      }
+      if(st.bloom>1) st.bloom=1;
+      if(st.bloom<0) st.bloom=0;
+
+      stemH = st.bloom*STEM_MAX;
+
+      if(st.bloom>0.3 && leaves.length<1) leaves.push({pos:0.35, side:-1, grow:0});
+      if(st.bloom>0.5 && leaves.length<2) leaves.push({pos:0.62, side:1, grow:0});
+      if(st.bloom>0.7 && leaves.length<3) leaves.push({pos:0.80, side:-1, grow:0});
+      for(var li=0;li<leaves.length;li++){
+        if(leaves[li].grow<1) leaves[li].grow=Math.min(1,leaves[li].grow+0.025*dt);
+      }
+
+      var ms=milestoneReached(prevBloom,st.bloom);
+      if(ms!==null){
+        st.score++;
+        st.bloomFlash=1.0;
+        if(window.LOOP) LOOP.emit('bloom',{n:st.score,pct:+st.bloom.toFixed(2)});
+        var tip2=getStemTip();
+        spawnParticle(tip2.x,tip2.y, ms>=1.0?GOLD:GREEN);
+        if(window.J) J.perfect(st.score);
+        if(ms>=1.0){ if(window.J) setTimeout(function(){J.fanfare();},300); }
+        if(!AUTO&&window.SHARE&&SHARE.dare!==null&&!dareBeaten&&st.score>SHARE.dare){
+          dareBeaten=true;if(window.J)J.fanfare();SHARE.beaten(st.score);
+        }
+      }
+      if(st.bloomFlash>0) st.bloomFlash=Math.max(0,st.bloomFlash-0.04*dt);
+
+      if(st.wilting && st.bloom<=0 && st.score>0) gameOver();
+      if(autoGiveUp && st.bloom<=0) gameOver();
+    }
+
+    for(var pi=particles.length-1;pi>=0;pi--){
+      var p=particles[pi];
+      p.x+=p.vx*dt; p.y+=p.vy*dt; p.vy+=0.1*dt;
+      p.life-=0.025*dt;
+      if(p.life<=0) particles.splice(pi,1);
+    }
+
+    // ---- DRAW ----
+    cx.save();
+    if(shakeAmt>0.3){cx.translate((Math.random()-0.5)*shakeAmt,(Math.random()-0.5)*shakeAmt);} shakeAmt*=Math.pow(0.85,dt);
+
+    var skyTop=cx.createLinearGradient(0,0,0,H);
+    var t1='hsl('+(180-st.bloom*120)+',30%,'+Math.round(6+st.bloom*14)+'%)';
+    var t2='hsl('+(120-st.bloom*60)+',25%,'+Math.round(4+st.bloom*8)+'%)';
+    skyTop.addColorStop(0,t1); skyTop.addColorStop(1,t2);
+    cx.fillStyle=skyTop; cx.fillRect(0,0,W,H);
+
+    cx.fillStyle='#1a3a18'; cx.fillRect(0,STEM_BASE_Y+16,W,H-STEM_BASE_Y-16);
+    cx.fillStyle='#2a5a22'; cx.fillRect(0,STEM_BASE_Y+12,W,8);
+
+    drawStem(now);
+
+    if(stemH>10){
+      var tip=getStemTip(); drawBloom(now, st.bloom, tip);
+    }
+
+    for(var pi2=0;pi2<particles.length;pi2++){
+      var pp=particles[pi2];
+      cx.beginPath(); cx.arc(pp.x,pp.y,pp.r,0,Math.PI*2);
+      cx.fillStyle=pp.color; cx.globalAlpha=pp.life; cx.fill(); cx.globalAlpha=1;
+    }
+
+    // bloom meter bar (left side)
+    var barX=20, barY=H/2-120, barH2=240, barW=16;
+    cx.fillStyle='rgba(0,0,0,0.4)'; cx.beginPath(); cx.roundRect(barX,barY,barW,barH2,8); cx.fill();
+    var fill=barH2*st.bloom;
+    if(fill>0){
+      var meterGrad=cx.createLinearGradient(0,barY+barH2,0,barY+barH2-fill);
+      meterGrad.addColorStop(0,'#2ec97a'); meterGrad.addColorStop(1,'#f2b134');
+      cx.fillStyle=meterGrad;
+      if(st.bloomFlash>0) cx.globalAlpha=0.7+0.3*st.bloomFlash;
+      cx.beginPath(); cx.roundRect(barX,barY+barH2-fill,barW,fill,8); cx.fill();
+      cx.globalAlpha=1;
+    }
+    cx.fillStyle='rgba(255,255,255,0.6)'; cx.font='700 10px Menlo,monospace'; cx.textAlign='center';
+    cx.fillText('BLOOM',barX+barW/2,barY-8);
+    cx.fillText(Math.round(st.bloom*100)+'%',barX+barW/2,barY+barH2+16);
+
+    // webcam PiP — copied from flappy-face reference (FC.drawPiP handles mirror + bar)
+    var smiling2 = AUTO ? (smileSmoothed>0.2) : wasSmiling;
+    var camW=118, camH=88, cxp=W-camW-12, cyp=12;
+    if(!AUTO){
+      // draw real webcam feed via FC.drawPiP (mirrors, red border when active, bar)
+      FC.drawPiP(cx, cxp, cyp, camW, camH, smiling2, smileSmoothed, W, H);
+    } else {
+      // simulated face for demo/bot
+      cx.save();
+      cx.strokeStyle='rgba(255,255,255,0.3)'; cx.lineWidth=2;
+      cx.beginPath(); cx.roundRect?cx.roundRect(cxp,cyp,camW,camH,12):cx.rect(cxp,cyp,camW,camH); cx.stroke();
+      cx.beginPath(); cx.roundRect?cx.roundRect(cxp,cyp,camW,camH,12):cx.rect(cxp,cyp,camW,camH); cx.clip();
+      cx.fillStyle='#241a12'; cx.fillRect(cxp,cyp,camW,camH);
+      var fx=cxp+camW/2, fy=cyp+camH/2;
+      cx.fillStyle=GOLD; cx.beginPath(); cx.arc(fx,fy,28,0,Math.PI*2); cx.fill();
+      var browRaise=smileSmoothed*6;
+      cx.strokeStyle='#333'; cx.lineWidth=2.5; cx.lineCap='round';
+      cx.beginPath(); cx.moveTo(fx-16,fy-12-browRaise); cx.quadraticCurveTo(fx-10,fy-16-browRaise*1.5,fx-4,fy-13-browRaise); cx.stroke();
+      cx.beginPath(); cx.moveTo(fx+4,fy-13-browRaise); cx.quadraticCurveTo(fx+10,fy-16-browRaise*1.5,fx+16,fy-12-browRaise); cx.stroke();
+      var eyeSq=1-smileSmoothed*0.5;
+      cx.fillStyle='#222';
+      cx.beginPath(); cx.ellipse(fx-11,fy-7,4,4*eyeSq,0,0,Math.PI*2); cx.fill();
+      cx.beginPath(); cx.ellipse(fx+11,fy-7,4,4*eyeSq,0,0,Math.PI*2); cx.fill();
+      if(smileSmoothed>0.3){
+        cx.fillStyle='rgba(255,150,150,'+smileSmoothed*0.5+')';
+        cx.beginPath(); cx.ellipse(fx-16,fy+2,8,5,0,0,Math.PI*2); cx.fill();
+        cx.beginPath(); cx.ellipse(fx+16,fy+2,8,5,0,0,Math.PI*2); cx.fill();
+      }
+      var smileW=10+smileSmoothed*12;
+      var smileDepth=3+smileSmoothed*14;
+      cx.beginPath();
+      cx.moveTo(fx-smileW,fy+8);
+      cx.quadraticCurveTo(fx,fy+8+smileDepth,fx+smileW,fy+8);
+      cx.strokeStyle='#333'; cx.lineWidth=2.5; cx.stroke();
+      if(smileSmoothed>0.5){
+        cx.fillStyle='#fff';
+        cx.beginPath(); cx.ellipse(fx,fy+9+smileDepth*0.4,smileW*0.7,smileDepth*0.5,0,0,Math.PI); cx.fill();
+      }
+      cx.restore();
+    }
+
+    // status label under PiP
+    var fcLabel = AUTO ? 'DEMO' : (FC.statusLabel() || (FC.sig.smile>SMILE_ON ? 'GRIN!' : 'show your face'));
+    cx.fillStyle=(fcLabel.indexOf('http')>=0||fcLabel.indexOf('blocked')>=0)?GOLD:'rgba(255,255,255,0.6)';
+    cx.font='700 9px Menlo,monospace'; cx.textAlign='center';
+    cx.fillText(fcLabel.toUpperCase(), cxp+camW/2, cyp+camH+(AUTO?13:22));
+
+    // score
+    cx.textAlign='center'; cx.fillStyle='#fff'; cx.font='900 52px -apple-system,Helvetica,Arial';
+    if(st&&(st.phase==='play'||st.phase==='over')) cx.fillText(st.score,W/2,90);
+    cx.fillStyle='rgba(255,255,255,0.4)'; cx.font='600 12px Menlo,monospace'; cx.fillText('BEST '+best,W/2,112);
+
+    // wilt warning
+    if(st&&st.phase==='play'&&st.wilting&&st.bloom<0.3&&st.score>0){
+      cx.fillStyle=VERM; cx.font='800 16px -apple-system,Helvetica,Arial';
+      cx.globalAlpha=0.5+0.5*Math.sin(now/150); cx.fillText('KEEP SMILING!',W/2,H-170); cx.globalAlpha=1;
+    }
+
+    if(st&&st.phase==='ready'){
+      cx.fillStyle=GREEN; cx.font='800 18px -apple-system,Helvetica,Arial';
+      cx.globalAlpha=0.6+0.4*Math.sin(now/300); cx.fillText('SMILE TO GROW THE PLANT',W/2,H/2+60); cx.globalAlpha=1;
+      cx.fillStyle='rgba(255,255,255,0.45)'; cx.font='600 13px -apple-system,Helvetica,Arial';
+      cx.fillText('grin wide — the bigger the smile, the faster it blooms',W/2,H/2+90);
+    }
+    if(st&&st.phase==='over'){
+      cx.fillStyle='rgba(11,26,14,0.7)'; cx.fillRect(0,0,W,H);
+      cx.fillStyle=st.score>=5?GOLD:VERM; cx.font='900 42px -apple-system,Helvetica,Arial';
+      cx.fillText(st.score>=5?'BLOOMED!':'WILTED.',W/2,H/2-30);
+      cx.fillStyle='#fff'; cx.font='800 24px -apple-system,Helvetica,Arial';
+      cx.fillText(st.score+' bloom'+(st.score!==1?'s':''),W/2,H/2+8);
+      if(!AUTO){ cx.fillStyle=TEAL; cx.font='700 15px -apple-system,Helvetica,Arial';
+        cx.globalAlpha=0.6+0.4*Math.sin(now/280); cx.fillText('SMILE to grow again',W/2,H/2+50); cx.globalAlpha=1; }
+    }
+    if(st&&st.phase==='cta'){
+      var tt=(now-ctaAt)/1000, e=Math.min(1,tt*2.2);
+      cx.fillStyle='rgba(11,26,14,'+(0.82*e)+')'; cx.fillRect(0,0,W,H);
+      cx.globalAlpha=e;
+      cx.fillStyle='#fff'; cx.font='900 40px -apple-system,Helvetica,Arial'; cx.fillText('BIG SMILE',W/2,H/2-30);
+      cx.fillStyle=GREEN; cx.font='700 17px -apple-system,Helvetica,Arial'; cx.fillText('grin to grow. stop and it wilts.',W/2,H/2+6);
+      cx.fillStyle=VERM; cx.font='900 24px -apple-system,Helvetica,Arial'; cx.fillText('▶ PLAY NOW',W/2,H/2+52);
+      cx.globalAlpha=1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- recording (shared FC lib) ----
+  var recBtn=document.getElementById('rec');
+  recBtn.addEventListener('click',function(){
+    var started=FC.toggleRecord(cv,'big-smile.webm',function(){
+      recBtn.textContent='● RECORD'; recBtn.classList.remove('on');
+      if(window.LOOP) LOOP.emit('recording_saved',{score:st?st.score:0});
+    });
+    if(started){ recBtn.textContent='■ STOP & SAVE'; recBtn.classList.add('on'); }
+  });
+
+  // scripted modes auto-start (no camera prompt)
+  if(AUTO){ document.getElementById('perm').style.display='none'; newRun(); requestAnimationFrame(frame); }
+})();
+</script>
+</body>
+</html>

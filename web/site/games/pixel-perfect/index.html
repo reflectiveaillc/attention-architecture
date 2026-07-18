@@ -1,0 +1,849 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Pixel Perfect — Tilt</title>
+<!--
+  LOOP / attention-architecture — Pixel Perfect
+  Circuits: 01-rpe (variable reward per placement), 02-novelty (new pattern each level),
+            05-ease (conditioning from pixel-art social content).
+  Mechanic: Tap/click to place the highlighted pixel at exactly the right moment.
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron run, sets window.__demoDone
+    ?bot=1&runs=N    imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'pixel-perfect';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // Seeded RNG (mulberry32) for reproducible demo clips
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- Game state ----
+  var state, flashes, runStartTs, best = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  try { best = +localStorage.getItem('pp_best') || 0; } catch (_) {}
+
+  // Pattern definitions: pixel art shapes on an NxN grid.
+  // Each pattern is a flat array of 0/1 where 1 = filled pixel.
+  // The cursor sweeps across pixels in order; player taps at the right one.
+  var PATTERNS = [
+    // Heart 5x5
+    { name:'HEART', grid:5, pixels:[
+      0,1,0,1,0,
+      1,1,1,1,1,
+      1,1,1,1,1,
+      0,1,1,1,0,
+      0,0,1,0,0
+    ]},
+    // Star 5x5
+    { name:'STAR', grid:5, pixels:[
+      0,0,1,0,0,
+      0,1,1,1,0,
+      1,1,1,1,1,
+      0,1,0,1,0,
+      1,0,0,0,1
+    ]},
+    // Arrow 5x5
+    { name:'ARROW', grid:5, pixels:[
+      0,0,1,0,0,
+      0,1,1,1,0,
+      1,1,1,1,1,
+      0,0,1,0,0,
+      0,0,1,0,0
+    ]},
+    // Diamond 6x6
+    { name:'DIAMOND', grid:6, pixels:[
+      0,0,1,1,0,0,
+      0,1,1,1,1,0,
+      1,1,1,1,1,1,
+      1,1,1,1,1,1,
+      0,1,1,1,1,0,
+      0,0,1,1,0,0
+    ]},
+    // Skull 6x6
+    { name:'SKULL', grid:6, pixels:[
+      0,1,1,1,1,0,
+      1,1,1,1,1,1,
+      1,0,1,1,0,1,
+      1,1,1,1,1,1,
+      0,1,0,0,1,0,
+      0,1,1,1,1,0
+    ]},
+    // Crown 7x7
+    { name:'CROWN', grid:7, pixels:[
+      1,0,0,0,0,0,1,
+      1,0,1,0,1,0,1,
+      1,1,1,1,1,1,1,
+      1,1,1,1,1,1,1,
+      1,1,1,1,1,1,1,
+      0,1,1,1,1,1,0,
+      0,0,1,1,1,0,0
+    ]},
+    // Lightning 6x6
+    { name:'ZAP', grid:6, pixels:[
+      0,0,1,1,1,0,
+      0,1,1,1,0,0,
+      1,1,1,0,0,0,
+      0,0,1,1,1,0,
+      0,0,0,1,1,1,
+      0,0,0,0,1,0
+    ]}
+  ];
+
+  // Palette of vivid colors cycling per level
+  var PALETTE = [
+    '#e8502e','#2ec5b6','#f2b134','#7c3aed','#0ea5e9','#ec4899','#22c55e','#f97316'
+  ];
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 6))));
+  }
+
+  // ---- Pattern / level logic ----
+  // For each level we pick a pattern and build an ordered list of pixel indices to place
+  // The cursor sweeps between pixels sequentially; the player must tap at each target
+  function pickPattern(level) {
+    var idx = Math.floor(rng() * PATTERNS.length);
+    var pat = PATTERNS[idx];
+    // collect filled pixel indices in raster order
+    var targets = [];
+    for (var i = 0; i < pat.pixels.length; i++) {
+      if (pat.pixels[i] === 1) targets.push(i);
+    }
+    // shuffle targets so placement order isn't top-left obvious
+    for (var j = targets.length - 1; j > 0; j--) {
+      var k = Math.floor(rng() * (j + 1));
+      var tmp = targets[j]; targets[j] = targets[k]; targets[k] = tmp;
+    }
+    // Tolerance: starts wide, shrinks per level. Min 2 frames.
+    var tolerance = Math.max(2, 18 - level * 1.5);
+    return { pat: pat, targets: targets, tolerance: tolerance, color: PALETTE[level % PALETTE.length] };
+  }
+
+  // Cursor sweeps across all cells (not just targets) for challenge
+  // Speed increases each level
+  function cursorSpeed(level) {
+    return 0.4 + level * 0.18;  // cells per frame
+  }
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      level: 0,
+      score: 0,
+      streak: 0,
+      placed: [],        // correctly placed pixel indices
+      missed: false,
+      overAt: 0,
+      ctaAt: 0,
+      levelData: null,
+      cursor: 0,         // current cell index (float, wraps)
+      cursorDir: 1,
+      pixelsLeft: 0,     // remaining pixels to place in current level
+      wrongPixel: -1,    // index of wrong pixel for flash effect
+      wrongAt: 0
+    };
+    flashes = [];
+    dareBeaten = false;
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) {
+      startRun();
+      return;
+    }
+    // human: show title
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.level = 0;
+    state.score = 0;
+    state.streak = 0;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    startLevel();
+  }
+
+  function startLevel() {
+    var ld = pickPattern(state.level);
+    state.levelData = ld;
+    state.placed = [];
+    state.missed = false;
+    state.cursor = 0;
+    state.cursorDir = 1;
+    state.pixelsLeft = ld.targets.length;
+    state.wrongPixel = -1;
+    // Set current target = first in targets array
+    state.targetIdx = 0;  // index into ld.targets
+  }
+
+  // Called when player taps — check if cursor is on the current target pixel
+  function placeTap() {
+    if (state.phase !== 'play') return;
+    var ld = state.levelData;
+    if (!ld) return;
+    var totalCells = ld.pat.grid * ld.pat.grid;
+    var curCell = Math.floor(state.cursor) % totalCells;
+    if (curCell < 0) curCell += totalCells;
+
+    var target = ld.targets[state.targetIdx];
+
+    // Check tolerance: within ld.tolerance frames of speed
+    var speed = cursorSpeed(state.level);
+    var dist = Math.min(
+      Math.abs(curCell - target),
+      totalCells - Math.abs(curCell - target)
+    );
+    var toleranceCells = ld.tolerance * speed;
+
+    if (dist <= toleranceCells) {
+      // CORRECT placement!
+      state.placed.push(target);
+      state.targetIdx++;
+      state.streak++;
+
+      var isPerfect = dist <= speed * 1.2;
+      var isGold    = dist === 0;
+
+      if (isGold) {
+        hitStop = 5; zoom = 1.04;
+        if (window.J) J.gold();
+        flash('EXACT!', GOLD, 52);
+        if (window.LOOP) LOOP.emit('pixel_exact', { level: state.level, n: state.placed.length });
+      } else if (isPerfect) {
+        hitStop = 4; zoom = 1.03;
+        if (window.J) J.perfect(state.streak);
+        flash('PERFECT', TEAL, 46);
+        if (window.LOOP) LOOP.emit('pixel_perfect', { level: state.level, n: state.placed.length });
+      } else {
+        if (window.J) J.hit(state.streak);
+        flash('+1', TEAL, 36);
+        if (window.LOOP) LOOP.emit('pixel_placed', { level: state.level, n: state.placed.length });
+      }
+
+      state.score++;
+
+      // Dare check
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score);
+      }
+
+      if (window.J) J.tension(Math.min(state.level / 7, 1));
+
+      // All pixels in level placed!
+      if (state.targetIdx >= ld.targets.length) {
+        completeLevel();
+      }
+    } else {
+      // WRONG — game over
+      state.wrongPixel = curCell;
+      state.wrongAt = performance.now();
+      shakeAmt = 8;
+      if (window.J) J.near();
+      // Show near-miss if close
+      if (dist <= toleranceCells * 2.5) {
+        flash('SO CLOSE!', VERM, 42);
+        if (window.LOOP) LOOP.emit('near_miss', { level: state.level, dist: +dist.toFixed(2) });
+        // Near miss gives a tiny buffer before death
+        setTimeout(function() { gameOver(); }, 180);
+      } else {
+        gameOver();
+      }
+    }
+  }
+
+  function completeLevel() {
+    var ld = state.levelData;
+    // Bonus for completing the pattern clean
+    if (window.J) J.fanfare();
+    flash(ld.pat.name + ' COMPLETE!', GOLD, 40);
+    if (window.LOOP) LOOP.emit('level_complete', { level: state.level, score: state.score });
+    hitStop = 6; zoom = 1.05;
+    // Advance to next level after brief pause
+    state.phase = 'levelup';
+    setTimeout(function() {
+      if (state.phase !== 'levelup') return;
+      state.level++;
+      state.phase = 'play';
+      startLevel();
+    }, 900);
+  }
+
+  function gameOver() {
+    if (state.phase === 'over' || state.phase === 'cta' || state.phase === 'levelup') return;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + state.score / 20, 1));
+      if (newBest) setTimeout(function() { J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('pp_best', String(best)); } catch(_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function() {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function() { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function() { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- Input ----
+  var MUTE_R  = { x: W - 46, y: 10,  w: 38, h: 38 };
+  var SHARE_R = { x: W/2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { placeTap(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'level' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function(e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function(e) { if (e.code === 'Space') tap(); });
+
+  // ---- Bot / Demo autopilot ----
+  var botRunsDone = 0;
+  var demoStep = 0;
+  // demo script: array of actions: 'hit'=place on target, 'near'=just outside, 'miss'=far off
+  // mirrors the mirror-neuron arc: goods → near-fail → recovery → final fail
+  var demoScript = ['hit','hit','hit','near','hit','hit','miss'];
+  var demoWaits  = [28, 22, 35, 55, 40, 30, 25]; // frames to wait before each action
+  var demoWait   = 20;
+
+  // Bot error: how many cells off from target (Gaussian sampled)
+  function gauss() {
+    var u = 1 - rng(), v = rng();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+
+  // How many frames until cursor reaches a target offset from current
+  var botActionQueued = false;
+  var botActionWait = 0;
+
+  function autopilot(dt) {
+    if (state.phase !== 'play') return;
+    var ld = state.levelData;
+    if (!ld) return;
+    var totalCells = ld.pat.grid * ld.pat.grid;
+    var target = ld.targets[state.targetIdx];
+    if (target === undefined) return;
+
+    if (DEMO) {
+      if (demoWait > 0) { demoWait -= dt; return; }
+      var action = demoScript[Math.min(demoStep, demoScript.length - 1)];
+      var curCell = Math.floor(state.cursor) % totalCells;
+      if (curCell < 0) curCell += totalCells;
+      var speed = cursorSpeed(state.level);
+      var toleranceCells = ld.tolerance * speed;
+
+      if (action === 'hit') {
+        // Place close to target (within tolerance)
+        var dist = Math.min(
+          Math.abs(curCell - target),
+          totalCells - Math.abs(curCell - target)
+        );
+        if (dist <= toleranceCells * 0.7) {
+          demoStep++;
+          demoWait = demoWaits[Math.min(demoStep, demoWaits.length - 1)] || 25;
+          placeTapForBot(0);
+        }
+      } else if (action === 'near') {
+        // Place just outside tolerance — triggers near-miss
+        var dist2 = Math.min(
+          Math.abs(curCell - target),
+          totalCells - Math.abs(curCell - target)
+        );
+        if (dist2 >= toleranceCells * 1.1 && dist2 <= toleranceCells * 2.2) {
+          demoStep++;
+          demoWait = demoWaits[Math.min(demoStep, demoWaits.length - 1)] || 25;
+          placeTapForBot(Math.ceil(toleranceCells * 1.5));
+        }
+      } else if (action === 'miss') {
+        // Drop far from target — game over
+        var dist3 = Math.min(
+          Math.abs(curCell - target),
+          totalCells - Math.abs(curCell - target)
+        );
+        if (dist3 >= toleranceCells * 3) {
+          demoStep++;
+          placeTapForBot(Math.ceil(toleranceCells * 4));
+        }
+      }
+    } else if (BOT) {
+      if (botActionWait > 0) { botActionWait -= dt; return; }
+      // Bot: ~75% hit, 25% miss eventually → game over
+      var curCell2 = Math.floor(state.cursor) % totalCells;
+      if (curCell2 < 0) curCell2 += totalCells;
+      var speed2 = cursorSpeed(state.level);
+      var tol2 = ld.tolerance * speed2;
+      var dist4 = Math.min(
+        Math.abs(curCell2 - target),
+        totalCells - Math.abs(curCell2 - target)
+      );
+      // Only attempt on ~every third frame chance when near target
+      if (dist4 <= tol2 * 0.8 && rng() < 0.08) {
+        // Decide: hit or intentional miss (after level 2+, increase miss rate)
+        var missRate = 0.15 + state.level * 0.10;
+        if (rng() < missRate) {
+          placeTapForBot(Math.ceil(tol2 * 3.5 + 1));
+        } else {
+          placeTapForBot(0);
+        }
+        botActionWait = 5 + Math.floor(rng() * 10);
+      }
+    }
+  }
+
+  // Place tap with an artificial offset (in cells) for bot/demo control
+  function placeTapForBot(cellOffset) {
+    if (state.phase !== 'play') return;
+    var ld = state.levelData;
+    if (!ld) return;
+    var totalCells = ld.pat.grid * ld.pat.grid;
+    var target = ld.targets[state.targetIdx];
+    if (target === undefined) return;
+
+    var curCell = Math.floor(state.cursor) % totalCells;
+    if (curCell < 0) curCell += totalCells;
+    var dist = Math.min(
+      Math.abs(curCell - target),
+      totalCells - Math.abs(curCell - target)
+    );
+
+    // Temporarily override cursor position relative to target
+    var speed = cursorSpeed(state.level);
+    var tol = ld.tolerance * speed;
+
+    if (cellOffset === 0) {
+      // Hit: snap cursor close to target
+      state.cursor = target + (rng() - 0.5) * tol * 0.4;
+    } else {
+      // Miss: place cursor far from target
+      state.cursor = (target + cellOffset) % totalCells;
+    }
+    placeTap();
+  }
+
+  // ---- Grid drawing helpers ----
+  function gridLayout(pat) {
+    var n = pat.grid;
+    // Grid fills a zone in center of canvas
+    // Cell size depends on grid size and level zoom
+    var maxW = 280, maxH = 280;
+    var cellSize = Math.min(Math.floor(maxW / n), Math.floor(maxH / n));
+    var gridW = cellSize * n, gridH = cellSize * n;
+    var ox = (W - gridW) / 2, oy = (H - gridH) / 2 - 30;
+    return { n: n, cellSize: cellSize, ox: ox, oy: oy, gridW: gridW, gridH: gridH };
+  }
+
+  // ---- Render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Advance cursor during play
+    if (hitStop > 0) { hitStop -= dt; }
+    else {
+      if (state.phase === 'play' && state.levelData) {
+        var totalCells = state.levelData.pat.grid * state.levelData.pat.grid;
+        state.cursor += cursorSpeed(state.level) * state.cursorDir * dt;
+        // Bounce cursor
+        if (state.cursor >= totalCells) {
+          state.cursor = totalCells - 1;
+          state.cursorDir = -1;
+        }
+        if (state.cursor < 0) {
+          state.cursor = 0;
+          state.cursorDir = 1;
+        }
+        autopilot(dt);
+      }
+    }
+
+    // Juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W/2 + sx, H/2 + sy); cx.scale(zoom, zoom); cx.translate(-W/2, -H/2);
+    }
+    shakeAmt *= Math.pow(0.84, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // BG
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- Draw based on phase ----
+    if (state.phase === 'title') {
+      drawTitle(now);
+    } else if (state.phase === 'challenge') {
+      drawChallenge();
+    } else if (state.phase === 'play' || state.phase === 'levelup') {
+      drawPlay(now, dt);
+    } else if (state.phase === 'over') {
+      drawPlay(now, dt);
+      drawOver(now);
+    } else if (state.phase === 'cta') {
+      drawPlay(now, dt);
+      drawOver(now);
+      drawCTA(now);
+    }
+
+    // Floating reward texts
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 42);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W/2, 220 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+    cx.fillText('PIXEL PERFECT', W/2, 260);
+    cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 15px Menlo, monospace';
+    cx.fillText('place each pixel exactly', W/2, 298);
+    cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+    var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+    cx.globalAlpha = pulse;
+    cx.fillText('TAP TO START', W/2, 344);
+    cx.globalAlpha = 1;
+    // Draw a small pixel-art heart preview
+    drawMiniPreview(W/2, 420, PALETTE[0]);
+    cx.fillStyle = 'rgba(255,255,255,0.25)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('one wrong pixel ruins it', W/2, 540);
+  }
+
+  function drawMiniPreview(cx2, cy, color) {
+    var pat = PATTERNS[0]; // heart
+    var n = pat.grid, cell = 20;
+    var ox = W/2 - n * cell / 2;
+    var oy2 = cy - n * cell / 2;
+    for (var i = 0; i < pat.pixels.length; i++) {
+      if (!pat.pixels[i]) continue;
+      var col = i % n, row = Math.floor(i / n);
+      cx.fillStyle = color;
+      cx.globalAlpha = 0.85;
+      cx.fillRect(ox + col * cell + 1, oy2 + row * cell + 1, cell - 2, cell - 2);
+    }
+    cx.globalAlpha = 1;
+  }
+
+  function drawChallenge() {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+    cx.fillText('SCORE TO BEAT', W/2, 300);
+    cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+    cx.fillText('12', W/2, 400);
+    cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText("today's top run", W/2, 432);
+  }
+
+  function drawPlay(now, dt) {
+    var ld = state.levelData;
+    if (!ld) return;
+
+    var layout = gridLayout(ld.pat);
+    var n = layout.n, cell = layout.cellSize, ox = layout.ox, oy = layout.oy;
+    var totalCells = n * n;
+
+    // Current cursor cell
+    var curCell = Math.floor(state.cursor) % totalCells;
+    if (curCell < 0) curCell += totalCells;
+    var curTarget = ld.targets[state.targetIdx];
+
+    // Score + level HUD
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.92)';
+    cx.font = '800 64px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score, W/2, 90);
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + best, W/2, 112);
+
+    // Level indicator
+    cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '700 14px Menlo, monospace';
+    cx.fillText('LEVEL ' + (state.level + 1) + '  —  ' + ld.pat.name, W/2, 136);
+
+    // Dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare, W/2, 158);
+    }
+
+    // Progress bar: pixels placed / total
+    var totalPixels = ld.targets.length;
+    var placed = state.placed.length;
+    var barW = 200, barH = 6;
+    var barX = W/2 - barW/2, barY = oy - 28;
+    cx.fillStyle = 'rgba(255,255,255,0.12)';
+    cx.fillRect(barX, barY, barW, barH);
+    cx.fillStyle = ld.color;
+    cx.fillRect(barX, barY, barW * (placed / Math.max(1, totalPixels)), barH);
+
+    // Pixels remaining label
+    cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 11px Menlo, monospace';
+    cx.fillText((totalPixels - placed) + ' pixels left', W/2, barY - 6);
+
+    // Grid cells
+    for (var i = 0; i < n * n; i++) {
+      var col = i % n, row = Math.floor(i / n);
+      var px = ox + col * cell, py = oy + row * cell;
+
+      // Is this a target pixel?
+      var isTarget = ld.pat.pixels[i] === 1;
+      // Is it already placed?
+      var isPlaced = state.placed.indexOf(i) !== -1;
+      // Is it the current active target?
+      var isCurrentTarget = (i === curTarget);
+      // Is cursor here?
+      var isCursor = (i === curCell);
+      // Is wrong pixel?
+      var isWrong = (i === state.wrongPixel && (performance.now() - state.wrongAt) < 400);
+
+      // Cell background
+      cx.fillStyle = 'rgba(255,255,255,0.04)';
+      cx.fillRect(px + 1, py + 1, cell - 2, cell - 2);
+
+      // Grid lines
+      cx.strokeStyle = 'rgba(255,255,255,0.08)'; cx.lineWidth = 0.5;
+      cx.strokeRect(px + 0.5, py + 0.5, cell, cell);
+
+      if (isPlaced) {
+        // Placed pixels glow in level color
+        cx.fillStyle = ld.color;
+        cx.globalAlpha = 0.9;
+        cx.fillRect(px + 1, py + 1, cell - 2, cell - 2);
+        // Inner bright center
+        cx.fillStyle = '#fff';
+        cx.globalAlpha = 0.3;
+        cx.fillRect(px + 3, py + 3, cell - 6, cell - 6);
+        cx.globalAlpha = 1;
+      } else if (isWrong) {
+        // Wrong cell flash red
+        cx.fillStyle = VERM;
+        cx.globalAlpha = 0.8 * Math.max(0, 1 - (performance.now() - state.wrongAt) / 400);
+        cx.fillRect(px + 1, py + 1, cell - 2, cell - 2);
+        cx.globalAlpha = 1;
+      } else if (isCurrentTarget && isTarget) {
+        // Active target: pulsing outline to help player aim
+        var pulse = 0.5 + 0.5 * Math.sin(now / 120);
+        cx.strokeStyle = ld.color;
+        cx.lineWidth = 2;
+        cx.globalAlpha = pulse;
+        cx.strokeRect(px + 2, py + 2, cell - 4, cell - 4);
+        cx.globalAlpha = 0.18;
+        cx.fillStyle = ld.color;
+        cx.fillRect(px + 1, py + 1, cell - 2, cell - 2);
+        cx.globalAlpha = 1;
+      } else if (isTarget) {
+        // Unfilled target pixel: subtle ghost
+        cx.fillStyle = ld.color;
+        cx.globalAlpha = 0.12;
+        cx.fillRect(px + 1, py + 1, cell - 2, cell - 2);
+        cx.globalAlpha = 1;
+      }
+
+      // Cursor highlight: sweeping indicator
+      if (isCursor && state.phase === 'play') {
+        var highlightA = 0.55 + 0.45 * Math.sin(now / 80);
+        cx.strokeStyle = '#fff';
+        cx.lineWidth = 1.5;
+        cx.globalAlpha = highlightA;
+        cx.strokeRect(px + 1.5, py + 1.5, cell - 3, cell - 3);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // Tension glow ring around grid as level increases
+    var tension = Math.min(state.level / 7, 1);
+    if (tension > 0.1) {
+      var glow = cx.createRadialGradient(W/2, oy + layout.gridH/2, layout.gridW/2 * 0.9,
+                                          W/2, oy + layout.gridH/2, layout.gridW/2 * 1.5);
+      glow.addColorStop(0, 'rgba(232,80,46,' + (0.06 * tension) + ')');
+      glow.addColorStop(1, 'rgba(232,80,46,0)');
+      cx.fillStyle = glow;
+      cx.fillRect(0, oy - 40, W, layout.gridH + 80);
+    }
+
+    // TAP hint during play
+    if (!DEMO && !BOT && state.phase === 'play') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.28)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP when cursor hits the target', W/2, oy + layout.gridH + 24);
+    }
+
+    // Level up banner
+    if (state.phase === 'levelup') {
+      cx.fillStyle = 'rgba(11,13,18,0.65)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = GOLD; cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('LEVEL ' + (state.level + 2), W/2, H/2 - 10);
+      cx.fillStyle = 'rgba(255,255,255,0.6)'; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('tighter tolerance…', W/2, H/2 + 22);
+    }
+  }
+
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.60)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+    cx.fillText('MISPLACED.', W/2, 300);
+    cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score + ' pixels placed', W/2, 345);
+    var pt = pctTop(state.score);
+    cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+    cx.fillText('TOP ' + pt + '% TODAY', W/2, 392);
+    cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('better than ' + (100 - pt) + '% of players', W/2, 416);
+    if (!DEMO && !BOT) {
+      var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+      cx.globalAlpha = p2; cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — TRY AGAIN', W/2, 462);
+      cx.globalAlpha = 1;
+      // Share pill
+      cx.fillStyle = 'rgba(242,177,52,0.14)';
+      cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) { cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23); }
+      else { cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h); }
+      cx.fill(); cx.stroke();
+      cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+      cx.fillText(
+        window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+        W/2, SHARE_R.y + 30
+      );
+    }
+  }
+
+  function drawCTA(now) {
+    var t = (now - state.ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.80 * ease) + ')'; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease; cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+    cx.fillText('PIXEL PERFECT', W/2, 300);
+    cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+    cx.fillText('placed ' + (window.__demoScore || 12) + '. can you beat it?', W/2, 342);
+    var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+    cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+    cx.font = '900 30px -apple-system, Helvetica, Arial';
+    cx.fillText('BEAT ' + (window.__demoScore || 12), W/2, 410);
+    cx.globalAlpha = ease;
+    cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W/2, 444);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- Boot ----
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

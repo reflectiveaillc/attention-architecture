@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Pinned Top — Tilt</title>
+<!--
+  LOOP / attention-architecture — Pinned Top
+  Circuits: 03-social (top-comment status), 01-rpe (variable reward timing),
+            06-zeigarnik (so close, one more try).
+  Conditioned path: thumb knows this move from Instagram/TikTok — tap to pin the
+  rising comment before it falls. Viral engine.
+  Modes:
+    ?demo=1&seed=7        scripted clip, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'pinned-top';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO     = qs.get('demo') === '1';
+  var BOT      = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED     = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // Comment pool — no apostrophes in string literals
+  var POOL_USERS = ['@nova.writes','@lxmn','@rez','@sunflwr_k','@m.oore',
+                    '@p_theway','@arivs','@dani_v','@yung_ctrl','@earthchild7',
+                    '@lo.ki','@nxt_wave'];
+  var POOL_TEXT  = ['this is the one','not me crying again','bro said what we feel',
+                    'ok why am i crying','living rent free','send this to your ex',
+                    'the algorithm knew','cannot stop watching','this is it chief',
+                    'telling everyone','unexpectedly emotional','okay but no fr'];
+
+  // ---- layout ----
+  var CARD_H    = 72;    // height of one comment card
+  var CARD_PAD  = 6;     // gap between cards
+  var SLOT_H    = CARD_H + CARD_PAD;
+  var NUM_SLOTS = 7;     // visible comment rows
+  var LIST_TOP  = 150;   // y of the topmost slot (the "hot" slot)
+  var LIST_BOT  = LIST_TOP + NUM_SLOTS * SLOT_H;
+
+  // The "hot zone" is slot 0 — a comment reaching it must be pinned or it escapes
+  var HOT_Y     = LIST_TOP;
+  // Window of frames player has to pin before it escapes
+  var PIN_WINDOW_MS = 1800; // ms
+
+  // ---- global state ----
+  var phase = 'title';   // title | challenge | play | over | cta
+  var score = 0;
+  var comboCount = 0;
+  var flashes = [];
+  var runStartTs = 0;
+  var overAt = 0, ctaAt = 0, challengeAt = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var dareBeaten = false;
+  var botRunsDone = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('pt_best') || 0; } catch (_) {}
+
+  // Comment card object:
+  //   id, user, text, likes, y (current y), targetY (destination slot y),
+  //   enteredHotAt (ms timestamp when it first reached HOT_Y, or 0),
+  //   pinned (bool), alpha, glow, flashT
+  var comments = [];
+  var nextId = 0;
+  var nextId2 = 100; // for bot/demo mode
+
+  // ---- helpers ----
+  function pctTop(s) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 9))));
+  }
+
+  function flash(txt, col, sz) {
+    flashes.push({ txt: txt, color: col, size: sz, t: 0 });
+  }
+
+  function spawnComment(slotIdx) {
+    var id = nextId++;
+    var poolIdx = id % POOL_USERS.length;
+    return {
+      id: id,
+      user:  POOL_USERS[poolIdx],
+      text:  POOL_TEXT[poolIdx],
+      likes: Math.floor(rng() * 140) + 2,
+      y: LIST_BOT + CARD_H,           // starts below visible area
+      targetY: LIST_TOP + slotIdx * SLOT_H,
+      enteredHotAt: 0,
+      pinned: false,
+      alpha: 1,
+      glow: 0,
+      flashT: 0
+    };
+  }
+
+  // Rise speed: px per frame unit; increases with score
+  function riseSpd() { return 1.1 + score * 0.08; }
+
+  // ---- init ----
+  function initComments() {
+    comments = [];
+    nextId = 0;
+    // fill slots 1..NUM_SLOTS-1 with comments already in place
+    for (var s = 1; s < NUM_SLOTS; s++) {
+      var c = spawnComment(s);
+      c.y = LIST_TOP + s * SLOT_H;  // already in position
+      comments.push(c);
+    }
+    // slot 0 starts rising from below
+    var hot = spawnComment(0);
+    comments.push(hot);
+  }
+
+  function newGame() {
+    score = 0; comboCount = 0; flashes = []; dareBeaten = false;
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    phase = 'title'; overAt = 0; ctaAt = 0;
+    initComments();
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- pin action ----
+  function doPinTop() {
+    if (phase !== 'play') return;
+    // Find the comment in the HOT slot (slot 0 target)
+    var hot = null;
+    for (var i = 0; i < comments.length; i++) {
+      if (comments[i].targetY === LIST_TOP && !comments[i].pinned) {
+        hot = comments[i]; break;
+      }
+    }
+    if (!hot) return;
+
+    // Must be close enough to top
+    var nearTop  = hot.y <= LIST_TOP + CARD_H * 1.6;
+    var tooEarly = hot.y > LIST_TOP + CARD_H * 3.2;
+    var perfect  = hot.y <= LIST_TOP + CARD_H * 0.6;
+
+    if (tooEarly) {
+      // Near-miss: tapped too early
+      flash('TOO EARLY!', VERM, 32);
+      shakeAmt = 4;
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { n: score, reason: 'too_early' });
+      // Missed the chance — game over
+      triggerGameOver();
+      return;
+    }
+
+    // Successful pin
+    hot.pinned = true;
+    hot.glow = 1;
+    hot.y = LIST_TOP;
+    hot.flashT = 1;
+
+    comboCount++;
+    score++;
+
+    if (window.J) {
+      if (perfect) { J.perfect(comboCount); hitStop = 5; zoom = 1.026; }
+      else { J.hit(score); }
+      J.tension(Math.min(score / 28, 1));
+      if (perfect || score % 5 === 0) J.gold();
+    }
+    if (perfect) shakeAmt = 2;
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 40);
+      if (window.J) J.fanfare();
+      SHARE.beaten(score);
+    }
+
+    if (perfect)      flash('PERFECT PIN', GOLD, 44);
+    else if (nearTop) flash('PINNED!', TEAL, 38);
+    else              flash('+' + score, TEAL, 32);
+
+    if (score > best) { best = score; try { localStorage.setItem('pt_best', String(best)); } catch(_){} }
+    if (window.LOOP) LOOP.emit('pin', { n: score, perfect: perfect });
+
+    // Retire pinned after 0.9s and shift all up, spawn new at bottom
+    var capturedHot = hot;
+    setTimeout(function () {
+      advanceThread(capturedHot);
+    }, 900);
+  }
+
+  function advanceThread(pinned) {
+    // remove pinned card
+    var idx = comments.indexOf(pinned);
+    if (idx !== -1) comments.splice(idx, 1);
+    // shift remaining cards up by one slot
+    for (var i = 0; i < comments.length; i++) {
+      comments[i].targetY -= SLOT_H;
+    }
+    // remove any card that went above the list
+    for (var i = comments.length - 1; i >= 0; i--) {
+      if (comments[i].targetY < LIST_TOP) {
+        comments.splice(i, 1);
+      }
+    }
+    // spawn a new comment at the bottom slot
+    var c = spawnComment(NUM_SLOTS - 1);
+    comments.push(c);
+  }
+
+  function triggerGameOver() {
+    if (phase !== 'play') return;
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 12;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.death(Math.min(0.3 + score / 28, 1));
+    if (DEMO) window.__demoScore = score;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 700);
+      }
+    }
+  }
+
+  function resetRun() {
+    score = 0; comboCount = 0; flashes = []; dareBeaten = false;
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    initComments();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10,  w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play')  { doPinTop(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'top pins' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  // Demo: human-feeling script — pin 5 times, one near-miss hesitation, then miss (let it escape)
+  // demoWaits: hesitation in frames before each action
+  var demoActions  = ['pin', 'pin', 'pin', 'near_hesitate', 'pin', 'pin', 'miss'];
+  var demoWaits    = [40, 32, 50, 60, 38, 44, 28];
+  var demoIdx = 0, demoTick = 0;
+  var demoNearFired = false;
+
+  // Bot: pin the first N then go passive so escape fires
+  var botPins = 0;
+  var botMaxPins = 5;  // pin this many then stop so game_over fires
+  var botTick = 0;
+  var botDelay = 18;   // frames between actions
+
+  function autopilot(now) {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      demoTick++;
+      var wait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 35;
+      if (demoTick < wait) return;
+
+      var action = demoActions[Math.min(demoIdx, demoActions.length - 1)];
+
+      // find the hot comment
+      var hot = null;
+      for (var i = 0; i < comments.length; i++) {
+        if (comments[i].targetY === LIST_TOP && !comments[i].pinned) { hot = comments[i]; break; }
+      }
+      if (!hot) return;
+
+      if (action === 'miss') {
+        // Let the comment reach top and wait — escape timer fires naturally
+        // Force it to be in position and trigger a near-miss scenario where
+        // the demo hesitates, then the comment escapes via timeout
+        if (hot.enteredHotAt > 0) {
+          // it's been in hot zone — just let escape timer run out
+          // (don't pin — game_over fires from update loop)
+        } else {
+          // push it to top so escape countdown starts
+          hot.y = LIST_TOP + 2;
+          hot.enteredHotAt = now;
+        }
+        // After a long enough wait the escape fires, do nothing
+        return;
+      }
+
+      if (action === 'near_hesitate') {
+        // Hesitate — make it look like a near-miss: comment is in hot zone
+        // already visible — we just skip the tick and let tension build
+        // Then on next action we pin it (recovery)
+        demoIdx++;
+        demoTick = 0;
+        flash('SO CLOSE', VERM, 36);
+        shakeAmt = 3;
+        if (window.J) J.near();
+        if (window.LOOP) LOOP.emit('near_miss', { n: score, reason: 'demo_tension' });
+        return;
+      }
+
+      if (action === 'pin') {
+        // Pin when hot comment is in window
+        if (hot.y <= LIST_TOP + CARD_H * 1.8) {
+          doPinTop();
+          demoIdx++;
+          demoTick = 0;
+        }
+      }
+
+    } else if (BOT) {
+      botTick++;
+      if (botTick < botDelay) return;
+
+      if (botPins >= botMaxPins) {
+        // Go passive — let comment escape naturally (escape timer handles it)
+        return;
+      }
+
+      var hot2 = null;
+      for (var i = 0; i < comments.length; i++) {
+        if (comments[i].targetY === LIST_TOP && !comments[i].pinned) { hot2 = comments[i]; break; }
+      }
+      if (!hot2) return;
+
+      // Pin when hot comment is in window (with some random variation)
+      var threshold = LIST_TOP + CARD_H * (1.0 + rng() * 0.8);
+      if (hot2.y <= threshold) {
+        botPins++;
+        doPinTop();
+        botTick = 0;
+        botDelay = 14 + Math.floor(rng() * 18);
+      }
+    }
+  }
+
+  // ---- draw comment card ----
+  function drawCard(c, isHot, now) {
+    var x = 18, w = W - 36, h = CARD_H;
+    var y = c.y;
+    if (y > LIST_BOT + CARD_H || y < LIST_TOP - CARD_H * 2) return;
+
+    cx.save();
+    cx.globalAlpha = Math.max(0, Math.min(1, c.alpha));
+
+    // glow
+    if (c.glow > 0.02) {
+      cx.shadowColor = c.pinned ? GOLD : TEAL;
+      cx.shadowBlur = 20 * c.glow;
+    }
+
+    // card bg
+    var bgA = c.pinned ? 0.26 : (isHot ? 0.16 : 0.10);
+    cx.fillStyle = c.pinned ? 'rgba(242,177,52,' + bgA + ')' :
+                   (isHot   ? 'rgba(46,197,182,' + bgA + ')' : 'rgba(255,255,255,' + bgA + ')');
+    cx.strokeStyle = c.pinned ? GOLD : (isHot ? TEAL : 'rgba(255,255,255,0.13)');
+    cx.lineWidth = c.pinned ? 2 : (isHot ? 1.5 : 0.8);
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(x, y, w, h, 10);
+    else cx.rect(x, y, w, h);
+    cx.fill();
+    cx.shadowBlur = 0;
+    cx.stroke();
+
+    // top-label
+    if (c.pinned) {
+      cx.fillStyle = GOLD;
+      cx.font = '700 11px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'left';
+      cx.fillText('\u{1F451} TOP COMMENT', x + 10, y + 16);
+    } else if (isHot) {
+      cx.fillStyle = TEAL;
+      cx.font = '700 11px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'left';
+      cx.fillText('▲ RISING', x + 10, y + 14);
+    }
+
+    // username
+    var nameY = c.pinned ? y + 33 : (isHot ? y + 29 : y + 23);
+    cx.fillStyle = c.pinned ? GOLD : (isHot ? 'rgba(46,197,182,0.9)' : 'rgba(255,255,255,0.65)');
+    cx.font = '700 12px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'left';
+    cx.fillText(c.user, x + 10, nameY);
+
+    // comment text
+    cx.fillStyle = 'rgba(255,255,255,0.88)';
+    cx.font = '500 13px -apple-system, Helvetica, Arial';
+    cx.fillText(c.text, x + 10, nameY + 17);
+
+    // likes counter
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 11px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'right';
+    cx.fillText('♥ ' + (c.likes + score * 3), x + w - 10, y + h - 8);
+
+    // escape timer bar (for hot comment in window)
+    if (isHot && c.enteredHotAt > 0 && !c.pinned) {
+      var elapsed = (now - c.enteredHotAt) / PIN_WINDOW_MS;
+      var barW = w * Math.max(0, 1 - elapsed);
+      cx.fillStyle = elapsed > 0.6 ? VERM : (elapsed > 0.3 ? GOLD : TEAL);
+      cx.fillRect(x, y + h - 3, barW, 3);
+    }
+
+    cx.restore();
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Update physics only during play
+    if (phase === 'play') {
+      if (hitStop > 0) {
+        hitStop -= dt;
+      } else {
+        autopilot(now);
+
+        var spd = riseSpd();
+        // move each comment toward its target
+        for (var i = 0; i < comments.length; i++) {
+          var c = comments[i];
+          if (c.pinned) {
+            c.glow *= Math.pow(0.96, dt);
+            continue;
+          }
+          // smoothly approach targetY
+          var dy = c.targetY - c.y;
+          if (Math.abs(dy) > 0.5) {
+            c.y += Math.sign(dy) * Math.min(Math.abs(dy), spd * dt);
+          } else {
+            c.y = c.targetY;
+          }
+
+          // Check if this is the hot comment (targetY === LIST_TOP)
+          if (c.targetY === LIST_TOP && !c.pinned) {
+            // Start escape countdown when near top
+            if (c.y <= LIST_TOP + CARD_H * 0.5 && c.enteredHotAt === 0) {
+              c.enteredHotAt = now;
+            }
+            // Escape: ran out of time
+            if (c.enteredHotAt > 0 && (now - c.enteredHotAt) > PIN_WINDOW_MS) {
+              triggerGameOver();
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // ---- draw ----
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.84, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // score + header
+    if (phase === 'play' || phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 58px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 88);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 110);
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          dareBeaten ? 'DARE BEATEN ✓' :
+          ('BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : '')),
+          W / 2, 132
+        );
+      }
+    }
+
+    // thread label
+    if (phase === 'play') {
+      cx.textAlign = 'left';
+      cx.fillStyle = 'rgba(255,255,255,0.25)';
+      cx.font = '600 11px Menlo, monospace';
+      cx.fillText('COMMENTS  ' + (844 + score * 7), 20, LIST_TOP - 10);
+      cx.strokeStyle = 'rgba(255,255,255,0.08)'; cx.lineWidth = 1;
+      cx.beginPath(); cx.moveTo(18, LIST_TOP - 4); cx.lineTo(W - 18, LIST_TOP - 4); cx.stroke();
+
+      // find hot comment
+      var hotComment = null;
+      for (var i = 0; i < comments.length; i++) {
+        if (comments[i].targetY === LIST_TOP && !comments[i].pinned) { hotComment = comments[i]; break; }
+      }
+
+      // draw all comments
+      for (var i = 0; i < comments.length; i++) {
+        drawCard(comments[i], comments[i] === hotComment, now);
+      }
+
+      // TAP hint on hot comment if not yet in window
+      if (hotComment && hotComment.enteredHotAt === 0 && hotComment.y <= LIST_TOP + CARD_H * 2.5) {
+        var pulse = 0.5 + 0.5 * Math.sin(now / 200);
+        cx.globalAlpha = pulse * 0.8;
+        cx.fillStyle = TEAL;
+        cx.font = '700 13px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText('TAP TO PIN', W / 2, LIST_TOP - 18);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // floating reward flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a2 = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a2; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.35) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 200 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // challenge card (demo beat 1)
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 302);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('22', W / 2, 402);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 432);
+    }
+
+    // title screen
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('PINNED TOP', W / 2, 280);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse2 = 0.6 + 0.4 * Math.sin(now / 310);
+      cx.globalAlpha = pulse2;
+      cx.fillText('TAP TO PIN', W / 2, 330);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('pin the top comment before it falls', W / 2, 362);
+    }
+
+    // game over screen
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('MISSED IT.', W / 2, 292);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' top pins', W / 2, 340);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 386);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 410);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 458);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W / 2, SHARE_R.y + 30
+        );
+      }
+    }
+
+    // demo CTA card
+    if (phase === 'cta') {
+      var tCTA = (now - ctaAt) / 1000, ease = Math.min(1, tCTA * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('PINNED TOP', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they got ' + (window.__demoScore || 22) + '. your move.', W / 2, 342);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 22), W / 2, 414);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 446);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

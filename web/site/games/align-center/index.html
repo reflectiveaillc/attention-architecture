@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Align Center — Tilt</title>
+<!--
+  LOOP / attention-architecture — Align Center
+  Circuits: 06-zeigarnik, 05-ease, 01-rpe
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, N runs, window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'align-center';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO    = qs.get('demo') === '1';
+  var BOT     = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED    = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // palette — calm: teal/gold, avoid vermillion
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL_D = '#1a9e90', TEAL_L = 'rgba(46,197,182,0.18)';
+  var WHITE  = 'rgba(255,255,255,0.92)';
+
+  // ---- game config ----
+  // puzzle types: 'text', 'icon', 'layout'
+  var PUZZLES = [
+    { type:'text',  label:'SALE 50% OFF',     font:'900 26px -apple-system, Helvetica, Arial', w:180, h:38 },
+    { type:'icon',  label:'♥',                 font:'900 48px -apple-system, Helvetica, Arial', w:52,  h:56 },
+    { type:'text',  label:'Follow for more',   font:'700 20px -apple-system, Helvetica, Arial', w:192, h:30 },
+    { type:'icon',  label:'✦',                 font:'900 40px -apple-system, Helvetica, Arial', w:44,  h:48 },
+    { type:'text',  label:'NEW ARRIVALS',      font:'900 22px -apple-system, Helvetica, Arial', w:196, h:32 },
+    { type:'icon',  label:'◈',                 font:'900 44px -apple-system, Helvetica, Arial', w:48,  h:52 },
+    { type:'text',  label:'Limited Edition',   font:'700 18px -apple-system, Helvetica, Arial', w:170, h:26 },
+    { type:'icon',  label:'⬡',                 font:'900 46px -apple-system, Helvetica, Arial', w:50,  h:54 },
+    { type:'text',  label:'OPEN NOW',          font:'900 30px -apple-system, Helvetica, Arial', w:165, h:40 },
+    { type:'layout',label:'PHOTO\nCAPTION',    font:'600 16px -apple-system, Helvetica, Arial', w:140, h:52 },
+  ];
+
+  var SNAP_PX    = 8;   // snap zone radius in px
+  var NEAR_PX    = 22;  // near-miss zone
+  var CENTER_X   = W / 2;
+  var CENTER_Y   = H / 2;
+  var GUIDE_FADE_DUR = 60; // frames guides glow after snap
+
+  // state
+  var state, flashes, dragging, runStartTs, best = 0, botRunsDone = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var ctaAt = 0, overAt = 0;
+  try { best = +localStorage.getItem('ac_best') || 0; } catch(_) {}
+
+  // input state
+  var pointer = { down: false, x: 0, y: 0, ox: 0, oy: 0 };
+  // element offset from pointer grab point
+  var grabOff = { x: 0, y: 0 };
+
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W/2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- puzzle element ----
+  function newElement(puzzleIdx, offsetMagnitude) {
+    var p = PUZZLES[puzzleIdx % PUZZLES.length];
+    // random initial offset biased away from center
+    var sign = rng() > 0.5 ? 1 : -1;
+    var dx = sign * (offsetMagnitude + rng() * 20);
+    var dy = (rng() - 0.5) * offsetMagnitude * 0.6;
+    return {
+      puzzle: p,
+      x: CENTER_X + dx,
+      y: CENTER_Y + dy,
+      locked: false,
+      snapGlow: 0,   // countdown for guide glow
+    };
+  }
+
+  function newGame() {
+    state = {
+      phase: 'title',   // title | play | over | cta
+      level: 0,
+      score: 0,
+      el: null,
+      overAt: 0,
+    };
+    flashes  = [];
+    dragging = false;
+    hitStop  = 0; zoom = 1; shakeAmt = 0;
+    botRunsDone = 0;
+
+    if (DEMO) {
+      demoPhase = 'settle';
+      demoTimer = 0;
+      demoStage = 0;
+      startRun();
+      return;
+    }
+    if (BOT) {
+      startRun();
+      return;
+    }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.level = 0;
+    state.score = 0;
+    runStartTs = Date.now();
+    spawnElement();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function spawnElement() {
+    var mag = Math.max(30, 90 - state.level * 6); // harder levels start closer
+    state.el = newElement(state.level, mag);
+    state.el.locked = false;
+    dragging = false;
+    // reset bot target
+    botTargetX = null; botTargetY = null;
+    botDone = false;
+  }
+
+  function checkSnap() {
+    var el = state.el;
+    if (!el || el.locked) return;
+    var dx = el.x - CENTER_X;
+    var dy = el.y - CENTER_Y;
+    var dist = Math.sqrt(dx*dx + dy*dy);
+
+    if (dist <= SNAP_PX) {
+      // SNAP — perfect center
+      el.x = CENTER_X; el.y = CENTER_Y;
+      el.locked = true;
+      el.snapGlow = GUIDE_FADE_DUR;
+      hitStop = 5;
+      zoom = 1.025;
+      shakeAmt = 0; // calm — no shake on success
+      state.score++;
+      if (window.J) J.calm(state.score);
+      flash('CENTERED', TEAL, 38);
+      if (window.LOOP) LOOP.emit('element_aligned', { level: state.level, score: state.score });
+      if (window.J) J.calm(state.score);
+      // schedule next element
+      setTimeout(function() {
+        state.level++;
+        if (DEMO && state.score >= demoTargetScore) {
+          endDemo();
+          return;
+        }
+        if (BOT) {
+          if (state.score >= botLevelTarget) {
+            gameOver();
+            return;
+          }
+        }
+        spawnElement();
+      }, DEMO ? 800 : BOT ? 400 : 900);
+    } else if (dist <= NEAR_PX) {
+      // near miss — guides pulse
+      if (window.LOOP) LOOP.emit('near_miss', { dist: +dist.toFixed(1), level: state.level });
+      flash('SO CLOSE', TEAL, 28);
+      if (window.J) J.calm(0); // soft bell
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J && newBest) setTimeout(function(){ J.calm(10); }, 300);
+    if (newBest) {
+      best = state.score;
+      try { localStorage.setItem('ac_best', String(best)); } catch(_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function() {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function() { window.__demoDone = true; }, 3600);
+      }, 2000);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function() { resetRun(); }, 700);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.level = 0; flashes = [];
+    dragging = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- input ----
+  function onPointerDown(ex, ey) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, ex, ey) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over' && performance.now() - overAt > 350) {
+      if (inR(SHARE_R, ex, ey) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'aligned' }); return;
+      }
+      resetRun(); return;
+    }
+    if (state.phase !== 'play') return;
+    var el = state.el;
+    if (!el || el.locked) return;
+    // check if pointer is over element
+    var hw = el.puzzle.w / 2 + 18, hh = el.puzzle.h / 2 + 18;
+    if (Math.abs(ex - el.x) <= hw && Math.abs(ey - el.y) <= hh) {
+      dragging = true;
+      grabOff.x = el.x - ex;
+      grabOff.y = el.y - ey;
+      pointer.x = ex; pointer.y = ey;
+    }
+  }
+
+  function onPointerMove(ex, ey) {
+    if (DEMO || BOT) return;
+    if (!dragging || state.phase !== 'play') return;
+    var el = state.el;
+    if (!el || el.locked) return;
+    el.x = ex + grabOff.x;
+    el.y = ey + grabOff.y;
+    // clamp inside canvas
+    var hw = el.puzzle.w / 2, hh = el.puzzle.h / 2;
+    el.x = Math.max(hw + 8, Math.min(W - hw - 8, el.x));
+    el.y = Math.max(hh + 8, Math.min(H - hh - 8, el.y));
+  }
+
+  function onPointerUp(ex, ey) {
+    if (DEMO || BOT) return;
+    if (!dragging) return;
+    dragging = false;
+    checkSnap();
+  }
+
+  cv.addEventListener('pointerdown', function(e) {
+    var r = cv.getBoundingClientRect();
+    onPointerDown((e.clientX - r.left)/scale, (e.clientY - r.top)/scale);
+  });
+  cv.addEventListener('pointermove', function(e) {
+    var r = cv.getBoundingClientRect();
+    onPointerMove((e.clientX - r.left)/scale, (e.clientY - r.top)/scale);
+  });
+  cv.addEventListener('pointerup', function(e) {
+    var r = cv.getBoundingClientRect();
+    onPointerUp((e.clientX - r.left)/scale, (e.clientY - r.top)/scale);
+  });
+  cv.addEventListener('pointercancel', function() { dragging = false; });
+
+  // ---- demo autopilot ----
+  // calm arc: settle → deepen → resolve → soft invitation
+  // Each stage: move element slowly toward center with slight wobble, then snap
+  var demoPhase = 'settle', demoTimer = 0, demoStage = 0;
+  var demoTargetScore = 5; // complete 5 alignments then show CTA
+  var demoMoveSpeed = 0.6; // px per frame toward center
+  var demoWobble = 0;
+  var demoSpeedMult = [0.5, 0.7, 0.85, 1.0, 1.1]; // each stage a bit quicker (settling in)
+
+  function endDemo() {
+    gameOver();
+  }
+
+  // ---- bot autopilot ----
+  var botTargetX = null, botTargetY = null, botDone = false;
+  var botLevelTarget = 4; // bot completes 4 levels then triggers game_over
+  var botSpeed = 1.8;
+
+  function autopilot(dt) {
+    if (!state.el || state.el.locked || state.phase !== 'play') return;
+    var el = state.el;
+
+    if (DEMO) {
+      demoTimer += dt;
+      // smoothly move element toward center with a tiny oscillation
+      var spd = demoMoveSpeed * (demoSpeedMult[Math.min(demoStage, demoSpeedMult.length-1)] || 1.0);
+      var dx = CENTER_X - el.x, dy = CENTER_Y - el.y;
+      var dist = Math.sqrt(dx*dx + dy*dy);
+      // add a gentle sinusoidal wobble for human feel
+      demoWobble += 0.07 * dt;
+      var perpX = -dy / (dist || 1), perpY = dx / (dist || 1);
+      var wobAmp = Math.max(0, 1 - state.score * 0.15) * 4;
+      var wob = Math.sin(demoWobble) * wobAmp;
+
+      if (dist < SNAP_PX + 0.5) {
+        // close enough — snap
+        el.x = CENTER_X; el.y = CENTER_Y;
+        dragging = false;
+        demoStage++;
+        demoWobble = 0;
+        checkSnap();
+      } else {
+        var step = Math.min(spd * dt, dist - SNAP_PX * 0.5);
+        el.x += (dx / dist) * step + perpX * wob * 0.3;
+        el.y += (dy / dist) * step + perpY * wob * 0.3;
+      }
+    } else if (BOT) {
+      // imperfect bot: drift toward center with random error
+      if (botDone) return;
+      if (botTargetX === null) {
+        // imperfect target: close to center but not perfect
+        var err = (rng() - 0.5) * 24;
+        var erry = (rng() - 0.5) * 18;
+        botTargetX = CENTER_X + err;
+        botTargetY = CENTER_Y + erry;
+      }
+      var bdx = botTargetX - el.x, bdy = botTargetY - el.y;
+      var bdist = Math.sqrt(bdx*bdx + bdy*bdy);
+      if (bdist < 2.5) {
+        // arrived at (imperfect) target — check snap
+        botDone = true;
+        botTargetX = null; botTargetY = null;
+        checkSnap();
+        // if not snapped (missed center), force game over after a moment
+        if (!el.locked) {
+          setTimeout(function() {
+            if (state.phase === 'play') gameOver();
+          }, 500);
+        }
+      } else {
+        var bstep = Math.min(botSpeed * dt, bdist);
+        el.x += (bdx / bdist) * bstep;
+        el.y += (bdy / bdist) * bstep;
+      }
+    }
+  }
+
+  // ---- draw helpers ----
+  function drawGuides(el, alpha) {
+    // crosshair guides at center
+    cx.save();
+    cx.globalAlpha = alpha;
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 1;
+    cx.setLineDash([4, 4]);
+    // vertical guide
+    cx.beginPath(); cx.moveTo(CENTER_X, 40); cx.lineTo(CENTER_X, H - 40); cx.stroke();
+    // horizontal guide
+    cx.beginPath(); cx.moveTo(40, CENTER_Y); cx.lineTo(W - 40, CENTER_Y); cx.stroke();
+    cx.setLineDash([]);
+    // center crosshair dot
+    var dotR = el && el.locked ? 8 : 5;
+    cx.beginPath();
+    cx.arc(CENTER_X, CENTER_Y, dotR, 0, Math.PI * 2);
+    cx.fillStyle = el && el.locked ? TEAL : 'rgba(46,197,182,0.5)';
+    cx.fill();
+    cx.restore();
+  }
+
+  function drawElement(el) {
+    if (!el) return;
+    var p = el.puzzle;
+    cx.save();
+    cx.translate(el.x, el.y);
+
+    // glow if locked/near center
+    var dx = el.x - CENTER_X, dy = el.y - CENTER_Y;
+    var dist = Math.sqrt(dx*dx + dy*dy);
+    var proximity = Math.max(0, 1 - dist / 60);
+
+    if (el.locked || proximity > 0.3) {
+      cx.shadowColor = TEAL;
+      cx.shadowBlur = el.locked ? 22 : 8 * proximity;
+    }
+
+    // background card
+    var hw = p.w / 2 + 12, hh = p.h / 2 + 10;
+    cx.fillStyle = el.locked ? 'rgba(46,197,182,0.12)' : 'rgba(255,255,255,0.06)';
+    cx.strokeStyle = el.locked ? TEAL : 'rgba(255,255,255,0.18)';
+    cx.lineWidth = el.locked ? 1.5 : 1;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(-hw, -hh, hw*2, hh*2, 8);
+    else cx.rect(-hw, -hh, hw*2, hh*2);
+    cx.fill(); cx.stroke();
+
+    // text/icon
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    cx.font = p.font;
+    cx.fillStyle = el.locked ? TEAL : WHITE;
+    cx.shadowBlur = 0;
+    if (p.type === 'layout') {
+      // two-line layout
+      var lines = p.label.split('\n');
+      cx.fillText(lines[0], 0, -10);
+      cx.font = '400 13px -apple-system, Helvetica, Arial';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.fillText(lines[1], 0, 12);
+    } else {
+      cx.fillText(p.label, 0, 0);
+    }
+
+    cx.restore();
+  }
+
+  function drawSnapRing(el) {
+    if (!el || !el.locked) return;
+    var t = 1 - el.snapGlow / GUIDE_FADE_DUR;
+    var a = Math.max(0, 1 - t * 1.6);
+    var r = 18 + t * 28;
+    cx.save();
+    cx.globalAlpha = a;
+    cx.beginPath();
+    cx.arc(CENTER_X, CENTER_Y, r, 0, Math.PI * 2);
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 2;
+    cx.stroke();
+    cx.restore();
+  }
+
+  function drawDistanceTick(el) {
+    if (!el || el.locked || state.phase !== 'play') return;
+    var dx = el.x - CENTER_X, dy = el.y - CENTER_Y;
+    var dist = Math.sqrt(dx*dx + dy*dy);
+    if (dist > 80) return; // only show when close
+    var a = Math.max(0, 1 - dist / 80);
+    cx.save();
+    cx.globalAlpha = a * 0.7;
+    cx.fillStyle = TEAL;
+    cx.textAlign = 'center';
+    cx.textBaseline = 'top';
+    cx.font = '600 11px Menlo, monospace';
+    cx.fillText(dist.toFixed(0) + 'px', CENTER_X, CENTER_Y + 16);
+    cx.restore();
+  }
+
+  // ---- render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // decay hit-stop; only run autopilot when not frozen
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      autopilot(dt);
+    }
+    if (el_snapGlowTick()) {} // handled below
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.1 || zoom > 1.001) {
+      var sx = (rng() - 0.5) * shakeAmt, sy = (rng() - 0.5) * shakeAmt;
+      cx.translate(W/2 + sx, H/2 + sy); cx.scale(zoom, zoom); cx.translate(-W/2, -H/2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-10, -10, W+20, H+20);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(242,177,52,0.03)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    var el = state.el;
+
+    if (state.phase === 'play' || state.phase === 'over') {
+      // snap ring expand effect
+      if (el) {
+        drawSnapRing(el);
+        if (el.snapGlow > 0) el.snapGlow -= dt;
+      }
+
+      // guides — always visible in play, fading opacity based on proximity
+      var guideAlpha = 0.2;
+      if (el && !el.locked) {
+        var ddx = el.x - CENTER_X, ddy = el.y - CENTER_Y;
+        var ddist = Math.sqrt(ddx*ddx + ddy*ddy);
+        guideAlpha = Math.max(0.15, Math.min(0.55, 0.15 + (1 - ddist / 120) * 0.4));
+      }
+      if (el && el.locked) guideAlpha = 0.55;
+      drawGuides(el, guideAlpha);
+
+      // distance readout
+      drawDistanceTick(el);
+
+      // the element
+      drawElement(el);
+    }
+
+    // score display
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = WHITE;
+      cx.font = '800 52px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W/2, 80);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W/2, 104);
+    }
+
+    // level indicator dots
+    if (state.phase === 'play') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.28)';
+      cx.font = '500 11px -apple-system, Helvetica, Arial';
+      cx.fillText('LEVEL ' + (state.level + 1), W/2, 128);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.save();
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.textBaseline = 'alphabetic';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W/2, CENTER_Y - 80 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      cx.restore();
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // title screen
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('ALIGN CENTER', W/2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('drag it to the exact center', W/2, 328);
+      var pulse = 0.55 + 0.45 * Math.sin(now / 460);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W/2, 376);
+      cx.globalAlpha = 1;
+      // draw a sample crosshair to prime the move
+      drawGuides(null, 0.18);
+    }
+
+    // game over
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('CENTERED', W/2, 300);
+      cx.fillStyle = '#fff';
+      cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' aligned', W/2, 344);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 320);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE', W/2, 400);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(46,197,182,0.1)';
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = TEAL;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W/2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card — calm invitation
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('ALIGN CENTER', W/2, 296);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '500 17px -apple-system, Helvetica, Arial';
+      cx.fillText('find the exact center. every time.', W/2, 336);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 340);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W/2, 404);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W/2, 436);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w/2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // snapGlow tick helper (called inside frame to avoid double-counting)
+  function el_snapGlowTick() { return false; } // handled inline in drawSnapRing
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

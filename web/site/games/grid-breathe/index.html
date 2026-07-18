@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Grid Breathe — Tilt</title>
+<!--
+  LOOP / attention-architecture — Grid Breathe
+  Circuits: 05-ease, 07-timing, 08-garden.
+  Engine: calm.
+  Modes:
+    ?demo=1&seed=7    scripted calm arc ~16s → soft CTA → window.__demoDone=true
+    ?bot=1&runs=N&seed=5   imperfect autoplay, N runs, window.__botDone=true
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'grid-breathe';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // Calm palette — soft, desaturated tones (no vermillion)
+  var TILE_COLORS = [
+    '#4ecdc4', // soft teal
+    '#a8e6cf', // mint
+    '#88d8b0', // seafoam
+    '#6ec6b8', // teal-mid
+    '#b5e8d5', // pale mint
+    '#5bbfb5', // teal-deep
+    '#7dd8c8', // aqua-light
+    '#3db8ab', // teal-vivid
+    '#a0d8d0', // ice teal
+  ];
+
+  // Grid constants
+  var GRID_N = 3;
+  var TILE_W = 100, TILE_H = 100, TILE_GAP = 10;
+  var GRID_W = GRID_N * TILE_W + (GRID_N - 1) * TILE_GAP;
+  var GRID_H = GRID_N * TILE_H + (GRID_N - 1) * TILE_GAP;
+  var GRID_X = (W - GRID_W) / 2;
+  var GRID_Y = (H - GRID_H) / 2 + 30;
+
+  // State
+  var phase; // 'title' | 'play' | 'settle' | 'pulse' | 'rest' | 'over' | 'cta'
+  var grid;           // array[9] of color index
+  var selected;       // index of selected tile or null
+  var swapCount;      // total swaps made
+  var runStartTs;
+  var settleAt, pulseAt, restAt, ctaAt, overAt;
+  var pulseBeat;      // animation progress 0..1
+  var flashes = [];
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var botRunsDone = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('gb_best') || 0; } catch (_) {}
+
+  // Tile glow animation for selected
+  var glowPhase = 0;
+
+  // Demo script state
+  var demoStep = 0, demoTimer = 0;
+  // Demo: a sequence of swap actions [fromIdx, toIdx] with delays (frames)
+  // Calm arc: settle → deepen → resolve
+  var demoScript = [
+    // settle: a few gentle rearrangements
+    { from: 0, to: 8, wait: 60 },
+    { from: 1, to: 6, wait: 70 },
+    { from: 3, to: 5, wait: 80 },
+    // deepen: considered moves, longer pauses
+    { from: 2, to: 7, wait: 100 },
+    { from: 0, to: 4, wait: 110 },
+    // resolve: final touches
+    { from: 1, to: 3, wait: 90 },
+    { from: 6, to: 8, wait: 80 },
+    // done — game auto-locks
+    { from: -1, to: -1, wait: 60 } // sentinel: trigger lock
+  ];
+
+  // Bot script: just make random swaps, then eventually stop
+  var botSwapsDone = 0;
+  var BOT_SWAPS_PER_RUN = 5 + Math.floor(rng() * 5); // 5-9 swaps per run then lock
+  var botTimer = 0, botPaused = false;
+
+  function initGrid() {
+    // Shuffle a permutation of the 9 calm colors using seeded rng
+    grid = [];
+    for (var i = 0; i < 9; i++) grid[i] = i;
+    // Fisher-Yates shuffle
+    for (var j = 8; j > 0; j--) {
+      var k = Math.floor(rng() * (j + 1));
+      var tmp = grid[j]; grid[j] = grid[k]; grid[k] = tmp;
+    }
+    selected = null;
+    swapCount = 0;
+    flashes = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    glowPhase = 0;
+    botSwapsDone = 0;
+    botTimer = 0;
+    botPaused = false;
+    BOT_SWAPS_PER_RUN = 5 + Math.floor(rng() * 5);
+  }
+
+  function tileRect(idx) {
+    var col = idx % GRID_N;
+    var row = Math.floor(idx / GRID_N);
+    return {
+      x: GRID_X + col * (TILE_W + TILE_GAP),
+      y: GRID_Y + row * (TILE_H + TILE_GAP),
+      w: TILE_W,
+      h: TILE_H
+    };
+  }
+
+  function hitTest(px, py) {
+    for (var i = 0; i < 9; i++) {
+      var r = tileRect(i);
+      if (px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h) return i;
+    }
+    return -1;
+  }
+
+  function swapTiles(a, b) {
+    var tmp = grid[a]; grid[a] = grid[b]; grid[b] = tmp;
+    swapCount++;
+    // Calm sound — soft bell
+    if (window.J) J.calm(swapCount);
+    // Light zoom-pulse on swap
+    zoom = 1.018;
+    // Emit event
+    if (window.LOOP) LOOP.emit('tile_swapped', { a: a, b: b, swaps: swapCount });
+    flash('balanced', TEAL, 18);
+    selected = null;
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function lockGrid() {
+    // Grid feels balanced — gentle lock
+    phase = 'settle';
+    settleAt = performance.now();
+    hitStop = 30; // brief freeze for the "bite"
+    zoom = 1.025;
+    if (window.J) J.calm(10); // deeper bell on completion
+    if (window.LOOP) LOOP.emit('grid_locked', { swaps: swapCount });
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var score = swapCount;
+    if (score > best) {
+      best = score;
+      try { localStorage.setItem('gb_best', String(best)); } catch (_) {}
+    }
+    if (DEMO) window.__demoScore = score;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      // → CTA after brief rest card
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { startRun(); }, 600);
+      }
+    }
+  }
+
+  function startRun() {
+    initGrid();
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function newGame() {
+    initGrid();
+    phase = DEMO || BOT ? 'play' : 'title';
+    if (DEMO || BOT) {
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+  }
+
+  // Input
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, px, py) { return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+
+    if (phase === 'title') {
+      startRun();
+      return;
+    }
+    if (phase === 'over' || phase === 'rest') {
+      if (performance.now() - (overAt || restAt || 0) > 350) {
+        startRun();
+        if (window.LOOP) LOOP.emit('restart', {});
+      }
+      return;
+    }
+    if (phase !== 'play') return;
+
+    var idx = (px !== undefined) ? hitTest(px, py) : -1;
+    if (idx === -1) {
+      // tap outside grid — treat as "done, lock"
+      if (swapCount > 0) lockGrid();
+      return;
+    }
+    if (selected === null) {
+      selected = idx;
+    } else if (selected === idx) {
+      selected = null; // deselect
+    } else {
+      swapTiles(selected, idx);
+    }
+  }
+
+  // Also allow tapping outside grid (on canvas background) to lock
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale;
+    var py = (e.clientY - r.top) / scale;
+    tap(px, py);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') tap();
+  });
+
+  // --- Autopilots ---
+
+  function demoAutopilot(dt) {
+    if (phase !== 'play') return;
+    demoTimer += dt;
+    var step = demoScript[Math.min(demoStep, demoScript.length - 1)];
+    if (!step) return;
+    // wait in frames (1 frame ~= 1 dt unit at 60fps)
+    if (demoTimer < step.wait) return;
+    demoTimer = 0;
+
+    if (step.from === -1) {
+      // sentinel: lock the grid
+      if (swapCount > 0) lockGrid();
+      demoStep++;
+      return;
+    }
+    swapTiles(step.from, step.to);
+    demoStep++;
+  }
+
+  function botAutopilot(dt) {
+    if (phase !== 'play') return;
+    if (botPaused) return;
+    botTimer += dt;
+    if (botTimer < 45) return; // ~0.75s between bot swaps
+    botTimer = 0;
+
+    if (botSwapsDone >= BOT_SWAPS_PER_RUN) {
+      // Done enough swaps — lock and finish
+      lockGrid();
+      botPaused = true;
+      return;
+    }
+    // Pick two random different tiles
+    var a = Math.floor(rng() * 9);
+    var b = Math.floor(rng() * 9);
+    while (b === a) b = Math.floor(rng() * 9);
+    swapTiles(a, b);
+    botSwapsDone++;
+  }
+
+  // --- Render ---
+
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3);
+    last = now;
+
+    // hitStop / autopilot gating
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      if (DEMO) demoAutopilot(dt);
+      if (BOT) botAutopilot(dt);
+    }
+
+    // settle → pulse → rest → over
+    if (phase === 'settle') {
+      var elapsed = now - settleAt;
+      if (elapsed > 800) {
+        phase = 'pulse';
+        pulseAt = now;
+        pulseBeat = 0;
+        if (window.J) J.calm(12);
+      }
+    }
+    if (phase === 'pulse') {
+      var pe = (now - pulseAt) / 1200; // 1.2s pulse cycle
+      pulseBeat = pe;
+      zoom = 1 + 0.018 * Math.sin(Math.PI * Math.min(pe, 1));
+      if (pe >= 1) {
+        phase = 'rest';
+        restAt = now;
+        zoom = 1;
+        if (window.J) J.calm(6);
+      }
+    }
+    if (phase === 'rest') {
+      var re = now - restAt;
+      if (re > 1200) {
+        // After rest — trigger game over
+        gameOver();
+      }
+    }
+
+    // juice: shake decay, zoom decay
+    if (hitStop <= 0) {
+      shakeAmt *= Math.pow(0.82, dt);
+      zoom += (1 - zoom) * 0.14 * dt;
+    }
+    glowPhase += dt * 0.04;
+
+    // --- Draw ---
+    cx.save();
+
+    // shake + zoom transform
+    if (shakeAmt > 0.2 || Math.abs(zoom - 1) > 0.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // Background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // Subtle ambient gradient
+    var bg = cx.createRadialGradient(W / 2, H / 2, 60, W / 2, H / 2, 360);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    // ---- Title screen ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 38px -apple-system, Helvetica, Arial';
+      cx.fillText('GRID BREATHE', W / 2, 280);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('swap tiles until it feels balanced', W / 2, 320);
+      var pulse = 0.55 + 0.35 * Math.sin(now / 600);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to begin', W / 2, 370);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Grid ----
+    if (phase === 'play' || phase === 'settle' || phase === 'pulse' || phase === 'rest' || phase === 'over') {
+      drawGrid(now);
+    }
+
+    // ---- Settle overlay ----
+    if (phase === 'settle') {
+      var sa = Math.min(1, (now - settleAt) / 600);
+      cx.globalAlpha = sa * 0.25;
+      cx.fillStyle = TEAL;
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Pulse label ----
+    if (phase === 'pulse') {
+      var pa = Math.sin(Math.PI * Math.min(pulseBeat, 1));
+      cx.globalAlpha = pa;
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText('breathe', W / 2, GRID_Y - 50);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Rest screen ----
+    if (phase === 'rest') {
+      var rProg = Math.min(1, (now - restAt) / 1200);
+      cx.globalAlpha = rProg * 0.18;
+      cx.fillStyle = TEAL;
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = rProg;
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('balanced', W / 2, GRID_Y - 50);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Play UI: swap count + instruction ----
+    if (phase === 'play') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.25)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('tap two tiles to swap', W / 2, GRID_Y + GRID_H + 44);
+      if (swapCount > 0) {
+        cx.fillStyle = 'rgba(255,255,255,0.18)';
+        cx.font = '600 12px -apple-system, Helvetica, Arial';
+        cx.fillText('tap outside to lock when it feels right', W / 2, GRID_Y + GRID_H + 66);
+      }
+      // swap count
+      if (swapCount > 0) {
+        cx.fillStyle = 'rgba(46,197,182,0.55)';
+        cx.font = '700 28px -apple-system, Helvetica, Arial';
+        cx.fillText(swapCount, W / 2, GRID_Y - 38);
+        cx.fillStyle = 'rgba(255,255,255,0.22)';
+        cx.font = '600 12px -apple-system, Helvetica, Arial';
+        cx.fillText('swaps', W / 2, GRID_Y - 20);
+      }
+    }
+
+    // ---- Over / score card ----
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '800 38px -apple-system, Helvetica, Arial';
+      cx.fillText('GRID BREATHE', W / 2, 280);
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(swapCount + ' swaps', W / 2, 325);
+      cx.fillStyle = GOLD;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('best: ' + best + ' swaps', W / 2, 360);
+      if (!DEMO && !BOT) {
+        var p2 = 0.55 + 0.35 * Math.sin(now / 600);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('tap to breathe again', W / 2, 420);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // ---- Demo CTA card ----
+    if (phase === 'cta') {
+      var ct = (now - ctaAt) / 1000;
+      var ease = Math.min(1, ct * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 40px -apple-system, Helvetica, Arial';
+      cx.fillText('GRID BREATHE', W / 2, 298);
+      cx.fillStyle = 'rgba(255,255,255,0.65)';
+      cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('find your balance', W / 2, 338);
+      var p3 = 0.65 + 0.28 * Math.sin(now / 500);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL;
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 435);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Floating flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 50);
+      cx.globalAlpha = fa * 0.8;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '600 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, GRID_Y - 70 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) flashes.splice(k, 1);
+    }
+
+    // ---- Mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawGrid(now) {
+    for (var i = 0; i < 9; i++) {
+      var r = tileRect(i);
+      var colorStr = TILE_COLORS[grid[i]];
+      var isSelected = (selected === i);
+
+      // Draw tile
+      cx.save();
+
+      // Selected tile: gentle glow + slight scale
+      if (isSelected) {
+        var glowA = 0.5 + 0.4 * Math.sin(glowPhase * Math.PI * 2);
+        cx.shadowColor = TEAL;
+        cx.shadowBlur = 18 * glowA;
+        var sc = 1.035;
+        cx.translate(r.x + r.w / 2, r.y + r.h / 2);
+        cx.scale(sc, sc);
+        cx.translate(-(r.x + r.w / 2), -(r.y + r.h / 2));
+      }
+
+      // Tile background gradient
+      var grad = cx.createLinearGradient(r.x, r.y, r.x + r.w, r.y + r.h);
+      grad.addColorStop(0, lighten(colorStr, 0.12));
+      grad.addColorStop(1, colorStr);
+      cx.fillStyle = grad;
+
+      // Rounded rect
+      var radius = 14;
+      cx.beginPath();
+      if (cx.roundRect) {
+        cx.roundRect(r.x, r.y, r.w, r.h, radius);
+      } else {
+        roundRect(cx, r.x, r.y, r.w, r.h, radius);
+      }
+      cx.fill();
+
+      // Subtle inner border
+      cx.strokeStyle = 'rgba(255,255,255,' + (isSelected ? '0.35' : '0.12') + ')';
+      cx.lineWidth = isSelected ? 2 : 1;
+      cx.stroke();
+
+      cx.restore();
+    }
+
+    // In pulse phase, draw pulsing overlay on each tile
+    if (phase === 'pulse') {
+      var pa2 = 0.08 + 0.12 * Math.sin(Math.PI * Math.min(pulseBeat, 1));
+      for (var j = 0; j < 9; j++) {
+        var rp = tileRect(j);
+        cx.globalAlpha = pa2;
+        cx.fillStyle = TEAL;
+        cx.beginPath();
+        if (cx.roundRect) {
+          cx.roundRect(rp.x, rp.y, rp.w, rp.h, 14);
+        } else {
+          roundRect(cx, rp.x, rp.y, rp.w, rp.h, 14);
+        }
+        cx.fill();
+        cx.globalAlpha = 1;
+      }
+    }
+  }
+
+  // Lighten a hex color by mixing with white
+  function lighten(hex, amt) {
+    var r = parseInt(hex.slice(1, 3), 16);
+    var g = parseInt(hex.slice(3, 5), 16);
+    var b = parseInt(hex.slice(5, 7), 16);
+    r = Math.round(r + (255 - r) * amt);
+    g = Math.round(g + (255 - g) * amt);
+    b = Math.round(b + (255 - b) * amt);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  // Fallback roundRect for older browsers
+  function roundRect(ctx, x, y, w, h, r) {
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

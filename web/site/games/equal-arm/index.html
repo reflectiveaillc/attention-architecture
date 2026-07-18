@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Equal Arm — Tilt</title>
+<!--
+  LOOP / attention-architecture — Equal Arm
+  Circuits: 01-rpe (variable reward per placement), 06-zeigarnik (one more try), 05-ease.
+  Mechanic: weights slide along a balance beam; tap to lock each weight.
+  Error shown in grams; PB = lowest total imbalance.
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'equal-arm';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  var BEAM_Y  = 480;          // pivot Y
+  var BEAM_LEN = 160;         // half-length of each arm (px)
+  var PIVOT_X = W / 2;
+  var MAX_TILT = 28;          // max beam angle degrees
+  var WEIGHT_R = 18;          // weight circle radius
+  var NUM_WEIGHTS = 4;        // weights per run
+  var PERFECT_G  = 20;        // error ≤ 20g counts as "perfect"
+  var NEAR_MISS_G = 60;       // error ≤ 60g counts as near
+
+  // ---- state ----
+  var phase;          // 'title' | 'challenge' | 'play' | 'over' | 'cta'
+  var weights;        // array of weight objects
+  var activeIdx;      // which weight is currently sliding
+  var lockedErrors;   // gram errors of each locked weight
+  var runStartTs;
+  var flashes;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var dareBeaten = false;
+  var pb = Infinity;  // personal best = lowest total error
+  try { var stored = +localStorage.getItem('ea_pb'); if (stored > 0) pb = stored; } catch (_) {}
+  var runScore = 0;   // integer "score" = 1000 - totalError (clamped ≥ 0), used for sharing
+  var challengeAt = 0, ctaAt = 0, overAt = 0;
+  var botRunsDone = 0;
+
+  // ---- weight definition ----
+  // Each weight has a mass (g) displayed, and starts sliding from one side.
+  // The ideal lock position is at dist = armLen * (otherMass / myMass) from pivot
+  // so that torques balance.  We randomise the masses each round.
+  function makeWeights() {
+    // 2 weights on each side: left 0,1; right 2,3
+    var ws = [];
+    var masses = [80 + Math.floor(rng() * 120),   // left 0
+                  60 + Math.floor(rng() * 100),   // left 1
+                  80 + Math.floor(rng() * 120),   // right 2
+                  60 + Math.floor(rng() * 100)];  // right 3
+    // perfect lock positions (fraction of BEAM_LEN from pivot)
+    // torque balance per arm: m0*d0 + m1*d1 == m2*d2 + m3*d3 ← hard to guarantee exactly
+    // so we instead pick the position that minimizes torque error as the "ideal"
+    // For simplicity: each arm has its own pair.
+    // Left arm torque = masses[0]*pos[0] + masses[1]*pos[1]
+    // Right arm torque = masses[2]*pos[2] + masses[3]*pos[3]
+    // We fix one weight per arm and let the other be the "balancing" one.
+    // left: fix w0 at 0.5, then ideal w1 = (rightTorque - m0*0.5*BL) / (m1*BL) ... too complex
+    // Simpler: each weight has an independent ideal position in [0.2..0.85] of BEAM_LEN
+    // The beam angle depends on totalTorqueImbalance; score is based on total gram-distance error
+    for (var i = 0; i < NUM_WEIGHTS; i++) {
+      var side = i < 2 ? -1 : 1;  // -1=left, +1=right
+      var idealFrac = 0.25 + rng() * 0.55;  // ideal lock pos as fraction of BEAM_LEN
+      var startFrac = side < 0 ? 1.0 : 0.0; // left weights start from tip, right from pivot
+      ws.push({
+        mass: masses[i],
+        side: side,
+        idealFrac: idealFrac,
+        frac: startFrac,   // current position (0=pivot, 1=tip)
+        locked: false,
+        lockFrac: 0,
+        lockError: 0,      // grams off from ideal
+        color: i < 2 ? TEAL : GOLD,
+        slideDir: side < 0 ? -1 : 1,   // left weights slide toward pivot (-frac), right away
+        speed: 0.004 + rng() * 0.003   // frac/frame
+      });
+    }
+    return ws;
+  }
+
+  function newGame() {
+    phase = 'title';
+    weights = makeWeights();
+    activeIdx = 0;
+    lockedErrors = [];
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    dareBeaten = false;
+    runScore = 0;
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+    } else if (BOT) {
+      startRun();
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    activeIdx = 0;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- beam physics (visual) ----
+  function beamAngleDeg() {
+    // compute torque imbalance from locked + current active
+    var leftTorque = 0, rightTorque = 0;
+    for (var i = 0; i < weights.length; i++) {
+      var w = weights[i];
+      var f = w.locked ? w.lockFrac : w.frac;
+      var torque = w.mass * f * BEAM_LEN;
+      if (w.side < 0) leftTorque  += torque;
+      else            rightTorque += torque;
+    }
+    var diff = rightTorque - leftTorque;
+    var maxTorque = 120 * BEAM_LEN * 2;  // rough normalisation
+    return Math.max(-MAX_TILT, Math.min(MAX_TILT, (diff / maxTorque) * MAX_TILT * 3));
+  }
+
+  // ---- locking ----
+  function lockActive() {
+    if (activeIdx >= NUM_WEIGHTS) return;
+    var w = weights[activeIdx];
+    if (w.locked) return;
+    w.locked = true;
+    w.lockFrac = w.frac;
+    // error in grams = |actual_torque - ideal_torque| = mass * |lockFrac - idealFrac| * BEAM_LEN / (BEAM_LEN/100)
+    // simplified: error = mass * |lockFrac - idealFrac| (scaled to grams)
+    var fracErr = Math.abs(w.lockFrac - w.idealFrac);
+    var err = Math.round(fracErr * w.mass * 2);   // grams
+    w.lockError = err;
+    lockedErrors.push(err);
+
+    var perfect = err <= PERFECT_G;
+    var near    = err <= NEAR_MISS_G && !perfect;
+
+    if (window.J) {
+      if (perfect) { J.perfect(activeIdx + 1); hitStop = 5; zoom = 1.04; }
+      else if (near) { J.near(); shakeAmt = 3; }
+      else { J.hit(activeIdx + 1); }
+      J.tension(activeIdx / (NUM_WEIGHTS - 1));
+    }
+    if (perfect) flash('PERFECT', TEAL, 44);
+    else if (near) { flash('SO CLOSE!', GOLD, 38); if (window.LOOP) LOOP.emit('near_miss', { idx: activeIdx, err: err }); }
+
+    if (window.LOOP) LOOP.emit('weight_locked', { idx: activeIdx, err: err, perfect: perfect });
+
+    activeIdx++;
+    if (activeIdx >= NUM_WEIGHTS) {
+      // all locked — score it
+      setTimeout(finishRun, 320);
+    }
+  }
+
+  function finishRun() {
+    var totalErr = 0;
+    for (var i = 0; i < lockedErrors.length; i++) totalErr += lockedErrors[i];
+    runScore = Math.max(0, 1000 - totalErr);
+    var newPb = totalErr < pb;
+    if (newPb) {
+      pb = totalErr;
+      try { localStorage.setItem('ea_pb', String(pb)); } catch (_) {}
+    }
+    var dur = (Date.now() - runStartTs) / 1000;
+    shakeAmt = newPb ? 0 : 4;
+    if (window.J) {
+      J.death(Math.min(0.2 + totalErr / 400, 1));
+      if (newPb) setTimeout(function () { J.fanfare(); }, 400);
+    }
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && runScore > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(runScore);
+    }
+    if (newPb) flash('NEW BEST!', GOLD, 46);
+    if (DEMO) window.__demoScore = runScore;
+    if (window.LOOP) LOOP.emit('game_over', { score: runScore, dur_s: +dur.toFixed(1) });
+    phase = 'over';
+    overAt = performance.now();
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(resetRun, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    weights = makeWeights();
+    activeIdx = 0;
+    lockedErrors = [];
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+  function pctTop(s) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 350)))); }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 560, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') { lockActive(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: runScore, unit: 'g imbalance' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  // demo script: offsets from ideal in fractions (positive = overshoot, negative = undershoot)
+  // arc: good → good → near-fail (big overshoot) → save → perfect → miss
+  var demoScript    = [-0.04, 0.05, 0.25, 0.02, -0.02];   // frac offsets from ideal
+  var demoWaits     = [45, 38, 60, 80, 50];                 // frames of hesitation (human feel)
+  var demoIdx = 0, demoWaitFrames = 50;
+  var botTargetFrac = null;
+
+  function autopilot() {
+    if (phase !== 'play') return;
+    if (activeIdx >= NUM_WEIGHTS) return;
+    var w = weights[activeIdx];
+    if (w.locked) return;
+
+    if (DEMO) {
+      if (demoWaitFrames > 0) { demoWaitFrames--; return; }
+      var offset = demoScript[Math.min(demoIdx, demoScript.length - 1)] || 0;
+      var target = Math.max(0.05, Math.min(0.95, w.idealFrac + offset));
+      // check if we've crossed the target
+      var atTarget = false;
+      if (w.side < 0) {
+        // sliding from tip (frac=1) toward pivot (frac=0)
+        atTarget = w.frac <= target + 0.005;
+      } else {
+        // sliding from pivot (frac=0) toward tip (frac=1)
+        atTarget = w.frac >= target - 0.005;
+      }
+      if (atTarget) {
+        lockActive();
+        demoIdx++;
+        demoWaitFrames = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 40;
+      }
+    } else if (BOT) {
+      if (botTargetFrac === null) {
+        // imperfect: aim near ideal with some random error
+        var err = (rng() - 0.5) * 0.3;
+        botTargetFrac = Math.max(0.05, Math.min(0.95, w.idealFrac + err));
+      }
+      var at = false;
+      if (w.side < 0) at = w.frac <= botTargetFrac + 0.006;
+      else            at = w.frac >= botTargetFrac - 0.006;
+      if (at) { botTargetFrac = null; lockActive(); }
+    }
+  }
+
+  // ---- render helpers ----
+  function weightX(w) {
+    var dist = w.frac * BEAM_LEN;
+    return PIVOT_X + w.side * dist;
+  }
+  function weightY(w, ang) {
+    var dist = w.frac * BEAM_LEN;
+    var angRad = (ang * Math.PI) / 180;
+    return BEAM_Y + w.side * dist * Math.sin(angRad);
+  }
+
+  // ---- frame loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // advance sliding weights
+    if (phase === 'play') {
+      if (hitStop > 0) {
+        hitStop -= dt;
+      } else {
+        autopilot();
+        if (activeIdx < NUM_WEIGHTS) {
+          var w = weights[activeIdx];
+          if (!w.locked) {
+            if (w.side < 0) {
+              // left: slides from tip (frac=1) toward pivot (frac=0) then bounces
+              w.frac += w.slideDir * w.speed * dt;
+              if (w.frac <= 0.02) { w.frac = 0.02; w.slideDir = 1; }
+              if (w.frac >= 1.0)  { w.frac = 1.0;  w.slideDir = -1; }
+            } else {
+              // right: slides from pivot (frac=0) toward tip (frac=1) then bounces
+              w.frac += w.slideDir * w.speed * dt;
+              if (w.frac >= 0.98) { w.frac = 0.98; w.slideDir = -1; }
+              if (w.frac <= 0.02) { w.frac = 0.02; w.slideDir = 1; }
+            }
+          }
+        }
+      }
+    }
+
+    var ang = beamAngleDeg();
+    var angRad = (ang * Math.PI) / 180;
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // ---- draw beam ----
+    if (phase !== 'title' && phase !== 'challenge') {
+      cx.save();
+      cx.translate(PIVOT_X, BEAM_Y);
+      cx.rotate(angRad);
+
+      // beam arms
+      cx.strokeStyle = 'rgba(255,255,255,0.85)'; cx.lineWidth = 5; cx.lineCap = 'round';
+      cx.beginPath(); cx.moveTo(-BEAM_LEN, 0); cx.lineTo(BEAM_LEN, 0); cx.stroke();
+
+      // arm tick marks (ideal positions)
+      for (var i = 0; i < weights.length; i++) {
+        var w = weights[i];
+        var tx = w.side * w.idealFrac * BEAM_LEN;
+        cx.strokeStyle = 'rgba(255,255,255,0.15)'; cx.lineWidth = 1.5;
+        cx.beginPath(); cx.moveTo(tx, -8); cx.lineTo(tx, 8); cx.stroke();
+      }
+
+      // locked weights (draw first, they stay put)
+      for (var i = 0; i < weights.length; i++) {
+        var w = weights[i];
+        if (!w.locked) continue;
+        var wx = w.side * w.lockFrac * BEAM_LEN;
+        // shadow
+        cx.shadowColor = w.color; cx.shadowBlur = 14;
+        cx.beginPath(); cx.arc(wx, 0, WEIGHT_R, 0, Math.PI * 2);
+        cx.fillStyle = w.color; cx.fill();
+        cx.shadowBlur = 0;
+        // mass label
+        cx.fillStyle = INK; cx.font = '700 11px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center'; cx.textBaseline = 'middle';
+        cx.fillText(w.mass + 'g', wx, 0);
+        cx.textBaseline = 'alphabetic';
+        // error badge
+        if (w.lockError > 0) {
+          cx.fillStyle = w.lockError <= PERFECT_G ? TEAL : (w.lockError <= NEAR_MISS_G ? GOLD : VERM);
+          cx.font = '600 9px Menlo, monospace';
+          cx.textAlign = 'center';
+          cx.fillText('+' + w.lockError + 'g', wx, -WEIGHT_R - 5);
+        }
+      }
+
+      // active sliding weight
+      if (phase === 'play' && activeIdx < NUM_WEIGHTS) {
+        var aw = weights[activeIdx];
+        if (!aw.locked) {
+          var awx = aw.side * aw.frac * BEAM_LEN;
+          // pulsing glow
+          var pulse = 0.7 + 0.3 * Math.sin(now / 180);
+          cx.shadowColor = aw.color; cx.shadowBlur = 20 * pulse;
+          cx.beginPath(); cx.arc(awx, 0, WEIGHT_R, 0, Math.PI * 2);
+          cx.fillStyle = aw.color; cx.globalAlpha = 0.92 + 0.08 * pulse; cx.fill();
+          cx.shadowBlur = 0; cx.globalAlpha = 1;
+          cx.fillStyle = INK; cx.font = '700 11px -apple-system, Helvetica, Arial';
+          cx.textAlign = 'center'; cx.textBaseline = 'middle';
+          cx.fillText(aw.mass + 'g', awx, 0);
+          cx.textBaseline = 'alphabetic';
+          // outline ring
+          cx.strokeStyle = '#fff'; cx.lineWidth = 1.5; cx.globalAlpha = 0.5 * pulse;
+          cx.beginPath(); cx.arc(awx, 0, WEIGHT_R + 4, 0, Math.PI * 2); cx.stroke();
+          cx.globalAlpha = 1;
+        }
+      }
+
+      // pivot circle
+      cx.beginPath(); cx.arc(0, 0, 7, 0, Math.PI * 2);
+      cx.fillStyle = '#fff'; cx.fill();
+
+      cx.restore();
+
+      // pivot stand
+      cx.strokeStyle = 'rgba(255,255,255,0.35)'; cx.lineWidth = 3;
+      cx.beginPath(); cx.moveTo(PIVOT_X, BEAM_Y); cx.lineTo(PIVOT_X, BEAM_Y + 70); cx.stroke();
+      cx.beginPath(); cx.moveTo(PIVOT_X - 40, BEAM_Y + 70); cx.lineTo(PIVOT_X + 40, BEAM_Y + 70); cx.stroke();
+
+      // tilt angle display
+      var displayAng = Math.abs(ang).toFixed(1);
+      cx.textAlign = 'center';
+      cx.fillStyle = Math.abs(ang) < 3 ? TEAL : (Math.abs(ang) < 10 ? GOLD : VERM);
+      cx.font = '700 13px Menlo, monospace';
+      cx.fillText(displayAng + '°', PIVOT_X, BEAM_Y + 95);
+    }
+
+    // ---- score/progress display ----
+    if (phase === 'play' || phase === 'over') {
+      // total error so far
+      var runErr = 0;
+      for (var i = 0; i < lockedErrors.length; i++) runErr += lockedErrors[i];
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 60px -apple-system, Helvetica, Arial';
+      cx.fillText(runErr + 'g', W / 2, 90);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText(pb === Infinity ? 'BEST —' : 'BEST ' + pb + 'g', W / 2, 112);
+
+      // progress dots
+      var dotY = 130;
+      for (var i = 0; i < NUM_WEIGHTS; i++) {
+        var dx = W / 2 + (i - NUM_WEIGHTS / 2 + 0.5) * 28;
+        cx.beginPath(); cx.arc(dx, dotY, 5, 0, Math.PI * 2);
+        if (i < activeIdx || (i === activeIdx && phase === 'over')) {
+          cx.fillStyle = lockedErrors[i] <= PERFECT_G ? TEAL : (lockedErrors[i] <= NEAR_MISS_G ? GOLD : VERM);
+        } else if (i === activeIdx) {
+          cx.fillStyle = 'rgba(255,255,255,0.8)';
+        } else {
+          cx.fillStyle = 'rgba(255,255,255,0.2)';
+        }
+        cx.fill();
+      }
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 155);
+      }
+    }
+
+    // ---- challenge card (demo beat 1) ----
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('BALANCE TO BEAT', W / 2, 290);
+      cx.fillStyle = GOLD; cx.font = '900 80px -apple-system, Helvetica, Arial';
+      cx.fillText('12g', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's best imbalance", W / 2, 422);
+    }
+
+    // ---- title screen ----
+    if (phase === 'title') {
+      // draw a static balanced beam illustration
+      cx.save();
+      cx.translate(PIVOT_X, BEAM_Y - 20);
+      cx.strokeStyle = 'rgba(255,255,255,0.7)'; cx.lineWidth = 5; cx.lineCap = 'round';
+      cx.beginPath(); cx.moveTo(-BEAM_LEN, 0); cx.lineTo(BEAM_LEN, 0); cx.stroke();
+      // weights on beam
+      var tColors = [TEAL, GOLD, TEAL, GOLD];
+      var tFracs = [0.55, 0.3, 0.65, 0.4];
+      var tSides = [-1, -1, 1, 1];
+      for (var i = 0; i < 4; i++) {
+        var tx2 = tSides[i] * tFracs[i] * BEAM_LEN;
+        cx.beginPath(); cx.arc(tx2, 0, WEIGHT_R - 2, 0, Math.PI * 2);
+        cx.fillStyle = tColors[i]; cx.fill();
+      }
+      cx.beginPath(); cx.arc(0, 0, 7, 0, Math.PI * 2); cx.fillStyle = '#fff'; cx.fill();
+      cx.restore();
+      cx.strokeStyle = 'rgba(255,255,255,0.3)'; cx.lineWidth = 3;
+      cx.beginPath(); cx.moveTo(PIVOT_X, BEAM_Y - 20); cx.lineTo(PIVOT_X, BEAM_Y + 50); cx.stroke();
+      cx.beginPath(); cx.moveTo(PIVOT_X - 36, BEAM_Y + 50); cx.lineTo(PIVOT_X + 36, BEAM_Y + 50); cx.stroke();
+
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('EQUAL ARM', W / 2, 260);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO LOCK', W / 2, 310); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('balance the beam. lowest error wins.', W / 2, 340);
+    }
+
+    // ---- game over card ----
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 160, W, H - 160);
+      var totalErr2 = 0;
+      for (var i = 0; i < lockedErrors.length; i++) totalErr2 += lockedErrors[i];
+      var isNewPb = (totalErr2 === pb);
+      cx.textAlign = 'center';
+      cx.fillStyle = isNewPb ? GOLD : VERM;
+      cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText(isNewPb ? 'NEW BEST.' : 'RESULT.', W / 2, 310);
+      cx.fillStyle = '#fff'; cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText(totalErr2 + 'g total imbalance', W / 2, 348);
+      var pt = pctTop(runScore);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('balanced better than ' + (100 - pt) + '% of players', W / 2, 414);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — TRY AGAIN', W / 2, 460);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- demo CTA card ----
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('EQUAL ARM', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText((window.__demoScore || 900) + ' — can you beat it?', W / 2, 332);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 900), W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 434);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // ---- mute toggle ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Feed Fadeout — Tilt</title>
+<!--
+  LOOP / attention-architecture — Feed Fadeout
+  Circuits: 05-ease, 07-timing, 06-zeigarnik.
+  Engine: calm.
+  The infinite autoplay feed runs out of fuel. You watch it die.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'feed-fadeout';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- Card / feed data ----
+  // Each card has a palette colour, a "content type" label, and a simulated
+  // progress bar. We generate them procedurally from rng so clips are repeatable.
+  var CARD_TYPES = ['short video', 'story', 'reel', 'live replay', 'suggested'];
+  var CARD_PALETTES = [
+    ['#2a3a4a','#3a5068'],   // muted blue
+    ['#1e3a2f','#2a5040'],   // muted green
+    ['#3a2a1e','#5a3a28'],   // warm brown
+    ['#2a2a3a','#3a3a58'],   // indigo
+    ['#1e2a3a','#283848'],   // navy
+  ];
+
+  var MAX_CARDS = 30;
+  var cards = [];
+  function makeCard(i) {
+    var pi = Math.floor(rng() * CARD_PALETTES.length);
+    var ti = Math.floor(rng() * CARD_TYPES.length);
+    var barFill = 0.2 + rng() * 0.75;
+    return {
+      type: CARD_TYPES[ti],
+      pal: CARD_PALETTES[pi],
+      barFill: barFill,
+      lines: Math.floor(2 + rng() * 3),
+      lineWidths: [0.4 + rng() * 0.45, 0.3 + rng() * 0.35, 0.2 + rng() * 0.3,
+                   0.3 + rng() * 0.4, 0.25 + rng() * 0.3]
+    };
+  }
+  for (var i = 0; i < MAX_CARDS; i++) cards.push(makeCard(i));
+
+  // ---- State ----
+  // phase: title | play | over | cta
+  // scrollY: virtual scroll offset (pixels, 0 at top)
+  // speed: scroll px/frame, starts at ~1.6, decays to 0
+  // brightness: 1 → 0, dims the whole feed
+  // volume proxy (for label): 1 → 0
+  var CARD_H = 200, CARD_GAP = 12;
+  var TOTAL_CARD_H = CARD_H + CARD_GAP;
+
+  var state, runStartTs, botRunsDone = 0;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  var ctaAt = 0;
+
+  // How long until feed dies (ms). Bot uses shortened run.
+  var LIFE_MS = BOT ? 8000 : (DEMO ? 6000 : 28000);
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      scrollY: 0,
+      speed: 1.6,        // px/frame at 60fps
+      t: 0,              // ms elapsed in play phase
+      brightness: 1.0,
+      score: 0,          // seconds the feed ran before death
+      overAt: 0
+    };
+    flashes = [];
+    rng = mulberry32(SEED);
+    for (var j = 0; j < MAX_CARDS; j++) cards[j] = makeCard(j);
+    if (DEMO) {
+      // Start playing immediately
+      startRun();
+    }
+    if (BOT) {
+      startRun();
+    }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    // Calm chime: first step
+    if (window.J) J.calm(0);
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    state.score = Math.round((Date.now() - runStartTs) / 1000);
+    var dur = (Date.now() - runStartTs) / 1000;
+    // Big shake at the death — the screen goes fully black
+    shakeAmt = 4;
+    if (window.J) J.calm(4); // a final resolution bell
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2000);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    state.phase = 'title';
+    state.scrollY = 0;
+    state.speed = 1.6;
+    state.t = 0;
+    state.brightness = 1.0;
+    flashes = [];
+    rng = mulberry32(SEED);
+    for (var j = 0; j < MAX_CARDS; j++) cards[j] = makeCard(j);
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- Input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    // During play, tapping does nothing — you just watch
+    if (state.phase === 'over' && performance.now() - state.overAt > 400) {
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- Autopilot ----
+  // Bot: just waits for the feed to die naturally (LIFE_MS shortened for bot)
+  // Demo: same — the game is watching, not acting
+  var demoStep = 0;
+  var demoCalmAt = [1500, 3000, 4500]; // ms into play: emit calm bells
+  var demoCalmFired = [false, false, false];
+
+  function autopilot(elapsed) {
+    if (DEMO) {
+      // Fire calm bells at scripted moments
+      for (var k = 0; k < demoCalmAt.length; k++) {
+        if (!demoCalmFired[k] && elapsed >= demoCalmAt[k]) {
+          demoCalmFired[k] = true;
+          if (window.J) J.calm(k + 1);
+          // floating text cues
+          var labels = ['settling…', 'deeper', 'stillness'];
+          flash(labels[k], 'rgba(46,197,182,0.85)', 18);
+          demoStep = k + 1;
+        }
+      }
+    }
+    // Bot: no actions needed — feed dies on its own
+  }
+
+  // ---- Render helpers ----
+  function drawCard(card, x, y, w, h, alpha, dimBrightness) {
+    var a = alpha * dimBrightness;
+    if (a <= 0) return;
+    cx.save();
+    cx.globalAlpha = a;
+
+    // Card background
+    var bg = cx.createLinearGradient(x, y, x, y + h);
+    bg.addColorStop(0, card.pal[0]);
+    bg.addColorStop(1, card.pal[1]);
+    cx.fillStyle = bg;
+    if (cx.roundRect) cx.roundRect(x, y, w, h, 10);
+    else { cx.beginPath(); cx.rect(x, y, w, h); }
+    cx.fill();
+
+    // Simulated image area (top 65%)
+    var imgH = h * 0.65;
+    cx.fillStyle = 'rgba(255,255,255,0.04)';
+    if (cx.roundRect) cx.roundRect(x + 8, y + 8, w - 16, imgH - 8, 6);
+    else cx.fillRect(x + 8, y + 8, w - 16, imgH - 8);
+    cx.fill();
+
+    // Playhead bar
+    var barY = y + imgH + 8;
+    cx.fillStyle = 'rgba(255,255,255,0.12)';
+    cx.fillRect(x + 10, barY, w - 20, 3);
+    cx.fillStyle = TEAL;
+    cx.fillRect(x + 10, barY, (w - 20) * card.barFill, 3);
+
+    // Type label
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '500 11px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'left';
+    cx.fillText(card.type, x + 10, barY + 16);
+
+    // Simulated text lines
+    var lineY = barY + 28;
+    for (var l = 0; l < card.lines && l < 3; l++) {
+      cx.fillStyle = 'rgba(255,255,255,' + (0.18 - l * 0.04) + ')';
+      cx.fillRect(x + 10, lineY + l * 12, (w - 20) * card.lineWidths[l], 6);
+    }
+
+    cx.restore();
+  }
+
+  // ---- Frame ----
+  var last = performance.now();
+  var calStep = 1;
+
+  function frame(now) {
+    var dt = Math.min(Math.max(0, (now - last) / 16.667), 3); last = now;
+
+    if (state.phase === 'play') {
+      var elapsed = Date.now() - runStartTs;
+      state.t = elapsed;
+
+      // Progress: 0 → 1 over LIFE_MS
+      var prog = Math.min(elapsed / LIFE_MS, 1);
+
+      // Speed decays from 1.6 to 0 smoothly (ease-out cubic)
+      var ease = 1 - prog;
+      state.speed = 1.6 * ease * ease * ease;
+
+      // Brightness decays: holds at 1 until 30%, then fades
+      var dimStart = 0.30;
+      if (prog < dimStart) {
+        state.brightness = 1.0;
+      } else {
+        var dimProg = (prog - dimStart) / (1 - dimStart);
+        state.brightness = Math.max(0, 1 - dimProg * dimProg);
+      }
+
+      // Advance scroll
+      state.scrollY += state.speed * dt;
+
+      // Calm sound ticks
+      if (window.J && prog > 0.5 && Math.floor(prog * 10) > calStep) {
+        calStep = Math.floor(prog * 10);
+        J.calm(calStep);
+      }
+
+      autopilot(elapsed);
+
+      // Emit near-miss-like event when almost stalled
+      if (prog > 0.8 && prog < 0.82 && window.LOOP) {
+        LOOP.emit('feed_stalling', { prog: +prog.toFixed(2) });
+      }
+
+      // Die
+      if (prog >= 1) {
+        calStep = 1;
+        gameOver();
+      }
+    }
+
+    // ---- juice transforms ----
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+    if (hitStop > 0) hitStop -= dt;
+
+    // ---- BG ----
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // ---- Feed ----
+    if (state.phase === 'play' || state.phase === 'over') {
+      var prog2 = state.phase === 'over' ? 1 : Math.min(state.t / LIFE_MS, 1);
+      var dim = state.brightness;
+
+      // Vignette: grows with dim loss
+      var vigR = cx.createRadialGradient(W / 2, H / 2, H * 0.2, W / 2, H / 2, H * 0.72);
+      vigR.addColorStop(0, 'rgba(11,13,18,0)');
+      vigR.addColorStop(1, 'rgba(11,13,18,' + (0.3 + 0.7 * (1 - dim)) + ')');
+
+      // Draw cards
+      var scrollMod = ((state.scrollY % TOTAL_CARD_H) + TOTAL_CARD_H) % TOTAL_CARD_H;
+      var startIdx = ((Math.floor(state.scrollY / TOTAL_CARD_H) % MAX_CARDS) + MAX_CARDS) % MAX_CARDS;
+      var visCards = Math.ceil(H / TOTAL_CARD_H) + 2;
+      var cardX = (W - 360) / 2;
+      var cardW = 360;
+
+      for (var ci = 0; ci < visCards; ci++) {
+        var idx = ((startIdx + ci) % MAX_CARDS + MAX_CARDS) % MAX_CARDS;
+        var cardY = ci * TOTAL_CARD_H - scrollMod + 10;
+        if (cardY > H + CARD_H) continue;
+        if (cardY + CARD_H < -CARD_H) continue;
+
+        // Alpha for cards near edges (soft vignette on top/bottom)
+        var edgeFade = 1;
+        if (cardY < 60) edgeFade = Math.max(0, (cardY + CARD_H) / (CARD_H + 60));
+        if (cardY + CARD_H > H - 40) edgeFade = Math.min(edgeFade, (H - cardY) / (CARD_H + 40));
+
+        drawCard(cards[idx], cardX, cardY, cardW, CARD_H, edgeFade, dim);
+      }
+
+      // Vignette overlay
+      cx.save();
+      cx.globalAlpha = 1;
+      cx.fillStyle = vigR;
+      cx.fillRect(0, 0, W, H);
+      cx.restore();
+
+      // Speed / dim HUD — small indicator top center
+      if (state.phase === 'play') {
+        var speedLabel = state.speed > 1.2 ? 'autoplay' :
+                         state.speed > 0.6 ? 'slowing…' :
+                         state.speed > 0.15 ? 'stalling…' : 'fading…';
+        cx.textAlign = 'center';
+        cx.fillStyle = 'rgba(46,197,182,' + (0.3 + 0.3 * dim) + ')';
+        cx.font = '400 11px Menlo, monospace';
+        cx.fillText(speedLabel, W / 2, 30);
+
+        // Elapsed seconds
+        var secs = Math.floor(state.t / 1000);
+        cx.fillStyle = 'rgba(255,255,255,' + (0.15 * dim) + ')';
+        cx.font = '300 10px Menlo, monospace';
+        cx.fillText(secs + 's', W / 2, 46);
+      }
+    }
+
+    // ---- Floating flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 55);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '600 ' + fl.size + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 320 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 55) flashes.splice(k, 1);
+    }
+
+    // ---- Title ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '700 32px -apple-system, Helvetica, Arial';
+      cx.fillText('FEED FADEOUT', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '400 15px -apple-system, Helvetica, Arial';
+      cx.fillText('the feed runs out of fuel.', W / 2, 334);
+      cx.fillText('watch it go dark.', W / 2, 356);
+      var pulse = 0.5 + 0.3 * Math.sin(now / 400);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to begin', W / 2, 400);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Game Over ----
+    if (state.phase === 'over' && !DEMO) {
+      // Black overlay fades in
+      var ot = Math.min((performance.now() - state.overAt) / 800, 1);
+      cx.fillStyle = 'rgba(11,13,18,' + (ot * 0.82) + ')';
+      cx.fillRect(0, 0, W, H);
+
+      cx.globalAlpha = ot;
+      cx.textAlign = 'center';
+
+      // Black frame label
+      cx.fillStyle = 'rgba(46,197,182,0.7)';
+      cx.font = '400 11px Menlo, monospace';
+      cx.fillText('the feed is done', W / 2, 270);
+
+      cx.fillStyle = '#fff';
+      cx.font = '700 48px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + 's', W / 2, 340);
+
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '400 14px -apple-system, Helvetica, Arial';
+      cx.fillText('feed ran for ' + state.score + ' seconds', W / 2, 368);
+
+      if (!BOT) {
+        var p2 = 0.5 + 0.35 * Math.sin(now / 500);
+        cx.globalAlpha = ot * p2;
+        cx.fillStyle = TEAL;
+        cx.font = '600 15px -apple-system, Helvetica, Arial';
+        cx.fillText('tap to watch again', W / 2, 430);
+      }
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Demo over (black frame moment) ----
+    if (state.phase === 'over' && DEMO) {
+      var dot2 = Math.min((performance.now() - state.overAt) / 1000, 1);
+      cx.fillStyle = 'rgba(11,13,18,' + (dot2 * 0.95) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = dot2 * 0.6;
+      cx.fillStyle = TEAL;
+      cx.textAlign = 'center';
+      cx.font = '400 11px Menlo, monospace';
+      cx.fillText('feed ended', W / 2, H / 2);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Demo CTA ----
+    if (state.phase === 'cta') {
+      var ct = (now - ctaAt) / 1000;
+      var ease2 = Math.min(1, ct * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.92 * ease2) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease2;
+      cx.textAlign = 'center';
+
+      cx.fillStyle = 'rgba(46,197,182,0.6)';
+      cx.font = '400 11px Menlo, monospace';
+      cx.fillText('feed fadeout', W / 2, 260);
+
+      cx.fillStyle = '#fff';
+      cx.font = '600 26px -apple-system, Helvetica, Arial';
+      cx.fillText('let yours go dark.', W / 2, 310);
+
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '400 14px -apple-system, Helvetica, Arial';
+      cx.fillText('how long does your feed run?', W / 2, 342);
+
+      var p4 = 0.7 + 0.25 * Math.sin(now / 350);
+      cx.globalAlpha = ease2 * p4;
+      cx.fillStyle = TEAL;
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 408);
+      cx.globalAlpha = ease2;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '400 12px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 436);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Streak Release — Tilt</title>
+<!--
+  LOOP / attention-architecture — Streak Release
+  Circuits: 04 loss (the streak you’re letting go of), 08 investment (days held),
+            05 ease (no tension, just release).
+  Modes:
+    ?demo=1&seed=7      scripted calm arc ~16s → soft CTA, sets window.__demoDone
+    ?bot=1&runs=3&seed=5 imperfect autoplay N runs, sets window.__botDone
+    ?clip=ID&src=tiktok attribution
+    ?sink=URL           event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'streak-release';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134', MINT = '#8de6d8';
+  var DAY_DURATION = 0.62;          // seconds per day tick
+
+  var state, dayTimer, releaseTimer, runStartTs, best = 0, totalReleases = 0, garden = [];
+  var hitStop = 0, zoom = 1, flashes = [], ctaAt = 0;
+  try { best = +localStorage.getItem('streak_release_best') || 0; } catch (_) {}
+  try { totalReleases = +localStorage.getItem('streak_release_total') || 0; } catch (_) {}
+
+  function newGame() {
+    state = { phase: 'title', daysLeft: 0, startingDays: 0, score: 0, overAt: 0 };
+    dayTimer = 0; releaseTimer = 0; flashes = [];
+    if (DEMO) { setTimeout(function () { startRun(20); }, 600); }
+    if (BOT) startRun();
+  }
+
+  function pickStreak() { return 9 + Math.floor(rng() * 12); } // 9–20 days
+
+  function startRun(forcedDays) {
+    var n = forcedDays || pickStreak();
+    state.phase = 'play';
+    state.startingDays = n;
+    state.daysLeft = n;
+    state.score = 0;
+    dayTimer = 0;
+    releaseTimer = 0;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED, starting_days: n });
+  }
+
+  function release(isAuto) {
+    if (state.phase !== 'play') return;
+    var released = state.startingDays - Math.max(0, state.daysLeft);
+    state.score = released;
+    totalReleases++;
+    garden.push({
+      days: released,
+      x: 30 + rng() * (W - 60),
+      y: H - 58 - (garden.length % 6) * 13,
+      hue: 160 + rng() * 50
+    });
+    hitStop = 2.5;
+    zoom = 1.018;
+    flash('+' + released + ' days', TEAL, 34);
+    if (window.J) J.calm(Math.min(totalReleases, 16));
+    if (window.LOOP) LOOP.emit('release', { days: released, total: totalReleases, auto: !!isAuto });
+    gameOver();
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (newBest) {
+      best = state.score;
+      try { localStorage.setItem('streak_release_best', String(best)); } catch (_) {}
+    }
+    try { localStorage.setItem('streak_release_total', String(totalReleases)); } catch (_) {}
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { startRun(); }, 900);
+    }
+  }
+
+  function resetRun() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 118, y: 520, w: 236, h: 44 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { release(false); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'days released' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  var botRunsDone = 0, botTarget = null;
+  function autopilot() {
+    if (!state.mover && state.phase !== 'play') return; // no mover in this game
+    if (state.phase !== 'play') return;
+    if (DEMO) {
+      // scripted calm arc: let the streak nearly empty, then release
+      if (state.daysLeft <= 0 && releaseTimer > 0.35) { release(true); }
+    } else if (BOT) {
+      // imperfect autopilot: release somewhere in the last third
+      if (botTarget === null) botTarget = Math.max(1, state.startingDays - Math.abs(gauss()) * (state.startingDays * 0.35));
+      if (state.daysLeft <= botTarget && state.daysLeft > 0) { botTarget = null; release(true); }
+      if (state.daysLeft <= 0) { release(true); }
+    }
+  }
+
+  // ---- render ----
+  function seedShape(x, y, hue, s) {
+    cx.save(); cx.translate(x, y); cx.scale(s, s);
+    cx.fillStyle = 'hsl(' + hue + ',55%,58%)';
+    cx.beginPath(); cx.ellipse(0, 0, 5, 8, 0, 0, Math.PI * 2); cx.fill();
+    cx.fillStyle = 'hsl(' + hue + ',60%,72%)';
+    cx.beginPath(); cx.ellipse(0, -5, 3, 6, -0.4, 0, Math.PI * 2); cx.fill();
+    cx.beginPath(); cx.ellipse(0, -5, 3, 6, 0.4, 0, Math.PI * 2); cx.fill();
+    cx.restore();
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // sim
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') {
+      dayTimer += dt * 0.016667;
+      if (dayTimer >= DAY_DURATION) {
+        dayTimer -= DAY_DURATION;
+        if (state.daysLeft > 0) {
+          state.daysLeft--;
+          if (window.J) J.calm(Math.max(1, state.startingDays - state.daysLeft));
+          if (window.LOOP) LOOP.emit('day_tick', { daysLeft: state.daysLeft });
+        }
+      }
+      if (state.daysLeft <= 0) {
+        releaseTimer += dt * 0.016667;
+        if (releaseTimer >= 0.45) { releaseTimer = 0; release(true); }
+      }
+      autopilot();
+    }
+
+    // juice transforms
+    cx.save();
+    if (zoom > 1.001) {
+      cx.translate(W / 2, H / 2); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // subtle garden bed line
+    cx.strokeStyle = 'rgba(46,197,182,0.18)';
+    cx.lineWidth = 1;
+    cx.beginPath(); cx.moveTo(20, H - 48); cx.lineTo(W - 20, H - 48); cx.stroke();
+
+    // planted seeds
+    for (var i = 0; i < garden.length; i++) {
+      var g = garden[i];
+      var age = Math.min(1, (garden.length - i) / 18);
+      seedShape(g.x, g.y, g.hue, 0.7 + age * 0.4);
+    }
+
+    // streak display during play / over
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      var dayPulse = 1 + 0.03 * Math.sin(now / 400);
+      var bigSize = Math.round(104 * dayPulse);
+      cx.fillStyle = '#fff';
+      cx.font = '200 ' + bigSize + 'px -apple-system, Helvetica, Arial';
+      var num = state.phase === 'play' ? Math.max(0, state.daysLeft) : state.score;
+      cx.fillText(num, W / 2, 340);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      if (state.phase === 'play') {
+        cx.fillText(state.daysLeft <= 0 ? 'release' : 'days left', W / 2, 380);
+        // starting streak line
+        cx.fillStyle = 'rgba(255,255,255,0.22)';
+        cx.font = '500 12px Menlo, monospace';
+        cx.fillText('streak of ' + state.startingDays, W / 2, 410);
+      } else {
+        cx.fillText('days released', W / 2, 380);
+      }
+
+      // progress ring
+      var ringR = 138;
+      cx.strokeStyle = 'rgba(255,255,255,0.08)';
+      cx.lineWidth = 3;
+      cx.beginPath(); cx.arc(W / 2, 315, ringR, 0, Math.PI * 2); cx.stroke();
+      if (state.phase === 'play') {
+        var progress = 1 - Math.max(0, state.daysLeft) / state.startingDays;
+        cx.strokeStyle = TEAL;
+        cx.globalAlpha = 0.55;
+        cx.beginPath(); cx.arc(W / 2, 315, ringR, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2); cx.stroke();
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 250 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // title card
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('STREAK RELEASE', W / 2, 280);
+      cx.fillStyle = MINT; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO BEGIN', W / 2, 330); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('let the days run out. let it go.', W / 2, 360);
+    }
+
+    // game over card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.45)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = MINT; cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('RELEASED.', W / 2, 170);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' days', W / 2, 215);
+      cx.fillStyle = GOLD; cx.font = '900 20px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 252);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText(totalReleases + ' seeds in your garden', W / 2, 282);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — RELEASE ANOTHER', W / 2, 500);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 22) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ SHARE THE RELEASE', W / 2, SHARE_R.y + 29);
+      }
+    }
+
+    // demo CTA card (soft invitation)
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.72 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('STREAK RELEASE', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('he let go of ' + (window.__demoScore || 14) + '.', W / 2, 345);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 260);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ GROW YOURS', W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = MINT; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 445);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

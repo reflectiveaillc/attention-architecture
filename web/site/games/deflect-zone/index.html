@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Deflect Zone — Tilt</title>
+<!--
+  LOOP / attention-architecture — Deflect Zone
+  Circuits: 01 RPE (variable reward per deflect timing), 04 loss, 06 Zeigarnik
+  Engine: viral
+  Modes:
+    ?demo=1&seed=7     mirror-neuron clip: challenge card → human-feeling play →
+                       near-fail + recovery → real fail → score card → CTA → __demoDone
+    ?bot=1&runs=N      imperfect autoplay, N runs, → __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'deflect-zone';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+
+  var qs = new URLSearchParams(location.search);
+  var DEMO     = qs.get('demo') === '1';
+  var BOT      = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED     = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- constants ----
+  var BALL_R     = 16;
+  var ZONE_Y     = 560;          // top edge of deflect zone strip
+  var ZONE_H_BASE = 80;          // initial zone height
+  var ZONE_MIN_H  = 22;
+  var BALL_SPEED_BASE = 5.5;
+  var BALL_SPEED_INC  = 0.22;
+
+  // ---- state ----
+  var phase, score, combo, round, deflects, runStartTs;
+  var ballX, ballY, ballVY;
+  var zoneH, ballSpeed;
+  var hitStop, shakeAmt, zoom;
+  var flashes = [], particles = [];
+  var dareBeaten = false;
+  var challengeAt = 0, overAt = 0, ctaAt = 0;
+  var botRunsDone = 0;
+
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function pctTop(s) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 9)))); }
+
+  function initRound() {
+    zoneH     = Math.max(ZONE_MIN_H, ZONE_H_BASE - round * 5.5);
+    ballSpeed = BALL_SPEED_BASE + round * BALL_SPEED_INC;
+    ballX     = W / 2 + (rng() - 0.5) * 60;
+    ballY     = -BALL_R - 10;
+    ballVY    = ballSpeed;
+  }
+
+  function newGame() {
+    phase     = 'title';
+    score     = 0;
+    combo     = 0;
+    round     = 0;
+    deflects  = 0;
+    dareBeaten = false;
+    hitStop   = 0;
+    shakeAmt  = 0;
+    zoom      = 1;
+    flashes   = [];
+    particles = [];
+    initRound();
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    round = 0;
+    score = 0;
+    combo = 0;
+    deflects = 0;
+    initRound();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function doDeflect() {
+    // check if ball is in zone
+    var inZone = ballY + BALL_R >= ZONE_Y && ballY - BALL_R <= ZONE_Y + zoneH;
+    deflects++;
+    if (!inZone) {
+      // deflect attempt missed timing — ball escapes
+      missDeflect();
+      return;
+    }
+    var t = (ballY + BALL_R - ZONE_Y) / zoneH;  // 0=top of zone, 1=bottom
+    var perfect = t >= 0.35 && t <= 0.65;        // centre third
+    var near    = !perfect && (t >= 0.15 && t <= 0.85);
+
+    round++;
+    score = round;
+    combo = perfect ? combo + 1 : 0;
+
+    if (window.J) {
+      if (perfect) J.perfect(combo);
+      else if (near) { J.hit(combo + 1); }
+      else { J.near(); }
+      J.tension(Math.min(round / 20, 1));
+    }
+
+    if (perfect) { hitStop = 55; zoom = 1.03; shakeAmt = 0; }
+    else if (!near) { shakeAmt = 4; }
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(score);
+    }
+
+    if (perfect) {
+      flash('PERFECT', TEAL, 46);
+      spawnParticles(W / 2, ZONE_Y + zoneH / 2, TEAL);
+    } else if (!near) {
+      flash('SO CLOSE!', VERM, 40);
+      if (window.LOOP) LOOP.emit('near_miss', { n: score, t: +t.toFixed(3) });
+    } else {
+      flash('+' + score, GOLD, 36);
+    }
+
+    if (window.LOOP) LOOP.emit('deflect', { n: score, perfect: perfect, t: +t.toFixed(3) });
+
+    // bounce ball back up
+    ballVY = -ballSpeed;
+    zoneH  = Math.max(ZONE_MIN_H, ZONE_H_BASE - round * 5.5);
+    ballSpeed = BALL_SPEED_BASE + round * BALL_SPEED_INC;
+  }
+
+  function missDeflect() {
+    // ball escaped below zone without deflection
+    gameOver('escape');
+  }
+
+  function gameOver(reason) {
+    phase   = 'over';
+    overAt  = performance.now();
+    shakeAmt = 10;
+    if (window.J) {
+      J.death(Math.min(0.25 + score / 30, 1));
+    }
+    spawnParticles(ballX, ballY, VERM);
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (DEMO) window.__demoScore = score;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1), reason: reason });
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    phase    = 'play';
+    score    = 0;
+    combo    = 0;
+    round    = 0;
+    deflects = 0;
+    dareBeaten = false;
+    flashes  = [];
+    particles = [];
+    initRound();
+    if (window.LOOP) LOOP.emit('restart', {});
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- particles ----
+  function spawnParticles(x, y, color) {
+    for (var i = 0; i < 14; i++) {
+      var a = rng() * Math.PI * 2;
+      var spd = 2 + rng() * 4;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * spd, vy: Math.sin(a) * spd - 2,
+                       color: color, life: 1, decay: 0.025 + rng() * 0.02, r: 3 + rng() * 4 });
+    }
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- demo autopilot ----
+  // arc: 5 good deflects (some perfect, some near), near-fail at round 6,
+  // recovery save at round 7, then real miss at round 8
+  // demoWaits = how long to wait (frames) before acting each round
+  var demoRound = 0;
+  // target t positions (0=top of zone, 1=bottom); 'miss'=tap outside zone; 'late'=tap after ball exits
+  var demoScript = [
+    { t: 0.50, wait: 38 },  // round 1 — centre perfect
+    { t: 0.42, wait: 32 },  // round 2 — slight off-centre
+    { t: 0.58, wait: 44 },  // round 3 — other side
+    { t: 0.72, wait: 28 },  // round 4 — near-edge, near-miss sound
+    { t: 0.48, wait: 50 },  // round 5 — centre, hesitation (tension building)
+    { t: 0.88, wait: 36 },  // round 6 — near-fail: barely in zone (reads as "over")
+    { t: 0.52, wait: 42 },  // round 7 — save! back to centre
+    { t: 'miss', wait: 34 } // round 8 — real miss, tap after ball exits
+  ];
+  var demoWait = 0, demoActed = false;
+
+  function autopilot() {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      var entry = demoScript[Math.min(demoRound, demoScript.length - 1)];
+      if (demoWait > 0) { demoWait--; return; }
+      if (demoActed) return;
+
+      if (entry.t === 'miss') {
+        // wait until ball is well past the zone then fake-tap
+        if (ballY > ZONE_Y + zoneH + 30) {
+          demoActed = true;
+          doDeflect();  // ball is below zone — missDeflect() path triggers
+        }
+        return;
+      }
+
+      // compute target ballY in zone based on t
+      var targetY = ZONE_Y + entry.t * zoneH;
+      var margin  = Math.abs(ballVY) * 0.7;
+      if (ballVY > 0 && Math.abs(ballY - targetY) <= margin) {
+        demoActed = true;
+        doDeflect();
+      } else if (ballVY < 0 && Math.abs(ballY - targetY) <= margin) {
+        demoActed = true;
+        doDeflect();
+      }
+    } else if (BOT) {
+      // imperfect bot: aims for a noisy centre of zone
+      var noise = (rng() - 0.5) * zoneH * 0.7;
+      var targetY2 = ZONE_Y + zoneH / 2 + noise;
+      var margin2 = Math.abs(ballVY) * 0.8;
+      if (ballVY > 0 && ballY >= targetY2 - margin2 && ballY <= ZONE_Y + zoneH + 20) {
+        doDeflect();
+      } else if (ballVY < 0 && ballY <= targetY2 + margin2 && ballY >= ZONE_Y - 20) {
+        doDeflect();
+      }
+    }
+  }
+
+  // reset demo state after each deflect
+  function advanceDemoRound() {
+    demoRound++;
+    var entry = demoScript[Math.min(demoRound, demoScript.length - 1)];
+    demoWait = entry ? entry.wait : 30;
+    demoActed = false;
+  }
+
+  // ---- tap input ----
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') { doDeflect(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'deflects' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- render helpers ----
+  function drawBall(x, y, r, color) {
+    var g = cx.createRadialGradient(x - r * 0.3, y - r * 0.3, r * 0.1, x, y, r);
+    g.addColorStop(0, '#fff');
+    g.addColorStop(0.4, color);
+    g.addColorStop(1, 'rgba(0,0,0,0.4)');
+    cx.beginPath(); cx.arc(x, y, r, 0, Math.PI * 2);
+    cx.fillStyle = g; cx.fill();
+  }
+
+  function drawZone(zY, zH, alpha) {
+    // zone glow strip
+    cx.globalAlpha = alpha * 0.18;
+    cx.fillStyle = TEAL;
+    cx.fillRect(0, zY, W, zH);
+    cx.globalAlpha = alpha;
+
+    // zone top/bottom edges
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 2;
+    cx.globalAlpha = alpha * 0.9;
+    cx.beginPath(); cx.moveTo(0, zY); cx.lineTo(W, zY); cx.stroke();
+    cx.beginPath(); cx.moveTo(0, zY + zH); cx.lineTo(W, zY + zH); cx.stroke();
+
+    // centre guide
+    cx.strokeStyle = 'rgba(46,197,182,0.3)';
+    cx.lineWidth = 1;
+    cx.setLineDash([6, 6]);
+    cx.beginPath(); cx.moveTo(0, zY + zH / 2); cx.lineTo(W, zY + zH / 2); cx.stroke();
+    cx.setLineDash([]);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- main frame loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // sim update
+    if (phase === 'play') {
+      if (hitStop > 0) {
+        hitStop -= dt;
+      } else {
+        // move ball
+        ballY += ballVY * dt;
+
+        // bounce off ceiling
+        if (ballY - BALL_R < 0) {
+          ballY  = BALL_R;
+          ballVY = Math.abs(ballVY);
+          if (window.J) J.tension(Math.min(round / 20, 1));
+        }
+
+        // fell below zone without being deflected
+        if (ballY - BALL_R > ZONE_Y + zoneH + 4) {
+          gameOver('escape');
+        }
+
+        autopilot();
+      }
+    }
+
+    // after demo deflect, advance demo script
+    if (DEMO && demoActed && phase === 'play') {
+      // check if we just deflected (ball is going up now)
+      if (ballVY < 0) {
+        advanceDemoRound();
+      }
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.84, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // -- title screen --
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('DEFLECT ZONE', W / 2, 280);
+      cx.fillStyle = TEAL; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO DEFLECT', W / 2, 330); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('time it. zone shrinks. don\'t miss.', W / 2, 362);
+      // draw static zone preview
+      drawZone(ZONE_Y, ZONE_H_BASE, 0.5);
+      // draw demo ball
+      drawBall(W / 2, ZONE_Y - 120, BALL_R, TEAL);
+    }
+
+    // -- challenge card (demo beat 1) --
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('7', W / 2, 405);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top deflector", W / 2, 435);
+    }
+
+    // -- play screen --
+    if (phase === 'play') {
+      // score
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('DEFLECTS', W / 2, 118);
+
+      // combo ring
+      if (combo >= 2) {
+        var cr = 36 + combo * 4;
+        var cg = cx.createRadialGradient(W / 2, 70, cr * 0.3, W / 2, 70, cr);
+        cg.addColorStop(0, 'rgba(242,177,52,0.0)');
+        cg.addColorStop(1, 'rgba(242,177,52,' + Math.min(0.5, combo * 0.07) + ')');
+        cx.beginPath(); cx.arc(W / 2, 70, cr, 0, Math.PI * 2);
+        cx.fillStyle = cg; cx.fill();
+        cx.fillStyle = GOLD; cx.font = '900 ' + Math.min(28, 14 + combo * 2) + 'px -apple-system, Helvetica, Arial';
+        cx.fillText('×' + combo, W / 2, 145);
+      }
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 162);
+      }
+
+      // zone
+      var zonePulse = 1 - (hitStop > 0 ? 0 : 0);
+      var zAlpha = 0.8 + 0.2 * Math.sin(now / 180);
+      drawZone(ZONE_Y, zoneH, zAlpha);
+
+      // zone shrink progress indicator
+      var shrinkPct = 1 - (zoneH - ZONE_MIN_H) / (ZONE_H_BASE - ZONE_MIN_H);
+      cx.fillStyle = 'rgba(255,255,255,0.15)';
+      cx.fillRect(20, ZONE_Y - 10, W - 40, 4);
+      cx.fillStyle = shrinkPct > 0.7 ? VERM : GOLD;
+      cx.fillRect(20, ZONE_Y - 10, (W - 40) * shrinkPct, 4);
+
+      // ball
+      if (hitStop <= 0 || phase === 'play') {
+        var ballColor = combo >= 3 ? GOLD : (combo >= 1 ? TEAL : VERM);
+        var ballGlow = combo >= 2;
+        if (ballGlow) {
+          cx.shadowColor = ballColor; cx.shadowBlur = 18 + combo * 4;
+        }
+        drawBall(ballX, ballY, BALL_R + (combo >= 3 ? 3 : 0), ballColor);
+        cx.shadowBlur = 0;
+      }
+    }
+
+    // -- game over screen --
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('MISSED.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' deflects', W / 2, 345);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('faster reflexes than ' + (100 - pt) + '% of players', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 462);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) {
+          cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        } else {
+          cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        }
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+      // draw zone + missed ball position
+      drawZone(ZONE_Y, zoneH, 0.4);
+      cx.globalAlpha = 0.5;
+      drawBall(ballX, Math.min(ballY, ZONE_Y + zoneH + 30), BALL_R, VERM);
+      cx.globalAlpha = 1;
+    }
+
+    // -- demo CTA card --
+    if (phase === 'cta') {
+      var t2 = (now - ctaAt) / 1000, ease = Math.min(1, t2 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('DEFLECT ZONE', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText((window.__demoScore || 7) + ' deflects. beat that.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 7), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // -- particles --
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pt2 = particles[p];
+      pt2.x += pt2.vx * dt; pt2.y += pt2.vy * dt;
+      pt2.vy += 0.15 * dt;
+      pt2.life -= pt2.decay * dt;
+      if (pt2.life <= 0) { particles.splice(p, 1); continue; }
+      cx.globalAlpha = pt2.life;
+      cx.beginPath(); cx.arc(pt2.x, pt2.y, pt2.r * pt2.life, 0, Math.PI * 2);
+      cx.fillStyle = pt2.color; cx.fill();
+      cx.globalAlpha = 1;
+    }
+
+    // -- flashes --
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 230 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // -- mute toggle (human only) --
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

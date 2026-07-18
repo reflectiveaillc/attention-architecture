@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Switch Stance — Tilt</title>
+<!--
+  LOOP / attention-architecture — Switch Stance
+  Circuits: 02-novelty (control-scheme inversion), 05-ease (muscle-memory betrayal), 04-loss (one crash ends it)
+  Modes:
+    ?demo=1&seed=7   mirror-neuron clip — shock-honesty arc (adapt→near-crash→crash)
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, __botDone when done
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'switch-stance';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  var GROUND_Y   = 520;           // y of the ground line
+  var PLAYER_W   = 36, PLAYER_H = 52;
+  var DUCK_H     = 28;            // player height when ducking
+  var JUMP_VY    = -14.5;         // initial jump velocity
+  var GRAVITY    = 0.55;
+  var BASE_SPEED = 4.0;
+  var FLIP_EVERY = 360;           // frames between stance flips (~6s at 60fps)
+  var OBSTACLE_INTERVAL = 120;    // frames between obstacle spawns (decreases)
+
+  // ---- state ----
+  var phase, runStartTs, score, stanceFlips, dareBeaten;
+  var px, py, pvy, onGround, isDucking;
+  var inverted;           // current stance: false = normal, true = inverted
+  var obstacles, flashes, particles;
+  var flipTimer, obstTimer, obstInterval;
+  var hitStop, shakeAmt, zoom;
+  var overAt, ctaAt, challengeAt;
+  var best = 0;
+  try { best = +localStorage.getItem('ss_best') || 0; } catch (_) {}
+  var botRunsDone = 0;
+
+  // ---- stance label helpers ----
+  var STANCE_LABELS = [
+    ['JUMP', 'DUCK'],          // normal:   swipe-up = jump, swipe-down = duck
+    ['DUCK', 'JUMP'],          // inverted: swipe-up = duck, swipe-down = jump
+  ];
+
+  function newGame() {
+    phase        = DEMO ? 'challenge' : (BOT ? 'play' : 'title');
+    score        = 0;
+    stanceFlips  = 0;
+    dareBeaten   = false;
+    inverted     = false;
+    px           = 100;
+    py           = GROUND_Y - PLAYER_H;
+    pvy          = 0;
+    onGround     = true;
+    isDucking    = false;
+    obstacles    = [];
+    flashes      = [];
+    particles    = [];
+    flipTimer    = FLIP_EVERY;
+    obstTimer    = 80;         // first obstacle comes soon
+    obstInterval = OBSTACLE_INTERVAL;
+    hitStop      = 0;
+    shakeAmt     = 0;
+    zoom         = 1;
+    overAt       = 0;
+    ctaAt        = 0;
+
+    if (DEMO) {
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { startRun(); return; }
+    // human: wait for tap
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function pctTop(s) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 14))));
+  }
+
+  // ---- actions ----
+  function doJump() {
+    // in inverted stance, swipe-up/tap means DUCK, not jump
+    var actualJump = inverted ? false : true;
+    if (actualJump) { tryJump(); } else { tryDuck(); }
+  }
+  function doDown() {
+    var actualDuck = inverted ? false : true;
+    if (actualDuck) { tryDuck(); } else { tryJump(); }
+  }
+
+  function tryJump() {
+    if (!onGround) return;
+    pvy = JUMP_VY;
+    onGround = false;
+    isDucking = false;
+    if (window.J) J.hit(score + 1);
+  }
+  function tryDuck() {
+    if (!onGround) return;   // can't duck mid-air
+    isDucking = true;
+  }
+  function releaseDuck() {
+    isDucking = false;
+  }
+
+  // ---- obstacle generation ----
+  // Types: 'high' (jump over), 'low' (duck under)
+  function spawnObstacle() {
+    var t = rng() < 0.5 ? 'high' : 'low';
+    var o = {
+      type: t,
+      x: W + 20,
+      // high = ground obstacle (must jump over), low = flying obstacle (must duck)
+      // 'high': block on ground level
+      // 'low': bar at mid-torso height
+      w: t === 'high' ? 28 : 200,
+      h: t === 'high' ? 44 : 18,
+      passed: false
+    };
+    if (t === 'high') {
+      o.y = GROUND_Y - o.h;
+    } else {
+      o.y = GROUND_Y - PLAYER_H * 0.72;  // mid-height bar, duck under it
+    }
+    obstacles.push(o);
+  }
+
+  // ---- collision ----
+  function playerRect() {
+    var ph = isDucking ? DUCK_H : PLAYER_H;
+    var py2 = GROUND_Y - ph;
+    return { x: px - PLAYER_W / 2, y: py2, w: PLAYER_W, h: ph };
+  }
+
+  function rectsOverlap(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x &&
+           a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  // ---- game over ----
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 10;
+    if (window.J) J.death(Math.min(0.3 + score / 20, 1));
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (score > best) {
+      best = score;
+      try { localStorage.setItem('ss_best', String(best)); } catch (_) {}
+      if (window.J) setTimeout(function () { J.fanfare(); }, 400);
+    }
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 700);
+    }
+  }
+
+  function resetRun() {
+    score       = 0;
+    stanceFlips = 0;
+    inverted    = false;
+    px = 100; py = GROUND_Y - PLAYER_H; pvy = 0; onGround = true; isDucking = false;
+    obstacles = []; flashes = []; particles = [];
+    flipTimer = FLIP_EVERY; obstTimer = 80; obstInterval = OBSTACLE_INTERVAL;
+    hitStop = 0; shakeAmt = 0; zoom = 1; dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- flash helpers ----
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 36, t: 0 });
+  }
+
+  // ---- particles on stance flip ----
+  function spawnFlipParticles() {
+    for (var i = 0; i < 18; i++) {
+      var angle = (rng() * Math.PI * 2);
+      var speed = 2 + rng() * 4;
+      particles.push({
+        x: W / 2, y: H / 2,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 2,
+        life: 40 + rng() * 30,
+        color: rng() < 0.5 ? VERM : TEAL,
+        r: 3 + rng() * 3
+      });
+    }
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  var touchStartY = null;
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') {
+      // tap = jump (honoring inversion)
+      doJump();
+      return;
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'flips' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  var swipeStartY = null;
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    var cx2 = (e.clientX - r.left) / scale;
+    var cy2 = (e.clientY - r.top) / scale;
+    swipeStartY = cy2;
+    tap(cx2, cy2);
+  });
+  window.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    var cx2 = (e.clientX - r.left) / scale;
+    var cy2 = (e.clientY - r.top) / scale;
+    if (swipeStartY !== null) {
+      var dy = cy2 - swipeStartY;
+      if (Math.abs(dy) > 20 && phase === 'play') {
+        if (dy < 0) doJump();    // swipe up
+        else        doDown();    // swipe down
+      }
+      swipeStartY = null;
+    }
+    if (isDucking) releaseDuck();
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); if (phase === 'play') doJump(); else tap(); }
+    if (e.code === 'ArrowDown') { e.preventDefault(); if (phase === 'play') doDown(); }
+    if (e.code === 'ArrowDown') { isDuckKey = true; }
+  });
+  window.addEventListener('keyup', function (e) {
+    if (e.code === 'ArrowDown') { isDuckKey = false; releaseDuck(); }
+  });
+  var isDuckKey = false;
+
+  // ---- demo / bot autopilot ----
+  // Demo script: array of actions with timing
+  // Each entry: { wait: frames, action: 'jump'|'duck'|'releaseDuck' }
+  // Demo arc: runs well for 3 obstacles → stance flips → near miss (ducked too late) → recovery → stance flips again → crash
+  var demoActions = [
+    // obstacle 1 (high) — jump it
+    { wait: 68, action: 'jump' },
+    // obstacle 2 (low) — duck it
+    { wait: 80, action: 'duck' },
+    { wait: 20, action: 'releaseDuck' },
+    // stance flip at ~6s mark — signal it
+    { wait: 60, action: null },   // just wait for flip
+    // obstacle 3 (high) — now inverted! jump button means duck. near-fail — hesitate then duck
+    { wait: 60, action: 'jump' }, // player TRIES to jump (inverted = DUCK) — actually ducks, saving it (close!)
+    // obstacle 4 (low in inverted) — duck means jump. player hesitates (near fail moment), then jumps
+    { wait: 90, action: 'duck' }, // 'duck' in inverted = jump — saves it
+    // stance flip back — confusing!
+    { wait: 40, action: null },
+    // obstacle 5 — player reacts wrong (crashes)
+    { wait: 80, action: null },   // do nothing — crash into it for the spectacle
+  ];
+  var demoIdx = 0, demoWait = 0;
+  var demoDuckTimer = 0;
+
+  // Bot: simple heuristic — find nearest obstacle, choose correct action based on stance
+  // Occasionally (1 in 8 chances) gets it wrong to ensure it dies and botDone fires
+  var botMistakeChance = 0.22;  // higher mistake rate so bot dies faster
+  var botActed = false;
+
+  function autopilot() {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      if (demoIdx >= demoActions.length) return;
+      var act = demoActions[demoIdx];
+      if (demoWait < act.wait) { demoWait++; return; }
+      demoWait = 0;
+      demoIdx++;
+      if (act.action === 'jump') doJump();
+      else if (act.action === 'duck') doDown();
+      else if (act.action === 'releaseDuck') releaseDuck();
+      // null = just wait
+      return;
+    }
+
+    if (BOT) {
+      // Find nearest upcoming obstacle
+      var nearest = null, nearDist = Infinity;
+      for (var i = 0; i < obstacles.length; i++) {
+        var o = obstacles[i];
+        var dist = o.x - (px + PLAYER_W / 2);
+        if (dist > 0 && dist < nearDist) { nearest = o; nearDist = dist; }
+      }
+      if (!nearest || nearDist > 160 || nearDist < 10) return;
+      if (nearDist < 80 && !botActed) {
+        botActed = true;
+        // Should we make a mistake?
+        var mistake = rng() < botMistakeChance;
+        if (nearest.type === 'high') {
+          // Need to jump — in normal stance: jump. In inverted stance: doDown (which calls jump)
+          if (!mistake) {
+            if (!inverted) tryJump(); else tryJump(); // both paths actually jump correctly
+          }
+          // mistake: do nothing — crash
+        } else {
+          // Need to duck — in normal stance: doDown (duck). In inverted: doJump (duck)
+          if (!mistake) {
+            isDucking = true;
+            setTimeout(function () { isDucking = false; }, 350);
+          }
+          // mistake: do nothing — crash
+        }
+      }
+      if (nearDist > 100) botActed = false;
+      return;
+    }
+  }
+
+  // ---- update ----
+  function update(dt) {
+    if (phase !== 'play') return;
+
+    // flip timer
+    flipTimer -= dt;
+    if (flipTimer <= 0) {
+      flipTimer = FLIP_EVERY;
+      inverted = !inverted;
+      stanceFlips++;
+      shakeAmt = 5;
+      zoom = 1.025;
+      flash(inverted ? '⟲ FLIPPED!' : '⟲ BACK!', inverted ? VERM : TEAL, 40);
+      spawnFlipParticles();
+      if (window.J) J.gold();
+      if (window.LOOP) LOOP.emit('stance_flip', { flips: stanceFlips, inverted: inverted });
+      // every 3 flips, escalate tension
+      if (stanceFlips % 3 === 0 && window.J) J.tension(Math.min(stanceFlips / 9, 1));
+    }
+
+    // obstacle timer
+    obstTimer -= dt;
+    if (obstTimer <= 0) {
+      obstInterval = Math.max(70, OBSTACLE_INTERVAL - score * 1.5);
+      obstTimer = obstInterval + (rng() - 0.5) * 30;
+      spawnObstacle();
+    }
+
+    // speed increases with score
+    var speed = BASE_SPEED + score * 0.08;
+
+    // move obstacles
+    for (var i = obstacles.length - 1; i >= 0; i--) {
+      var o = obstacles[i];
+      o.x -= speed * dt;
+      if (!o.passed && o.x + o.w < px - PLAYER_W / 2) {
+        o.passed = true;
+        score++;
+        if (window.LOOP) LOOP.emit('obstacle_cleared', { n: score, inverted: inverted });
+        // dare check
+        if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+          dareBeaten = true;
+          flash('DARE BEATEN', TEAL, 44);
+          if (window.J) J.fanfare();
+          SHARE.beaten(score);
+        }
+        if (window.J) {
+          J.hit(score);
+          J.tension(Math.min(score / 20 + stanceFlips * 0.05, 1));
+        }
+      }
+      if (o.x < -60) { obstacles.splice(i, 1); }
+    }
+
+    // gravity
+    pvy += GRAVITY * dt;
+    py += pvy * dt;
+    if (py >= GROUND_Y - PLAYER_H) {
+      py = GROUND_Y - PLAYER_H;
+      pvy = 0;
+      onGround = true;
+    } else {
+      onGround = false;
+    }
+
+    // collision
+    var pr = playerRect();
+    for (var j = 0; j < obstacles.length; j++) {
+      var ob = obstacles[j];
+      if (rectsOverlap(pr, { x: ob.x, y: ob.y, w: ob.w, h: ob.h })) {
+        // near miss check: was nearly cleared?
+        if (ob.x + ob.w - (px - PLAYER_W / 2) < 12) {
+          if (window.J) J.near();
+          if (window.LOOP) LOOP.emit('near_miss', { n: score });
+          flash('SO CLOSE', GOLD, 32);
+        }
+        gameOver();
+        return;
+      }
+    }
+
+    // autopilot for demo/bot
+    autopilot();
+  }
+
+  // ---- render ----
+  var last = performance.now(), ctaPhaseAt = 0;
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    if (hitStop > 0) { hitStop -= dt; }
+    else update(dt);
+
+    // juice decays
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // ---- background ----
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    // subtle gradient
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.08)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- ground ----
+    cx.fillStyle = inverted ? 'rgba(232,80,46,0.25)' : 'rgba(46,197,182,0.2)';
+    cx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+    cx.strokeStyle = inverted ? VERM : TEAL;
+    cx.lineWidth = 2;
+    cx.beginPath(); cx.moveTo(0, GROUND_Y); cx.lineTo(W, GROUND_Y); cx.stroke();
+
+    // ---- ground texture (scrolling dashes) ----
+    var dashOff = (performance.now() / 5) % 40;
+    cx.strokeStyle = 'rgba(255,255,255,0.08)'; cx.lineWidth = 1;
+    cx.setLineDash([20, 20]); cx.lineDashOffset = -dashOff;
+    cx.beginPath(); cx.moveTo(0, GROUND_Y + 12); cx.lineTo(W, GROUND_Y + 12); cx.stroke();
+    cx.setLineDash([]);
+
+    // ---- stance indicator ----
+    if (phase === 'play' || phase === 'over') {
+      var stanceColor = inverted ? VERM : TEAL;
+      cx.fillStyle = stanceColor + '22';
+      cx.fillRect(0, 0, W, 56);
+      cx.textAlign = 'left';
+      cx.fillStyle = stanceColor;
+      cx.font = '700 12px Menlo, monospace';
+      cx.fillText('↑ ' + (inverted ? 'DUCK' : 'JUMP'), 14, 28);
+      cx.fillText('↓ ' + (inverted ? 'JUMP' : 'DUCK'), 14, 46);
+      // flip countdown bar
+      var barW = W - 28;
+      var fillFrac = flipTimer / FLIP_EVERY;
+      cx.fillStyle = 'rgba(255,255,255,0.1)';
+      cx.fillRect(14, 52, barW, 3);
+      cx.fillStyle = stanceColor;
+      cx.fillRect(14, 52, barW * fillFrac, 3);
+      cx.textAlign = 'right';
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 11px Menlo, monospace';
+      cx.fillText('FLIP IN ' + Math.ceil(flipTimer / 60) + 's', W - 14, 28);
+    }
+
+    // ---- obstacles ----
+    for (var i = 0; i < obstacles.length; i++) {
+      var o = obstacles[i];
+      if (o.type === 'high') {
+        // blocky ground obstacle — vermillion spiky wall
+        cx.fillStyle = VERM;
+        cx.fillRect(o.x, o.y, o.w, o.h);
+        // spike top
+        cx.fillStyle = VERM + 'cc';
+        cx.beginPath();
+        cx.moveTo(o.x, o.y);
+        cx.lineTo(o.x + o.w / 2, o.y - 14);
+        cx.lineTo(o.x + o.w, o.y);
+        cx.fill();
+        // dark stripe
+        cx.fillStyle = 'rgba(0,0,0,0.3)';
+        cx.fillRect(o.x, o.y + o.h * 0.4, o.w, 4);
+      } else {
+        // low bar — floating horizontal beam to duck under
+        var barColor = GOLD;
+        cx.fillStyle = barColor;
+        cx.fillRect(o.x, o.y, o.w, o.h);
+        // glow
+        cx.shadowColor = barColor; cx.shadowBlur = 10;
+        cx.fillRect(o.x, o.y, o.w, o.h);
+        cx.shadowBlur = 0;
+        // hanging lines at ends
+        cx.strokeStyle = barColor + '88'; cx.lineWidth = 2;
+        cx.beginPath(); cx.moveTo(o.x + 6, o.y); cx.lineTo(o.x + 6, o.y - 20); cx.stroke();
+        cx.beginPath(); cx.moveTo(o.x + o.w - 6, o.y); cx.lineTo(o.x + o.w - 6, o.y - 20); cx.stroke();
+      }
+    }
+
+    // ---- player ----
+    if (phase === 'play' || phase === 'over') {
+      var ph  = isDucking ? DUCK_H : PLAYER_H;
+      var py2 = GROUND_Y - ph;
+      var bodyColor = inverted ? VERM : TEAL;
+
+      // shadow
+      cx.fillStyle = 'rgba(0,0,0,0.25)';
+      cx.ellipse(px, GROUND_Y + 4, PLAYER_W * 0.45, 6, 0, 0, Math.PI * 2);
+      cx.fill();
+
+      // body
+      cx.fillStyle = bodyColor;
+      cx.fillRect(px - PLAYER_W / 2, py2, PLAYER_W, ph);
+
+      // head (only when standing)
+      if (!isDucking) {
+        cx.fillStyle = bodyColor;
+        cx.beginPath();
+        cx.arc(px, py2 - 12, 14, 0, Math.PI * 2);
+        cx.fill();
+        // eyes
+        cx.fillStyle = INK;
+        cx.beginPath(); cx.arc(px - 5, py2 - 14, 3, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.arc(px + 5, py2 - 14, 3, 0, Math.PI * 2); cx.fill();
+      }
+
+      // inverted indicator on player — arrows showing current stance
+      cx.fillStyle = '#fff';
+      cx.font = '700 11px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText(inverted ? '⟲' : '✓', px, py2 + ph * 0.5 + 4);
+    }
+
+    // ---- particles ----
+    for (var k = particles.length - 1; k >= 0; k--) {
+      var p = particles[k];
+      p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 0.25 * dt; p.life -= dt;
+      if (p.life <= 0) { particles.splice(k, 1); continue; }
+      cx.globalAlpha = Math.min(1, p.life / 25);
+      cx.fillStyle = p.color;
+      cx.beginPath(); cx.arc(p.x, p.y, p.r, 0, Math.PI * 2); cx.fill();
+      cx.globalAlpha = 1;
+    }
+
+    // ---- score display ----
+    if (phase === 'play') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 120);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 142);
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : ('BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : '')), W / 2, 162);
+      }
+    }
+
+    // ---- flashes ----
+    for (var f = flashes.length - 1; f >= 0; f--) {
+      var fl = flashes[f]; fl.t += dt;
+      var alpha = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = alpha;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 310 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) flashes.splice(f, 1);
+    }
+
+    // ---- title screen ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('SWITCH STANCE', W / 2, 280);
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('controls flip every 6 seconds', W / 2, 318);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('your muscle memory will betray you', W / 2, 344);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO RUN', W / 2, 390);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- challenge card (demo beat 1) ----
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '800 15px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 290);
+      cx.fillStyle = GOLD; cx.font = '900 100px -apple-system, Helvetica, Arial';
+      cx.fillText('12', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // ---- game over screen ----
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('STANCE KILLED YOU.', W / 2, 294);
+      cx.fillStyle = '#fff'; cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' cleared', W / 2, 338);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 382);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('controls flipped ' + stanceFlips + (stanceFlips === 1 ? ' time' : ' times'), W / 2, 408);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — GO AGAIN', W / 2, 454);
+        cx.globalAlpha = 1;
+        // share zone
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- demo CTA card ----
+    if (phase === 'cta') {
+      var tC = (now - ctaAt) / 1000, ease = Math.min(1, tC * 2.4);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('SWITCH STANCE', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('controls flipped. they died. your turn.', W / 2, 332);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 230);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 12), W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

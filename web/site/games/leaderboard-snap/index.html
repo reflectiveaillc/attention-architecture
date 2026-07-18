@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Leaderboard Snap — Tilt</title>
+<!--
+  LOOP / attention-architecture — Leaderboard Snap
+  Circuits: 01 RPE (variable reward per snap), 03 social (share the screenshot),
+            06 Zeigarnik (one-time snap, friends must answer before it expires).
+  Modes:
+    ?demo=1&seed=7        scripted run for clip capture, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+    ?dare=<score>         incoming challenge from a friend
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'leaderboard-snap';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720, CENTER = W / 2;
+  var TRACK_PAD = 40, TRACK_HW = (W - TRACK_PAD * 2) / 2;
+  var PERFECT_PX = 12, NEAR_PX = 55;
+  var ROUND_SECS = 30;
+  var BASE_PERFECT = 250, BASE_NEAR = 100, COMBO_PERFECT = 50, COMBO_NEAR = 25, GOLD_EVERY = 5;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 28;
+  var SEED = +qs.get('seed') || 42;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134';
+
+  var state, flashes, runStartTs, best = 0, perfectStreak = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  var challengeAt = 0, ctaAt = 0, botRunsDone = 0, botTarget = null;
+  try { best = +localStorage.getItem('ls_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      score: 0, combo: 0, perfectStreak: 0, lives: 3, maxLives: 3,
+      timeLeft: ROUND_SECS, runTime: 0, overAt: 0, overReason: '',
+      marker: { x: CENTER - TRACK_HW, dir: 1, speed: 3.4 }
+    };
+    flashes = []; dareBeaten = false; perfectStreak = 0; botTarget = null;
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1200);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 900))));
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.score = 0; state.combo = 0; state.perfectStreak = 0; state.lives = 3;
+    state.timeLeft = ROUND_SECS; state.runTime = 0;
+    runStartTs = Date.now();
+    spawnTarget();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function resetRun() {
+    state.score = 0; state.combo = 0; state.perfectStreak = 0; state.lives = 3;
+    state.timeLeft = ROUND_SECS; state.runTime = 0; flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function spawnTarget() {
+    var half = TRACK_HW;
+    state.marker.dir = rng() > 0.5 ? 1 : -1;
+    state.marker.x = CENTER + (state.marker.dir > 0 ? -half : half);
+    state.marker.speed = 3.4 + state.score * 0.0025 + (ROUND_SECS - state.timeLeft) * 0.06;
+    botTarget = null;
+  }
+
+  function snap() {
+    if (state.phase !== 'play') return;
+    var dx = state.marker.x - CENTER;
+    var adx = Math.abs(dx);
+    var quality = adx <= PERFECT_PX ? 'perfect' : (adx <= NEAR_PX ? 'near' : 'miss');
+
+    if (quality === 'miss') {
+      miss();
+      return;
+    }
+
+    var pts;
+    if (quality === 'perfect') {
+      state.combo++;
+      state.perfectStreak++;
+      pts = BASE_PERFECT + (state.combo - 1) * COMBO_PERFECT;
+      hitStop = 5; zoom = 1.03; shakeAmt = 2.5;
+      if (state.perfectStreak % GOLD_EVERY === 0) {
+        pts += 300;
+        flash('GOLD SNAP', GOLD, 44);
+        if (window.J) J.gold();
+      } else {
+        flash('PERFECT', TEAL, 40);
+        if (window.J) J.perfect(state.combo);
+      }
+    } else {
+      state.combo++;
+      state.perfectStreak = 0;
+      pts = BASE_NEAR + (state.combo - 1) * COMBO_NEAR;
+      flash('+' + pts, VERM, 34);
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { n: state.score, dist: Math.round(adx) });
+    }
+
+    state.score += pts;
+    if (window.J) {
+      J.hit(state.combo);
+      J.tension(Math.min(state.combo / 15, 1));
+    }
+    if (window.LOOP) LOOP.emit('snap', { score: state.score, quality: quality, pts: pts, combo: state.combo });
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+
+    spawnTarget();
+  }
+
+  function miss() {
+    state.combo = 0; state.perfectStreak = 0;
+    state.lives--;
+    shakeAmt = 7;
+    flash('MISS', VERM, 46);
+    if (window.J) J.death(Math.min(0.25 + state.score / 3000, 1));
+    if (window.LOOP) LOOP.emit('miss', { lives: state.lives, score: state.score });
+    if (state.lives <= 0) { gameOver('miss'); }
+    else { spawnTarget(); }
+  }
+
+  function gameOver(reason) {
+    if (state.phase === 'over' || state.phase === 'cta') return;
+    state.phase = 'over';
+    state.overReason = reason || 'timeout';
+    state.overAt = performance.now();
+    if (reason === 'miss') shakeAmt = 11;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (newBest) {
+      best = state.score;
+      try { localStorage.setItem('ls_best', String(best)); } catch (_) {}
+      if (window.J) setTimeout(function () { J.fanfare(); }, 400);
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), reason: state.overReason });
+
+    if (DEMO) {
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else { setTimeout(function () { resetRun(); }, 900); }
+    }
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 120, y: 570, w: 240, h: 44 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { snap(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'pts' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  var DEMO_CHALLENGE = 1650;
+  var demoScript = [
+    { off: 0 }, { off: 30 }, { off: -45 }, { off: 5 },
+    { off: 90, type: 'miss' },
+    { off: 10 }, { off: -45 }, { off: 0 },
+    { off: 120, type: 'miss' }
+  ];
+  var demoWaits = [30, 28, 42, 36, 50, 32, 54, 40, 22];
+  var demoIdx = 0, demoWait = demoWaits[0];
+
+  function autopilot() {
+    if (!state.marker || state.phase !== 'play') return;
+    var m = state.marker, offset = m.x - CENTER, v = m.speed * m.dir;
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      var step = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      var target = step.off;
+      if (step.type === 'miss') {
+        if (Math.abs(offset - target) <= Math.abs(v) * 0.65) {
+          demoIdx++;
+          demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 30;
+          snap();
+        }
+        return;
+      }
+      if (Math.abs(offset - target) <= Math.abs(v) * 0.65) {
+        demoIdx++;
+        demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 30;
+        snap();
+      }
+    } else if (BOT) {
+      if (botTarget === null) botTarget = gauss() * BOT_ERR;
+      if (Math.abs(offset - botTarget) <= Math.abs(v) * 0.65) { botTarget = null; snap(); }
+    }
+  }
+
+  // ---- drawing helpers ----
+  function roundRectPath(x, y, w, h, r) {
+    var rr = Math.min(r, w / 2, h / 2);
+    cx.beginPath();
+    cx.moveTo(x + rr, y);
+    cx.lineTo(x + w - rr, y); cx.quadraticCurveTo(x + w, y, x + w, y + rr);
+    cx.lineTo(x + w, y + h - rr); cx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+    cx.lineTo(x + rr, y + h); cx.quadraticCurveTo(x, y + h, x, y + h - rr);
+    cx.lineTo(x, y + rr); cx.quadraticCurveTo(x, y, x + rr, y);
+    cx.closePath();
+  }
+
+  function drawTrack() {
+    // guide line
+    cx.strokeStyle = 'rgba(255,255,255,0.10)';
+    cx.lineWidth = 2;
+    cx.beginPath();
+    cx.moveTo(TRACK_PAD, 430);
+    cx.lineTo(W - TRACK_PAD, 430);
+    cx.stroke();
+
+    // snap zone
+    var z = cx.createLinearGradient(CENTER - NEAR_PX, 0, CENTER + NEAR_PX, 0);
+    z.addColorStop(0, 'rgba(46,197,182,0.10)');
+    z.addColorStop(0.5, 'rgba(242,177,52,0.18)');
+    z.addColorStop(1, 'rgba(46,197,182,0.10)');
+    cx.fillStyle = z;
+    roundRectPath(CENTER - NEAR_PX, 400, NEAR_PX * 2, 60, 12);
+    cx.fill();
+
+    // perfect zone
+    cx.strokeStyle = 'rgba(242,177,52,0.45)';
+    cx.lineWidth = 2;
+    roundRectPath(CENTER - PERFECT_PX, 408, PERFECT_PX * 2, 44, 8);
+    cx.stroke();
+
+    // center frame icon
+    cx.fillStyle = 'rgba(255,255,255,0.25)';
+    cx.font = '18px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.fillText('◻', CENTER, 437);
+  }
+
+  function drawMarker() {
+    var m = state.marker;
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 120);
+    // ring
+    cx.beginPath();
+    cx.arc(m.x, 430, 18, 0, Math.PI * 2);
+    cx.fillStyle = 'rgba(232,80,46,0.18)';
+    cx.fill();
+    cx.lineWidth = 3;
+    cx.strokeStyle = 'rgba(232,80,46,' + (0.7 + pulse * 0.3) + ')';
+    cx.stroke();
+    // core
+    cx.beginPath();
+    cx.arc(m.x, 430, 9, 0, Math.PI * 2);
+    cx.fillStyle = '#fff';
+    cx.fill();
+  }
+
+  function drawLeaderboardCard() {
+    var x = 30, y = 210, w = 345, h = 340, r = 18;
+    // card bg
+    cx.fillStyle = '#11151d';
+    roundRectPath(x, y, w, h, r);
+    cx.fill();
+    cx.strokeStyle = 'rgba(255,255,255,0.12)';
+    cx.lineWidth = 1.5;
+    cx.stroke();
+
+    cx.textAlign = 'left';
+    cx.fillStyle = '#fff';
+    cx.font = '800 20px -apple-system, Helvetica, Arial';
+    cx.fillText('LEADERBOARD SNAP', x + 22, y + 40);
+    cx.fillStyle = 'rgba(255,255,255,0.40)';
+    cx.font = '600 12px Menlo, monospace';
+    cx.fillText('TODAY · 30s ROUND', x + 22, y + 60);
+
+    var rows = [
+      { n: 1, label: 'YOU', score: state.score, you: true },
+      { n: 2, label: 'friend slot', empty: true },
+      { n: 3, label: 'friend slot', empty: true },
+      { n: 4, label: 'friend slot', empty: true }
+    ];
+    var rowY = y + 88, rowH = 54, left = x + 12;
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (row.you) {
+        cx.fillStyle = 'rgba(242,177,52,0.15)';
+        roundRectPath(left, rowY, w - 24, rowH, 12);
+        cx.fill();
+      }
+      cx.textAlign = 'left';
+      cx.fillStyle = row.you ? GOLD : 'rgba(255,255,255,0.55)';
+      cx.font = '900 16px Menlo, monospace';
+      cx.fillText('#' + row.n, left + 14, rowY + 33);
+      cx.fillStyle = row.you ? '#fff' : 'rgba(255,255,255,0.45)';
+      cx.font = row.you ? '700 17px -apple-system, Helvetica, Arial' : '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText(row.you ? 'YOU' : row.label, left + 48, rowY + 33);
+      cx.textAlign = 'right';
+      cx.fillStyle = row.you ? GOLD : TEAL;
+      cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText(row.you ? row.score.toLocaleString() + ' pts' : '+ invite', x + w - 18, rowY + 33);
+      rowY += rowH + 8;
+    }
+
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.30)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('snap expires after friends play', CENTER, y + h - 18);
+  }
+
+  function drawSharePill(label) {
+    roundRectPath(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 22);
+    cx.fillStyle = 'rgba(242,177,52,0.14)';
+    cx.fill();
+    cx.strokeStyle = GOLD;
+    cx.lineWidth = 1.5;
+    cx.stroke();
+    cx.fillStyle = GOLD;
+    cx.font = '800 16px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.fillText(label, CENTER, SHARE_R.y + 29);
+  }
+
+  // ---- main render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') {
+      var secs = dt * 0.016667;
+      state.timeLeft -= secs;
+      state.runTime += secs;
+      if (state.timeLeft <= 0) { state.timeLeft = 0; gameOver('timeout'); }
+      else {
+        var m = state.marker;
+        m.x += m.speed * m.dir * dt;
+        var limit = CENTER + TRACK_HW;
+        if (m.x > CENTER + TRACK_HW) { m.x = CENTER + TRACK_HW; m.dir = -1; }
+        if (m.x < CENTER - TRACK_HW) { m.x = CENTER - TRACK_HW; m.dir = 1; }
+        autopilot();
+      }
+    }
+
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(CENTER + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-CENTER, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK;
+    cx.fillRect(-40, -40, W + 80, H + 80);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    // top info
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.92)';
+    cx.font = '800 56px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score.toLocaleString(), CENTER, 84);
+    cx.fillStyle = 'rgba(255,255,255,0.40)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + best.toLocaleString(), CENTER, 108);
+
+    // timer bar
+    var tw = (state.timeLeft / ROUND_SECS) * (W - 80);
+    var tc = state.timeLeft < 8 ? VERM : (state.timeLeft < 18 ? GOLD : TEAL);
+    cx.fillStyle = 'rgba(255,255,255,0.10)';
+    roundRectPath(40, 124, W - 80, 6, 3);
+    cx.fill();
+    cx.fillStyle = tc;
+    roundRectPath(40, 124, tw, 6, 3);
+    cx.fill();
+
+    // lives
+    for (var li = 0; li < state.maxLives; li++) {
+      var lx = 18 + li * 18;
+      cx.fillStyle = li < state.lives ? VERM : 'rgba(255,255,255,0.15)';
+      roundRectPath(lx, 18, 12, 12, 3);
+      cx.fill();
+    }
+
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), CENTER, 156);
+    }
+
+    // combo
+    if (state.combo > 1) {
+      var pulse = 1 + 0.08 * Math.min(state.combo, 12);
+      cx.textAlign = 'center';
+      cx.fillStyle = GOLD;
+      cx.font = '900 ' + (22 * pulse) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText('×' + state.combo, CENTER, 184);
+    }
+
+    // game field
+    drawTrack();
+    if (state.phase === 'play' || state.phase === 'title') drawMarker();
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 42);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, CENTER, 330 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('LEADERBOARD SNAP', CENTER, 310);
+      var p = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = p;
+      cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP WHEN THE RING HITS THE FRAME', CENTER, 354);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('30s · snap your score · dare the timeline', CENTER, 384);
+    }
+
+    // challenge card (demo)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.50)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', CENTER, 300);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText(DEMO_CHALLENGE.toLocaleString(), CENTER, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top snap", CENTER, 430);
+    }
+
+    // game over + leaderboard
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)';
+      cx.fillRect(0, 0, W, H);
+      drawLeaderboardCard();
+      cx.textAlign = 'center';
+      cx.fillStyle = state.overReason === 'miss' ? VERM : TEAL;
+      cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText(state.overReason === 'miss' ? 'SNAP FAILED.' : 'ROUND OVER', CENTER, 176);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', CENTER, 582);
+      if (!DEMO && !BOT) {
+        var label = (window.SHARE && SHARE.dare !== null && dareBeaten) ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND';
+        drawSharePill(label);
+        var pulse = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = pulse;
+        cx.fillStyle = TEAL;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', CENTER, 644);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('LEADERBOARD SNAP', CENTER, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they scored ' + (window.__demoScore || DEMO_CHALLENGE) + '. your move.', CENTER, 342);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM;
+      cx.globalAlpha = ease * p3;
+      cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || DEMO_CHALLENGE), CENTER, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', CENTER, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '18px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 27);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

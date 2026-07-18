@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>F1 Start — Tilt</title>
+<!--
+  LOOP / attention-architecture — F1 START
+  Circuits: 01-rpe (variable reward per reaction), 04-loss (jumped the gun),
+            07-timing (pure reaction window).
+  Modes:
+    ?demo=1&seed=7   mirror-neuron clip: anticipation agony arc, sets __demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay N runs, sets __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'f1-start';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- Game constants ----
+  var NUM_LIGHTS = 5;
+  var LIGHT_R = 28;           // radius of each light panel circle
+  var LIGHTS_Y = 280;         // center Y of light row
+  var LIGHT_GAP = 62;         // gap between lights
+  var LIGHTS_X_START = W / 2 - (NUM_LIGHTS - 1) * LIGHT_GAP / 2;
+
+  // timing windows (ms) for perfect/good/okay/jump
+  var WIN_PERFECT = 120;    // ±ms from lights-out
+  var WIN_GOOD    = 280;
+  var WIN_OK      = 500;
+  var MAX_WAIT    = 3000;   // auto-fail (no tap) after 3s after lights out
+
+  // score = reaction time in ms (lower is better displayed as positive number score)
+  // We report score as 1000 - reactionMs so higher = better in leaderboard
+  var best = 9999;
+  try { var s = +localStorage.getItem('f1_best'); if (s > 0 && s < 9999) best = s; } catch (_) {}
+
+  // ---- State ----
+  var phase; // 'title' | 'challenge' | 'sequence' | 'wait' | 'result' | 'over' | 'cta'
+  var lightsLit;       // how many red lights are currently on (0-5)
+  var seqTimer;        // ms until next light change event
+  var lightsOutAt;     // performance.now() when all lights went out
+  var tapAt;           // performance.now() when player tapped
+  var reactionMs;      // computed reaction time
+  var jumpedGun;       // tapped before lights out
+  var jumpTimer;       // ms shown on jump-gun penalty screen
+  var resultScore;     // the score we show
+  var runStartTs;
+  var flashes = [];
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var ctaAt = 0, challengeAt = 0, overAt = 0;
+  var dareBeaten = false;
+  var botRunsDone = 0;
+  var last = performance.now();
+
+  // demo & bot state
+  var demoPhaseState;  // 'seq' | 'wait' | 'earlyTapPending' | 'lateTapPending'
+  var demoBotTimer;    // countdown in ms
+  var demoBotDecided = false;
+
+  // light glow animation
+  var lightGlow = [0,0,0,0,0]; // 0..1 glow intensity per light
+
+  // floating texts
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  function pctTop(ms) {
+    // lower reaction time = better = smaller %
+    return Math.max(1, Math.min(99, Math.round(100 * (1 - Math.exp(-(ms - 100) / 200)))));
+  }
+
+  function scoreDisplay(ms) {
+    // Show reaction in ms, lower = better
+    return ms;
+  }
+
+  // ---- New game / reset ----
+  function newGame() {
+    phase = 'title';
+    lightsLit = 0;
+    seqTimer = 0;
+    lightsOutAt = 0;
+    tapAt = 0;
+    reactionMs = 0;
+    jumpedGun = false;
+    jumpTimer = 0;
+    resultScore = 0;
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    dareBeaten = false;
+    demoBotTimer = 0;
+    demoBotDecided = false;
+    lightGlow = [0,0,0,0,0];
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(function() { startSequence(); }, 1250);
+      return;
+    }
+    if (BOT) {
+      startSequence();
+      return;
+    }
+  }
+
+  function startSequence() {
+    phase = 'sequence';
+    lightsLit = 0;
+    lightsOutAt = 0;
+    tapAt = 0;
+    jumpedGun = false;
+    runStartTs = Date.now();
+    // Time between each light turning on: 800-1200ms each (seeded)
+    seqTimer = 600 + rng() * 600;  // wait before first light
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    demoPhaseState = 'seq';
+    demoBotDecided = false;
+  }
+
+  function lightOn() {
+    lightsLit++;
+    lightGlow[lightsLit - 1] = 1.5; // over-drive for glow flash
+    if (window.J) J.tension(lightsLit / NUM_LIGHTS);
+    if (lightsLit < NUM_LIGHTS) {
+      // schedule next light
+      seqTimer = 700 + rng() * 700;
+    } else {
+      // all 5 lights on — now the random delay before going out
+      // This is the anticipation agony: delay 0.8s to 3.2s, random
+      var holdMs = 800 + rng() * 2400;
+      seqTimer = holdMs;
+      phase = 'wait';
+      demoPhaseState = 'wait';
+    }
+  }
+
+  function lightsOut() {
+    lightsLit = 0;
+    lightsOutAt = performance.now();
+    phase = 'wait_tap'; // waiting for tap now
+    lightGlow = [0,0,0,0,0];
+    // flash green signal
+    flash('GO!', TEAL, 52);
+    if (window.J) { J.gold(); J.tension(0); }
+  }
+
+  function handleTap() {
+    if (DEMO || BOT) return; // scripted only
+    if (phase === 'sequence' || phase === 'wait') {
+      // tapped before lights out = jumped the gun
+      jumpedGun = true;
+      jumpTimer = 1500; // show penalty 1.5s before restart
+      phase = 'jump';
+      shakeAmt = 10;
+      flash('TOO EARLY!', VERM, 44);
+      if (window.J) J.death(0.6);
+      if (window.LOOP) LOOP.emit('jumped_gun', {});
+      var dur = (Date.now() - runStartTs) / 1000;
+      if (window.LOOP) LOOP.emit('game_over', { score: 9999, dur_s: +dur.toFixed(1) });
+      return;
+    }
+    if (phase === 'wait_tap') {
+      var now = performance.now();
+      tapAt = now;
+      reactionMs = Math.round(tapAt - lightsOutAt);
+      evalReaction();
+      return;
+    }
+    if (phase === 'result' && performance.now() - overAt > 400) {
+      // check share zone
+      return; // will be handled by pointer check
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      resetRun();
+    }
+  }
+
+  function evalReaction() {
+    var ms = reactionMs;
+    resultScore = ms;
+    var isNewBest = ms < best;
+    if (isNewBest) best = ms;
+
+    var quality, scoreVal;
+    if (ms < WIN_PERFECT) {
+      quality = 'PERFECT';
+      scoreVal = 3;
+      hitStop = 5; zoom = 1.04;
+      flash('PERFECT LAUNCH!', TEAL, 46);
+      if (window.J) { J.perfect(1); J.fanfare(); }
+    } else if (ms < WIN_GOOD) {
+      quality = 'GOOD';
+      scoreVal = 2;
+      zoom = 1.02;
+      flash('CLEAN LAUNCH', TEAL, 38);
+      if (window.J) J.hit(2);
+    } else if (ms < WIN_OK) {
+      quality = 'OKAY';
+      scoreVal = 1;
+      flash('SLOW.', GOLD, 36);
+      if (window.J) J.hit(1);
+    } else {
+      quality = 'SLOW';
+      scoreVal = 0;
+      shakeAmt = 6;
+      flash('TOO SLOW', VERM, 36);
+      if (window.J) J.near();
+    }
+
+    if (isNewBest && ms < 9999) {
+      try { localStorage.setItem('f1_best', String(best)); } catch (_) {}
+      setTimeout(function() { if (window.J) J.fanfare(); }, 300);
+    }
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && ms < SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN!', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(ms);
+    }
+
+    if (window.LOOP) {
+      var dur = (Date.now() - runStartTs) / 1000;
+      LOOP.emit('game_over', { score: ms, dur_s: +dur.toFixed(1) });
+      LOOP.emit('reaction', { ms: ms, quality: quality });
+    }
+
+    if (DEMO) {
+      window.__demoScore = ms;
+    }
+
+    phase = 'result';
+    overAt = performance.now();
+
+    if (DEMO) {
+      // show result 2.2s then CTA
+      setTimeout(function() {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function() { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function() { resetRun(); }, 700);
+    }
+  }
+
+  function resetRun() {
+    phase = 'title';
+    lightsLit = 0;
+    lightGlow = [0,0,0,0,0];
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    demoPhaseState = 'seq';
+    demoBotDecided = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    setTimeout(function() { startSequence(); }, 10);
+  }
+
+  // ---- Input ----
+  var MUTE_R  = { x: W - 46, y: 10,  w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 504, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  window.addEventListener('pointerdown', function(e) {
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / scale;
+    var py = (e.clientY - r.top) / scale;
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'result' && inR(SHARE_R, px, py) && window.SHARE) {
+      SHARE.send({ score: resultScore, unit: 'ms' }); return;
+    }
+    if (phase === 'title') { startSequence(); return; }
+    if (phase === 'result' && performance.now() - overAt > 400) { resetRun(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) { resetRun(); return; }
+    handleTap();
+  });
+  window.addEventListener('keydown', function(e) {
+    if (e.code === 'Space') {
+      if (DEMO || BOT) return;
+      if (phase === 'title') { startSequence(); return; }
+      if (phase === 'result' && performance.now() - overAt > 400) { resetRun(); return; }
+      handleTap();
+    }
+  });
+
+  // ---- Autopilot (demo + bot) ----
+  // Demo script:
+  //   Run 1: near-perfect reaction (intentionally early)
+  //   Run 2 (the real demo):
+  //     - anticipation agony (lights count slowly)
+  //     - at ~60%: nearly jump the gun but hold
+  //     - then tap at ~+50ms (good reaction)
+  //   The demo is a SINGLE run with the arc built in
+
+  // For demo: we track whether we've decided to tap
+  var demoReactionTarget = 0; // target ms after lights-out
+  var demoJumpFake = false;   // did we plan a fake-jump that we hold?
+
+  function autopilot(dt) {
+    if (!DEMO && !BOT) return;
+    if (phase === 'sequence') {
+      // nothing to do, lights advance on timer
+    } else if (phase === 'wait') {
+      // Anticipation hold — for demo, simulate "almost tapping" by nothing
+      // (the tension is visual: all 5 lights on, player holds)
+      if (DEMO && !demoBotDecided) {
+        // do nothing — human-feeling hesitation during the wait phase
+      }
+    } else if (phase === 'wait_tap') {
+      if (!demoBotDecided) {
+        demoBotDecided = true;
+        if (DEMO) {
+          // Target a human-feeling reaction time: 90-180ms
+          demoReactionTarget = 80 + rng() * 120;
+        } else if (BOT) {
+          // Bot: somewhat imperfect, 100-600ms reaction
+          demoReactionTarget = 120 + rng() * 400;
+        }
+      }
+      var elapsed = performance.now() - lightsOutAt;
+      if (elapsed >= demoReactionTarget) {
+        // bot/demo taps
+        tapAt = lightsOutAt + demoReactionTarget;
+        reactionMs = Math.round(demoReactionTarget);
+        evalReaction();
+        demoBotDecided = false;
+      }
+    }
+  }
+
+  // ---- Render ----
+  function drawLight(i, lit, glow) {
+    var x = LIGHTS_X_START + i * LIGHT_GAP;
+    var y = LIGHTS_Y;
+    // outer housing (dark panel)
+    cx.beginPath();
+    cx.arc(x, y, LIGHT_R + 6, 0, Math.PI * 2);
+    cx.fillStyle = '#181c24';
+    cx.fill();
+    cx.strokeStyle = '#2a2e3a';
+    cx.lineWidth = 2;
+    cx.stroke();
+
+    // glow behind light when lit
+    if (lit || glow > 0.01) {
+      var g = cx.createRadialGradient(x, y, 0, x, y, LIGHT_R + 20);
+      var alpha = lit ? 0.4 : glow * 0.4;
+      g.addColorStop(0, 'rgba(232,80,46,' + (lit ? 0.55 : glow * 0.55) + ')');
+      g.addColorStop(1, 'rgba(232,80,46,0)');
+      cx.beginPath();
+      cx.arc(x, y, LIGHT_R + 20, 0, Math.PI * 2);
+      cx.fillStyle = g;
+      cx.fill();
+    }
+
+    // light circle
+    cx.beginPath();
+    cx.arc(x, y, LIGHT_R, 0, Math.PI * 2);
+    if (lit) {
+      var rg = cx.createRadialGradient(x - 6, y - 6, 2, x, y, LIGHT_R);
+      rg.addColorStop(0, '#ff7850');
+      rg.addColorStop(0.5, VERM);
+      rg.addColorStop(1, '#b83a1a');
+      cx.fillStyle = rg;
+    } else if (glow > 0.01) {
+      var gg = cx.createRadialGradient(x - 4, y - 4, 1, x, y, LIGHT_R);
+      gg.addColorStop(0, 'rgba(232,80,46,' + glow * 0.8 + ')');
+      gg.addColorStop(1, 'rgba(100,30,10,' + glow * 0.4 + ')');
+      cx.fillStyle = gg;
+    } else {
+      // off state — dark red
+      cx.fillStyle = '#2a1010';
+    }
+    cx.fill();
+
+    // highlight
+    if (lit) {
+      cx.beginPath();
+      cx.arc(x - 8, y - 8, 8, 0, Math.PI * 2);
+      cx.fillStyle = 'rgba(255,255,255,0.25)';
+      cx.fill();
+    }
+  }
+
+  function drawAllLights(phase_) {
+    // Draw the overhead gantry bar
+    var barL = LIGHTS_X_START - LIGHT_R - 16;
+    var barR = LIGHTS_X_START + (NUM_LIGHTS - 1) * LIGHT_GAP + LIGHT_R + 16;
+    var barY = LIGHTS_Y - LIGHT_R - 14;
+    var barH = (LIGHT_R + 14) * 2 + 28;
+
+    // supports from top
+    for (var i = 0; i < NUM_LIGHTS; i++) {
+      var sx = LIGHTS_X_START + i * LIGHT_GAP;
+      cx.fillStyle = '#1e2230';
+      cx.fillRect(sx - 4, 0, 8, barY);
+    }
+
+    // main bar
+    cx.fillStyle = '#1e2230';
+    cx.fillRect(barL, barY, barR - barL, barH);
+    cx.strokeStyle = '#2e3448';
+    cx.lineWidth = 2;
+    cx.strokeRect(barL, barY, barR - barL, barH);
+
+    // each light
+    for (var j = 0; j < NUM_LIGHTS; j++) {
+      var isLit = j < lightsLit;
+      drawLight(j, isLit, lightGlow[j]);
+    }
+
+    // green "GO" strips below gantry — only when lights go out
+    if (phase_ === 'wait_tap' || (phase_ === 'result' && !jumpedGun)) {
+      var goAlpha = phase_ === 'wait_tap' ? 1 : Math.max(0, 1 - (performance.now() - overAt) / 1500);
+      for (var k = 0; k < NUM_LIGHTS; k++) {
+        var gx = LIGHTS_X_START + k * LIGHT_GAP;
+        var glg = cx.createRadialGradient(gx, LIGHTS_Y, 0, gx, LIGHTS_Y, LIGHT_R + 16);
+        glg.addColorStop(0, 'rgba(46,197,182,' + goAlpha * 0.6 + ')');
+        glg.addColorStop(1, 'rgba(46,197,182,0)');
+        cx.beginPath();
+        cx.arc(gx, LIGHTS_Y, LIGHT_R + 16, 0, Math.PI * 2);
+        cx.fillStyle = glg;
+        cx.fill();
+        // green light
+        cx.beginPath();
+        cx.arc(gx, LIGHTS_Y, LIGHT_R, 0, Math.PI * 2);
+        var grg = cx.createRadialGradient(gx - 6, LIGHTS_Y - 6, 2, gx, LIGHTS_Y, LIGHT_R);
+        grg.addColorStop(0, 'rgba(100,255,220,' + goAlpha + ')');
+        grg.addColorStop(0.5, 'rgba(46,197,182,' + goAlpha + ')');
+        grg.addColorStop(1, 'rgba(20,120,100,' + goAlpha + ')');
+        cx.fillStyle = grg;
+        cx.fill();
+      }
+    }
+  }
+
+  function drawTrack() {
+    // Road stripes leading into distance
+    var roadTop = LIGHTS_Y + LIGHT_R + 50;
+    cx.fillStyle = '#131620';
+    cx.fillRect(0, roadTop, W, H - roadTop);
+
+    // perspective grid lines
+    var vx = W / 2, vy = roadTop;
+    cx.strokeStyle = 'rgba(255,255,255,0.07)';
+    cx.lineWidth = 1;
+    for (var i = -4; i <= 4; i++) {
+      cx.beginPath();
+      cx.moveTo(vx + i * 60, vy);
+      cx.lineTo(vx + i * 200, H);
+      cx.stroke();
+    }
+    // horizontal lines (fading into distance)
+    for (var d = 0; d < 6; d++) {
+      var ty = roadTop + d * (H - roadTop) / 6;
+      cx.globalAlpha = 0.05 + d * 0.02;
+      cx.beginPath();
+      cx.moveTo(0, ty);
+      cx.lineTo(W, ty);
+      cx.stroke();
+    }
+    cx.globalAlpha = 1;
+
+    // center dashes
+    cx.setLineDash([20, 18]);
+    cx.strokeStyle = 'rgba(255,255,255,0.12)';
+    cx.lineWidth = 2;
+    cx.beginPath();
+    cx.moveTo(W / 2, roadTop);
+    cx.lineTo(W / 2, H);
+    cx.stroke();
+    cx.setLineDash([]);
+  }
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Light glow decay
+    for (var i = 0; i < NUM_LIGHTS; i++) {
+      if (lightGlow[i] > 0) lightGlow[i] = Math.max(0, lightGlow[i] - dt * 0.07);
+    }
+
+    // Phase timers
+    if (phase === 'sequence') {
+      if (hitStop > 0) { hitStop -= dt; }
+      else {
+        seqTimer -= dt * 16.667;
+        if (seqTimer <= 0) lightOn();
+      }
+    } else if (phase === 'wait') {
+      if (hitStop > 0) { hitStop -= dt; }
+      else {
+        seqTimer -= dt * 16.667;
+        if (seqTimer <= 0) lightsOut();
+      }
+    } else if (phase === 'wait_tap') {
+      // auto-fail if no tap after MAX_WAIT
+      var elapsed = performance.now() - lightsOutAt;
+      if (!DEMO && !BOT && elapsed > MAX_WAIT) {
+        reactionMs = MAX_WAIT;
+        resultScore = MAX_WAIT;
+        phase = 'result';
+        overAt = performance.now();
+        if (window.J) J.death(1.0);
+        flash('FROZEN!', VERM, 42);
+        if (window.LOOP) {
+          LOOP.emit('game_over', { score: MAX_WAIT, dur_s: +((Date.now() - runStartTs) / 1000).toFixed(1) });
+        }
+      }
+      autopilot(dt);
+    } else if (phase === 'jump') {
+      jumpTimer -= dt * 16.667;
+      if (!DEMO && !BOT && jumpTimer <= 0) {
+        resetRun();
+      }
+    }
+
+    // autopilot for bot/demo in wait_tap is handled above; call for other phases
+    if (phase !== 'wait_tap') autopilot(dt);
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(11,13,18,1)');
+    bg.addColorStop(0.4, 'rgba(20,16,10,0.9)');
+    bg.addColorStop(1, 'rgba(11,13,18,1)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // track
+    drawTrack();
+
+    // lights gantry (all non-title phases)
+    if (phase !== 'title' && phase !== 'cta' && phase !== 'challenge') {
+      drawAllLights(phase);
+    }
+
+    // ---- TITLE ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('F1 START', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('wait for the lights to go out', W / 2, 298);
+      cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('then tap as fast as you can', W / 2, 320);
+      var pulse = 0.55 + 0.45 * Math.sin(now / 320);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM; cx.font = '800 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 390);
+      cx.globalAlpha = 1;
+      // small best
+      if (best < 9000) {
+        cx.fillStyle = 'rgba(242,177,52,0.6)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+        cx.fillText('BEST  ' + best + ' ms', W / 2, 420);
+      }
+    }
+
+    // ---- CHALLENGE card (demo beat 1) ----
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '800 15px Menlo, monospace';
+      cx.fillText('REACTION TO BEAT', W / 2, 296);
+      cx.fillStyle = GOLD; cx.font = '900 100px -apple-system, Helvetica, Arial';
+      cx.fillText('118', W / 2, 420);
+      cx.fillStyle = VERM; cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText('ms', W / 2, 452);
+      cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText("today's fastest launch", W / 2, 478);
+    }
+
+    // ---- SEQUENCE — lights counting up ----
+    if (phase === 'sequence') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.25)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('WAIT…', W / 2, LIGHTS_Y + LIGHT_R + 44);
+    }
+
+    // ---- WAIT — all 5 lit, tension before extinction ----
+    if (phase === 'wait') {
+      var elapsed2 = -seqTimer; // negative while waiting → positive when lights out
+      // tension rising text
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(232,80,46,0.6)'; cx.font = '700 14px -apple-system, Helvetica, Arial';
+      cx.fillText('HOLD…', W / 2, LIGHTS_Y + LIGHT_R + 44);
+      // tension sound ramp — call J.tension as time passes
+      if (window.J && Math.random() < 0.02) J.tension(Math.min(0.9, 0.2 + (1 - seqTimer / 2400) * 0.7));
+    }
+
+    // ---- WAIT TAP — lights out, tap now! ----
+    if (phase === 'wait_tap') {
+      cx.textAlign = 'center';
+      var tapElapsed = performance.now() - lightsOutAt;
+      var tapAlpha = Math.min(1, tapElapsed / 80);
+      cx.globalAlpha = tapAlpha;
+      cx.fillStyle = TEAL; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP!', W / 2, LIGHTS_Y + LIGHT_R + 54);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- JUMP THE GUN ----
+    if (phase === 'jump') {
+      cx.fillStyle = 'rgba(11,13,18,0.7)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('JUMPED THE GUN', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.6)'; cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('too eager — wait for all lights to go out', W / 2, 336);
+      cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('trying again…', W / 2, 370);
+    }
+
+    // ---- RESULT ----
+    if (phase === 'result') {
+      cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+
+      if (reactionMs >= MAX_WAIT) {
+        cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+        cx.fillText('FROZEN.', W / 2, 286);
+      } else {
+        var label = reactionMs < WIN_PERFECT ? 'PERFECT LAUNCH' : reactionMs < WIN_GOOD ? 'CLEAN LAUNCH' : reactionMs < WIN_OK ? 'SLOW START' : 'TOO SLOW';
+        var labelColor = reactionMs < WIN_GOOD ? TEAL : reactionMs < WIN_OK ? GOLD : VERM;
+        cx.fillStyle = labelColor; cx.font = '900 30px -apple-system, Helvetica, Arial';
+        cx.fillText(label, W / 2, 278);
+      }
+
+      // big reaction time
+      cx.fillStyle = '#fff'; cx.font = '900 80px -apple-system, Helvetica, Arial';
+      cx.fillText(reactionMs < MAX_WAIT ? reactionMs : '—', W / 2, 376);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('ms', W / 2, 400);
+
+      var pt2 = reactionMs < MAX_WAIT ? pctTop(reactionMs) : 99;
+      cx.fillStyle = GOLD; cx.font = '800 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt2 + '% TODAY', W / 2, 436);
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST  ' + (best < 9000 ? best + ' ms' : '—'), W / 2, 458);
+
+      // dare beaten banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && dareBeaten) {
+        cx.fillStyle = TEAL; cx.font = '700 14px -apple-system, Helvetica, Arial';
+        cx.fillText('DARE BEATEN ✓', W / 2, 478);
+      }
+      // incoming dare during result
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten) {
+        cx.fillStyle = GOLD; cx.font = '700 13px -apple-system, Helvetica, Arial';
+        cx.fillText('target: BEAT ' + SHARE.dare + ' ms', W / 2, 478);
+      }
+
+      if (!DEMO && !BOT) {
+        var p3 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p3; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — GO AGAIN', W / 2, 482);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.13)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        var shareLabel = (window.SHARE && SHARE.dare !== null && dareBeaten) ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND';
+        cx.fillText(shareLabel, W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- dare banner during sequence/wait/wait_tap ----
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten &&
+        (phase === 'sequence' || phase === 'wait' || phase === 'wait_tap')) {
+      cx.fillStyle = GOLD; cx.font = '700 13px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('BEAT ' + SHARE.dare + ' ms' + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 660);
+    }
+
+    // ---- CTA card (demo) ----
+    if (phase === 'cta') {
+      var t2 = (now - ctaAt) / 1000, ease = Math.min(1, t2 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('F1 START', W / 2, 286);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('can you beat ' + (window.__demoScore || 118) + ' ms?', W / 2, 326);
+      var p4 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p4;
+      cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 118), W / 2, 396);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 430);
+      cx.globalAlpha = 1;
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 210 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

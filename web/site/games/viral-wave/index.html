@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Viral Wave — Tilt</title>
+<!--
+  LOOP / attention-architecture — Viral Wave
+  Conditioned path: the going-viral view-count spike. The thumb already knows
+  this move from Instagram/TikTok — the game IS that move.
+  Mechanic: view count spins up fast; tap RIDE to multiply while it rises — the
+  instant it peaks, STOP. One tap past the peak and the post crashes to zero.
+  Engine: viral. Circuits: 01-rpe, 04-loss, 02-novelty. Video trick: ecstasy fail.
+  Modes (query params):
+    ?demo=1&seed=7        scripted run for clip capture (good lock → near-miss
+                          recovery → spectacular crash → CTA), sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay for traffic simulation, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'viral-wave';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo/bot clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- wave tuning ----
+  // curvePos advances along the spike: 0 = post launches, 1.0 = peak, >1 = crash.
+  var ADV_BASE = 0.0038, ADV_PER_COMBO = 0.00032, RIDE_PUSH = 0.038;
+  var PEAK_LO = 0.78, PEAK_HI = 1.00;     // STOP window (lock success)
+  var PERFECT_LO = 0.92;                  // gold lock
+  var NEAR_LOCK_HI = 0.84;                // edge lock = "SO CLOSE" recovery
+  var CRASH_NEAR_HI = 1.05;               // one-tap-too-far = near-miss crash
+  var FIZZLE_AT = 1.10;                   // rode past everything with no tap = post dies
+  function baseGrowth(cp) {
+    if (cp <= 1.0) return Math.pow(10, cp * 6.3);          // ~2M at the peak
+    var fall = 1.0 - 0.9 * (cp - 1.0);                     // post-peak: views plummet
+    return Math.pow(10, 6.3 * Math.max(0, fall));
+  }
+  function fmt(n) {
+    n = Math.floor(Math.max(0, n));
+    if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M';
+    if (n >= 1e3) return Math.round(n / 1e3) + 'K';
+    return '' + n;
+  }
+
+  var state, runStartTs, best = 0;
+  var hitStop = 0, zoom = 1, dareBeaten = false, shakeAmt = 0, challengeAt = 0, ctaAt = 0, last = performance.now();
+  var flashes = [];
+  try { best = +localStorage.getItem('vw_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',           // title | challenge | play | over | cta
+      subPhase: 'ride',          // ride | lock | crash  (within play)
+      curvePos: 0, combo: 0, multiplier: 1,
+      views: 0, lockViews: 0, sessionScore: 0, posts: 0,
+      lockPause: 0, crashT: 0, crashStart: 0, overAt: 0
+    };
+    flashes = []; dareBeaten = false; hitStop = 0; zoom = 1; shakeAmt = 0;
+    if (DEMO) {
+      // mirror-neuron beat 1: the challenge card primes "score to beat"
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      demoIdx = 0; demoWait = demoScript[0].w;
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 1.2e6))));
+  }
+
+  function startRun() {
+    state.phase = 'play'; state.subPhase = 'ride';
+    state.curvePos = 0; state.combo = 0; state.multiplier = 1;
+    state.sessionScore = 0; state.posts = 0; state.views = 0;
+    runStartTs = Date.now();
+    if (BOT) botNewPost();
+    if (DEMO) { demoIdx = 0; demoWait = demoScript[0].w; }
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function resetPost() {
+    state.curvePos = 0; state.combo = 0; state.multiplier = 1; state.subPhase = 'ride';
+    hitStop = 0;                       // don't let a perfect-lock hitStop bleed into the next post
+    if (BOT) botNewPost();
+  }
+
+  function resetRun() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- the one action: a single tap. meaning depends on where the curve is ----
+  //   cp < 0.78        → RIDE  (multiply views, push toward the peak)
+  //   0.78 ≤ cp ≤ 1.00 → STOP  (lock views into the session score)
+  //   cp > 1.00        → CRASH (one tap past the peak, post dies)
+  function doTap() {
+    if (state.phase !== 'play' || state.subPhase !== 'ride') return;
+    var cp = state.curvePos;
+    if (cp > PEAK_HI) { crash(cp); return; }
+    if (cp >= PEAK_LO) { lockPost(cp); return; }
+    // RIDE
+    state.combo++;
+    state.multiplier = 1 + state.combo * 0.3;
+    state.curvePos = Math.min(state.curvePos + RIDE_PUSH, FIZZLE_AT);
+    shakeAmt = Math.max(shakeAmt, 1.6 + state.combo * 0.12);
+    if (window.J) J.hit(state.combo);
+    if (window.LOOP) LOOP.emit('ride', { n: state.combo, cp: +cp.toFixed(3) });
+  }
+
+  function lockPost(cp) {
+    var views = Math.floor(baseGrowth(cp) * state.multiplier);
+    state.lockViews = views;
+    state.sessionScore += views;
+    state.posts++;
+    var perfect = cp >= PERFECT_LO;
+    var near = cp < NEAR_LOCK_HI;        // edge lock — the "SO CLOSE" save
+    if (window.J) {
+      if (perfect) { J.perfect(state.posts); J.gold(); }
+      else if (near) J.near();
+      else J.hit(state.combo);
+    }
+    if (perfect) { hitStop = 4; zoom = 1.03; shakeAmt = 4; flash('PERFECT', GOLD, 46); flash('+' + fmt(views), TEAL, 30); }
+    else if (near) { shakeAmt = 5; flash('SO CLOSE!', TEAL, 40); if (window.LOOP) LOOP.emit('near_miss', { cp: +cp.toFixed(3), kind: 'edge_lock' }); }
+    else { shakeAmt = 2.5; flash('+' + fmt(views), TEAL, 32); }
+    if (window.LOOP) LOOP.emit('post_locked', { cp: +cp.toFixed(3), views: views, perfect: perfect, near: near, posts: state.posts });
+    // incoming dare beaten?
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.sessionScore > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.sessionScore);
+    }
+    state.subPhase = 'lock'; state.lockPause = 34;
+  }
+
+  function crash(cp) {
+    state.subPhase = 'crash'; state.crashT = 0; state.crashStart = state.views;
+    shakeAmt = 11;
+    var near = cp <= CRASH_NEAR_HI;
+    if (window.J) { if (near) J.near(); J.death(Math.min(0.4 + state.posts * 0.1 + state.combo * 0.02, 1)); J.tension(0); }
+    if (near) { flash('SO CLOSE!', VERM, 42); if (window.LOOP) LOOP.emit('near_miss', { cp: +cp.toFixed(3), kind: 'edge_crash' }); }
+    else flash('CRASHED', VERM, 40);
+    if (window.LOOP) LOOP.emit('crash', { cp: +cp.toFixed(3), posts: state.posts });
+  }
+
+  function gameOver() {
+    state.phase = 'over'; state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.sessionScore > best;
+    if (window.J) { J.tension(0); if (newBest) setTimeout(function () { J.fanfare(); }, 450); }
+    if (DEMO) window.__demoScore = state.sessionScore;
+    if (newBest) { best = state.sessionScore; try { localStorage.setItem('vw_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.sessionScore, dur_s: +dur.toFixed(1) });
+    if (DEMO) setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+      setTimeout(function () { window.__demoDone = true; }, 3600); }, 2200);
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 900);
+    }
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;                 // scripted modes ignore human taps
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { doTap(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.sessionScore, unit: 'peak views' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  // demo script: list of {t: target curvePos, w: hesitation (dt-units) before this tap}.
+  // Waits are kept smaller than time-to-target so each tap fires AT the crossing (not
+  // an overshoot) — the visible gap between taps is wait + advance-to-target, which
+  // reads as human hesitation. dt-scaled waits + dt-scaled curve advance => the cp
+  // trajectory (and thus the final score) is deterministic across framerates.
+  // arc: post1 GOOD lock → post2 edge SO-CLOSE recovery (near-fail + save) →
+  // post3 ride hard, hesitate past the peak, one tap too far → CRASH spectacle.
+  var demoScript = [
+    { t: 0.20, w: 18 }, { t: 0.40, w: 18 }, { t: 0.58, w: 18 }, { t: 0.74, w: 14 }, { t: 0.89, w: 10 },   // post1 → GOOD lock
+    { t: 0.22, w: 18 }, { t: 0.45, w: 18 }, { t: 0.62, w: 18 }, { t: 0.82, w: 10 },                      // post2 → SO-CLOSE recovery
+    { t: 0.24, w: 18 }, { t: 0.42, w: 18 }, { t: 0.58, w: 18 }, { t: 0.72, w: 18 }, { t: 1.03, w: 18 }    // post3 → CRASH
+  ];
+  var demoIdx = 0, demoWait = 0;
+  var botRunsDone = 0;
+  var botRideTarget = 5, botStopTarget = 0.90, botRidesDone = 0, botRideTimer = 8;
+
+  function botNewPost() {
+    botRideTarget = 3 + Math.floor(rng() * 7);                          // 3..9 rides
+    botStopTarget = Math.max(PEAK_LO + 0.02, Math.min(1.08, 0.90 + gauss() * 0.13));
+    botRidesDone = 0; botRideTimer = 6 + Math.floor(rng() * 8);
+  }
+
+  function autopilot(dt) {
+    if (state.subPhase !== 'ride') return;
+    if (DEMO) {
+      if (demoIdx >= demoScript.length) return;
+      if (demoWait > 0) { demoWait -= dt; return; }         // human-feeling hesitation (dt-scaled)
+      var step = demoScript[demoIdx];
+      if (state.curvePos >= step.t) {
+        doTap();
+        demoIdx++;
+        demoWait = demoIdx < demoScript.length ? demoScript[demoIdx].w : 0;
+      }
+    } else if (BOT) {
+      if (botRidesDone < botRideTarget) {
+        botRideTimer -= dt;
+        if (botRideTimer <= 0) { doTap(); botRidesDone++; botRideTimer = 6 + Math.floor(rng() * 8); }
+      } else if (state.curvePos >= botStopTarget) {
+        doTap();                                            // STOP — or crash if target > 1.0
+      }
+    }
+  }
+
+  // ---- render ----
+  // wave graph geometry
+  var gx0 = 30, gy0 = 410, gw = 345, gh = 190;
+  var MAXV_LOG = 7.0;
+  function xOf(cp) { return gx0 + (Math.min(cp, 1.15) / 1.15) * gw; }
+  function yOf(views) { return gy0 + gh - (Math.log10(Math.max(1, views)) / MAXV_LOG) * gh; }
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // sim — hitStop freezes the spike (the impact "bites"), but ALWAYS decays
+    if (state.phase === 'play') {
+      if (state.subPhase === 'ride') {
+        if (hitStop > 0) { hitStop -= dt; }
+        else {
+          state.curvePos += (ADV_BASE + state.combo * ADV_PER_COMBO) * dt;
+          state.views = baseGrowth(state.curvePos) * state.multiplier;
+          if (window.J) J.tension(Math.min(state.curvePos, 1));
+          if (state.curvePos > FIZZLE_AT) crash(FIZZLE_AT);
+          else autopilot(dt);
+        }
+      } else if (state.subPhase === 'lock') {
+        state.lockPause -= dt;
+        if (state.lockPause <= 0) resetPost();
+      } else if (state.subPhase === 'crash') {
+        state.crashT += dt;
+        state.views = state.crashStart * Math.max(0, 1 - state.crashT / 42);
+        if (state.crashT > 42) gameOver();
+      }
+    }
+
+    // juice transforms: decaying shake + zoom-pulse
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.07)'); bg.addColorStop(1, 'rgba(232,80,46,0.08)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // crash red wash (the death spectacle — the most beautiful frame)
+    if (state.subPhase === 'crash') {
+      cx.fillStyle = 'rgba(232,80,46,' + (0.18 * Math.max(0, 1 - state.crashT / 42)) + ')';
+      cx.fillRect(0, 0, W, H);
+    }
+
+    // ---- live views number (the spike you're riding) ----
+    if (state.phase === 'play') {
+      cx.textAlign = 'center';
+      cx.fillStyle = state.subPhase === 'crash' ? VERM : 'rgba(255,255,255,0.95)';
+      cx.font = '900 60px -apple-system, Helvetica, Arial';
+      cx.fillText(fmt(state.views), W / 2, 92);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '700 12px Menlo, monospace';
+      cx.fillText('VIEWS', W / 2, 112);
+    }
+
+    // session total + posts
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'left';
+      cx.fillStyle = 'rgba(255,255,255,0.85)'; cx.font = '800 20px -apple-system, Helvetica, Arial';
+      cx.fillText(fmt(state.sessionScore), 16, 32);
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '700 10px Menlo, monospace';
+      cx.fillText('TOTAL  · ' + state.posts + ' POSTS', 16, 48);
+      cx.textAlign = 'right';
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '700 10px Menlo, monospace';
+      cx.fillText('BEST ' + fmt(best), W - 56, 32);
+
+      // multiplier + combo (stakes must be VISIBLE)
+      if (state.phase === 'play' && state.subPhase === 'ride' && state.combo > 0) {
+        cx.textAlign = 'center';
+        var mc = Math.min(1, state.combo / 12);
+        cx.fillStyle = 'rgba(' + Math.round(46 + (232 - 46) * mc) + ',' + Math.round(197 - 60 * mc) + ',' + Math.round(182 - 130 * mc) + ',0.95)';
+        cx.font = '900 40px -apple-system, Helvetica, Arial';
+        cx.fillText('×' + state.multiplier.toFixed(1), W / 2, 300);
+        cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '700 11px Menlo, monospace';
+        cx.fillText('RIDE STREAK ' + state.combo, W / 2, 320);
+      }
+
+      // incoming dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.textAlign = 'center';
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + fmt(SHARE.dare) + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 146);
+      }
+    }
+
+    // ---- wave graph (the view-count spike) ----
+    if (state.phase === 'play') {
+      // peak zone band (teal) + crash zone band (red)
+      cx.fillStyle = 'rgba(46,197,182,0.12)';
+      cx.fillRect(xOf(PEAK_LO), gy0, xOf(PEAK_HI) - xOf(PEAK_LO), gh);
+      cx.fillStyle = 'rgba(232,80,46,0.12)';
+      cx.fillRect(xOf(PEAK_HI), gy0, xOf(FIZZLE_AT) - xOf(PEAK_HI), gh);
+      // peak line
+      cx.strokeStyle = 'rgba(242,177,52,0.5)'; cx.lineWidth = 1; cx.setLineDash([3, 3]);
+      cx.beginPath(); cx.moveTo(xOf(1.0), gy0); cx.lineTo(xOf(1.0), gy0 + gh); cx.stroke(); cx.setLineDash([]);
+      cx.fillStyle = 'rgba(242,177,52,0.6)'; cx.textAlign = 'center'; cx.font = '700 9px Menlo, monospace';
+      cx.fillText('PEAK', xOf(1.0), gy0 - 6);
+
+      // ideal curve (faint)
+      cx.strokeStyle = 'rgba(255,255,255,0.10)'; cx.lineWidth = 1.5;
+      cx.beginPath();
+      for (var cp = 0; cp <= 1.15; cp += 0.02) {
+        var yy = yOf(baseGrowth(cp));
+        if (cp === 0) cx.moveTo(xOf(cp), yy); else cx.lineTo(xOf(cp), yy);
+      }
+      cx.stroke();
+
+      // bright trace up to current position
+      var endCp = state.subPhase === 'crash' ? Math.min(1.15, 1.0 + state.crashT / 42 * 0.12) : Math.min(state.curvePos, 1.15);
+      var traceColor = state.subPhase === 'crash' ? VERM : (state.curvePos > PEAK_HI ? VERM : TEAL);
+      cx.strokeStyle = traceColor; cx.lineWidth = 3; cx.shadowColor = traceColor; cx.shadowBlur = 12;
+      cx.beginPath();
+      for (var cp2 = 0; cp2 <= endCp; cp2 += 0.015) {
+        var yy2 = yOf(baseGrowth(cp2));
+        if (cp2 === 0) cx.moveTo(xOf(cp2), yy2); else cx.lineTo(xOf(cp2), yy2);
+      }
+      cx.stroke(); cx.shadowBlur = 0;
+
+      // current dot
+      if (state.subPhase !== 'crash') {
+        var dx = xOf(state.curvePos), dy = yOf(state.views);
+        cx.fillStyle = '#fff'; cx.beginPath(); cx.arc(dx, dy, 6, 0, Math.PI * 2); cx.fill();
+        cx.strokeStyle = traceColor; cx.lineWidth = 2; cx.beginPath(); cx.arc(dx, dy, 9, 0, Math.PI * 2); cx.stroke();
+      }
+    }
+
+    // ---- RIDE / STOP button ----
+    if (state.phase === 'play') {
+      var btn = { x: 40, y: 618, w: 325, h: 74 };
+      var inPeak = state.curvePos >= PEAK_LO && state.curvePos <= PEAK_HI;
+      var pastPeak = state.curvePos > PEAK_HI;
+      var label, col;
+      if (state.subPhase === 'crash') { label = '— flatlined —'; col = VERM; }
+      else if (state.subPhase === 'lock') { label = '✓ LOCKED'; col = TEAL; }
+      else if (pastPeak) { label = 'TOO LATE'; col = VERM; }
+      else if (inPeak) { label = 'STOP!'; col = GOLD; }
+      else { label = 'RIDE'; col = VERM; }
+      var pulse = (inPeak || pastPeak) ? (0.65 + 0.35 * Math.sin(now / 120)) : 1;
+      cx.globalAlpha = state.subPhase === 'lock' || state.subPhase === 'crash' ? 0.5 : pulse;
+      cx.fillStyle = 'rgba(255,255,255,0.05)';
+      cx.strokeStyle = col; cx.lineWidth = 2;
+      cx.beginPath();
+      cx.roundRect ? cx.roundRect(btn.x, btn.y, btn.w, btn.h, 14) : cx.rect(btn.x, btn.y, btn.w, btn.h);
+      cx.fill(); cx.stroke();
+      cx.globalAlpha = 1;
+      cx.fillStyle = col; cx.textAlign = 'center';
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText(label, W / 2, btn.y + 47);
+    }
+
+    // ---- challenge card (demo beat 1) ----
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 88px -apple-system, Helvetica, Arial';
+      cx.fillText('1.2M', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // ---- flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 230 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // ---- title ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('VIRAL WAVE', W / 2, 280);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var p = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = p; cx.fillText('TAP TO RIDE', W / 2, 330); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('ride the spike. stop at the peak. don’t be greedy.', W / 2, 360);
+    }
+
+    // ---- game over / score card ----
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('FLATLINED.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(fmt(state.sessionScore) + ' views', W / 2, 345);
+      var pt = pctTop(state.sessionScore);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players  ·  ' + state.posts + ' posts', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE POST', W / 2, 462);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- demo CTA card ----
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('VIRAL WAVE', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('you rode it to ' + fmt(window.__demoScore || 0) + '. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + fmt(window.__demoScore || 0), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

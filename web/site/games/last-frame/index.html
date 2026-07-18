@@ -1,0 +1,910 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Last Frame — Tilt</title>
+<!--
+  LOOP / attention-architecture — Last Frame
+  Circuits: 01-rpe (variable reward per catch), 06-zeigarnik (one more try), 02-novelty (fake-out reveals)
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron run, sets window.__demoDone
+    ?bot=1&runs=N&seed=M  imperfect autoplay, sets window.__botDone
+    ?dare=N          challenge mode
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'last-frame';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO     = qs.get('demo') === '1';
+  var BOT      = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED     = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 520, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- clip templates ----------------------------------------------------------------
+  // Each clip has: title, duration (ms), fakeOuts (frames where clip dims/pauses but
+  // isn't the real end), validWindow (start/end ms for the REAL tap window),
+  // and a draw(cx, progress, W, H, rng) function.
+  // progress is 0→1 over the clip's duration.
+  var CLIPS = [
+    {
+      id: 'dive',
+      label: 'THE DIVE',
+      theme: TEAL,
+      dur: 3400,
+      fakeOuts: [0.38, 0.62],   // fraction through clip
+      validStart: 0.90,
+      validEnd:   0.97,
+      draw: function(cx, p, rng2) {
+        // A figure falling toward water — the splash IS the moment
+        var bgG = cx.createLinearGradient(0, 0, 0, H);
+        bgG.addColorStop(0, '#0b1a2e');
+        bgG.addColorStop(1, '#0d3352');
+        cx.fillStyle = bgG; cx.fillRect(0, 0, W, H);
+
+        // water line
+        var waterY = H - 160;
+        for (var i = 0; i < W; i += 2) {
+          var wy = waterY + Math.sin((i * 0.07) + p * 18) * 4;
+          cx.fillStyle = 'rgba(46,197,182,0.3)'; cx.fillRect(i, wy, 2, H - wy);
+        }
+        cx.fillStyle = 'rgba(46,197,182,0.12)'; cx.fillRect(0, waterY, W, H - waterY);
+
+        // diver falls from top, arcs toward water
+        var diveProgress = Math.min(p / 0.92, 1);
+        var arcX = W / 2 + Math.sin(diveProgress * Math.PI * 0.5) * 60;
+        var arcY = 80 + diveProgress * diveProgress * (waterY - 80 - 30);
+        var rot  = diveProgress * Math.PI * 1.8;
+
+        cx.save();
+        cx.translate(arcX, arcY);
+        cx.rotate(rot);
+        // body
+        cx.fillStyle = VERM;
+        cx.fillRect(-6, -20, 12, 26);
+        // head
+        cx.beginPath(); cx.arc(0, -24, 9, 0, Math.PI * 2);
+        cx.fillStyle = '#f5c8a0'; cx.fill();
+        // arms
+        cx.strokeStyle = VERM; cx.lineWidth = 4;
+        cx.beginPath();
+        var armAngle = diveProgress > 0.5 ? -Math.PI / 2 : Math.PI * 0.2;
+        cx.moveTo(-18, -10); cx.lineTo(-6, -8);
+        cx.moveTo(18, -10); cx.lineTo(6, -8);
+        cx.stroke();
+        cx.restore();
+
+        // splash at impact
+        if (p >= 0.90) {
+          var sAmt = (p - 0.90) / 0.07;
+          var splashR = sAmt * 80;
+          cx.save();
+          cx.translate(arcX, waterY);
+          for (var j = 0; j < 8; j++) {
+            var ang = (j / 8) * Math.PI * 2;
+            var len = splashR * (0.7 + Math.sin(ang * 3) * 0.3);
+            cx.strokeStyle = 'rgba(46,197,182,' + (1 - sAmt * 0.7) + ')';
+            cx.lineWidth = 2;
+            cx.beginPath();
+            cx.moveTo(Math.cos(ang) * 10, Math.sin(ang) * 5);
+            cx.lineTo(Math.cos(ang) * len, Math.sin(ang) * len * 0.5);
+            cx.stroke();
+          }
+          cx.restore();
+        }
+      }
+    },
+    {
+      id: 'reveal',
+      label: 'THE REVEAL',
+      theme: GOLD,
+      dur: 3200,
+      fakeOuts: [0.35, 0.58],
+      validStart: 0.88,
+      validEnd:   0.96,
+      draw: function(cx, p, rng2) {
+        // A curtain slowly pulls back to reveal a glowing trophy
+        cx.fillStyle = '#0b0d12'; cx.fillRect(0, 0, W, H);
+
+        // glow behind curtain
+        var glow = cx.createRadialGradient(W/2, H/2, 0, W/2, H/2, 180);
+        glow.addColorStop(0, 'rgba(242,177,52,' + (p * 0.4) + ')');
+        glow.addColorStop(1, 'rgba(242,177,52,0)');
+        cx.fillStyle = glow; cx.fillRect(0, 0, W, H);
+
+        // trophy (behind curtain initially)
+        var trophyAlpha = Math.max(0, (p - 0.5) / 0.4);
+        cx.globalAlpha = trophyAlpha;
+        cx.fillStyle = GOLD;
+        // cup
+        cx.beginPath();
+        cx.moveTo(W/2 - 50, H/2 - 80);
+        cx.lineTo(W/2 + 50, H/2 - 80);
+        cx.quadraticCurveTo(W/2 + 60, H/2 + 10, W/2 + 20, H/2 + 40);
+        cx.lineTo(W/2 + 20, H/2 + 60);
+        cx.lineTo(W/2 + 40, H/2 + 70);
+        cx.lineTo(W/2 - 40, H/2 + 70);
+        cx.lineTo(W/2 - 20, H/2 + 60);
+        cx.lineTo(W/2 - 20, H/2 + 40);
+        cx.quadraticCurveTo(W/2 - 60, H/2 + 10, W/2 - 50, H/2 - 80);
+        cx.fill();
+        cx.globalAlpha = 1;
+
+        // curtain panels slide apart with progress
+        var open = Math.min(p / 0.92, 1);
+        var curtainOpen = open * open * (W / 2 + 10);
+        // left curtain
+        cx.fillStyle = '#8b1a1a';
+        cx.fillRect(0, 0, W / 2 - curtainOpen, H);
+        // right curtain
+        cx.fillStyle = '#8b1a1a';
+        cx.fillRect(W / 2 + curtainOpen, 0, W / 2, H);
+        // curtain folds/shading
+        var foldX = W / 2 - curtainOpen;
+        if (foldX > 0) {
+          var fG = cx.createLinearGradient(foldX, 0, foldX + 20, 0);
+          fG.addColorStop(0, 'rgba(0,0,0,0.4)');
+          fG.addColorStop(1, 'rgba(0,0,0,0)');
+          cx.fillStyle = fG; cx.fillRect(foldX, 0, 20, H);
+        }
+      }
+    },
+    {
+      id: 'catch',
+      label: 'THE CATCH',
+      theme: VERM,
+      dur: 3000,
+      fakeOuts: [0.33, 0.60],
+      validStart: 0.87,
+      validEnd:   0.95,
+      draw: function(cx, p, rng2) {
+        // A ball arcing toward a glove — catch it at the right moment
+        var bgG = cx.createLinearGradient(0, 0, 0, H);
+        bgG.addColorStop(0, '#0b1420');
+        bgG.addColorStop(1, '#1a0b0b');
+        cx.fillStyle = bgG; cx.fillRect(0, 0, W, H);
+
+        // field lines (crowd/stadium feel)
+        cx.strokeStyle = 'rgba(255,255,255,0.06)';
+        cx.lineWidth = 1;
+        for (var i = 0; i < 6; i++) {
+          cx.beginPath();
+          cx.moveTo(0, H * 0.4 + i * 50);
+          cx.lineTo(W, H * 0.4 + i * 50);
+          cx.stroke();
+        }
+
+        // arc: ball starts top-left, arcs to glove bottom-right
+        var t = Math.min(p / 0.92, 1);
+        var ballX = 60 + t * (W - 120);
+        var arcH  = 260;
+        var ballY = H * 0.25 + arcH * (4 * t * (1 - t)) - arcH + (H * 0.5) * t;
+        var ballR = 16 + t * 6;
+
+        // motion trail
+        for (var j = 1; j <= 5; j++) {
+          var tt = Math.max(0, t - j * 0.04);
+          var tx = 60 + tt * (W - 120);
+          var ty = H * 0.25 + arcH * (4 * tt * (1 - tt)) - arcH + (H * 0.5) * tt;
+          cx.beginPath(); cx.arc(tx, ty, ballR * (1 - j * 0.15), 0, Math.PI * 2);
+          cx.fillStyle = 'rgba(232,80,46,' + (0.25 - j * 0.04) + ')'; cx.fill();
+        }
+
+        // the ball
+        cx.beginPath(); cx.arc(ballX, ballY, ballR, 0, Math.PI * 2);
+        cx.fillStyle = VERM; cx.fill();
+        cx.strokeStyle = 'rgba(255,255,255,0.4)'; cx.lineWidth = 2; cx.stroke();
+        // seams
+        cx.strokeStyle = 'rgba(255,255,255,0.6)'; cx.lineWidth = 1.5;
+        cx.beginPath(); cx.arc(ballX, ballY, ballR * 0.6, 0.3, Math.PI - 0.3); cx.stroke();
+        cx.beginPath(); cx.arc(ballX, ballY, ballR * 0.6, Math.PI + 0.3, -0.3 + Math.PI * 2); cx.stroke();
+
+        // glove (bottom-right)
+        var gloveX = W - 80, gloveY = H - 220;
+        cx.fillStyle = '#8B4513';
+        cx.beginPath();
+        cx.arc(gloveX, gloveY, 34, 0, Math.PI * 2); cx.fill();
+        cx.fillStyle = '#6B3410';
+        cx.fillRect(gloveX - 18, gloveY + 10, 36, 28);
+
+        // flash on catch moment
+        if (p >= 0.88) {
+          var fl = (p - 0.88) / 0.07;
+          cx.fillStyle = 'rgba(232,80,46,' + (fl * 0.6) + ')';
+          cx.fillRect(0, 0, W, H);
+        }
+      }
+    },
+    {
+      id: 'spark',
+      label: 'THE SPARK',
+      theme: GOLD,
+      dur: 3600,
+      fakeOuts: [0.40, 0.63],
+      validStart: 0.89,
+      validEnd:   0.96,
+      draw: function(cx, p, rng2) {
+        // A fuse burning toward a firework — the explosion IS the frame
+        cx.fillStyle = '#080a10'; cx.fillRect(0, 0, W, H);
+
+        // night sky stars
+        for (var i = 0; i < 40; i++) {
+          var sx = ((i * 173 + 7) % W);
+          var sy = ((i * 97 + 13) % (H * 0.6));
+          var sa = 0.3 + 0.7 * ((i * 37) % 100) / 100;
+          cx.fillStyle = 'rgba(255,255,255,' + sa + ')';
+          cx.fillRect(sx, sy, 1.5, 1.5);
+        }
+
+        // fuse path: bottom-left to center
+        var fuseEndX = W / 2, fuseEndY = H * 0.42;
+        var fuseStartX = 40, fuseStartY = H - 60;
+        var fuseLen = p * 0.92;  // burn progress
+        var sparkX = fuseStartX + fuseLen * (fuseEndX - fuseStartX);
+        var sparkY = fuseStartY + fuseLen * (fuseEndY - fuseStartY) +
+                     Math.sin(fuseLen * Math.PI * 6) * 10;
+
+        // burned fuse (dim)
+        cx.strokeStyle = 'rgba(80,50,20,0.6)'; cx.lineWidth = 3;
+        cx.setLineDash([4, 3]);
+        cx.beginPath();
+        cx.moveTo(fuseStartX, fuseStartY);
+        cx.lineTo(sparkX, sparkY);
+        cx.stroke();
+        // unburned fuse (bright)
+        cx.strokeStyle = 'rgba(180,140,60,0.8)'; cx.lineWidth = 3;
+        cx.beginPath();
+        cx.moveTo(sparkX, sparkY);
+        cx.lineTo(fuseEndX + Math.sin(fuseLen*8)*5, fuseEndY);
+        cx.stroke();
+        cx.setLineDash([]);
+
+        // spark ember at burn point
+        var sparkGlow = cx.createRadialGradient(sparkX, sparkY, 0, sparkX, sparkY, 20);
+        sparkGlow.addColorStop(0, 'rgba(255,200,50,0.9)');
+        sparkGlow.addColorStop(0.3, 'rgba(232,80,46,0.6)');
+        sparkGlow.addColorStop(1, 'rgba(0,0,0,0)');
+        cx.fillStyle = sparkGlow; cx.fillRect(sparkX - 20, sparkY - 20, 40, 40);
+        cx.fillStyle = '#fff'; cx.beginPath(); cx.arc(sparkX, sparkY, 3, 0, Math.PI * 2); cx.fill();
+
+        // rocket shell at fuse end
+        cx.fillStyle = '#334'; cx.beginPath(); cx.arc(fuseEndX, fuseEndY, 18, 0, Math.PI * 2); cx.fill();
+        cx.strokeStyle = GOLD; cx.lineWidth = 2; cx.stroke();
+
+        // EXPLOSION on valid frame
+        if (p >= 0.89) {
+          var ex = (p - 0.89) / 0.07;
+          for (var j = 0; j < 16; j++) {
+            var ang = (j / 16) * Math.PI * 2;
+            var len = ex * (60 + Math.sin(j * 2.1) * 30);
+            var ex2 = fuseEndX + Math.cos(ang) * len;
+            var ey2 = fuseEndY + Math.sin(ang) * len;
+            cx.strokeStyle = j % 3 === 0 ? GOLD : (j % 3 === 1 ? VERM : TEAL);
+            cx.lineWidth = 2.5 * (1 - ex * 0.5);
+            cx.globalAlpha = 1 - ex * 0.7;
+            cx.beginPath(); cx.moveTo(fuseEndX, fuseEndY); cx.lineTo(ex2, ey2); cx.stroke();
+          }
+          cx.globalAlpha = 1;
+          // white flash
+          cx.fillStyle = 'rgba(255,255,255,' + (ex * 0.8 * (1 - ex)) + ')';
+          cx.fillRect(0, 0, W, H);
+        }
+      }
+    }
+  ];
+
+  // ---- game state -----------------------------------------------------------------
+  var phase, score, lives, clipIdx, clipList;
+  var clipT = 0, clipDur = 0;
+  var tapResult = null;   // 'hit'|'early'|'late'|null
+  var resultT = 0;
+  var shakeAmt = 0, zoom = 1, hitStop = 0;
+  var flashes = [];
+  var overAt = 0, runStartTs = 0;
+  var challengeAt = 0, ctaAt = 0;
+  var dareBeaten = false;
+  var best = 0;
+  try { best = +localStorage.getItem('lf_best') || 0; } catch (_) {}
+
+  // fake-out state: brief dim flash at fake-out moments
+  var fakeOutIdx = 0, fakeOutFlash = 0;
+
+  // bot / demo
+  var botRunsDone = 0;
+  var demoStep = 0;
+  var demoWaits = [0.90, 0.92, 0.62 /*fake-out tap — early, fails gracefully*/, 0.91, 0.89, 0.94, 'miss'];
+  var demoWaitVariance = [0.005, -0.003, 0, 0.004, -0.006, 0.002, 0];
+
+  function pctTop(s) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 5)))); }
+
+  function buildClipList() {
+    // shuffle a repeating list of clips (seeded)
+    var pool = [], idx = [0,1,2,3];
+    for (var i = idx.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
+    }
+    return idx;
+  }
+
+  function newGame() {
+    phase = DEMO ? 'challenge' : (BOT ? 'play' : 'title');
+    score = 0; lives = 3; clipIdx = 0;
+    clipList = buildClipList();
+    fakeOutIdx = 0; fakeOutFlash = 0;
+    dareBeaten = false;
+    tapResult = null;
+    flashes = [];
+    shakeAmt = 0; zoom = 1; hitStop = 0;
+    demoStep = 0;
+    botHits = 0; botAction = null;
+
+    if (DEMO) {
+      challengeAt = performance.now();
+      setTimeout(function() { startRound(); }, 1250);
+    } else if (BOT) {
+      startRound();
+    }
+    // human: tap from title screen
+  }
+
+  function currentClip() { return CLIPS[clipList[clipIdx % clipList.length]]; }
+
+  function startRound() {
+    phase = 'play';
+    tapResult = null;
+    resultT = 0;
+    fakeOutIdx = 0;
+    fakeOutFlash = 0;
+    botAction = null; // force re-decision for this clip
+    var cl = currentClip();
+    clipDur = cl.dur;
+    clipT = 0;
+    runStartTs = Date.now();
+    if (BOT) scheduleBotAction(); // pre-decide bot action for this clip
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED, clip: cl.id });
+  }
+
+  function doTap() {
+    if (phase !== 'play') return;
+    var cl = currentClip();
+    var p = clipT / clipDur;
+    if (p >= cl.validStart && p <= cl.validEnd) {
+      // HIT
+      tapResult = 'hit';
+      score++;
+      hitStop = 5;
+      zoom = 1.04;
+      shakeAmt = 3;
+      var isGold = score > 0 && score % 5 === 0;
+      if (window.J) {
+        if (isGold) J.gold();
+        else J.perfect(score);
+      }
+      flash('LAST FRAME', isGold ? GOLD : TEAL, 42);
+      if (isGold) flash('×' + score, GOLD, 34);
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 38);
+        if (window.J) J.fanfare();
+        SHARE.beaten(score);
+      }
+      if (BOT) botHits++;
+      if (window.LOOP) LOOP.emit('catch', { score: score, clip: cl.id });
+      resultT = performance.now();
+      setTimeout(advanceRound, 900);
+    } else if (p < cl.validStart) {
+      // EARLY — check if it's a fake-out zone
+      var inFakeOut = false;
+      for (var i = 0; i < cl.fakeOuts.length; i++) {
+        if (Math.abs(p - cl.fakeOuts[i]) < 0.07) { inFakeOut = true; break; }
+      }
+      if (inFakeOut) {
+        // near miss — they fell for the fake-out
+        tapResult = 'fakeout';
+        if (window.J) J.near();
+        if (window.LOOP) LOOP.emit('near_miss', { clip: cl.id, p: +p.toFixed(3) });
+        flash('TOO SOON', VERM, 36);
+        shakeAmt = 6;
+        loseLife();
+      } else {
+        // just tapped early (not at a fake-out)
+        tapResult = 'early';
+        if (window.J) J.near();
+        flash('WAIT FOR IT', GOLD, 32);
+        shakeAmt = 4;
+        loseLife();
+      }
+      resultT = performance.now();
+    } else {
+      // LATE — missed it
+      tapResult = 'late';
+      if (window.J) J.near();
+      flash('MISSED IT', VERM, 36);
+      shakeAmt = 5;
+      loseLife();
+      resultT = performance.now();
+    }
+  }
+
+  function loseLife() {
+    lives--;
+    if (lives <= 0) {
+      setTimeout(gameOver, 700);
+    } else {
+      setTimeout(advanceRound, 900);
+    }
+  }
+
+  function advanceRound() {
+    clipIdx++;
+    // loop the clip list (4 clips looping forever until game over)
+    if (clipIdx >= clipList.length) {
+      // reshuffle
+      clipList = buildClipList();
+      clipIdx = 0;
+    }
+    startRound();
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = score > best;
+    if (window.J) { J.death(Math.min(0.4 + score / 10, 1)); if (newBest) setTimeout(function() { J.fanfare(); }, 450); }
+    if (newBest) { best = score; try { localStorage.setItem('lf_best', String(best)); } catch (_) {} }
+    if (DEMO) window.__demoScore = score;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function() {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function() { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function() { resetRun(); }, 800);
+    }
+  }
+
+  function resetRun() {
+    score = 0; lives = 3; clipIdx = 0;
+    clipList = buildClipList();
+    demoStep = 0;
+    fakeOutIdx = 0; fakeOutFlash = 0;
+    dareBeaten = false;
+    tapResult = null; flashes = [];
+    botHits = 0; botAction = null; // reset bot state for new run
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRound();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input -----------------------------------------------------------------------
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRound(); return; }
+    if (phase === 'play') { doTap(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'catches' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function(e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function(e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilot -------------------------------------------------------------------
+  // Demo script: tap at specific progress points for each clip.
+  // Bot: decide action at clip-start (once), then execute at the right frame.
+  //      After BOT_HIT_LIMIT hits, go passive so lives drain and game_over fires.
+
+  var BOT_HIT_LIMIT = 4;   // bot gets at most 4 hits per run, then misses every clip
+  var botHits = 0;         // hits this run
+  var botAction = null;    // { kind: 'hit'|'early'|'miss', triggerP: Number }
+
+  // demo script: [frac_through_clip_to_tap, ...] — one per clip round
+  // arc: hit→hit→fake-out(miss)→near-fail save→hit→miss(last clip runs out)
+  var DEMO_SCRIPT_P = [0.92, 0.91, 0.58, 0.90, 0.93, 'miss'];
+  var demoScriptIdx = 0;
+
+  function scheduleBotAction() {
+    // Called at the start of each clip round (in startRound) to pre-decide what the bot does.
+    var cl = currentClip();
+    if (botHits >= BOT_HIT_LIMIT) {
+      // go passive — let the clip time out (counts as a miss)
+      botAction = { kind: 'miss', triggerP: 2 };
+      return;
+    }
+    var roll = rng();
+    if (roll < 0.55) {
+      // HIT — tap somewhere in valid window
+      var botP = cl.validStart + rng() * (cl.validEnd - cl.validStart) * 0.8;
+      botAction = { kind: 'hit', triggerP: botP };
+    } else if (roll < 0.75) {
+      // EARLY — tap at one of the fake-out markers
+      var fo = cl.fakeOuts[Math.floor(rng() * cl.fakeOuts.length)];
+      botAction = { kind: 'early', triggerP: fo + 0.01 };
+    } else {
+      // MISS — let clip run out
+      botAction = { kind: 'miss', triggerP: 2 };
+    }
+  }
+
+  function autopilot(dt) {
+    if (phase !== 'play' || hitStop > 0) return;
+    var cl = currentClip();
+    var p = clipT / clipDur;
+
+    if (DEMO) {
+      var want = DEMO_SCRIPT_P[Math.min(demoScriptIdx, DEMO_SCRIPT_P.length - 1)];
+      if (want === 'miss') return; // let the clip run out naturally -> game_over
+      // add a bit of human hesitation variance
+      var target = want + (demoScriptIdx < demoWaitVariance.length ? demoWaitVariance[demoScriptIdx] : 0);
+      if (p >= target && tapResult === null) {
+        doTap();
+        demoScriptIdx++;
+      }
+    } else if (BOT) {
+      if (!botAction) scheduleBotAction();
+      if (botAction && p >= botAction.triggerP && tapResult === null) {
+        if (botAction.kind !== 'miss') doTap();
+        botAction = null; // consumed
+      }
+    }
+  }
+
+  // ---- render helpers -------------------------------------------------------------
+  function drawHearts(cx, lives) {
+    for (var i = 0; i < 3; i++) {
+      var hx = W / 2 - 36 + i * 36, hy = H - 72;
+      cx.fillStyle = i < lives ? VERM : 'rgba(255,255,255,0.15)';
+      cx.font = '22px -apple-system';
+      cx.textAlign = 'center';
+      cx.fillText('♥', hx, hy);
+    }
+  }
+
+  function drawFakeOutFlash(p, cl) {
+    for (var i = 0; i < cl.fakeOuts.length; i++) {
+      var fo = cl.fakeOuts[i];
+      var dist = Math.abs(p - fo);
+      if (dist < 0.035) {
+        // subtle screen dim pulse at fake-out moments
+        var intensity = (1 - dist / 0.035);
+        cx.fillStyle = 'rgba(0,0,0,' + (intensity * 0.55) + ')';
+        cx.fillRect(0, 0, W, H);
+        // "wait..." ghost text
+        cx.globalAlpha = intensity * 0.5;
+        cx.fillStyle = '#fff';
+        cx.font = '700 18px Menlo, monospace';
+        cx.textAlign = 'center';
+        cx.fillText('wait...', W / 2, H / 2 + 80);
+        cx.globalAlpha = 1;
+      }
+    }
+  }
+
+  function drawProgressBar(p, cl) {
+    var bx = 30, by = H - 110, bw = W - 60, bh = 6;
+    // track
+    cx.fillStyle = 'rgba(255,255,255,0.12)';
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(bx, by, bw, bh, 3);
+    else cx.rect(bx, by, bw, bh);
+    cx.fill();
+    // fill
+    cx.fillStyle = cl.theme;
+    cx.globalAlpha = 0.8;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(bx, by, bw * p, bh, 3);
+    else cx.rect(bx, by, bw * p, bh);
+    cx.fill();
+    cx.globalAlpha = 1;
+
+    // valid window indicator (subtle tick marks)
+    var vsX = bx + cl.validStart * bw;
+    var veX = bx + cl.validEnd * bw;
+    cx.fillStyle = GOLD;
+    cx.globalAlpha = 0.6;
+    cx.fillRect(vsX, by - 4, veX - vsX, bh + 8);
+    cx.globalAlpha = 1;
+
+    // fake-out tick marks (dim)
+    for (var i = 0; i < cl.fakeOuts.length; i++) {
+      var fx = bx + cl.fakeOuts[i] * bw;
+      cx.fillStyle = 'rgba(232,80,46,0.35)';
+      cx.fillRect(fx - 1, by - 3, 2, bh + 6);
+    }
+  }
+
+  // ---- main loop ------------------------------------------------------------------
+  var last = performance.now(), ctaAt2 = 0;
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // advance clip timer (frozen during hit-stop)
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else if (phase === 'play') {
+      clipT += 16.667 * dt;
+      // clip ended without a valid tap → miss
+      if (clipT >= clipDur && tapResult === null) {
+        tapResult = 'late';
+        flash('TOO LATE', VERM, 36);
+        if (window.J) J.near();
+        shakeAmt = 5;
+        loseLife();
+      }
+      autopilot(dt);
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.84, dt);
+    zoom += (1 - zoom) * 0.13 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+
+    if (phase === 'title') {
+      // ---- title screen ----
+      var tg = cx.createLinearGradient(0, 0, 0, H);
+      tg.addColorStop(0, 'rgba(46,197,182,0.06)');
+      tg.addColorStop(1, 'rgba(232,80,46,0.07)');
+      cx.fillStyle = tg; cx.fillRect(0, 0, W, H);
+
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 52px -apple-system, Helvetica, Arial';
+      cx.fillText('LAST FRAME', W / 2, 280);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('tap the moment. not before.', W / 2, 318);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 310);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM;
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO PLAY', W / 2, 380);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('wait for it.', W / 2, 412);
+
+    } else if (phase === 'challenge') {
+      // ---- demo beat 1: challenge card ----
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD;
+      cx.font = '900 100px -apple-system, Helvetica, Arial';
+      cx.fillText('7', W / 2, 410);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 440);
+
+    } else if (phase === 'play') {
+      // ---- CLIP PLAYING ----
+      var cl = currentClip();
+      var p = Math.min(clipT / clipDur, 1);
+
+      // draw clip visuals
+      cl.draw(cx, p, rng);
+
+      // vignette overlay
+      var vig = cx.createRadialGradient(W/2, H/2, H*0.25, W/2, H/2, H*0.75);
+      vig.addColorStop(0, 'rgba(0,0,0,0)');
+      vig.addColorStop(1, 'rgba(0,0,0,0.45)');
+      cx.fillStyle = vig; cx.fillRect(0, 0, W, H);
+
+      // fake-out flash
+      if (tapResult === null) drawFakeOutFlash(p, cl);
+
+      // clip label
+      cx.textAlign = 'left';
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '700 12px Menlo, monospace';
+      cx.fillText(cl.label, 28, 42);
+
+      // score
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '800 52px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 118);
+
+      // hearts
+      drawHearts(cx, lives);
+
+      // progress bar
+      drawProgressBar(p, cl);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 146);
+      }
+
+      // result flash overlay on this clip
+      if (tapResult === 'hit') {
+        var rAge = (performance.now() - resultT) / 900;
+        if (rAge < 1) {
+          var flashAlpha = Math.max(0, (1 - rAge) * 0.45);
+          cx.fillStyle = 'rgba(46,197,182,' + flashAlpha + ')';
+          cx.fillRect(0, 0, W, H);
+        }
+      } else if (tapResult === 'early' || tapResult === 'fakeout' || tapResult === 'late') {
+        var rAge2 = (performance.now() - resultT) / 900;
+        if (rAge2 < 1) {
+          var fa2 = Math.max(0, (1 - rAge2) * 0.4);
+          cx.fillStyle = 'rgba(232,80,46,' + fa2 + ')';
+          cx.fillRect(0, 0, W, H);
+        }
+      }
+
+      // tension rising: J.tension as clip approaches valid frame
+      if (p > 0.70 && p < cl.validStart && window.J) {
+        J.tension(Math.min((p - 0.70) / (cl.validStart - 0.70), 1));
+      }
+
+    } else if (phase === 'over') {
+      // ---- GAME OVER ----
+      cx.fillStyle = 'rgba(11,13,18,0.65)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('MISSED IT.', W / 2, 295);
+      cx.fillStyle = '#fff';
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' catches', W / 2, 342);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 388);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 412);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 290);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 458);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+
+    } else if (phase === 'cta') {
+      // ---- DEMO CTA ----
+      if (!ctaAt2) ctaAt2 = now;
+      var tc = (now - ctaAt2) / 1000;
+      var ease = Math.min(1, tc * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('LAST FRAME', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('she caught ' + (window.__demoScore || 7) + '. your move.', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM;
+      cx.globalAlpha = ease * p3;
+      cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 7), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 446);
+      cx.globalAlpha = 1;
+    }
+
+    // floating reward texts
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 250 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

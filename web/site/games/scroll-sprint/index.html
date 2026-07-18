@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Scroll Sprint — Tilt</title>
+<!--
+  LOOP / attention-architecture — Scroll Sprint
+  Circuits: 03 social-compare (the race), 01 RPE (milestones), 02 novelty (absurd real-world units).
+  Modes (query params):
+    ?demo=1&seed=7        scripted human-feeling run for clip capture,
+                          sets window.__demoScore and window.__demoDone
+    ?bot=1&runs=N&seed=5  synthetic thumb-scroll waves, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'scroll-sprint';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 5;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var PX_PER_IN = 96, IN_PER_FT = 12, IN_PER_MPH = 176; // 1 mph = 17.6 in/s; over 10s = 176 in total
+  var RUN_S = 10;
+  var MAX_BAR_PX_S = 11000; // speed bar saturates here (~6.25 mph)
+  var DEMO_TARGET_FT = 41.2;
+
+  var state, runStartTs, overAt, ctaAt, armedAt;
+  var totalPx = 0, lastFt = 0, lastMilestone = 0;
+  var speed01 = 0, rawSpeed = 0; // instantaneous scroll velocity (px/s) + normalized
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  var flashes = [], streaks = [], countTicks = [];
+  var bestFt = 0, pointerY = null, pointerDown = false;
+  var botRunsDone = 0, botTargetFt = 0;
+
+  try { bestFt = +localStorage.getItem('ss_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = { phase: 'title' };                // title | challenge | armed | play | over | cta
+    totalPx = 0; lastFt = 0; lastMilestone = 0;
+    speed01 = 0; rawSpeed = 0;
+    hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    flashes = []; streaks = []; countTicks = [];
+    pointerY = null; pointerDown = false;
+    if (window.J) J.tension(0);
+
+    if (DEMO) {
+      buildDemoVels();
+      state.phase = 'challenge';
+      setTimeout(startCountdown, 1200);
+      return;
+    }
+    if (BOT) {
+      beginRun();
+    }
+  }
+
+  function startCountdown() {
+    state.phase = 'armed';
+    armedAt = performance.now();
+  }
+
+  function beginRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function endRun() {
+    state.phase = 'over';
+    overAt = performance.now();
+    if (window.J) J.tension(0);
+    if (DEMO) {
+      totalPx = DEMO_TARGET_FT * IN_PER_FT * PX_PER_IN;
+    }
+    var finalFt = totalPx / PX_PER_IN / IN_PER_FT;
+    var newBest = finalFt > bestFt;
+    if (newBest) {
+      bestFt = finalFt;
+      try { localStorage.setItem('ss_best', String(bestFt)); } catch (_) {}
+      if (window.J) J.fanfare();
+    } else if (window.J) {
+      J.death(Math.min(0.2 + finalFt / 80, 0.7));
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: +finalFt.toFixed(1), dur_s: RUN_S });
+
+    if (DEMO) {
+      window.__demoScore = DEMO_TARGET_FT;
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRunFast(); }, 400);
+    }
+  }
+
+  function resetRunFast() {
+    totalPx = 0; lastFt = 0; lastMilestone = 0;
+    speed01 = 0; rawSpeed = 0;
+    dareBeaten = false;
+    flashes = []; streaks = []; countTicks = [];
+    pointerY = null; pointerDown = false;
+    botVels = [];
+    if (window.J) J.tension(0);
+    if (window.LOOP) LOOP.emit('restart', {});
+    beginRun();
+  }
+
+  function resetRun() {
+    totalPx = 0; lastFt = 0; lastMilestone = 0;
+    speed01 = 0; rawSpeed = 0;
+    dareBeaten = false;
+    flashes = []; streaks = []; countTicks = [];
+    pointerY = null; pointerDown = false;
+    botVels = [];
+    if (window.J) J.tension(0);
+    if (window.LOOP) LOOP.emit('restart', {});
+    startCountdown();
+  }
+
+  // ---- distance / unit helpers ----
+  function ftIn() {
+    var inTotal = totalPx / PX_PER_IN;
+    var ft = Math.floor(inTotal / IN_PER_FT);
+    var inc = Math.floor(inTotal % IN_PER_FT);
+    return { ft: ft, in: inc, inTotal: inTotal };
+  }
+  function mph() {
+    var inTotal = totalPx / PX_PER_IN;
+    return inTotal / IN_PER_MPH; // average mph over the 10s run
+  }
+  function benchLine(ft) {
+    if (ft >= 55) return 'your thumb is an athlete — top 2%';
+    if (ft >= 45) return 'top 9%';
+    if (ft >= 35) return 'faster than most';
+    if (ft >= 25) return 'average thumb (29 ft)';
+    return 'warm-up lap?';
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 520, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;                 // scripted modes ignore human taps
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startCountdown(); return; }
+    if (state.phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        var scoreFt = +(totalPx / PX_PER_IN / IN_PER_FT).toFixed(1);
+        SHARE.send({ score: scoreFt, unit: 'ft' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  function addScroll(dy) {
+    if (state.phase !== 'play' || dy <= 0) return;
+    totalPx += dy;
+    rawSpeed = dy * 60; // approx px/s (frame at 16.67ms)
+    speed01 = Math.min(1, rawSpeed / MAX_BAR_PX_S);
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale;
+    var y = (e.clientY - r.top) / scale;
+    pointerDown = true; pointerY = y;
+    tap(x, y);
+  });
+  window.addEventListener('pointermove', function (e) {
+    if (!pointerDown) return;
+    var r = cv.getBoundingClientRect();
+    var y = (e.clientY - r.top) / scale;
+    if (pointerY !== null) addScroll(y - pointerY);
+    pointerY = y;
+  });
+  window.addEventListener('pointerup', function () { pointerDown = false; pointerY = null; });
+  window.addEventListener('pointercancel', function () { pointerDown = false; pointerY = null; });
+  window.addEventListener('wheel', function (e) {
+    if (DEMO || BOT || state.phase !== 'play') return;
+    if (e.deltaY > 0) addScroll(e.deltaY * 0.6);
+    e.preventDefault();
+  }, { passive: false });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  var demoVels = [], botVels = [];
+
+  function buildDemoVels() {
+    // human thumb: bursts + micro-pauses, ends at exactly 41.2 ft
+    // near-fail at 8s (~33 ft), late surge barely beats 38 ft
+    var base = [5800, 5000, 5400, 4600, 4200, 5400, 5000, 3500, 5200, 4900]; // per-second shape
+    var buckets = [];
+    for (var i = 0; i < 100; i++) {
+      var sec = Math.floor(i / 10);
+      var v = base[sec] + Math.sin(i * 0.8 + sec) * 350 + (rng() - 0.5) * 400;
+      buckets.push(Math.max(300, v));
+    }
+    var targetPx = 41.2 * IN_PER_FT * PX_PER_IN;
+    var sum = buckets.reduce(function (a, b) { return a + b; }, 0) * 0.1;
+    var scale = targetPx / sum;
+    for (var j = 0; j < buckets.length; j++) demoVels[j] = buckets[j] * scale;
+  }
+
+  function buildBotVels(runIdx) {
+    var targetFt = 22 + rng() * 26; // 22–48 ft
+    botTargetFt = targetFt;
+    var targetPx = targetFt * IN_PER_FT * PX_PER_IN;
+    var buckets = [];
+    for (var i = 0; i < 100; i++) {
+      var wave = Math.sin(i * 0.25 + runIdx * 1.7) * 0.5 + 0.5;
+      var wave2 = Math.sin(i * 0.63 + runIdx * 2.1) * 0.3;
+      var v = (0.25 + 0.35 * wave + 0.15 * wave2) * MAX_BAR_PX_S;
+      v += gauss() * 400;
+      buckets.push(Math.max(200, v));
+    }
+    var sum = buckets.reduce(function (a, b) { return a + b; }, 0) * 0.1;
+    var scale = targetPx / sum;
+    for (var j = 0; j < buckets.length; j++) botVels[j] = buckets[j] * scale;
+  }
+
+  function demoVelocity(t) {
+    var idx = Math.min(99, Math.floor(t * 10));
+    return demoVels[idx] || 0;
+  }
+
+  function botVelocity(t) {
+    var idx = Math.min(99, Math.floor(t * 10));
+    return botVels[idx] || 0;
+  }
+
+  function autopilot(dt) {
+    if (state.phase !== 'play') return;
+    var t = (Date.now() - runStartTs) / 1000; // runStartTs is Date.now()-based (the clock uses it too)
+    if (t >= RUN_S) { endRun(); return; }
+    if (BOT && botVels.length === 0) buildBotVels(botRunsDone);
+    var v = DEMO ? demoVelocity(t) : botVelocity(t);
+    totalPx += v * dt;
+    rawSpeed = v;
+    speed01 = Math.min(1, v / MAX_BAR_PX_S);
+  }
+
+  // ---- juice helpers ----
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+  function milestoneFlash(ft) { flash('+ ' + ft + ' FT', GOLD, 52); hitStop = 5; zoom = 1.04; shakeAmt = 5; }
+  function spawnStreaks() {
+    if (speed01 < 0.05) return;
+    var count = Math.floor(1 + speed01 * 5);
+    for (var i = 0; i < count; i++) {
+      if (rng() > 0.3) continue;
+      streaks.push({ x: 30 + rng() * (W - 60), y: -40 - rng() * 80, len: 60 + rng() * 160, speed: 8 + speed01 * 24, alpha: 0.08 + speed01 * 0.28 });
+    }
+  }
+
+  // ---- render helpers ----
+  function drawOdometer(x, y, ft, inc, now) {
+    // rolling-digit feel: big integer feet, smaller inches, blur/ghost when fast
+    var roll = (ftIn().inTotal % IN_PER_FT) / IN_PER_FT; // 0..1 fraction of next foot
+    var blurOff = roll * (speed01 > 0.3 ? 14 : 0);
+    var ghostAlpha = speed01 > 0.25 ? 0.35 : 0;
+
+    cx.textAlign = 'center';
+    cx.textBaseline = 'alphabetic';
+
+    // ghost of previous foot (blurs upward when fast)
+    if (ghostAlpha > 0) {
+      cx.globalAlpha = ghostAlpha * (1 - roll);
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '900 90px -apple-system, Helvetica, Arial';
+      cx.fillText(Math.max(0, ft - 1), x, y - 90 + blurOff);
+      cx.globalAlpha = 1;
+    }
+
+    // main feet digits
+    cx.fillStyle = '#fff';
+    cx.font = '900 90px -apple-system, Helvetica, Arial';
+    var ftStr = String(ft);
+    // slight scale pulse on speed
+    var pulse = 1 + speed01 * 0.02;
+    cx.save(); cx.translate(x, y); cx.scale(pulse, pulse); cx.textAlign = 'center';
+    cx.shadowColor = 'rgba(46,197,182,' + (0.1 + speed01 * 0.25) + ')';
+    cx.shadowBlur = 10 + speed01 * 18;
+    cx.fillText(ftStr, 0, 0);
+    cx.shadowBlur = 0;
+    cx.restore();
+
+    // unit label
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('FT', x + 40 + ftStr.length * 26, y - 54);
+
+    // inches
+    cx.fillStyle = GOLD;
+    cx.font = '800 32px -apple-system, Helvetica, Arial';
+    cx.fillText(inc + ' IN', x + 48 + ftStr.length * 26, y - 20);
+  }
+
+  function drawSpeedBar(x, y, w, h) {
+    cx.fillStyle = 'rgba(255,255,255,0.1)';
+    cx.fillRect(x, y, w, h);
+    var fill = speed01 * w;
+    var g = cx.createLinearGradient(x, 0, x + w, 0);
+    g.addColorStop(0, TEAL);
+    g.addColorStop(0.6, GOLD);
+    g.addColorStop(1, VERM);
+    cx.fillStyle = g;
+    cx.fillRect(x, y, fill, h);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'left';
+    cx.fillText((rawSpeed / PX_PER_IN).toFixed(1) + ' in/s', x, y - 6);
+  }
+
+  function drawTimer(y, remaining, urgent) {
+    cx.textAlign = 'center';
+    var p = urgent ? 0.7 + 0.3 * Math.sin(performance.now() / 120) : 1;
+    cx.fillStyle = urgent ? VERM : 'rgba(255,255,255,0.85)';
+    cx.font = '800 38px -apple-system, Helvetica, Arial';
+    cx.globalAlpha = p;
+    cx.fillText(remaining.toFixed(2), W / 2, y);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 1000, 0.05); last = now; // dt in seconds
+
+    // countdown logic
+    if (state.phase === 'armed') {
+      var cdElapsed = now - armedAt;
+      if (cdElapsed >= 2400) beginRun();
+    }
+
+    // run timer + autopilot
+    if (state.phase === 'play') {
+      var elapsed = (Date.now() - runStartTs) / 1000;
+      if (!DEMO && !BOT) {
+        rawSpeed *= Math.pow(0.92, dt * 60); // decay rawSpeed when no input
+        speed01 = Math.min(1, rawSpeed / MAX_BAR_PX_S);
+      } else {
+        autopilot(dt);
+      }
+      if (elapsed >= RUN_S) endRun();
+    }
+
+    // speed-based tension riser
+    if (state.phase === 'play' && window.J) J.tension(speed01);
+
+    // milestone / per-foot ticks
+    var fi = ftIn();
+    if (state.phase === 'play') {
+      var ftInt = fi.ft;
+      if (ftInt > lastFt) {
+        countTicks.push({ ft: ftInt, t: 0 });
+        if (window.J) J.tick();
+        lastFt = ftInt;
+      }
+      var milestone = Math.floor(ftInt / 10) * 10;
+      if (milestone > lastMilestone && milestone >= 10) {
+        milestoneFlash(milestone);
+        if (window.J) J.hit(milestone / 10);
+        if (window.LOOP) LOOP.emit('milestone', { ft: milestone });
+        lastMilestone = milestone;
+      }
+      // dare beaten mid-run
+      var ftDec = fi.inTotal / IN_PER_FT;
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && ftDec > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 46);
+        if (window.J) J.fanfare();
+        SHARE.beaten(+ftDec.toFixed(1));
+      }
+    }
+
+    spawnStreaks();
+
+    // hit-stop / shake / zoom decay
+    if (hitStop > 0) hitStop -= dt * 60;
+    else hitStop = 0;
+    shakeAmt *= Math.pow(0.85, dt * 60);
+    zoom += (1 - zoom) * 0.15 * dt * 60;
+
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // track hash marks (move with distance to sell scrolling)
+    cx.strokeStyle = 'rgba(255,255,255,0.08)';
+    cx.lineWidth = 1;
+    var markSpacing = 60;
+    var offset = (totalPx * 0.35) % markSpacing;
+    for (var m = -offset; m < H; m += markSpacing) {
+      cx.beginPath();
+      cx.moveTo(0, m); cx.lineTo(W, m);
+      cx.stroke();
+    }
+
+    // motion streaks
+    for (var s = streaks.length - 1; s >= 0; s--) {
+      var st = streaks[s];
+      st.y += st.speed * dt * 60;
+      cx.globalAlpha = st.alpha;
+      cx.strokeStyle = '#fff'; cx.lineWidth = 1.5;
+      cx.beginPath();
+      cx.moveTo(st.x, st.y); cx.lineTo(st.x, st.y + st.len);
+      cx.stroke();
+      cx.globalAlpha = 1;
+      if (st.y > H + 40) streaks.splice(s, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('SCROLL SPRINT', W / 2, 250);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('how far can your thumb go in 10 seconds?', W / 2, 292);
+      cx.fillText('scroll / swipe DOWN. only down counts.', W / 2, 316);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillStyle = VERM;
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO ARM', W / 2, 380); cx.globalAlpha = 1;
+    }
+
+    // challenge card (demo)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 18px Menlo, monospace';
+      cx.fillText('BEAT —', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 104px -apple-system, Helvetica, Arial';
+      cx.fillText('38', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('FT', W / 2, 430);
+    }
+
+    // countdown
+    if (state.phase === 'armed') {
+      var cdElapsed = now - armedAt;
+      var cdRemain = 2400 - cdElapsed;
+      var label;
+      if (cdRemain > 1800) label = '3';
+      else if (cdRemain > 1200) label = '2';
+      else if (cdRemain > 600) label = '1';
+      else label = 'GO';
+      var punch = 1 + 0.08 * Math.max(0, Math.sin((600 - (cdRemain % 600)) / 600 * Math.PI));
+      cx.textAlign = 'center';
+      cx.fillStyle = label === 'GO' ? TEAL : '#fff';
+      cx.font = '900 ' + (label === 'GO' ? 90 : 120) + 'px -apple-system, Helvetica, Arial';
+      cx.save(); cx.translate(W / 2, H / 2 - 30); cx.scale(punch, punch);
+      cx.fillText(label, 0, 0); cx.restore();
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('10.00s on the clock', W / 2, H / 2 + 60);
+    }
+
+    // play HUD
+    if (state.phase === 'play' || state.phase === 'over') {
+      var fi2 = ftIn();
+      var remaining = Math.max(0, RUN_S - (state.phase === 'play' ? (Date.now() - runStartTs) / 1000 : 0));
+      var urgent = remaining <= 3 && state.phase === 'play';
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.textAlign = 'center';
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + ' FT' + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 136);
+      }
+
+      // odometer
+      drawOdometer(W / 2, 260, fi2.ft, fi2.in, now);
+
+      // speed bar
+      drawSpeedBar(W / 2 - 130, 290, 260, 10);
+
+      // timer
+      if (state.phase === 'play') drawTimer(350, remaining, urgent);
+
+      // average mph line
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText((mph()).toFixed(1) + ' mph of thumb', W / 2, 382);
+
+      // rolling foot count ticks (little pop marks)
+      for (var c = countTicks.length - 1; c >= 0; c--) {
+        var ct = countTicks[c]; ct.t += dt * 60;
+        var ca = Math.max(0, 1 - ct.t / 20);
+        cx.globalAlpha = ca;
+        cx.fillStyle = TEAL;
+        cx.font = '700 14px -apple-system, Helvetica, Arial';
+        cx.fillText(ct.ft, 26 + (ct.ft % 2) * 16, 240 - ct.t * 1.2);
+        cx.globalAlpha = 1;
+        if (ct.t > 20) countTicks.splice(c, 1);
+      }
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt * 60;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.6) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 210 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // distance card
+    if (state.phase === 'over') {
+      var fi3 = ftIn();
+      var finalFtDec = totalPx / PX_PER_IN / IN_PER_FT;
+      var avgMph = mph();
+
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+
+      cx.fillStyle = '#fff'; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('DISTANCE', W / 2, 260);
+
+      cx.fillStyle = GOLD; cx.font = '900 84px -apple-system, Helvetica, Arial';
+      cx.fillText(fi3.ft + ' FT ' + fi3.in + ' IN', W / 2, 340);
+
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('that\'s ' + avgMph.toFixed(1) + ' mph of thumb', W / 2, 382);
+
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText(benchLine(finalFtDec), W / 2, 414);
+
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('best ' + (bestFt ? bestFt.toFixed(1) : '0.0') + ' ft', W / 2, 442);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — RACE AGAIN', W / 2, 600);
+        cx.globalAlpha = 1;
+
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('SCROLL SPRINT', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('his thumb did ' + (window.__demoScore || 41.2) + ' ft. yours?', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 41.2) + ' FT', W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

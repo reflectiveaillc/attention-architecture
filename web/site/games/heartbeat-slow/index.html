@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Heartbeat Slow — Tilt</title>
+<!--
+  LOOP / attention-architecture — Heartbeat Slow
+  Circuits: 01-rpe, 07-timing, 05-ease.
+  Engine: calm.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'heartbeat-slow';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  // calm palette — no vermillion
+  var HEART_COL  = '#e06080';   // soft rose
+  var HEART_DIM  = '#7a3050';   // dimmed rose
+  var TEXT_COL   = 'rgba(255,255,255,0.92)';
+
+  // ---- game constants ----
+  var BPM_START  = 118;   // start heart rate
+  var BPM_WIN    = 62;    // resting / win threshold
+  var BPM_DROP   = 3;     // bpm reduction per good tap
+  var BPM_RISE   = 5;     // bpm penalty per miss
+  var BPM_MAX    = 140;   // game-over ceiling
+  var WIN_WINDOW = 0.28;  // fraction of beat interval where a tap counts as matched
+
+  // ---- state ----
+  var phase;          // 'title' | 'play' | 'over' | 'win' | 'cta'
+  var bpm, beatInterval, nextBeatAt, beatPhase;
+  var score;          // beats successfully matched
+  var misses;         // consecutive misses (lose if >= 5)
+  var totalMisses;
+  var runStartTs;
+  var overAt, ctaAt, winAt;
+  var phaseStartTs;   // for demo
+
+  // juice
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  var pulseScale = 1;   // heart pulse scale
+  var bgDim = 0;        // 0=bright,1=full dark (accumulated as bpm drops)
+  var dareBeaten = false;
+
+  // MUTE / SHARE zones (human mode only)
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, px, py) { return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h; }
+
+  // ---- init / reset ----
+  function initGame() {
+    bpm          = BPM_START;
+    beatInterval = 60000 / bpm;   // ms per beat
+    nextBeatAt   = performance.now() + beatInterval * 0.5;
+    beatPhase    = 0;              // 0-1 within the beat
+    score        = 0;
+    misses       = 0;
+    totalMisses  = 0;
+    overAt       = 0;
+    winAt        = 0;
+    flashes      = [];
+    hitStop      = 0;
+    shakeAmt     = 0;
+    zoom         = 1;
+    pulseScale   = 1;
+    bgDim        = Math.max(0, (bpm - BPM_WIN) / (BPM_START - BPM_WIN));
+    bgDim        = 1 - bgDim; // starts near 0 (bright-ish)
+    dareBeaten   = false;
+  }
+
+  function startPlay() {
+    phase      = 'play';
+    runStartTs = Date.now();
+    initGame();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function newGame() {
+    rng = mulberry32(SEED);
+    phase = 'title';
+    initGame();
+    if (DEMO) {
+      // skip title, go straight to play
+      startPlay();
+      return;
+    }
+    if (BOT) {
+      startPlay();
+    }
+  }
+
+  // ---- beat logic ----
+  function updateBeat(now) {
+    beatPhase = 1 - (nextBeatAt - now) / beatInterval;
+    if (beatPhase < 0) beatPhase = 0;
+    if (beatPhase > 1) beatPhase = 1;
+  }
+
+  // called every frame — checks if we missed a beat (window already passed)
+  function checkMissedBeat(now) {
+    if (phase !== 'play') return;
+    // if current time is past the beat window end
+    var windowEnd = nextBeatAt + beatInterval * WIN_WINDOW;
+    if (now > windowEnd && beatPhase >= 1) {
+      registerMiss();
+      advanceBeat(now);
+    }
+  }
+
+  function advanceBeat(now) {
+    beatInterval = 60000 / bpm;
+    nextBeatAt = now + beatInterval * (1 - WIN_WINDOW * 0.5);
+    beatPhase = 0;
+    // heart pulse on each beat
+    pulseScale = 1.18;
+  }
+
+  function registerHit(now) {
+    misses = 0;
+    score++;
+    bpm = Math.max(BPM_WIN - 1, bpm - BPM_DROP);
+    beatInterval = 60000 / bpm;
+    bgDim = (BPM_START - bpm) / (BPM_START - BPM_WIN);
+    bgDim = Math.min(1, Math.max(0, bgDim));
+
+    hitStop = 3;
+    zoom = 1.03;
+    if (window.J) J.calm(score);
+    flash('+slow', TEAL, 26);
+
+    if (window.LOOP) LOOP.emit('beat_matched', { score: score, bpm: Math.round(bpm) });
+
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE REACHED', TEAL, 36);
+      if (window.J) J.calm(score + 5);
+      if (window.SHARE) SHARE.beaten(score);
+    }
+
+    // win check
+    if (bpm <= BPM_WIN) {
+      triggerWin();
+      return;
+    }
+    advanceBeat(now);
+  }
+
+  function registerMiss() {
+    misses++;
+    totalMisses++;
+    bpm = Math.min(BPM_MAX, bpm + BPM_RISE);
+    beatInterval = 60000 / bpm;
+    bgDim = (BPM_START - bpm) / (BPM_START - BPM_WIN);
+    bgDim = Math.min(1, Math.max(0, bgDim));
+
+    shakeAmt = 4;
+    flash('miss', 'rgba(255,255,255,0.5)', 22);
+    if (window.LOOP) LOOP.emit('near_miss', { score: score, bpm: Math.round(bpm) });
+
+    if (misses >= 5 || bpm >= BPM_MAX) {
+      triggerOver();
+    }
+  }
+
+  function triggerOver() {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    shakeAmt = 6;
+    if (window.J) J.calm(0);
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { startPlay(); }, 800);
+      }
+    }
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () { phase = 'cta'; ctaAt = performance.now(); setTimeout(function () { window.__demoDone = true; }, 3600); }, 2200);
+    }
+  }
+
+  function triggerWin() {
+    phase = 'win';
+    winAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    zoom = 1.04;
+    if (window.J) J.calm(score + 10);
+    flash('REST REACHED', TEAL, 38);
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { startPlay(); }, 800);
+      }
+    }
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () { phase = 'cta'; ctaAt = performance.now(); setTimeout(function () { window.__demoDone = true; }, 3600); }, 2800);
+    }
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- tap / input ----
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startPlay(); return; }
+    if (phase === 'play') {
+      var now = performance.now();
+      var dist = Math.abs(now - nextBeatAt);
+      if (dist < beatInterval * WIN_WINDOW) {
+        registerHit(now);
+      } else {
+        // tapped but missed the window
+        registerMiss();
+      }
+      return;
+    }
+    if ((phase === 'over' || phase === 'win') && performance.now() - (overAt || winAt) > 400) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'beats slowed' }); return;
+      }
+      if (window.LOOP) LOOP.emit('restart', {});
+      startPlay();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- bot / demo autopilot ----
+  var botRunsDone = 0;
+
+  // Demo script: list of beat indices to HIT (1=hit, 0=miss)
+  // Arc: hit several beats to slow down, then miss a cluster → over
+  // Total ~16s at starting 118bpm (~2 beats/sec → ~32 beats in 16s)
+  // Script: 12 hits settling → 3 misses → game_over → CTA
+  var demoScript = [1,1,1,1,1,1,1,1,1,1,1,1, 0,0,0,0,0];
+  var demoBeat = 0;   // which beat we're on in the demo script
+
+  // Bot: imperfect — hits most beats but misses some, eventually enough to lose
+  // After K hits, goes passive so misses accumulate and game_over fires
+  var BOT_HIT_LIMIT = 8;  // after this many hits, stop tapping → misses accumulate → game_over
+  var botHitsThisRun = 0;
+
+  function autopilot(now) {
+    if (phase !== 'play') return;
+    var dist = Math.abs(now - nextBeatAt);
+    var inWindow = dist < beatInterval * WIN_WINDOW * 0.85;
+
+    if (DEMO) {
+      if (demoBeat < demoScript.length) {
+        // trigger on the beat
+        if (inWindow && dist < 16.667 * 2) {  // only tap once per beat window
+          var shouldHit = demoScript[demoBeat] === 1;
+          demoBeat++;
+          if (shouldHit) {
+            registerHit(now);
+          }
+          // if miss, don't tap → miss is handled by checkMissedBeat
+        }
+      }
+      return;
+    }
+
+    if (BOT) {
+      if (botHitsThisRun >= BOT_HIT_LIMIT) {
+        // go passive — let misses accumulate → game_over
+        return;
+      }
+      // imperfect timing: add noise
+      var noise = (rng() - 0.5) * beatInterval * 0.15;
+      var distWithNoise = Math.abs(now - (nextBeatAt + noise));
+      if (distWithNoise < beatInterval * WIN_WINDOW * 0.7) {
+        botHitsThisRun++;
+        registerHit(now);
+      }
+    }
+  }
+
+  // reset per run for bot
+  var _origStartPlay = startPlay;
+  startPlay = function () {
+    botHitsThisRun = 0;
+    demoBeat = 0;
+    _origStartPlay();
+  };
+
+  // ---- drawing helpers ----
+  function drawHeart(cx, x, y, size, col, alpha) {
+    cx.save();
+    cx.globalAlpha = alpha !== undefined ? alpha : 1;
+    cx.fillStyle = col || HEART_COL;
+    cx.beginPath();
+    // simple heart via bezier
+    var s = size * 0.5;
+    cx.moveTo(x, y + s * 0.3);
+    cx.bezierCurveTo(x, y - s * 0.5, x - s, y - s * 0.5, x - s, y);
+    cx.bezierCurveTo(x - s, y + s * 0.4, x, y + s * 0.9, x, y + s * 1.1);
+    cx.bezierCurveTo(x, y + s * 0.9, x + s, y + s * 0.4, x + s, y);
+    cx.bezierCurveTo(x + s, y - s * 0.5, x, y - s * 0.5, x, y + s * 0.3);
+    cx.closePath();
+    cx.fill();
+    cx.restore();
+  }
+
+  // ---- render ----
+  var last = performance.now();
+  var ctaAt = 0;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // update beat phase
+    updateBeat(now);
+    checkMissedBeat(now);
+
+    // autopilot runs (decay hitStop first, then run)
+    if (hitStop > 0) { hitStop -= dt; }
+    else { autopilot(now); }
+
+    // decay juice
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom      += (1 - zoom) * 0.14 * dt;
+    pulseScale += (1 - pulseScale) * 0.18 * dt;
+
+    // ---- draw ----
+    cx.save();
+    // shake + zoom
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background — dims as heart rate drops
+    var dimmed = bgDim; // 0=starting tint, 1=deep calm dark
+    var bgR = Math.round(11 + dimmed * 4);
+    var bgG = Math.round(13 + dimmed * 8);
+    var bgB = Math.round(18 + dimmed * 15);
+    cx.fillStyle = 'rgb(' + bgR + ',' + bgG + ',' + bgB + ')';
+    cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // subtle teal glow as it calms
+    if (dimmed > 0.1) {
+      var g = cx.createRadialGradient(W / 2, H * 0.45, 0, W / 2, H * 0.45, 220);
+      g.addColorStop(0, 'rgba(46,197,182,' + (dimmed * 0.12) + ')');
+      g.addColorStop(1, 'rgba(46,197,182,0)');
+      cx.fillStyle = g;
+      cx.fillRect(0, 0, W, H);
+    }
+
+    // ---- heart ----
+    if (phase === 'play' || phase === 'over' || phase === 'win') {
+      var heartY   = H * 0.42;
+      var heartSize = 110 * pulseScale;
+      var heartAlpha = 0.9 - dimmed * 0.25;  // dims slightly as you calm
+      // beat ring — shows timing window
+      if (phase === 'play') {
+        var ringR = heartSize * 1.4;
+        var ringAlpha = Math.max(0, 0.35 - beatPhase * 0.30);
+        cx.save();
+        cx.globalAlpha = ringAlpha;
+        cx.strokeStyle = TEAL;
+        cx.lineWidth = 2.5;
+        cx.beginPath();
+        cx.arc(W / 2, heartY, ringR * (0.7 + beatPhase * 0.55), 0, Math.PI * 2);
+        cx.stroke();
+        cx.restore();
+        // second ring for visual rhythm
+        var ring2 = heartSize * 1.8;
+        var r2alpha = Math.max(0, 0.18 - beatPhase * 0.18);
+        cx.save();
+        cx.globalAlpha = r2alpha;
+        cx.strokeStyle = TEAL;
+        cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.arc(W / 2, heartY, ring2 * (0.6 + beatPhase * 0.6), 0, Math.PI * 2);
+        cx.stroke();
+        cx.restore();
+      }
+      // actual heart
+      var hcol = dimmed > 0.6 ? HEART_DIM : HEART_COL;
+      // blend color smoothly
+      drawHeart(cx, W / 2, heartY, heartSize, hcol, heartAlpha);
+    }
+
+    // ---- BPM display ----
+    if (phase === 'play' || phase === 'over' || phase === 'win') {
+      cx.textAlign = 'center';
+      cx.fillStyle = TEXT_COL;
+      cx.font = '800 72px -apple-system, Helvetica, Arial';
+      cx.fillText(Math.round(bpm), W / 2, H * 0.72);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('BPM', W / 2, H * 0.72 + 22);
+      // score (beats matched)
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' beats slowed', W / 2, H * 0.82);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'REACHED ✓' : 'REACH ' + SHARE.dare + (SHARE.by ? ' — from ' + SHARE.by : ''), W / 2, 148);
+      }
+    }
+
+    // ---- tap target indicator (play only) ----
+    if (phase === 'play') {
+      // progress bar toward sleep rate
+      var prog = Math.min(1, (BPM_START - bpm) / (BPM_START - BPM_WIN));
+      var barW = W * 0.6, barX = W / 2 - barW / 2, barY = H * 0.84;
+      cx.fillStyle = 'rgba(255,255,255,0.08)';
+      cx.beginPath();
+      cx.roundRect ? cx.roundRect(barX, barY, barW, 4, 2) : cx.rect(barX, barY, barW, 4);
+      cx.fill();
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = 0.7;
+      cx.beginPath();
+      cx.roundRect ? cx.roundRect(barX, barY, barW * prog, 4, 2) : cx.rect(barX, barY, barW * prog, 4);
+      cx.fill();
+      cx.globalAlpha = 1;
+
+      // hint label
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.22)';
+      cx.font = '500 11px -apple-system, Helvetica, Arial';
+      cx.fillText('tap with the beat → ' + BPM_WIN + ' bpm', W / 2, barY + 18);
+    }
+
+    // ---- flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, H * 0.55 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // ---- title ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 38px -apple-system, Helvetica, Arial';
+      cx.fillText('HEARTBEAT SLOW', W / 2, H * 0.36);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('tap with each beat', W / 2, H * 0.44);
+      cx.fillText('walk the rate down to rest', W / 2, H * 0.48);
+      var pulse = 0.55 + 0.45 * Math.sin(now / 600);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, H * 0.58);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- over ----
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '800 34px -apple-system, Helvetica, Arial';
+      cx.fillText('STILL RACING', W / 2, H * 0.38);
+      cx.fillStyle = TEXT_COL;
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' beats slowed', W / 2, H * 0.45);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('reached ' + Math.round(bpm) + ' bpm', W / 2, H * 0.50);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 380);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — TRY AGAIN', W / 2, H * 0.60);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- win ----
+    if (phase === 'win') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '800 34px -apple-system, Helvetica, Arial';
+      cx.fillText('RESTING RATE', W / 2, H * 0.36);
+      cx.fillStyle = TEXT_COL;
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' beats slowed', W / 2, H * 0.43);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('you reached ' + Math.round(bpm) + ' bpm', W / 2, H * 0.49);
+      if (!DEMO && !BOT) {
+        var p3 = 0.6 + 0.4 * Math.sin(now / 420);
+        cx.globalAlpha = p3;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — GO AGAIN', W / 2, H * 0.60);
+        cx.globalAlpha = 1;
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- demo CTA card ----
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.95)';
+      cx.font = '800 38px -apple-system, Helvetica, Arial';
+      cx.fillText('HEARTBEAT SLOW', W / 2, H * 0.38);
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '500 17px -apple-system, Helvetica, Arial';
+      cx.fillText('bring the rate down yourself', W / 2, H * 0.46);
+      var p4 = 0.7 + 0.3 * Math.sin(now / 300);
+      cx.globalAlpha = ease * p4;
+      cx.fillStyle = TEAL;
+      cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, H * 0.57);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, H * 0.63);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Shadowban Roulette — Tilt</title>
+<!--
+  LOOP / attention-architecture — Shadowban Roulette
+  Circuits: 06 Zeigarnik (unresolved review), 04 loss (trust spent forever),
+            03 social (shadowban = public shame).
+  Modes:
+    ?demo=1&seed=7        scripted clip run, sets window.__demoDone
+    ?bot=1&runs=3&seed=7  imperfect autoplay traffic sim, sets window.__botDone
+    ?dare=<n>[&by=<name>] incoming dare banner + SHARE.beaten() on pass
+    ?clip=ID&src=tiktok   attribution
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'shadowban-roulette';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 14;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134';
+  var CARD_W = 335, CARD_H = 86, CARD_GAP = 14, MAX_FEED = 5;
+  var TRUST_MAX = 100, NEAR_THRESHOLD = 22;
+
+  var state, runStartTs, best = 0, dareBeaten = false;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, challengeAt = 0, ctaAt = 0;
+  var flashes = [], floaters = [];
+  try { best = +localStorage.getItem('sbr_best') || 0; } catch (_) {}
+
+  // ---- helpers ----
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  function pctTop(score) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 12)))); }
+  function roundRect(x, y, w, h, r) {
+    if (cx.roundRect) { cx.roundRect(x, y, w, h, r); return; }
+    r = Math.min(r, w / 2, h / 2);
+    cx.beginPath(); cx.moveTo(x + r, y); cx.lineTo(x + w - r, y); cx.quadraticCurveTo(x + w, y, x + w, y + r);
+    cx.lineTo(x + w, y + h - r); cx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    cx.lineTo(x + r, y + h); cx.quadraticCurveTo(x, y + h, x, y + h - r);
+    cx.lineTo(x, y + r); cx.quadraticCurveTo(x, y, x + r, y); cx.closePath();
+  }
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      trust: TRUST_MAX,
+      score: 0,
+      posts: [],
+      nextId: 1,
+      spawnIn: 0,
+      overAt: 0,
+      combo: 0
+    };
+    flashes = []; floaters = []; dareBeaten = false;
+    if (DEMO) {
+      prebuildDemoFeed();
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1200);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  // demo opens mid-anxiety: 3 posts reviewing, score already loaded
+  function prebuildDemoFeed() {
+    var now = performance.now();
+    var dur = 4.0;
+    state.posts.push({ id: state.nextId++, spawnTime: now - 1200, reviewDur: dur, status: 'reviewing', checkCount: 0, flashT: 0, resultShown: false });
+    state.posts.push({ id: state.nextId++, spawnTime: now - 700,  reviewDur: dur, status: 'reviewing', checkCount: 0, flashT: 0, resultShown: false });
+    state.posts.push({ id: state.nextId++, spawnTime: now - 300,  reviewDur: dur, status: 'reviewing', checkCount: 0, flashT: 0, resultShown: false });
+    state.score = 25;
+  }
+
+  function makePost(spawnTime) {
+    var baseDur = 2.8 + state.score * 0.07;
+    return {
+      id: state.nextId++,
+      spawnTime: spawnTime,
+      reviewDur: clamp(baseDur + gauss() * 0.35, 1.8, 5.5),
+      status: 'reviewing',
+      checkCount: 0,
+      flashT: 0,
+      resultShown: false
+    };
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // ---- core mechanic ----
+  function spawnDt() { return clamp(2.8 - state.score * 0.04, 0.9, 3.4); }
+
+  function safety(p, now) {
+    var age = (now - p.spawnTime) / 1000;
+    return clamp(age / p.reviewDur, 0, 1);
+  }
+
+  function autoClear(now) {
+    for (var i = state.posts.length - 1; i >= 0; i--) {
+      var p = state.posts[i];
+      if (p.status !== 'reviewing') continue;
+      if (safety(p, now) >= 1) {
+        p.status = 'cleared'; p.flashT = 1;
+        state.score++;
+        state.combo++;
+        if (window.J) J.hit(state.combo);
+        flash('CLEARED', TEAL, 32);
+        float('+' + state.combo, TEAL, cardY(i) + 30);
+        if (window.LOOP) LOOP.emit('post_cleared', { n: state.score, auto: true });
+      }
+    }
+  }
+
+  function expireOld(now) {
+    while (state.posts.length > MAX_FEED) {
+      var old = state.posts.shift();
+      if (old.status === 'reviewing') {
+        old.status = 'lost';
+        if (window.LOOP) LOOP.emit('post_lost', { id: old.id });
+      }
+    }
+    for (var i = state.posts.length - 1; i >= 0; i--) {
+      var p = state.posts[i];
+      if (p.status === 'reviewing' && (now - p.spawnTime) / 1000 > p.reviewDur * 2.6) {
+        p.status = 'lost';
+        state.posts.splice(i, 1);
+        if (window.LOOP) LOOP.emit('post_lost', { id: p.id });
+      }
+    }
+  }
+
+  function checkPost(idx) {
+    if (state.phase !== 'play') return;
+    var p = state.posts[idx];
+    if (!p || p.status !== 'reviewing') return;
+
+    var now = performance.now();
+    var s = safety(p, now);
+    p.checkCount++;
+    state.combo = 0;
+
+    // demo overrides: force the narrative arc
+    var force = null;
+    if (DEMO && demoForces.length) force = demoForces.shift();
+    if (force === 'clear') s = 0.95;
+    else if (force === 'near') s = 0.05;
+    else if (force === 'ban') s = 0.15;
+
+    var cost = 8 + Math.round((1 - s) * 14) + p.checkCount * 3;
+    state.trust -= cost;
+
+    var risk = (1 - s) * 0.8 + Math.max(0, (50 - state.trust) / 100);
+    var banned = rng() < risk || state.trust <= 0;
+    if (force === 'ban') banned = true;
+    if (force === 'clear') banned = false;
+
+    var near = !banned && state.trust < NEAR_THRESHOLD && state.trust > 0;
+    if (force === 'near' && state.trust > 12) state.trust = 12; // guarantee the sliver
+
+    if (window.J) {
+      if (banned) J.death(Math.min(0.4 + state.score / 35, 1));
+      else if (near) J.near();
+      else J.hit(1);
+      J.tension(Math.min(1, 1 - state.trust / TRUST_MAX));
+    }
+
+    if (banned) {
+      p.status = 'shadowbanned'; p.flashT = 1; p.resultShown = true;
+      hitStop = 5; shakeAmt = 10; zoom = 1.04;
+      gameOver('shadowbanned');
+      return;
+    }
+
+    p.status = 'cleared'; p.flashT = 1; p.resultShown = true;
+    state.score++;
+    state.trust = clamp(state.trust, 0, TRUST_MAX);
+    hitStop = near ? 3 : 1; zoom = 1.02;
+
+    if (near) {
+      shakeAmt = 5;
+      flash('SO CLOSE', VERM, 34);
+      float('trust ' + Math.round(state.trust) + '%', VERM, cardY(idx) + 30);
+      if (window.LOOP) LOOP.emit('near_miss', { n: state.score, trust: state.trust });
+    } else {
+      flash('CLEARED', TEAL, 32);
+      float('+' + 1, TEAL, cardY(idx) + 30);
+    }
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+
+    if (window.LOOP) LOOP.emit('post_cleared', { n: state.score, auto: false, trust: state.trust, safety: +s.toFixed(2) });
+  }
+
+  function gameOver(reason) {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.tension(0);
+      if (newBest) setTimeout(function () { J.fanfare(); }, 500);
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('sbr_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), reason: reason });
+    if (DEMO) setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+      setTimeout(function () { window.__demoDone = true; }, 3500); }, 2800);
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 900);
+    }
+  }
+
+  function resetRun() {
+    state.posts = []; state.score = 0; state.trust = TRUST_MAX; state.nextId = 1; state.spawnIn = 0; state.combo = 0;
+    flashes = []; floaters = []; dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+  function float(txt, color, y) { floaters.push({ txt: txt, color: color, y: y, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 516, w: 250, h: 46 };
+  var CHECK_R = { x: W / 2 - 140, y: H - 110, w: 280, h: 62 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function cardY(i) { return 156 + i * (CARD_H + CARD_GAP); }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') {
+      for (var i = 0; i < state.posts.length; i++) {
+        var r = { x: (W - CARD_W) / 2, y: cardY(i), w: CARD_W, h: CARD_H };
+        if (state.posts[i].status === 'reviewing' && inR(r, x, y)) { checkPost(i); return; }
+      }
+      if (inR(CHECK_R, x, y)) {
+        for (var j = 0; j < state.posts.length; j++) { if (state.posts[j].status === 'reviewing') { checkPost(j); return; } }
+      }
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'posts cleared' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilots ----
+  var demoForces = [], demoIdx = 0, demoWait = 90;
+  var demoWaits = [65, 95, 110, 60, 190, 50];
+  var demoScript = ['clear', 'clear', 'clear', 'clear', 'near', 'wait', 'ban'];
+  var botRunsDone = 0, botTarget = null;
+
+  function firstReviewing() {
+    for (var i = 0; i < state.posts.length; i++) { if (state.posts[i].status === 'reviewing') return i; }
+    return -1;
+  }
+
+  function autopilot(now) {
+    if (state.phase !== 'play') return;
+
+    if (DEMO) {
+      if (demoIdx >= demoScript.length) return;
+      if (demoWait > 0) { demoWait--; return; }
+      var want = demoScript[demoIdx];
+      if (want === 'wait') { demoIdx++; demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 30; return; }
+      var idx = firstReviewing();
+      if (idx < 0) { demoWait = 12; return; } // stall until a post appears
+      demoForces.push(want);
+      checkPost(idx);
+      demoIdx++;
+      demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 30;
+      return;
+    }
+
+    if (BOT) {
+      for (var i = 0; i < state.posts.length; i++) {
+        var p = state.posts[i];
+        if (p.status !== 'reviewing') continue;
+        if (botTarget === null) botTarget = clamp(0.72 + gauss() * (BOT_ERR / 100), 0.35, 0.98);
+        if (safety(p, now) >= botTarget) { botTarget = null; checkPost(i); return; }
+      }
+    }
+  }
+
+  // ---- render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else if (state.phase === 'play') {
+      state.spawnIn -= dt;
+      if (state.spawnIn <= 0) {
+        state.posts.push(makePost(now));
+        state.spawnIn = spawnDt() * 60;
+        expireOld(now);
+      }
+      autoClear(now);
+      expireOld(now);
+      autopilot(now);
+    }
+
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(232,80,46,0.05)'); bg.addColorStop(0.5, 'rgba(11,13,18,0)'); bg.addColorStop(1, 'rgba(46,197,182,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // top hud
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '800 56px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score, W / 2, 78);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('POSTS CLEARED', W / 2, 100);
+    cx.fillText('BEST ' + best, W / 2, 118);
+
+    var tw = 220, th = 10, tx = (W - tw) / 2, ty = 128;
+    cx.fillStyle = 'rgba(255,255,255,0.12)';
+    roundRect(tx, ty, tw, th, 5); cx.fill();
+    var trustPct = state.trust / TRUST_MAX;
+    var trustColor = trustPct > 0.5 ? TEAL : trustPct > 0.25 ? GOLD : VERM;
+    cx.fillStyle = trustColor;
+    roundRect(tx, ty, tw * trustPct, th, 5); cx.fill();
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.font = '700 11px Menlo, monospace';
+    cx.fillText('TRUST ' + Math.round(state.trust) + '%', W / 2, ty + 24);
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 152);
+    }
+
+    // feed cards
+    var x = (W - CARD_W) / 2;
+    for (var i = 0; i < state.posts.length; i++) {
+      var p = state.posts[i], y = cardY(i);
+      if (y > H || y < -CARD_H) continue;
+      var s = safety(p, now);
+
+      cx.fillStyle = 'rgba(255,255,255,0.06)';
+      if (p.flashT > 0) { cx.fillStyle = p.status === 'shadowbanned' ? 'rgba(232,80,46,0.18)' : 'rgba(46,197,182,0.18)'; p.flashT -= 0.04 * dt; }
+      roundRect(x, y, CARD_W, CARD_H, 14); cx.fill();
+
+      cx.fillStyle = 'rgba(255,255,255,0.08)';
+      roundRect(x + 10, y + 10, 66, 66, 10); cx.fill();
+      cx.fillStyle = 'rgba(255,255,255,0.18)';
+      cx.beginPath(); cx.moveTo(x + 36, y + 34); cx.lineTo(x + 52, y + 43); cx.lineTo(x + 36, y + 52); cx.closePath(); cx.fill();
+
+      cx.textAlign = 'left';
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '700 14px -apple-system, Helvetica, Arial';
+      cx.fillText('@user' + (1000 + p.id), x + 88, y + 30);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('video #' + p.id, x + 88, y + 48);
+
+      cx.textAlign = 'right';
+      if (p.status === 'reviewing') {
+        var pulse = 0.5 + 0.5 * Math.sin(now / 200);
+        cx.fillStyle = 'rgba(242,177,52,' + (0.5 + pulse * 0.5) + ')';
+        cx.font = '800 13px Menlo, monospace';
+        cx.fillText('Reviewing' + ['', '.', '..', '...'][Math.floor(now / 400) % 4], x + CARD_W - 16, y + 30);
+        cx.fillStyle = 'rgba(255,255,255,0.1)';
+        roundRect(x + 88, y + 58, CARD_W - 104, 6, 3); cx.fill();
+        cx.fillStyle = GOLD;
+        roundRect(x + 88, y + 58, (CARD_W - 104) * s, 6, 3); cx.fill();
+      } else if (p.status === 'cleared') {
+        cx.fillStyle = TEAL; cx.font = '800 13px Menlo, monospace';
+        cx.fillText('CLEARED', x + CARD_W - 16, y + 30);
+      } else if (p.status === 'shadowbanned') {
+        cx.fillStyle = VERM; cx.font = '800 13px Menlo, monospace';
+        cx.fillText('SHADOWBANNED', x + CARD_W - 16, y + 30);
+      } else if (p.status === 'lost') {
+        cx.fillStyle = 'rgba(255,255,255,0.25)'; cx.font = '800 13px Menlo, monospace';
+        cx.fillText('EXPIRED', x + CARD_W - 16, y + 30);
+      }
+    }
+
+    if (state.phase === 'play' && state.posts.some(function (p) { return p.status === 'reviewing'; })) {
+      var bx = CHECK_R.x, by = CHECK_R.y, bw = CHECK_R.w, bh = CHECK_R.h;
+      var bPulse = 0.85 + 0.15 * Math.sin(now / 220);
+      cx.fillStyle = 'rgba(232,80,46,' + bPulse + ')';
+      roundRect(bx, by, bw, bh, 31); cx.fill();
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('CHECK', W / 2, by + 40);
+      cx.fillStyle = 'rgba(255,255,255,0.6)'; cx.font = '600 11px -apple-system, Helvetica, Arial';
+      cx.fillText('costs trust • risks shadowban', W / 2, by + bh + 18);
+    }
+
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('SHADOWBAN', W / 2, 300);
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('ROULETTE', W / 2, 344);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('your video is being reviewed...', W / 2, 390);
+      var p1 = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = p1; cx.fillStyle = TEAL; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO PLAY', W / 2, 440); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('wait for review. checking costs trust.', W / 2, 470);
+    }
+
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('32', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 240 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    for (var f = floaters.length - 1; f >= 0; f--) {
+      var ft = floaters[f]; ft.t += dt;
+      var fa = Math.max(0, 1 - ft.t / 35);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = ft.color;
+      cx.font = '800 ' + (18 + ft.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(ft.txt, W / 2, ft.y - ft.t * 0.8);
+      cx.globalAlpha = 1;
+      if (ft.t > 35) floaters.splice(f, 1);
+    }
+
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('SHADOWBANNED.', W / 2, 310);
+      cx.fillStyle = '#fff'; cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' posts cleared', W / 2, 355);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 402);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 426);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 476);
+        cx.globalAlpha = 1;
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('SHADOWBAN', W / 2, 280);
+      cx.fillStyle = VERM; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('ROULETTE', W / 2, 324);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('he cleared ' + (window.__demoScore || 32) + '. your move.', W / 2, 364);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 32), W / 2, 434);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 466);
+      cx.globalAlpha = 1;
+    }
+
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

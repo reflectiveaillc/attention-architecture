@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Unfollow Quiet — Tilt</title>
+<!--
+  LOOP / attention-architecture — Unfollow Quiet (CALM engine, contract v2)
+  Circuits: 05-ease, 03-social, 08-garden.
+  Conditioned path: mute/unfollow move from Instagram/TikTok — the player's thumb already knows it.
+  Modes (query params):
+    ?demo=1&seed=7        scripted calm arc ~16s → soft CTA card, sets window.__demoDone + __demoScore
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'unfollow-quiet';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK  = '#0b0d12';
+  var TEAL = '#2ec5b6';
+  var GOLD = '#f2b134';
+
+  // ---- tile grid config ----
+  // 4 columns x 7 rows = 28 tiles
+  var COLS = 4, ROWS = 7;
+  var TILE_W = 88, TILE_H = 78, GAP = 8;
+  var GRID_X = (W - (COLS * TILE_W + (COLS - 1) * GAP)) / 2;
+  var GRID_Y = 110;
+
+  // noisy account labels — all uppercase, aggressive, social-noise coded
+  var LABELS = [
+    'HUSTLE.BRO','GRWM QUEEN','VIRAL 🔥','HOT TAKES',
+    'DAILY DUMP','UNBOX KING','FYP ADDICT','CLOUT FARM',
+    'SPICY RATIO','MAIN POP','DRAMA TEA','EXPOSURE',
+    'REACH HACK','LIKES 4U','TREND LORD','FILTER ME',
+    'SPAM BRAIN','NOISE4EVER','FOLLOW4F','LOUD AF',
+    'SEEN@3AM','SCROLLHOLE','RATIO WAR','EGO FEED',
+    'GHOST MODE','DM FLOOD','POST MORE','VIBE SHIFT'
+  ];
+
+  // "noisy" hues — these are loud saturated colors (NOT vermillion but still loud)
+  // orange, yellow-green, magenta-purple, amber — all high-saturation
+  var NOISY_HUES = [22, 44, 285, 38, 320, 58, 260, 14];
+
+  var tiles = [];
+  var flashes = [];
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var quieted = 0;          // score: tiles unfollowed
+  var totalTiles = COLS * ROWS;
+  var startedAt = 0;
+  var gamePhase = 'title';  // title | play | over | cta
+  var overAt = 0;
+  var ctaAt  = 0;
+  var noiseLevel = 1.0;     // 1 = full noise, decays as tiles are removed
+  var titleOpacity = 1;
+
+  // ---- build tile grid ----
+  function buildGrid() {
+    tiles = [];
+    var labelPool = LABELS.slice();
+    // shuffle labels
+    for (var i = labelPool.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = labelPool[i]; labelPool[i] = labelPool[j]; labelPool[j] = tmp;
+    }
+    for (var row = 0; row < ROWS; row++) {
+      for (var col = 0; col < COLS; col++) {
+        var idx = row * COLS + col;
+        var hue = NOISY_HUES[Math.floor(rng() * NOISY_HUES.length)];
+        tiles.push({
+          col: col, row: row,
+          x: GRID_X + col * (TILE_W + GAP),
+          y: GRID_Y + row * (TILE_H + GAP),
+          label: labelPool[idx % labelPool.length],
+          hue: hue,
+          // animation state
+          state: 'noisy',   // noisy | fading | quiet
+          fadeT: 0,         // 0..1 fade progress
+          fadeSpeed: 0.018 + rng() * 0.008,
+          // visual wiggle (noise)
+          wigglePhase: rng() * Math.PI * 2,
+          wiggleAmp:   1.5 + rng() * 1.5,
+          // pulse timing offset
+          pulseOffset: rng() * Math.PI * 2,
+          // icon: a small emoji-like shape index (0-3)
+          iconShape: Math.floor(rng() * 4),
+          // saturation varies per tile
+          sat: 62 + Math.floor(rng() * 22),
+          lit: 46 + Math.floor(rng() * 14),
+          // z-order jitter for overlap feel
+          zOff: (rng() - 0.5) * 2
+        });
+      }
+    }
+  }
+
+  // ---- motes drifting upward ----
+  var motes = [];
+  function spawnMote() {
+    var x = rng() * W;
+    var y = H + 10 + rng() * 30;
+    var hue = 168 + rng() * 16;
+    motes.push({ x: x, y: y, size: 2 + rng() * 3, hue: hue, vy: 0.25 + rng() * 0.4, phase: rng() * Math.PI * 2 });
+  }
+  var moteTimer = 0;
+
+  // ---- helpers ----
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function hitTile(tile) {
+    if (tile.state !== 'noisy') return;
+    tile.state = 'fading';
+    tile.fadeT = 0;
+    quieted++;
+    noiseLevel = 1 - quieted / totalTiles;
+
+    if (window.J) J.calm(quieted);
+
+    // visual juice: gentle hit-stop + zoom on milestones
+    var milestone = quieted % 7 === 0 || quieted === totalTiles;
+    if (milestone) {
+      hitStop = 5; zoom = 1.03; shakeAmt = 1.2;
+      flash('quieter', TEAL, 22);
+    } else {
+      hitStop = 2; zoom = 1.012;
+      flash('·', TEAL, 16);
+    }
+
+    if (window.LOOP) LOOP.emit('tile_unfollowed', { n: quieted, label: tile.label });
+
+    if (quieted >= totalTiles) {
+      endGame();
+    }
+  }
+
+  function endGame() {
+    if (gamePhase === 'over' || gamePhase === 'cta') return;
+    gamePhase = 'over';
+    overAt = performance.now();
+    var dur = startedAt ? (Date.now() - startedAt) / 1000 : 0;
+    if (window.J) J.calm(quieted + 3); // final swell
+    if (window.LOOP) LOOP.emit('game_over', { score: quieted, dur_s: +dur.toFixed(1) });
+    window.__demoScore = quieted;
+
+    if (DEMO) {
+      setTimeout(function () {
+        gamePhase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    rng = mulberry32(SEED + botRunsDone);
+    buildGrid();
+    quieted = 0;
+    noiseLevel = 1;
+    flashes = [];
+    gamePhase = 'play';
+    startedAt = Date.now();
+    if (window.LOOP) {
+      LOOP.emit('restart', {});
+      LOOP.emit('play_start', { seed: SEED });
+    }
+    botActionIdx = 0;
+    botNextActionAt = performance.now() + 300;
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 120, y: 500, w: 240, h: 44 };
+  function inR(r, px, py) { return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h; }
+
+  function tileAt(px, py) {
+    for (var i = 0; i < tiles.length; i++) {
+      var t = tiles[i];
+      if (t.state === 'noisy' &&
+          px >= t.x && px <= t.x + TILE_W &&
+          py >= t.y && py <= t.y + TILE_H) {
+        return t;
+      }
+    }
+    return null;
+  }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (gamePhase === 'title') {
+      gamePhase = 'play';
+      startedAt = Date.now();
+      titleOpacity = 0;
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      return;
+    }
+    if (gamePhase === 'play') {
+      if (px !== undefined) {
+        var tile = tileAt(px, py);
+        if (tile) hitTile(tile);
+      }
+      return;
+    }
+    if (gamePhase === 'over' && performance.now() - overAt > 400) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: quieted, unit: 'unfollowed' }); return;
+      }
+      // restart
+      rng = mulberry32(SEED + Math.floor(Math.random() * 100));
+      buildGrid();
+      quieted = 0; noiseLevel = 1; flashes = [];
+      gamePhase = 'play';
+      startedAt = Date.now();
+      if (window.LOOP) {
+        LOOP.emit('restart', {});
+        LOOP.emit('play_start', { seed: SEED });
+      }
+    }
+  }
+
+  function screenToGame(ex, ey) {
+    var rect = cv.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(W, (ex - rect.left) / scale)),
+      y: Math.max(0, Math.min(H, (ey - rect.top) / scale))
+    };
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var p = screenToGame(e.clientX, e.clientY);
+    tap(p.x, p.y);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (DEMO || BOT) return;
+    if (e.code === 'Space') {
+      // tap a random noisy tile
+      var noisy = tiles.filter(function (t) { return t.state === 'noisy'; });
+      if (noisy.length) {
+        var pick = noisy[Math.floor(Math.random() * noisy.length)];
+        tap(pick.x + TILE_W / 2, pick.y + TILE_H / 2);
+      }
+    }
+  });
+
+  // ---- demo autopilot ----
+  // Arc: settle (slow first taps) → deepen (rhythm builds) → resolve (last few tiles) → pause
+  var demoActions = [];
+  var demoIdx = 0;
+  var demoStartTs = 0;
+  var demoPlayStarted = false;
+
+  function buildDemoActions() {
+    // Pick 28 tiles in a human-feeling order: outer edges first, then inward
+    // with variable timing (settle → faster → slow resolve)
+    var order = [];
+    for (var i = 0; i < tiles.length; i++) order.push(i);
+    // shuffle with rng to get a "human" path
+    for (var j = order.length - 1; j > 0; j--) {
+      var k = Math.floor(rng() * (j + 1));
+      var tmp = order[j]; order[j] = order[k]; order[k] = tmp;
+    }
+    // timing: first 4 slow (settle), next 16 medium (deepen), last 8 slow (resolve)
+    var timings = [];
+    var t = 1200;
+    for (var n = 0; n < totalTiles; n++) {
+      var wait;
+      if (n < 4)       wait = 1600 + Math.round((rng() - 0.5) * 400);   // settle
+      else if (n < 20) wait = 480  + Math.round((rng() - 0.5) * 180);   // deepen
+      else             wait = 900  + Math.round((rng() - 0.5) * 300);   // resolve
+      t += wait;
+      timings.push(t);
+    }
+    demoActions = order.map(function (tileIdx, i) {
+      return { tileIdx: tileIdx, time: timings[i] };
+    });
+  }
+
+  // ---- bot autopilot ----
+  var botRunsDone = 0;
+  var botActionIdx = 0;
+  var botNextActionAt = 0;
+  var BOT_INTERVAL = 350; // ms between bot taps (fast enough to finish)
+
+  function autopilot(now) {
+    if (DEMO && !window.__demoDone && gamePhase === 'play') {
+      if (!demoPlayStarted) return;
+      var elapsed = now - demoStartTs;
+      while (demoIdx < demoActions.length && elapsed >= demoActions[demoIdx].time) {
+        var act = demoActions[demoIdx++];
+        var tile = tiles[act.tileIdx];
+        if (tile && tile.state === 'noisy') hitTile(tile);
+      }
+    }
+    if (BOT && !window.__botDone && gamePhase === 'play') {
+      if (now >= botNextActionAt) {
+        // find next noisy tile
+        var noisy = [];
+        for (var i = 0; i < tiles.length; i++) {
+          if (tiles[i].state === 'noisy') noisy.push(i);
+        }
+        if (noisy.length > 0) {
+          var pick = noisy[Math.floor(rng() * noisy.length)];
+          hitTile(tiles[pick]);
+          botActionIdx++;
+          botNextActionAt = now + BOT_INTERVAL + Math.round((rng() - 0.5) * 100);
+        }
+      }
+    }
+  }
+
+  // ---- draw helpers ----
+  function drawNoisyTile(tile, now) {
+    var x = tile.x, y = tile.y;
+    var wiggle = Math.sin(now / 320 + tile.wigglePhase) * tile.wiggleAmp;
+    x += wiggle;
+
+    // noisy pulse (brightness oscillation)
+    var pulse = Math.sin(now / 180 + tile.pulseOffset) * 0.08;
+    var lit = Math.round(tile.lit + pulse * 20);
+
+    // background
+    cx.fillStyle = 'hsl(' + tile.hue + ',' + tile.sat + '%,' + lit + '%)';
+    cx.beginPath();
+    if (cx.roundRect) { cx.roundRect(x, y, TILE_W, TILE_H, 8); }
+    else { cx.rect(x, y, TILE_W, TILE_H); }
+    cx.fill();
+
+    // small icon shape
+    cx.save();
+    cx.translate(x + 14, y + 18);
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    var sh = tile.iconShape;
+    cx.beginPath();
+    if (sh === 0) {
+      cx.arc(0, 0, 6, 0, Math.PI * 2); cx.fill();
+    } else if (sh === 1) {
+      cx.fillRect(-6, -5, 12, 10);
+    } else if (sh === 2) {
+      cx.moveTo(0, -7); cx.lineTo(6, 6); cx.lineTo(-6, 6); cx.closePath(); cx.fill();
+    } else {
+      cx.arc(0, 0, 5, 0, Math.PI * 2); cx.fill();
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.arc(5, -5, 3, 0, Math.PI * 2); cx.fill();
+    }
+    cx.restore();
+
+    // label
+    cx.textAlign = 'left';
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '700 9px Menlo, monospace';
+    var labelStr = tile.label.length > 10 ? tile.label.slice(0, 10) : tile.label;
+    cx.fillText(labelStr, x + 8, y + TILE_H - 18);
+
+    // small "noise dots" row
+    cx.fillStyle = 'rgba(255,255,255,0.25)';
+    for (var d = 0; d < 3; d++) {
+      var dotX = x + 8 + d * 8;
+      cx.beginPath();
+      cx.arc(dotX, y + TILE_H - 8, 2, 0, Math.PI * 2);
+      cx.fill();
+    }
+
+    // thin border
+    cx.strokeStyle = 'rgba(255,255,255,0.18)';
+    cx.lineWidth = 1;
+    cx.beginPath();
+    if (cx.roundRect) { cx.roundRect(x, y, TILE_W, TILE_H, 8); }
+    else { cx.rect(x, y, TILE_W, TILE_H); }
+    cx.stroke();
+  }
+
+  function drawFadingTile(tile) {
+    var fade = 1 - tile.fadeT; // fadeT goes 0→1, opacity goes 1→0
+    var x = tile.x, y = tile.y;
+    cx.save();
+    cx.globalAlpha = fade;
+    // faded hue shifts to desaturated teal
+    cx.fillStyle = 'hsl(168,25%,30%)';
+    cx.beginPath();
+    if (cx.roundRect) { cx.roundRect(x, y, TILE_W, TILE_H, 8); }
+    else { cx.rect(x, y, TILE_W, TILE_H); }
+    cx.fill();
+    // label also fades
+    cx.fillStyle = 'rgba(46,197,182,0.6)';
+    cx.textAlign = 'center';
+    cx.font = '600 9px Menlo, monospace';
+    cx.fillText('unfollowed', x + TILE_W / 2, y + TILE_H / 2 + 4);
+    cx.restore();
+  }
+
+  function drawQuietSlot(tile) {
+    // barely visible ghost outline — the quiet breath
+    cx.strokeStyle = 'rgba(46,197,182,0.08)';
+    cx.lineWidth = 1;
+    cx.beginPath();
+    if (cx.roundRect) { cx.roundRect(tile.x, tile.y, TILE_W, TILE_H, 8); }
+    else { cx.rect(tile.x, tile.y, TILE_W, TILE_H); }
+    cx.stroke();
+  }
+
+  // ---- HUD ----
+  function drawHUD(now) {
+    // progress bar — shows how quiet the feed is becoming
+    var barW = W - 80, barX = 40, barY = 72, barH = 6;
+    var quietPct = quieted / totalTiles;
+    cx.fillStyle = 'rgba(255,255,255,0.08)';
+    cx.beginPath();
+    if (cx.roundRect) { cx.roundRect(barX, barY, barW, barH, 3); }
+    else { cx.rect(barX, barY, barW, barH); }
+    cx.fill();
+    if (quietPct > 0) {
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = 0.7 + 0.3 * quietPct;
+      cx.beginPath();
+      if (cx.roundRect) { cx.roundRect(barX, barY, barW * quietPct, barH, 3); }
+      else { cx.rect(barX, barY, barW * quietPct, barH); }
+      cx.fill();
+      cx.globalAlpha = 1;
+    }
+
+    // label
+    cx.textAlign = 'left';
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '600 11px -apple-system, Helvetica, Arial';
+    cx.fillText('NOISE', barX, barY - 5);
+    cx.textAlign = 'right';
+    cx.fillStyle = quietPct > 0.5 ? TEAL : 'rgba(255,255,255,0.45)';
+    cx.fillText('QUIET', barX + barW, barY - 5);
+
+    // count
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.3)';
+    cx.font = '600 11px -apple-system, Helvetica, Arial';
+    cx.fillText(quieted + ' / ' + totalTiles, W / 2, barY - 5);
+  }
+
+  function drawTitle(now) {
+    if (titleOpacity <= 0) return;
+    var a = Math.min(1, titleOpacity);
+    cx.save();
+    cx.globalAlpha = a;
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '800 36px -apple-system, Helvetica, Arial';
+    cx.fillText('UNFOLLOW QUIET', W / 2, 270);
+    cx.fillStyle = TEAL;
+    cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('tap the noise away', W / 2, 306);
+    cx.fillStyle = 'rgba(255,255,255,0.38)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('no score. just calm.', W / 2, 334);
+    cx.restore();
+  }
+
+  function drawOver(now) {
+    var elapsed = (now - overAt) / 1000;
+    var ease = Math.min(1, elapsed * 2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.7 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL;
+    cx.font = '900 38px -apple-system, Helvetica, Arial';
+    cx.fillText('ALL QUIET.', W / 2, 288);
+    cx.fillStyle = 'rgba(255,255,255,0.8)';
+    cx.font = '700 20px -apple-system, Helvetica, Arial';
+    cx.fillText(quieted + ' unfollowed', W / 2, 326);
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText('your feed is yours again', W / 2, 354);
+
+    if (!DEMO && !BOT) {
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = ease * pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — CLEAR ANOTHER FEED', W / 2, 406);
+      cx.globalAlpha = ease;
+      // share pill
+      cx.fillStyle = 'rgba(46,197,182,0.12)';
+      cx.strokeStyle = TEAL;
+      cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) { cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 22); }
+      else { cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h); }
+      cx.fill(); cx.stroke();
+      cx.fillStyle = TEAL;
+      cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 28);
+    }
+    cx.globalAlpha = 1;
+  }
+
+  function drawCTA(now) {
+    var elapsed = (now - ctaAt) / 1000;
+    var ease = Math.min(1, elapsed * 2.2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL;
+    cx.font = '900 40px -apple-system, Helvetica, Arial';
+    cx.fillText('UNFOLLOW QUIET', W / 2, 286);
+    cx.fillStyle = 'rgba(255,255,255,0.78)';
+    cx.font = '700 19px -apple-system, Helvetica, Arial';
+    cx.fillText((window.__demoScore || quieted) + ' tiles quieted', W / 2, 326);
+    var pulse = 0.7 + 0.3 * Math.sin(now / 260);
+    cx.fillStyle = TEAL;
+    cx.globalAlpha = ease * pulse;
+    cx.font = '900 24px -apple-system, Helvetica, Arial';
+    cx.fillText('▶  REACH IT', W / 2, 394);
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(46,197,182,0.6)';
+    cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 426);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // hit-stop decay
+    if (hitStop > 0) { hitStop -= dt; }
+
+    // update tile fading
+    for (var i = 0; i < tiles.length; i++) {
+      var tile = tiles[i];
+      if (tile.state === 'fading') {
+        tile.fadeT += tile.fadeSpeed * dt;
+        if (tile.fadeT >= 1) {
+          tile.fadeT = 1;
+          tile.state = 'quiet';
+        }
+      }
+    }
+
+    // motes (more as feed quiets)
+    moteTimer += dt;
+    var moteRate = 60 + (1 - noiseLevel) * (-40);  // faster when quiet
+    if (moteTimer > moteRate) { spawnMote(); moteTimer = 0; }
+    for (var m = motes.length - 1; m >= 0; m--) {
+      var p = motes[m];
+      if (hitStop <= 0) { p.y -= p.vy * dt; p.phase += 0.02 * dt; }
+      if (p.y < -20) motes.splice(m, 1);
+    }
+
+    // run autopilot (outside hit-stop guard — autopilot checks time, not sim state)
+    autopilot(now);
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background — shifts from harsh to soft as noise level drops
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    var tealAmt = (1 - noiseLevel) * 0.09;
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,' + tealAmt + ')');
+    bg.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    // draw motes
+    for (var mi = 0; mi < motes.length; mi++) {
+      var mo = motes[mi];
+      cx.save();
+      cx.translate(mo.x + Math.sin(mo.phase + mo.y * 0.018) * 5, mo.y);
+      cx.rotate(mo.phase);
+      cx.beginPath();
+      cx.ellipse(0, 0, mo.size, mo.size * 0.5, 0, 0, Math.PI * 2);
+      cx.fillStyle = 'hsla(168,55%,65%,' + ((1 - noiseLevel) * 0.38) + ')';
+      cx.fill();
+      cx.restore();
+    }
+
+    // draw tiles
+    if (gamePhase === 'play' || gamePhase === 'over' || gamePhase === 'title') {
+      for (var ti = 0; ti < tiles.length; ti++) {
+        var t = tiles[ti];
+        if (t.state === 'noisy')  drawNoisyTile(t, now);
+        if (t.state === 'fading') drawFadingTile(t);
+        if (t.state === 'quiet')  drawQuietSlot(t);
+      }
+    }
+
+    // HUD
+    if (gamePhase === 'play' || gamePhase === 'over') {
+      drawHUD(now);
+    }
+
+    // title overlay
+    if (gamePhase === 'title') {
+      drawTitle(now);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 36);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 60 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 36) flashes.splice(k, 1);
+    }
+
+    // game over overlay
+    if (gamePhase === 'over') drawOver(now);
+
+    // demo CTA card
+    if (gamePhase === 'cta') {
+      // still show background tiles quietly fading
+      for (var ti2 = 0; ti2 < tiles.length; ti2++) {
+        var t2 = tiles[ti2];
+        if (t2.state === 'quiet') drawQuietSlot(t2);
+      }
+      drawCTA(now);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- init ----
+  buildGrid();
+
+  if (DEMO) {
+    gamePhase = 'play';
+    startedAt = Date.now();
+    titleOpacity = 0;
+    buildDemoActions();
+    demoStartTs = performance.now();
+    demoPlayStarted = true;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  } else if (BOT) {
+    gamePhase = 'play';
+    startedAt = Date.now();
+    botNextActionAt = performance.now() + 200;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

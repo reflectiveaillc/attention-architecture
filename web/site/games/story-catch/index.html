@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Story Catch — Tilt</title>
+<!--
+  LOOP / attention-architecture — Story Catch
+  Circuits: 01-rpe (variable reward), 04-loss (FOMO expiry), 02-novelty (ring colours)
+  Modes:
+    ?demo=1&seed=7        scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'story-catch';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // palette
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ── Game config ─────────────────────────────────────────────────────────────
+  var RING_LIFE   = 4.5;   // seconds a ring lives at base speed
+  var CATCH_WIN   = 0.22;  // fraction of ring life where tap is "perfect" (near full)
+  var NEAR_THRESH = 0.35;  // fraction below which ring is "near-miss territory"
+  var BUBBLE_R    = 30;    // bubble circle radius
+  var ROW_Y       = [220, 340, 460, 580]; // y rows bubbles can appear in
+  var COL_SLOTS   = [82, 162, 242, 322];  // x columns
+  var COMBO_GOLD  = 5;     // combo streak for gold sound
+
+  // ── State ────────────────────────────────────────────────────────────────────
+  var phase, bubbles, flashes, combo, score, runStartTs, overAt;
+  var hitStop = 0, shakeAmt = 0, zoom = 1, dareBeaten = false;
+  var spawnTimer = 0, spawnInterval = 2.0;  // seconds between new bubble waves
+  var speedMul = 1.0;
+  var ctaAt = 0, challengeAt = 0;
+  var botRunsDone = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('sc_best') || 0; } catch (_) {}
+
+  function pctTop(s) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 10))));
+  }
+
+  // ── Bubble pool ──────────────────────────────────────────────────────────────
+  var HUE_TABLE = [0, 28, 168, 200, 260, 310, 45]; // distinctive hues
+
+  function spawnBubble() {
+    // pick a random unoccupied slot
+    var usedSlots = {};
+    for (var i = 0; i < bubbles.length; i++) {
+      usedSlots[bubbles[i].col + '_' + bubbles[i].row] = 1;
+    }
+    var free = [];
+    for (var c = 0; c < COL_SLOTS.length; c++) {
+      for (var r = 0; r < ROW_Y.length; r++) {
+        if (!usedSlots[c + '_' + r]) free.push({c: c, r: r});
+      }
+    }
+    if (!free.length) return null;
+    var pick = free[Math.floor(rng() * free.length)];
+    var hue  = HUE_TABLE[Math.floor(rng() * HUE_TABLE.length)];
+    return {
+      col:   pick.c,
+      row:   pick.r,
+      x:     COL_SLOTS[pick.c],
+      y:     ROW_Y[pick.r],
+      hue:   hue,
+      life:  RING_LIFE / speedMul,   // seconds this bubble will live
+      t:     0,                       // elapsed seconds
+      state: 'live',                  // live | caught | expired | popping
+      popT:  0
+    };
+  }
+
+  function newGame() {
+    phase        = DEMO ? 'challenge' : (BOT ? 'play' : 'title');
+    bubbles      = [];
+    flashes      = [];
+    combo        = 0;
+    score        = 0;
+    spawnTimer   = 0;
+    spawnInterval= 2.0;
+    speedMul     = 1.0;
+    hitStop      = 0;
+    shakeAmt     = 0;
+    zoom         = 1;
+    dareBeaten   = false;
+    overAt       = 0;
+
+    if (DEMO) {
+      challengeAt = performance.now();
+      setTimeout(function () { startRun(); }, 1250);
+    } else if (BOT) {
+      startRun();
+    }
+  }
+
+  function startRun() {
+    phase      = 'play';
+    runStartTs = Date.now();
+    spawnBubbleWave(2);
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function spawnBubbleWave(n) {
+    var spawned = 0;
+    for (var attempt = 0; attempt < 20 && spawned < n; attempt++) {
+      var b = spawnBubble();
+      if (b) { bubbles.push(b); spawned++; }
+    }
+  }
+
+  // ── Tap / catch logic ────────────────────────────────────────────────────────
+  function tryTap(px, py) {
+    // find the closest live bubble within touch radius
+    var best_i = -1, best_d = 9999;
+    for (var i = 0; i < bubbles.length; i++) {
+      var b = bubbles[i];
+      if (b.state !== 'live') continue;
+      var dx = px - b.x, dy = py - b.y;
+      var d  = Math.sqrt(dx * dx + dy * dy);
+      if (d < BUBBLE_R * 2.0 && d < best_d) { best_d = d; best_i = i; }
+    }
+    if (best_i < 0) return;
+    catchBubble(best_i);
+  }
+
+  function catchBubble(i) {
+    var b  = bubbles[i];
+    var frac = b.t / b.life;   // 0 = just spawned, 1 = expired
+    // "peak brightness" = ring nearly full (frac LOW means ring FULL)
+    var ringFull = 1.0 - frac; // 1 = perfectly full ring
+
+    if (frac >= 1.0) return;   // already expired (shouldn't happen but guard)
+
+    var perfect = ringFull >= (1.0 - CATCH_WIN);  // tapped while ring still very full
+    var near    = !perfect && ringFull < NEAR_THRESH; // caught it just barely
+
+    b.state = 'caught';
+    b.popT  = 0;
+
+    combo++;
+    score++;
+
+    if (window.J) {
+      if (perfect)       J.perfect(combo);
+      else if (near)     J.near();
+      else               J.hit(combo);
+      if (combo >= COMBO_GOLD) J.gold();
+      J.tension(Math.min(combo / 12, 1));
+    }
+
+    if (perfect) { hitStop = 4; zoom = 1.03; }
+    if (near)    { shakeAmt = 4; }
+
+    // check dare beat
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(score);
+    }
+
+    if (perfect) flash('PERFECT', TEAL, 46);
+    else if (near) {
+      flash('SO CLOSE!', VERM, 38);
+      if (window.LOOP) LOOP.emit('near_miss', { n: score, frac: +frac.toFixed(3) });
+    } else {
+      flash('+1', GOLD, 34);
+    }
+
+    if (window.LOOP) LOOP.emit('story_caught', { n: score, frac: +frac.toFixed(3), perfect: perfect });
+
+    if (score > best) { best = score; try { localStorage.setItem('sc_best', String(best)); } catch (_) {} }
+  }
+
+  function expireBubble(i) {
+    var b = bubbles[i];
+    b.state = 'expired';
+    b.popT  = 0;
+    combo   = 0;   // combo breaks on miss
+    shakeAmt = 3;
+    if (window.J) J.tension(0);
+    flash('EXPIRED', VERM, 28);
+    if (window.LOOP) LOOP.emit('story_expired', { n: score });
+    // 3 expirations trigger game over
+    expiredCount++;
+    if (expiredCount >= 3) {
+      setTimeout(function () { gameOver(); }, 400);
+    }
+  }
+
+  var expiredCount = 0;
+
+  function gameOver() {
+    if (phase !== 'play') return;
+    phase  = 'over';
+    overAt = performance.now();
+    shakeAmt = 8;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.death(Math.min(0.3 + score / 30, 1));
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    bubbles = []; flashes = [];
+    combo = 0; score = 0;
+    spawnTimer = 0; spawnInterval = 2.0; speedMul = 1.0;
+    expiredCount = 0;
+    dareBeaten = false;
+    botDecisions = {}; botBubblesSeen = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0,
+                   x: W / 2 + (rng() - 0.5) * 60, y: 310 });
+  }
+
+  // ── Demo autopilot ───────────────────────────────────────────────────────────
+  // arc: good catches → near-fail miss → recovery → then miss → over
+  // demoScript: fraction of ring life to wait before catching (0 = instant, 0.7 = nearly expired)
+  // 'miss' = let it expire; 'near' = catch at NEAR_THRESH edge
+  var demoScript   = [0.05, 0.10, 0.08, 'near', 0.06, 'miss', 'miss', 'miss'];
+  var demoIdx      = 0;
+  // hesitation per step (in sim frames ~60fps): how many frames AFTER target frac to wait
+  var demoWaits    = [22, 18, 30, 48, 20, 0, 0, 0];
+  var demoHesitate = 0;
+  var demoDidHesitate = false;
+
+  // bot: per-bubble decision made at first sight; ~30% bubbles are intentional misses
+  var botDecisions = {}; // bubble index → targetFrac or 'miss'
+  var botBubblesSeen = 0;
+
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      demoPilot(dt);
+    } else if (BOT) {
+      botPilot(dt);
+    }
+  }
+
+  function demoPilot() {
+    if (demoIdx >= demoScript.length) return;
+    // find a live bubble to act on
+    var b = null, bi = -1;
+    for (var i = 0; i < bubbles.length; i++) {
+      if (bubbles[i].state === 'live') { b = bubbles[i]; bi = i; break; }
+    }
+    if (!b) return;
+
+    var want = demoScript[demoIdx];
+
+    if (want === 'miss') {
+      // let it expire naturally — advance script when bubble expires (t >= life)
+      if (b.t / b.life >= 0.98) {
+        demoIdx++;
+        demoHesitate = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 20;
+        demoDidHesitate = false;
+      }
+      return;
+    }
+
+    var targetFrac = (want === 'near') ? NEAR_THRESH + 0.05 : want;
+
+    if (demoHesitate > 0) { demoHesitate--; return; }
+
+    var frac = b.t / b.life;
+    if (frac >= targetFrac) {
+      catchBubble(bi);
+      demoIdx++;
+      demoHesitate = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 20;
+      demoDidHesitate = false;
+    }
+  }
+
+  function botPilot() {
+    for (var i = 0; i < bubbles.length; i++) {
+      var b = bubbles[i];
+      if (b.state !== 'live') continue;
+
+      // assign a decision the first time we see this bubble
+      // use the bubble's array index + position as a stable key
+      var key = b.x + '_' + b.y + '_' + b.hue;
+      if (botDecisions[key] === undefined) {
+        botBubblesSeen++;
+        // miss every 3rd bubble to guarantee expiries leading to game over
+        if (botBubblesSeen % 3 === 0) {
+          botDecisions[key] = 'miss';
+        } else {
+          botDecisions[key] = 0.08 + rng() * 0.45; // catch at a random point in the window
+        }
+      }
+
+      var decision = botDecisions[key];
+      if (decision === 'miss') continue; // let this one expire
+
+      var frac = b.t / b.life;
+      if (frac >= decision && frac < 0.98) {
+        delete botDecisions[key];
+        catchBubble(i);
+        return; // one catch per frame to feel human
+      }
+    }
+  }
+
+  // ── Input ─────────────────────────────────────────────────────────────────────
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, px, py) { return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') { tryTap(px !== undefined ? px : W / 2, py !== undefined ? py : H / 2); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'caught' }); return;
+      }
+      expiredCount = 0;
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ── Render helpers ────────────────────────────────────────────────────────────
+  function drawBubble(b, now) {
+    if (b.state === 'caught' || b.state === 'expired') {
+      // pop animation
+      b.popT += 1 / 60;
+      var pt = Math.min(b.popT * 3, 1);
+      cx.save();
+      cx.globalAlpha = 1 - pt;
+      cx.translate(b.x, b.y);
+      cx.scale(1 + pt * 0.6, 1 + pt * 0.6);
+      // draw shrinking ring burst
+      cx.beginPath();
+      cx.arc(0, 0, BUBBLE_R, 0, Math.PI * 2);
+      cx.strokeStyle = b.state === 'caught'
+        ? 'hsl(' + b.hue + ',80%,65%)'
+        : 'rgba(255,80,80,0.7)';
+      cx.lineWidth = 4;
+      cx.stroke();
+      cx.restore();
+      return;
+    }
+
+    var frac    = b.t / b.life;           // 0 → 1 as it ages
+    var ringAmt = 1.0 - frac;             // 1 = full ring, 0 = gone
+
+    // glow at high ringAmt (peak brightness cue)
+    var glowA = ringAmt * 0.7;
+    cx.save();
+    cx.shadowColor = 'hsl(' + b.hue + ',100%,60%)';
+    cx.shadowBlur  = 18 * glowA;
+
+    // avatar circle fill
+    cx.beginPath();
+    cx.arc(b.x, b.y, BUBBLE_R - 2, 0, Math.PI * 2);
+    cx.fillStyle = 'hsl(' + b.hue + ',40%,22%)';
+    cx.fill();
+
+    // avatar face (simple)
+    cx.fillStyle = 'hsl(' + b.hue + ',60%,60%)';
+    cx.font = '700 14px -apple-system, Arial';
+    cx.textAlign = 'center';
+    cx.fillText(avatarChar(b.hue), b.x, b.y + 5);
+
+    // ring arc
+    var startA = -Math.PI / 2;
+    var endA   = startA + Math.PI * 2 * ringAmt;
+
+    cx.beginPath();
+    cx.arc(b.x, b.y, BUBBLE_R, startA, endA);
+    var ringColor = frac < CATCH_WIN
+      ? 'hsl(' + b.hue + ',90%,60%)'    // peak: bright, catch me!
+      : frac < 0.6
+      ? GOLD                              // mid: getting urgent
+      : VERM;                             // late: danger
+    cx.strokeStyle = ringColor;
+    cx.lineWidth   = 4;
+    cx.lineCap     = 'round';
+    cx.stroke();
+
+    // tick mark at "perfect" zone boundary (visual guide)
+    var perfectA = startA + Math.PI * 2 * (1 - CATCH_WIN);
+    cx.beginPath();
+    cx.arc(b.x, b.y, BUBBLE_R + 4, perfectA - 0.04, perfectA + 0.04);
+    cx.strokeStyle = 'rgba(255,255,255,0.5)';
+    cx.lineWidth = 2;
+    cx.stroke();
+
+    cx.restore();
+
+    // urgency pulse when ring < 30%
+    if (ringAmt < 0.3) {
+      var pulse = 0.4 + 0.6 * Math.abs(Math.sin(now / 150));
+      cx.save();
+      cx.globalAlpha = pulse * 0.25;
+      cx.beginPath();
+      cx.arc(b.x, b.y, BUBBLE_R + 8, 0, Math.PI * 2);
+      cx.strokeStyle = VERM;
+      cx.lineWidth = 3;
+      cx.stroke();
+      cx.restore();
+    }
+  }
+
+  function avatarChar(hue) {
+    // simple letter avatars from hue
+    var chars = ['A','B','C','D','E','F','G'];
+    return chars[Math.floor(hue / 55) % chars.length];
+  }
+
+  // ── Main loop ─────────────────────────────────────────────────────────────────
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // ── update ──
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else if (phase === 'play') {
+      // update bubbles
+      var dtSec = dt * 16.667 / 1000;
+      var toRemove = [];
+      for (var i = 0; i < bubbles.length; i++) {
+        var b = bubbles[i];
+        if (b.state === 'live') {
+          b.t += dtSec * speedMul;
+          if (b.t >= b.life) {
+            expireBubble(i);
+          }
+        } else if (b.state === 'caught' || b.state === 'expired') {
+          if (b.popT > 0.4) toRemove.push(i);
+        }
+      }
+      for (var j = toRemove.length - 1; j >= 0; j--) bubbles.splice(toRemove[j], 1);
+
+      // spawn new bubbles
+      spawnTimer -= dtSec;
+      if (spawnTimer <= 0) {
+        var live = bubbles.filter(function (x) { return x.state === 'live'; }).length;
+        var want = Math.min(2 + Math.floor(score / 5), 4);
+        spawnBubbleWave(Math.max(0, want - live));
+        spawnTimer = spawnInterval;
+        // ramp up speed
+        speedMul     = 1.0 + score * 0.04;
+        spawnInterval = Math.max(0.8, 2.0 - score * 0.08);
+      }
+
+      autopilot(dt);
+    }
+
+    // ── draw ──
+    cx.save();
+    // juice transforms
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom     += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // title screen
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Arial';
+      cx.fillText('STORY CATCH', W / 2, 280);
+      cx.fillStyle = TEAL; cx.font = '700 17px -apple-system, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillText('TAP RINGS BEFORE THEY EXPIRE', W / 2, 330);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Arial';
+      cx.fillText('3 expirations = game over', W / 2, 360);
+    }
+
+    // challenge card (demo beat 1)
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Arial';
+      cx.fillText('18', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // play
+    if (phase === 'play') {
+      // draw all bubbles
+      for (var i = 0; i < bubbles.length; i++) {
+        drawBubble(bubbles[i], now);
+      }
+
+      // HUD: score
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)'; cx.font = '800 64px -apple-system, Arial';
+      cx.fillText(score, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 13px -apple-system, Arial';
+      cx.fillText('BEST ' + best, W / 2, 120);
+
+      // expiry strikes
+      drawStrikes();
+
+      // combo
+      if (combo >= 2) {
+        var cs = Math.min(1, combo / 8);
+        cx.fillStyle = 'hsl(' + Math.floor(cs * 50) + ',100%,60%)';
+        cx.font = '900 ' + (22 + combo * 2) + 'px -apple-system, Arial';
+        cx.textAlign = 'center';
+        cx.fillText('×' + combo, W / 2, 148);
+      }
+
+      // incoming dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Arial';
+        cx.textAlign = 'center';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 170);
+      }
+    }
+
+    // game over card
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      // still render bubbles underneath for beauty
+      for (var i = 0; i < bubbles.length; i++) drawBubble(bubbles[i], now);
+
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Arial';
+      cx.fillText('TOO SLOW.', W / 2, 290);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Arial';
+      cx.fillText(score + ' caught', W / 2, 338);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 382);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 406);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 450);
+        cx.globalAlpha = 1;
+
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA
+    if (phase === 'cta') {
+      var t   = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Arial';
+      cx.fillText('STORY CATCH', W / 2, 292);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Arial';
+      cx.fillText('caught ' + (window.__demoScore || 18) + '. your ring is draining.', W / 2, 336);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 18), W / 2, 406);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // floating reward flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a  = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 1.2);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawStrikes() {
+    // 3 strike indicators bottom bar
+    var sx = W / 2 - 32, sy = H - 50;
+    for (var s = 0; s < 3; s++) {
+      cx.beginPath();
+      cx.arc(sx + s * 32, sy, 8, 0, Math.PI * 2);
+      if (s < expiredCount) {
+        cx.fillStyle = VERM;
+        cx.fill();
+      } else {
+        cx.strokeStyle = 'rgba(255,255,255,0.3)';
+        cx.lineWidth = 2;
+        cx.stroke();
+      }
+    }
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

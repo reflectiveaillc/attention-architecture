@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Head Dodge — Tilt</title>
+<!--
+  LOOP / attention-architecture — Head Dodge (FACE-CONTROL engine)
+  The player TILTS THEIR HEAD left/right to slide a runner dodging falling blocks.
+  Control: FC.sig.headTilt (-1 left .. +1 right) from the shared face-control.js lib.
+  Dead-zone ±0.12 — small wobble doesn't steer.
+  Funny-face payoff: frantic side-to-side head-bobbing caught on webcam.
+  PiP composited into the canvas so a single recording captures face + gameplay.
+  AUTO modes (?demo=1 / ?bot=1): no camera, no MediaPipe — simulated face animates
+  to show head-tilt (tilted oval head in corner PiP).
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:none;
+               font-family:-apple-system,'Helvetica Neue',Arial,sans-serif; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+  video { display:none; }
+  #ui { position:fixed; left:0; right:0; bottom:max(16px,env(safe-area-inset-bottom)); display:flex; gap:10px; justify-content:center; z-index:10; }
+  button { background:#12151d; color:#fff; border:1px solid rgba(255,255,255,.15); border-radius:99px;
+           padding:12px 20px; font-size:15px; font-weight:800; cursor:pointer; }
+  button.rec { background:#e8502e; border-color:#e8502e; }
+  button.rec.on { animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.55; } }
+  #perm { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; text-align:center; padding:24px; z-index:20; background:#0b0d12; }
+  #perm h1 { font-size:34px; font-weight:900; margin:0; }
+  #perm p { color:rgba(255,255,255,.6); font-size:15px; max-width:320px; margin:0; }
+  #perm .big { background:#e8502e; border-color:#e8502e; font-size:18px; padding:16px 28px; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="perm">
+  <h1>HEAD DODGE</h1>
+  <p>Tilt your head <b>left &amp; right</b> to slide your runner and dodge the falling blocks. The wilder the head-bob, the higher the score.</p>
+  <button class="big" id="start">▶ ALLOW CAMERA &amp; PLAY</button>
+  <p style="font-size:12px;opacity:.5">camera stays on your device — nothing is uploaded</p>
+</div>
+<div id="ui" style="display:none">
+  <button id="rec" class="rec">● RECORD</button>
+</div>
+<script>window.LOOP_GAME = 'head-dodge';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script src="../../js/face-control.js"></script>
+<script type="module">
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+  var AUTO = DEMO || BOT;   // no camera in scripted modes
+
+  function mulberry32(a){ return function(){ a|=0; a=a+0x6D2B79F5|0; var t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return((t^t>>>14)>>>0)/4294967296; }; }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio||1,2), scale=1;
+  function fit(){ var s=Math.min(window.innerWidth/W,window.innerHeight/H); scale=s; cv.style.width=(W*s)+'px'; cv.style.height=(H*s)+'px'; cv.width=W*dpr; cv.height=H*dpr; cx.setTransform(dpr,0,0,dpr,0,0); }
+  window.addEventListener('resize',fit); fit();
+
+  var VERM='#e8502e', TEAL='#2ec5b6', GOLD='#f2b134', INK='#0b0d12';
+
+  // shared face-control library
+  var FC = window.FaceControl;
+
+  // ---- game constants ----
+  var RUNNER_W=36, RUNNER_H=54, BLOCK_W=60, BLOCK_H=28;
+  var LANE_COUNT=5, LANE_W=W/LANE_COUNT;
+  var FLOOR=H-80, BLOCK_SPEED_BASE=2.2, BLOCK_EVERY=130; // FACE-TUNED: slow start, generous spacing
+  // Tilt thresholds — low so a natural lean triggers, hysteresis so it's stable
+  var TILT_DEAD = 0.06; // inner dead-zone: ignore micro-wobble
+  var TILT_ON   = 0.12; // a SMALL natural head lean activates steering
+  var TILT_OFF  = 0.07; // hysteresis: stay active until tilt drops below this
+
+  // ---- game state ----
+  var st, blocks, spawnT, best=0, shakeAmt=0, dareBeaten=false;
+  try{ best=+localStorage.getItem('hd_best')||0; }catch(_){}
+
+  // tiltSmoothed: smoothed FC.sig.headTilt used for rendering and movement
+  // controlActive: true when |tilt| exceeds threshold (with hysteresis)
+  var tiltSmoothed=0, controlActive=false, lastSteerEmit=0;
+
+  // test hook — exposes key state for auto-validation
+  window.__st = function(){ return { st:st, tiltSmoothed:tiltSmoothed, controlActive:controlActive, blocks:blocks, TILT_ON:TILT_ON, TILT_OFF:TILT_OFF }; };
+
+  // simulated tilt for demo/bot
+  var autoTilt=0;
+
+  function newRun(){
+    st={ phase:'ready', rx:W/2, score:0, overAt:0, speed:BLOCK_SPEED_BASE };
+    blocks=[]; spawnT=0; dareBeaten=false;
+    if(AUTO){ st.phase='play'; start(); }
+  }
+  function start(){
+    st.phase='play'; st.rx=W/2; st.score=0; st.speed=BLOCK_SPEED_BASE; blocks=[]; spawnT=0; dareBeaten=false;
+    runStartTs=Date.now();
+    if(window.LOOP) LOOP.emit('play_start',{seed:SEED});
+  }
+  var runStartTs=0, botRunsDone=0, ctaAt=0;
+
+  function spawnBlock(){
+    var lane = Math.floor(rng()*LANE_COUNT);
+    var bx = (lane + 0.5)*LANE_W;
+    blocks.push({ x:bx, y:-BLOCK_H, scored:false });
+  }
+
+  function gameOver(){
+    st.phase='over'; st.overAt=performance.now(); shakeAmt=12;
+    var dur=(Date.now()-runStartTs)/1000;
+    var nb=st.score>best; if(nb){ best=st.score; try{ localStorage.setItem('hd_best',String(best)); }catch(_){} }
+    if(window.J){ J.death(Math.min(0.3+st.score/20,1)); if(nb) setTimeout(function(){ J.fanfare(); },450); }
+    if(DEMO) window.__demoScore=st.score;
+    if(window.LOOP) LOOP.emit('game_over',{score:st.score,dur_s:+dur.toFixed(1)});
+    if(BOT){ botRunsDone++; if(botRunsDone>=BOT_RUNS) window.__botDone=true; else setTimeout(function(){ newRun(); },700); }
+    if(DEMO){ setTimeout(function(){ st.phase='cta'; ctaAt=performance.now(); setTimeout(function(){ window.__demoDone=true; },3200); },1400); }
+  }
+
+  // ---- input: FACE ONLY. Tap/space ONLY restarts after a crash — never steers.
+  // The movement is driven exclusively by tilting your head (FC.sig.headTilt).
+  function tapRestart(){ if(AUTO) return; if(st.phase==='over'&&performance.now()-st.overAt>500) newRun(); }
+  window.addEventListener('keydown',function(e){
+    if(e.code==='Space'){e.preventDefault(); tapRestart();}
+  });
+  cv.addEventListener('pointerdown', tapRestart);
+
+  // ---- camera start (shared FC lib) ----
+  async function startCamera(){
+    document.getElementById('perm').style.display='none';
+    document.getElementById('ui').style.display='flex';
+    await FC.start();   // secure-context check + camera + MediaPipe (in the lib)
+    newRun();
+    requestAnimationFrame(frame);
+  }
+  document.getElementById('start').addEventListener('click', startCamera);
+
+  // ---- autopilot for demo/bot ----
+  var autoDir=0;
+  function computeAutoTilt(dt){
+    if(st.phase!=='play') return 0;
+    // Find the lowest incoming block and dodge away from it.
+    var threat=null, threatY=-Infinity;
+    for(var i=0;i<blocks.length;i++){
+      var b=blocks[i];
+      if(b.y>threatY && b.y<FLOOR-BLOCK_H){ threatY=b.y; threat=b; }
+    }
+    // Demo give-up cap: choke after 6 dodges; bot give-up after score-based cap.
+    var giveUp=(DEMO && st.score>=6)||(BOT && st.score>=3+botRunsDone*2);
+    if(giveUp) return 0;
+    if(!threat) return autoDir;
+    var dx=threat.x - st.rx;
+    if(Math.abs(dx)<RUNNER_W+BLOCK_W*0.5){
+      autoDir = dx>0 ? -1 : 1;
+    } else {
+      autoDir = (W/2 - st.rx)>10 ? 0.4 : (W/2 - st.rx)<-10 ? -0.4 : 0;
+    }
+    return autoDir;
+  }
+
+  // ---- render loop ----
+  var last=performance.now();
+  function frame(now){
+    var dt=Math.min((now-last)/16.667,3); last=now;
+
+    // --- tilt input ---
+    var rawTilt;
+    if(AUTO){
+      autoTilt=computeAutoTilt(dt);
+      tiltSmoothed += (autoTilt - tiltSmoothed)*0.18*dt;
+      // hysteresis for AUTO too
+      controlActive = controlActive ? Math.abs(tiltSmoothed)>TILT_OFF : Math.abs(tiltSmoothed)>TILT_ON;
+      rawTilt = tiltSmoothed;
+    } else {
+      FC.update(now);
+      // face-only: head tilt is the sole driver
+      var faceTilt = FC.sig.headTilt;
+      // Snappier smoothing (0.4) — a SMALL natural lean should register fast
+      tiltSmoothed += (faceTilt - tiltSmoothed)*0.4*dt;
+      // Hysteresis: activate at TILT_ON, stay active until below TILT_OFF
+      var wasActive = controlActive;
+      controlActive = controlActive ? Math.abs(tiltSmoothed)>TILT_OFF : Math.abs(tiltSmoothed)>TILT_ON;
+      // steer event on the activation edge (throttled) — proves face→game response
+      if(controlActive && !wasActive && st && st.phase==='play' && now-lastSteerEmit>400){
+        lastSteerEmit=now; if(window.LOOP) LOOP.emit('steer',{dir:tiltSmoothed>0?'r':'l'});
+      }
+      // Proportional dead-zone: within ±TILT_DEAD → zero, outside → full tilt value
+      rawTilt = Math.abs(tiltSmoothed) > TILT_DEAD ? tiltSmoothed : 0;
+      // FACE STARTS THE RUN: continuous control has no discrete tap to begin play,
+      // so start once the face is detected (or the first head tilt).
+      if(st && st.phase==='ready' && (FC.faceSeen || controlActive)) start();
+    }
+
+    // --- update runner position ---
+    if(st && st.phase==='play'){
+      // Proportional steering: max speed 3.6px/frame (down from 5.8), sqrt for gentler feel
+      var absTilt = Math.abs(rawTilt);
+      var speed = 3.6 * Math.sqrt(absTilt);
+      st.rx += rawTilt * speed * dt;
+      var half=RUNNER_W/2;
+      if(st.rx<half) st.rx=half;
+      if(st.rx>W-half) st.rx=W-half;
+
+      // Gentle ramp: first 5 dodges = slow, then gradually speeds up (cap at 2x base)
+      st.speed = BLOCK_SPEED_BASE + Math.min(st.score * 0.06, BLOCK_SPEED_BASE);
+
+      // Spawn rate also ramps gently: much slower at start
+      spawnT+=dt;
+      if(spawnT>=BLOCK_EVERY/(1+st.score*0.012)){ spawnT=0; spawnBlock(); }
+
+      for(var i=blocks.length-1;i>=0;i--){
+        var b=blocks[i]; b.y+=st.speed*dt;
+        if(!b.scored && b.y>FLOOR+BLOCK_H){ b.scored=true; st.score++;
+          if(window.J) J.perfect(st.score);
+          if(!AUTO&&window.SHARE&&SHARE.dare!==null&&!dareBeaten&&st.score>SHARE.dare){ dareBeaten=true; if(window.J) J.fanfare(); SHARE.beaten(st.score); }
+        }
+        if(b.y>H+BLOCK_H) blocks.splice(i,1);
+        if(b.y+BLOCK_H>FLOOR-RUNNER_H && b.y<FLOOR+4 &&
+           b.x-BLOCK_W/2<st.rx+RUNNER_W/2 && b.x+BLOCK_W/2>st.rx-RUNNER_W/2){
+          gameOver();
+        }
+      }
+    }
+
+    // ---- draw ----
+    cx.save();
+    if(shakeAmt>0.3){ cx.translate((Math.random()-0.5)*shakeAmt,(Math.random()-0.5)*shakeAmt); } shakeAmt*=Math.pow(0.82,dt);
+
+    var bg=cx.createLinearGradient(0,0,0,H); bg.addColorStop(0,'#0e1830'); bg.addColorStop(1,'#0b0d12');
+    cx.fillStyle=bg; cx.fillRect(0,0,W,H);
+
+    // lane lines
+    cx.strokeStyle='rgba(255,255,255,0.06)'; cx.lineWidth=1;
+    for(var l=1;l<LANE_COUNT;l++){
+      cx.beginPath(); cx.moveTo(l*LANE_W,0); cx.lineTo(l*LANE_W,H); cx.stroke();
+    }
+
+    // floor
+    cx.fillStyle='rgba(46,197,182,0.15)'; cx.fillRect(0,FLOOR,W,4);
+    cx.fillStyle='rgba(46,197,182,0.06)'; cx.fillRect(0,FLOOR+4,W,H-FLOOR-4);
+
+    // falling blocks
+    for(var j=0;j<blocks.length;j++){
+      var bb=blocks[j];
+      var bLeft=bb.x-BLOCK_W/2, bTop=bb.y;
+      var bg2=cx.createLinearGradient(bLeft,0,bLeft+BLOCK_W,0);
+      bg2.addColorStop(0,VERM); bg2.addColorStop(1,'#c0392b');
+      cx.fillStyle=bg2;
+      cx.beginPath();
+      if(cx.roundRect) cx.roundRect(bLeft,bTop,BLOCK_W,BLOCK_H,6);
+      else cx.rect(bLeft,bTop,BLOCK_W,BLOCK_H);
+      cx.fill();
+      cx.fillStyle='rgba(255,255,255,0.15)';
+      cx.fillRect(bLeft+4,bTop+4,BLOCK_W-8,4);
+    }
+
+    // runner
+    if(st){
+      var rx=st.rx;
+      cx.fillStyle=TEAL;
+      cx.beginPath();
+      if(cx.roundRect) cx.roundRect(rx-RUNNER_W/2,FLOOR-RUNNER_H,RUNNER_W,RUNNER_H,8);
+      else cx.rect(rx-RUNNER_W/2,FLOOR-RUNNER_H,RUNNER_W,RUNNER_H);
+      cx.fill();
+      cx.fillStyle=GOLD;
+      cx.beginPath(); cx.arc(rx,FLOOR-RUNNER_H-14,14,0,Math.PI*2); cx.fill();
+      cx.fillStyle='#111';
+      cx.beginPath(); cx.arc(rx-5,FLOOR-RUNNER_H-16,3,0,Math.PI*2); cx.fill();
+      cx.beginPath(); cx.arc(rx+5,FLOOR-RUNNER_H-16,3,0,Math.PI*2); cx.fill();
+      // lean indicator
+      cx.fillStyle='rgba(255,255,255,0.22)';
+      var lean=tiltSmoothed*8;
+      cx.beginPath(); cx.arc(rx+lean,FLOOR-RUNNER_H/2,5,0,Math.PI*2); cx.fill();
+    }
+
+    // webcam PiP — use FC.drawPiP (mirrors FC.video, red border when active)
+    var camW=118, camH=88, cpx=W-camW-12, cpy=12;
+    if(!AUTO){
+      // barVal: fill from center outward based on tilt direction/magnitude
+      var barMag=Math.min(1,Math.abs(tiltSmoothed)*1.4);
+      FC.drawPiP(cx, cpx, cpy, camW, camH, controlActive, barMag, W, H);
+
+      // status label
+      var fcLabel=FC.statusLabel()||'TILT HEAD';
+      cx.fillStyle=(fcLabel.indexOf('http')>=0||fcLabel.indexOf('blocked')>=0)?GOLD:'rgba(255,255,255,0.6)';
+      cx.font='700 9px Menlo,monospace'; cx.textAlign='center';
+      cx.fillText(fcLabel.toUpperCase(),cpx+camW/2,cpy+camH+22);
+    } else {
+      // AUTO: simulated face - tilting oval head
+      cx.save();
+      cx.strokeStyle='rgba(255,255,255,0.3)'; cx.lineWidth=2;
+      cx.beginPath();
+      if(cx.roundRect) cx.roundRect(cpx,cpy,camW,camH,12); else cx.rect(cpx,cpy,camW,camH);
+      cx.stroke(); cx.clip();
+      cx.fillStyle='#1a1230'; cx.fillRect(cpx,cpy,camW,camH);
+      var faceX=cpx+camW/2, faceY=cpy+camH/2-4;
+      cx.save();
+      cx.translate(faceX,faceY);
+      cx.rotate(tiltSmoothed*0.45);
+      cx.fillStyle=GOLD; cx.beginPath(); cx.ellipse(0,0,22,30,0,0,Math.PI*2); cx.fill();
+      var eyeOpen=2+Math.abs(tiltSmoothed)*4;
+      cx.fillStyle='#111';
+      cx.beginPath(); cx.ellipse(-8,-8,4,eyeOpen,0,0,Math.PI*2); cx.fill();
+      cx.beginPath(); cx.ellipse(8,-8,4,eyeOpen,0,0,Math.PI*2); cx.fill();
+      var mouthW=6+Math.abs(tiltSmoothed)*10;
+      cx.fillStyle=VERM;
+      cx.beginPath(); cx.ellipse(0,12,mouthW,4,0,0,Math.PI*2); cx.fill();
+      if(Math.abs(tiltSmoothed)>0.4){
+        cx.strokeStyle='rgba(255,255,255,0.6)'; cx.lineWidth=2;
+        var hairX=tiltSmoothed>0?18:-18;
+        cx.beginPath(); cx.moveTo(hairX,-30); cx.lineTo(hairX+tiltSmoothed*14,-22); cx.stroke();
+      }
+      cx.restore();
+      cx.restore();
+      // DEMO label under PiP
+      cx.fillStyle='rgba(255,255,255,0.6)';
+      cx.font='700 9px Menlo,monospace'; cx.textAlign='center';
+      cx.fillText('DEMO',cpx+camW/2,cpy+camH+22);
+    }
+
+    // score
+    cx.textAlign='center'; cx.fillStyle='#fff'; cx.font='900 56px -apple-system,Helvetica,Arial';
+    if(st&&(st.phase==='play'||st.phase==='over')) cx.fillText(st.score,W/2,90);
+    cx.fillStyle='rgba(255,255,255,0.4)'; cx.font='600 12px Menlo,monospace'; cx.fillText('BEST '+best,W/2,112);
+
+    // phase overlays
+    if(st&&st.phase==='ready'){
+      cx.fillStyle=VERM; cx.font='800 18px -apple-system,Helvetica,Arial';
+      cx.globalAlpha=0.6+0.4*Math.sin(now/300); cx.fillText('TILT YOUR HEAD TO DODGE',W/2,H/2-40);
+      cx.globalAlpha=0.5+0.3*Math.sin(now/400+1); cx.font='700 13px -apple-system,Helvetica,Arial';
+      cx.fillStyle='#fff'; cx.fillText('← lean left or right →',W/2,H/2-14);
+      cx.globalAlpha=1;
+    }
+    if(st&&st.phase==='over'){
+      cx.fillStyle='rgba(11,13,18,0.6)'; cx.fillRect(0,0,W,H);
+      cx.fillStyle=VERM; cx.font='900 42px -apple-system,Helvetica,Arial'; cx.fillText('SMASHED.',W/2,H/2-30);
+      cx.fillStyle='#fff'; cx.font='800 24px -apple-system,Helvetica,Arial'; cx.fillText(st.score+' dodges',W/2,H/2+8);
+      if(!AUTO){ cx.fillStyle=TEAL; cx.font='700 15px -apple-system,Helvetica,Arial';
+        cx.globalAlpha=0.6+0.4*Math.sin(now/280); cx.fillText('tap to play again',W/2,H/2+50); cx.globalAlpha=1; }
+    }
+    if(st&&st.phase==='cta'){
+      var tt=(now-ctaAt)/1000, ee=Math.min(1,tt*2.2);
+      cx.fillStyle='rgba(11,13,18,'+(0.82*ee)+')'; cx.fillRect(0,0,W,H);
+      cx.globalAlpha=ee;
+      cx.fillStyle='#fff'; cx.font='900 40px -apple-system,Helvetica,Arial'; cx.fillText('HEAD DODGE',W/2,H/2-30);
+      cx.fillStyle=TEAL; cx.font='700 17px -apple-system,Helvetica,Arial'; cx.fillText('tilt your head. dodge everything.',W/2,H/2+6);
+      cx.fillStyle=VERM; cx.font='900 24px -apple-system,Helvetica,Arial'; cx.fillText('▶ PLAY NOW',W/2,H/2+52);
+      cx.globalAlpha=1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- recording (shared FaceControl lib) ----
+  var recBtn=document.getElementById('rec');
+  recBtn.addEventListener('click',function(){
+    var started=FC.toggleRecord(cv,'head-dodge.webm',function(){
+      recBtn.textContent='● RECORD'; recBtn.classList.remove('on');
+      if(window.LOOP) LOOP.emit('recording_saved',{score:st?st.score:0});
+    });
+    if(started){ recBtn.textContent='■ STOP & SAVE'; recBtn.classList.add('on'); }
+  });
+
+  // scripted modes auto-start (no camera prompt)
+  if(AUTO){ document.getElementById('perm').style.display='none'; newRun(); requestAnimationFrame(frame); }
+})();
+</script>
+</body>
+</html>

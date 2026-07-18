@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Lip Sync Duel — Tilt</title>
+<!--
+  LOOP / attention-architecture — Lip Sync Duel
+  Circuits: 03-social (duet participation), 01-rpe (variable reward on timing), 05-ease (thumb knows the move)
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N&seed=M  imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'lip-sync-duel';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // palette
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ─── Lyric lines ───────────────────────────────────────────────────────────
+  // Each line is an array of words. One word is "active" — it must be tapped
+  // when it crosses the marker. Decoy words blink early to bait a bad tap.
+  var LINES = [
+    ['drop', 'the', 'beat', 'now', 'feel', 'it'],
+    ['move', 'your', 'body', 'yeah', 'lose', 'control'],
+    ['light', 'up', 'the', 'night', 'we', 'are', 'alive'],
+    ['hit', 'me', 'with', 'that', 'fire', 'and', 'soul'],
+    ['raise', 'your', 'voice', 'scream', 'loud', 'and', 'free'],
+    ['let', 'the', 'music', 'take', 'you', 'higher'],
+    ['dance', 'until', 'the', 'morning', 'light'],
+    ['echo', 'in', 'the', 'dark', 'tonight'],
+    ['shine', 'bright', 'like', 'a', 'nova', 'star'],
+    ['ride', 'the', 'wave', 'wherever', 'you', 'are'],
+  ];
+
+  // ─── Game state ─────────────────────────────────────────────────────────────
+  var state, flashes, hitStop, zoom, shakeAmt, dareBeaten, runStartTs;
+  var ctaAt = 0, challengeAt = 0, best = 0;
+  try { best = +localStorage.getItem('lsd_best') || 0; } catch (_) {}
+
+  // layout constants
+  var SCROLL_LANE_Y = H / 2;   // vertical center of lyric lane
+  var MARKER_X = W / 2;        // where the active word must hit
+  var WORD_SPACING = 88;       // px between word centers
+  var HIT_WINDOW = 34;         // px radius around marker = perfect zone
+  var NEAR_WINDOW = 62;        // wider near-miss zone
+  var DECOY_FLASH_DURATION = 18; // frames a decoy lights up
+
+  function newGame() {
+    state = {
+      phase: 'title',        // title | challenge | play | over | cta
+      lineIdx: 0,            // which lyric line we're on
+      words: [],             // [{text, x, isActive, decoyFlash}]
+      scrollX: 0,            // rightward offset that moves words left
+      scrollSpeed: 1.6,      // px/frame base, scales up per round
+      score: 0,
+      combo: 0,
+      bars: 0,               // bars "sung" (successful active-word hits)
+      round: 0,
+      overAt: 0,
+      missX: 0,              // x pos where the miss happened
+    };
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { startRun(); return; }
+  }
+
+  function buildLine() {
+    var words = LINES[state.lineIdx % LINES.length];
+    var activeIdx = Math.floor(rng() * words.length);
+    // start them off-screen to the right
+    var startX = W + 60;
+    state.words = words.map(function (w, i) {
+      return {
+        text: w,
+        x: startX + i * WORD_SPACING,
+        isActive: (i === activeIdx),
+        decoyFlash: 0,        // countdown timer for decoy glow
+        hit: false,
+      };
+    });
+    state.scrollX = 0;
+    // inject one decoy blink: pick a non-active word that arrives before the active
+    var decoyIdx = -1;
+    for (var d = 0; d < words.length; d++) {
+      if (d !== activeIdx && d < activeIdx) { decoyIdx = d; break; }
+    }
+    if (decoyIdx >= 0) state.words[decoyIdx].isDecoy = true;
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.score = 0; state.combo = 0; state.bars = 0; state.round = 0;
+    state.scrollSpeed = 1.6;
+    state.lineIdx = 0;
+    runStartTs = Date.now();
+    buildLine();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function advanceLine() {
+    state.lineIdx++;
+    state.round++;
+    state.scrollSpeed = 1.6 + state.round * 0.22;   // gets faster each round
+    buildLine();
+  }
+
+  // called when player taps (or autopilot fires)
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.bars, unit: 'bars' }); return;
+      }
+      resetRun(); return;
+    }
+    if (state.phase === 'play') { resolveHit(); }
+  }
+
+  function resolveHit() {
+    // find the active word
+    var activeWord = null;
+    for (var i = 0; i < state.words.length; i++) {
+      if (state.words[i].isActive && !state.words[i].hit) { activeWord = state.words[i]; break; }
+    }
+    if (!activeWord) { return; }
+
+    var dist = Math.abs(activeWord.x - MARKER_X);
+
+    if (dist <= HIT_WINDOW) {
+      // perfect hit
+      activeWord.hit = true;
+      state.combo++;
+      state.bars++;
+      state.score += 10 + state.combo * 2;
+      hitStop = 5; zoom = 1.03;
+      if (window.J) {
+        if (state.combo >= 3) J.perfect(state.combo);
+        else J.hit(state.combo);
+        J.tension(Math.min(state.round / 10, 1));
+      }
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.bars > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.bars);
+      }
+      if (state.combo >= 5) { flash('×' + state.combo + ' COMBO', GOLD, 42); if (window.J) J.gold(); }
+      else flash('NAILED IT', TEAL, 40);
+      if (window.LOOP) LOOP.emit('bar_hit', { n: state.bars, combo: state.combo, dist: +dist.toFixed(1), perfect: true });
+      advanceLine();
+
+    } else if (dist <= NEAR_WINDOW) {
+      // near miss — don't score but don't die
+      shakeAmt = 4;
+      state.combo = 0;
+      flash('SO CLOSE', VERM, 38);
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { n: state.bars, dist: +dist.toFixed(1) });
+      // still advance so the line moves on
+      activeWord.hit = true;
+      advanceLine();
+
+    } else {
+      // miss — game over
+      state.missX = activeWord.x;
+      if (window.J) J.death(Math.min(0.3 + state.bars / 30, 1));
+      shakeAmt = 10;
+      gameOver();
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (state.bars > best) {
+      best = state.bars;
+      try { localStorage.setItem('lsd_best', String(best)); } catch (_) {}
+      if (window.J) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = state.bars;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.bars, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 800);
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.combo = 0; state.bars = 0;
+    state.round = 0; state.lineIdx = 0; state.scrollSpeed = 1.6;
+    flashes = []; dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+  function pctTop(n) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-n / 10)))); }
+
+  // ─── Input ─────────────────────────────────────────────────────────────────
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ─── Bot / Demo autopilot ──────────────────────────────────────────────────
+  var botRunsDone = 0;
+  // demo: sequence of offsets (relative to perfect, px) to simulate human hesitation
+  // 'near' = near miss, 'miss' = intentional off
+  var demoScript = [2, -4, 6, 'near', 1, -3, 'miss'];
+  var demoWaits  = [28, 32, 24, 50, 30, 26, 20]; // hesitation in frames
+  var demoIdx = 0, demoWait = 36;
+  // bot: how many bars each "good run" plays before forced miss
+  var BOT_GOOD_BARS = 6;
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    var activeWord = null;
+    for (var i = 0; i < state.words.length; i++) {
+      if (state.words[i].isActive && !state.words[i].hit) { activeWord = state.words[i]; break; }
+    }
+    if (!activeWord) return;
+
+    var dist = activeWord.x - MARKER_X; // positive means still approaching
+
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      var want = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      if (want === 'miss') {
+        // let word scroll fully past marker then tap (guaranteed miss)
+        if (activeWord.x < MARKER_X - NEAR_WINDOW - 10) {
+          demoIdx++;
+          demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 24;
+          resolveHit();
+        }
+        return;
+      }
+      if (want === 'near') {
+        // tap when word is at near-miss distance
+        var nearTarget = NEAR_WINDOW - 6;
+        if (dist <= nearTarget) {
+          demoIdx++;
+          demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 24;
+          resolveHit();
+        }
+        return;
+      }
+      // numeric offset: tap when word is within |want| px of marker
+      var target = want; // offset relative to center
+      if (Math.abs(dist - target) <= state.scrollSpeed * 0.8) {
+        demoIdx++;
+        demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 24;
+        resolveHit();
+      }
+      return;
+    }
+
+    if (BOT) {
+      // play BOT_GOOD_BARS bars decently, then miss to end the run
+      if (state.bars < BOT_GOOD_BARS) {
+        // aim for a hit with some random error
+        var err = (rng() - 0.5) * 20;
+        if (Math.abs(dist - err) <= state.scrollSpeed * 1.2) {
+          resolveHit();
+        }
+      } else {
+        // forced miss: let the word scroll way past and tap
+        if (activeWord.x < MARKER_X - NEAR_WINDOW - 20) {
+          resolveHit(); // guaranteed miss, triggers gameOver
+        }
+      }
+      return;
+    }
+  }
+
+  // ─── Render ────────────────────────────────────────────────────────────────
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // update scroll
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      if (state.phase === 'play') {
+        // move all words left
+        for (var i = 0; i < state.words.length; i++) {
+          state.words[i].x -= state.scrollSpeed * dt;
+          // decoy flash timer
+          if (state.words[i].isDecoy) {
+            var dw = state.words[i];
+            // start decoy flash when it's 80px before marker
+            if (!dw.hit && !dw.decoyFlash && dw.x < MARKER_X + 80 && dw.x > MARKER_X) {
+              dw.decoyFlash = DECOY_FLASH_DURATION;
+            }
+            if (dw.decoyFlash > 0) dw.decoyFlash -= dt;
+          }
+        }
+        // check if all words scrolled off screen or active word missed
+        var activeWord = null;
+        for (var j = 0; j < state.words.length; j++) {
+          if (state.words[j].isActive && !state.words[j].hit) { activeWord = state.words[j]; break; }
+        }
+        // if active word scrolled past without being hit
+        if (activeWord && activeWord.x < MARKER_X - NEAR_WINDOW - 30 && !DEMO && !BOT) {
+          // treat as miss (player was too late)
+          if (window.J) J.death(Math.min(0.3 + state.bars / 30, 1));
+          shakeAmt = 10;
+          state.missX = activeWord.x;
+          gameOver();
+        } else {
+          autopilot();
+        }
+        // advance line when all words off-screen left
+        var allGone = state.words.every(function (w) { return w.x < -60; });
+        if (allGone && state.phase === 'play') advanceLine();
+      }
+    }
+
+    // juice
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.83, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ── Title screen ───
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('LIP SYNC DUEL', W / 2, 280);
+      cx.fillStyle = VERM; cx.font = '700 17px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillText('TAP ON THE BEAT', W / 2, 328);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('hit the word as it crosses the line', W / 2, 358);
+    }
+
+    // ── Challenge card (demo beat 1) ───
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('BARS TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('7', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // ── Play screen ───
+    if (state.phase === 'play') {
+      // split lane divider
+      cx.strokeStyle = 'rgba(255,255,255,0.08)'; cx.lineWidth = 1;
+      cx.beginPath(); cx.moveTo(0, SCROLL_LANE_Y - 44); cx.lineTo(W, SCROLL_LANE_Y - 44); cx.stroke();
+      cx.beginPath(); cx.moveTo(0, SCROLL_LANE_Y + 44); cx.lineTo(W, SCROLL_LANE_Y + 44); cx.stroke();
+
+      // marker line (vertical)
+      cx.strokeStyle = TEAL; cx.lineWidth = 2;
+      cx.globalAlpha = 0.5 + 0.2 * Math.sin(now / 180);
+      cx.beginPath(); cx.moveTo(MARKER_X, SCROLL_LANE_Y - 44); cx.lineTo(MARKER_X, SCROLL_LANE_Y + 44); cx.stroke();
+      cx.globalAlpha = 1;
+
+      // "DUET" label on the marker
+      cx.fillStyle = 'rgba(46,197,182,0.5)'; cx.font = '700 10px Menlo, monospace';
+      cx.textAlign = 'center';
+      cx.fillText('DUET', MARKER_X, SCROLL_LANE_Y - 50);
+
+      // scrolling words
+      for (var i = 0; i < state.words.length; i++) {
+        var w = state.words[i];
+        var isActive = w.isActive && !w.hit;
+        var distFromMarker = Math.abs(w.x - MARKER_X);
+        var inZone = isActive && distFromMarker < HIT_WINDOW;
+        var inNear = isActive && distFromMarker < NEAR_WINDOW;
+        var decoyGlow = w.isDecoy && w.decoyFlash > 0;
+
+        // word glow ring when approaching marker
+        if (isActive && distFromMarker < 90) {
+          var alpha = Math.max(0, 1 - distFromMarker / 90) * 0.4;
+          cx.globalAlpha = alpha;
+          cx.fillStyle = inZone ? TEAL : GOLD;
+          cx.beginPath();
+          cx.arc(w.x, SCROLL_LANE_Y, 36, 0, Math.PI * 2);
+          cx.fill();
+          cx.globalAlpha = 1;
+        }
+
+        // decoy word flashes vermillion to bait the tap
+        if (decoyGlow) {
+          var df = w.decoyFlash / DECOY_FLASH_DURATION;
+          cx.globalAlpha = df * 0.35;
+          cx.fillStyle = VERM;
+          cx.beginPath();
+          cx.arc(w.x, SCROLL_LANE_Y, 34, 0, Math.PI * 2);
+          cx.fill();
+          cx.globalAlpha = 1;
+        }
+
+        // word text
+        var fontSize = isActive ? 22 : 16;
+        if (inZone) fontSize = 26;
+        cx.textAlign = 'center';
+        cx.font = (isActive ? '900' : '600') + ' ' + fontSize + 'px -apple-system, Helvetica, Arial';
+
+        if (w.hit) {
+          cx.fillStyle = 'rgba(46,197,182,0.3)';
+        } else if (inZone) {
+          cx.fillStyle = TEAL;
+        } else if (decoyGlow) {
+          cx.fillStyle = VERM;
+        } else if (isActive) {
+          cx.fillStyle = '#fff';
+        } else {
+          cx.fillStyle = 'rgba(255,255,255,0.4)';
+        }
+        cx.fillText(w.text.toUpperCase(), w.x, SCROLL_LANE_Y + fontSize / 3);
+      }
+
+      // score
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '800 58px -apple-system, Helvetica, Arial';
+      cx.fillText(state.bars, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best + ' BARS', W / 2, 118);
+
+      // combo display
+      if (state.combo >= 2) {
+        var comboSize = 16 + state.combo * 2.5;
+        comboSize = Math.min(comboSize, 42);
+        var comboAlpha = 0.7 + 0.3 * Math.sin(now / 120);
+        cx.globalAlpha = comboAlpha;
+        cx.fillStyle = state.combo >= 5 ? GOLD : TEAL;
+        cx.font = '900 ' + comboSize + 'px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText('×' + state.combo, W / 2, 148);
+        cx.globalAlpha = 1;
+      }
+
+      // round speed indicator
+      cx.fillStyle = 'rgba(255,255,255,0.25)';
+      cx.font = '600 11px Menlo, monospace';
+      cx.textAlign = 'right';
+      cx.fillText('ROUND ' + (state.round + 1), W - 14, H - 16);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.textAlign = 'center';
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — by ' + SHARE.by : ''), W / 2, 146);
+      }
+    }
+
+    // ── Game over screen ───
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('OFF BEAT.', W / 2, 290);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.bars + ' bars', W / 2, 334);
+      var pt = pctTop(state.bars);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 378);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 402);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 450);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) {
+          cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        } else {
+          cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        }
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W / 2, SHARE_R.y + 30
+        );
+      }
+    }
+
+    // ── Demo CTA card ───
+    if (state.phase === 'cta') {
+      var t2 = (now - ctaAt) / 1000, ease = Math.min(1, t2 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('LIP SYNC DUEL', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('they sang ' + (window.__demoScore || 7) + ' bars. your move.', W / 2, 332);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 7), W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // ── Flashes (floating reward text) ───
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, SCROLL_LANE_Y - 80 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // ── Mute toggle (human only) ───
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

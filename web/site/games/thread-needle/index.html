@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Thread Needle — Tilt</title>
+<!--
+  LOOP / attention-architecture — Thread Needle
+  Circuits: 01-rpe (variable reward per timing), 06-zeigarnik (one more try), 05-ease (conditioned craft gesture).
+  Mechanic: A gap pulses open and shut; tap to send thread through at the widest moment.
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron arc, sets window.__demoDone
+    ?bot=1&runs=N&seed=M  imperfect autopilot, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'thread-needle';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  var NEEDLE_X    = W / 2;         // horizontal center of the needle path
+  var NEEDLE_Y    = 360;           // y position of the needle eye
+  var MAX_GAP     = 72;            // widest gap (px total, half each side = 36px)
+  var THREAD_W    = 8;             // thread line width
+  var PERFECT_PCT = 0.78;          // gap fraction >= this → perfect
+  var GOOD_PCT    = 0.50;          // gap fraction >= this → good (was 0.55)
+  var HIT_MIN     = 0.10;          // minimum frac to count as a hit (frac*MAX_GAP >= THREAD_W/2+3)
+  var THREAD_SPD  = 12;            // px per frame thread travels (at 60fps)
+  var GAP_PERIOD  = 2200;          // ms per full open-close cycle
+
+  // ---- state ----
+  var phase, score, combo, streak, lives, flashes;
+  var vibAmp;
+  var gapPhase, gapPeriod;
+  var currentGapFraction;
+  var threadInFlight;              // null or { y, hit, frac, alpha }
+  var hitStop, shakeAmt, zoom;
+  var overAt, runStartTs;
+  var dareBeaten = false;
+  var challengeAt = 0, ctaAt = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('tn_best') || 0; } catch (_) {}
+
+  // demo / bot control
+  var botRunsDone = 0;
+  // bot: simple per-frame autopilot
+  var botPendingShot = false;
+  // demo: setTimeout-driven, direct gap override
+  var demoGapOverride = -1;        // -1 = use sine; 0..1 = forced fraction
+  var demoScheduled   = false;
+
+  function pctTop(s) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 10))));
+  }
+
+  // ---- game init ----
+  function newGame() {
+    phase         = DEMO ? 'challenge' : (BOT ? 'play' : 'title');
+    score         = 0;
+    combo         = 0;
+    streak        = 0;
+    lives         = (DEMO || BOT) ? 1 : 3;
+    flashes       = [];
+    hitStop       = 0;
+    shakeAmt      = 0;
+    zoom          = 1;
+    overAt        = 0;
+    dareBeaten    = false;
+    vibAmp        = 0;
+    gapPhase      = 0;
+    gapPeriod     = GAP_PERIOD;
+    currentGapFraction = 0.5;
+    threadInFlight = null;
+    demoGapOverride = -1;
+
+    if (DEMO) {
+      challengeAt = performance.now();
+      demoScheduled = false;
+      return;
+    }
+    if (BOT) {
+      startRun();
+      return;
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    gapPhase   = 0;
+    gapPeriod  = GAP_PERIOD;
+    vibAmp     = 0;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    if (DEMO && !demoScheduled) scheduleDemoShots();
+  }
+
+  // ---- demo: fire shots on a fixed timeline (reliable, no wave-hunting) ----
+  // Each entry: { delay_ms, frac }
+  // frac > HIT_MIN → hit. frac < HIT_MIN → miss → game over (lives=1).
+  // Mirror-neuron arc: confident → near-fail → recovery → death
+  var DEMO_SHOTS = [
+    { delay:  800, frac: 0.92 },   // 0: confident, nearly perfect
+    { delay: 1800, frac: 0.86 },   // 1: solid
+    { delay: 2800, frac: 0.80 },   // 2: combo building
+    { delay: 3900, frac: 0.65 },   // 3: hesitation
+    { delay: 4900, frac: 0.93 },   // 4: back in stride
+    { delay: 6100, frac: 0.35 },   // 5: near-fail (SO CLOSE — reads "it's over")
+    { delay: 7200, frac: 0.90 },   // 6: recovery! perfect save
+    { delay: 8100, frac: 0.87 },   // 7: riding high
+    { delay: 9100, frac: 0.04 },   // 8: miss → death (gap nearly closed)
+  ];
+
+  function scheduleDemoShots() {
+    demoScheduled = true;
+    DEMO_SHOTS.forEach(function (shot) {
+      setTimeout(function () {
+        if (phase !== 'play') return;
+        // override the visual gap fraction to what the script wants
+        demoGapOverride = shot.frac;
+        currentGapFraction = shot.frac;
+        // fire after 1 frame so the canvas shows the right gap first
+        setTimeout(function () {
+          demoGapOverride = -1;
+          if (phase === 'play') attemptThread();
+        }, 32);
+      }, shot.delay);
+    });
+  }
+
+  // ---- core mechanics ----
+  function attemptThread() {
+    if (phase !== 'play') return;
+    if (threadInFlight) return;    // one thread at a time
+
+    var frac = currentGapFraction;
+    var hit  = frac >= HIT_MIN;
+
+    threadInFlight = { y: 180, frac: frac, hit: hit, alpha: 1, color: '#fff' };
+
+    if (hit) {
+      var perfect = frac >= PERFECT_PCT;
+      var good    = frac >= GOOD_PCT;
+
+      if (perfect) {
+        combo++;  streak++;
+        score += 3 + Math.floor(combo / 3);
+        hitStop  = 5;
+        zoom     = 1.025;
+        shakeAmt = 1.5;
+        threadInFlight.color = TEAL;
+        flash('PERFECT', TEAL, 42);
+        if (window.J) J.perfect(streak);
+        if (window.LOOP) LOOP.emit('thread_perfect', { score: score, frac: +frac.toFixed(3) });
+      } else if (good) {
+        combo++;  streak++;
+        score += 2;
+        threadInFlight.color = '#aef';
+        flash('+2', '#aef', 34);
+        if (window.J) J.hit(combo);
+        if (window.LOOP) LOOP.emit('thread_good', { score: score, frac: +frac.toFixed(3) });
+      } else {
+        // near-miss — barely made it through
+        combo = Math.max(0, combo - 1);
+        streak = 0;
+        score += 1;
+        shakeAmt = 4;
+        threadInFlight.color = VERM;
+        flash('SO CLOSE', VERM, 38);
+        if (window.J) J.near();
+        if (window.LOOP) LOOP.emit('near_miss', { score: score, frac: +frac.toFixed(3) });
+      }
+
+      // dare check
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(score);
+      }
+
+      // gold on long combo
+      if (combo > 0 && combo % 7 === 0) {
+        if (window.J) J.gold();
+        flash('\xd7' + combo + '!', GOLD, 50);
+        zoom = 1.04;
+      }
+
+      // tension
+      if (window.J) J.tension(Math.min(score / 25, 1));
+
+      // difficulty ramp
+      gapPeriod = Math.max(900, GAP_PERIOD - score * 65);
+      vibAmp    = Math.min(0.55, score * 0.022);
+
+    } else {
+      // missed — gap was too closed
+      lives--;
+      combo  = 0;
+      streak = 0;
+      shakeAmt = 10;
+      threadInFlight.color = VERM;
+      flash('MISSED', VERM, 44);
+      if (window.J) J.death(0.5 + Math.min(0.45, score / 20));
+      if (window.LOOP) LOOP.emit('thread_miss', { score: score, frac: +frac.toFixed(3) });
+
+      if (lives <= 0) {
+        threadInFlight = null;
+        gameOver();
+        return;
+      }
+    }
+  }
+
+  function gameOver() {
+    phase   = 'over';
+    overAt  = performance.now();
+    shakeAmt = 12;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = score > best;
+    if (window.J) {
+      J.death(Math.min(0.5 + score / 30, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 500);
+    }
+    if (newBest) {
+      best = score;
+      try { localStorage.setItem('tn_best', String(best)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2500);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    score = 0; combo = 0; streak = 0;
+    lives = (DEMO || BOT) ? 1 : 3;
+    flashes = [];
+    threadInFlight  = null;
+    vibAmp   = 0;
+    gapPhase = 0;
+    gapPeriod = GAP_PERIOD;
+    demoGapOverride = -1;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') { attemptThread(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'threads' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.code === 'ArrowUp') tap();
+  });
+
+  // ---- BOT autopilot ----
+  // called every frame; fires once per window based on probability
+  var botCooldown = 0;  // frames to wait before next shot attempt
+  function botAutopilot(dt) {
+    if (phase !== 'play') return;
+    if (threadInFlight) return;
+    if (hitStop > 0) return;
+    botCooldown -= dt;
+    if (botCooldown > 0) return;
+
+    // decide if now is a good time to fire
+    var frac = currentGapFraction;
+    // bot aims for good windows but sometimes misses (miss = frac < HIT_MIN → death)
+    var wantsGood = rng() > 0.15;  // 85% chance wants a good shot
+    if (wantsGood) {
+      // fire near open (frac > 0.6) with some noise
+      if (frac > 0.55 + (rng() - 0.5) * 0.3) {
+        botCooldown = 18 + Math.floor(rng() * 20);
+        attemptThread();
+      }
+    } else {
+      // "miss" attempt — fire when gap is very narrow
+      if (frac < 0.08) {
+        botCooldown = 12;
+        attemptThread();
+      }
+    }
+  }
+
+  // ---- render ----
+  function drawNeedle(now) {
+    var eyeY   = NEEDLE_Y;
+    var halfG  = currentGapFraction * MAX_GAP / 2;
+    var eyeTop = eyeY - halfG;
+    var eyeBot = eyeY + halfG;
+
+    // vibration horizontal wobble at high levels
+    var vibOff = vibAmp > 0.05 ? Math.sin(now * 0.055) * vibAmp * 14 : 0;
+
+    cx.save();
+    cx.translate(NEEDLE_X + vibOff, 0);
+
+    // needle above eye
+    cx.strokeStyle = 'rgba(255,255,255,0.88)';
+    cx.lineWidth   = 5;
+    cx.lineCap     = 'round';
+    cx.beginPath(); cx.moveTo(0, 175); cx.lineTo(0, eyeTop); cx.stroke();
+
+    // needle below eye
+    cx.beginPath(); cx.moveTo(0, eyeBot); cx.lineTo(0, 565); cx.stroke();
+
+    // eye walls (oval shape)
+    if (halfG > 1) {
+      cx.lineWidth = 3;
+      // left bezier
+      cx.beginPath();
+      cx.moveTo(0, eyeTop);
+      cx.bezierCurveTo(-halfG * 0.9, eyeTop + halfG * 0.6,
+                       -halfG * 0.9, eyeBot - halfG * 0.6,
+                       0, eyeBot);
+      cx.stroke();
+      // right bezier
+      cx.beginPath();
+      cx.moveTo(0, eyeTop);
+      cx.bezierCurveTo( halfG * 0.9, eyeTop + halfG * 0.6,
+                        halfG * 0.9, eyeBot - halfG * 0.6,
+                        0, eyeBot);
+      cx.stroke();
+    }
+
+    // glow when wide open
+    if (currentGapFraction > 0.65) {
+      var a2 = (currentGapFraction - 0.65) / 0.35;
+      var glw = cx.createRadialGradient(0, eyeY, 0, 0, eyeY, halfG * 2.2);
+      glw.addColorStop(0, 'rgba(46,197,182,' + (a2 * 0.4) + ')');
+      glw.addColorStop(1, 'rgba(46,197,182,0)');
+      cx.fillStyle = glw;
+      cx.beginPath();
+      cx.ellipse(0, eyeY, halfG * 2.2, halfG * 1.4, 0, 0, Math.PI * 2);
+      cx.fill();
+    }
+
+    cx.restore();
+  }
+
+  function drawThread(now) {
+    if (!threadInFlight) return;
+    var tf = threadInFlight;
+    tf.y += THREAD_SPD;           // advance thread (no dt needed — visual only)
+
+    // main thread line from top down to current y
+    cx.save();
+    cx.strokeStyle = tf.color;
+    cx.lineWidth   = 3;
+    cx.globalAlpha = tf.alpha;
+    cx.lineCap     = 'round';
+    cx.beginPath();
+    cx.moveTo(NEEDLE_X, 160);
+    cx.lineTo(NEEDLE_X, Math.min(tf.y, 570));
+    cx.stroke();
+    cx.restore();
+
+    // fade after passing the needle
+    if (tf.y > NEEDLE_Y + 90) {
+      tf.alpha -= 0.05;
+    }
+    if (tf.alpha <= 0 || tf.y > 610) {
+      threadInFlight = null;
+    }
+  }
+
+  function drawGapMeter(now) {
+    var cx_ = 60, cy_ = 65, r = 32;
+    var frac = currentGapFraction;
+
+    // background
+    cx.save();
+    cx.beginPath();
+    cx.arc(cx_, cy_, r, 0, Math.PI * 2);
+    cx.strokeStyle = 'rgba(255,255,255,0.1)';
+    cx.lineWidth = 5;
+    cx.stroke();
+
+    // filled arc
+    var col = frac >= PERFECT_PCT ? TEAL : (frac >= GOOD_PCT ? GOLD : (frac < 0.25 ? VERM : '#fff'));
+    cx.beginPath();
+    cx.arc(cx_, cy_, r, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2);
+    cx.strokeStyle = col;
+    cx.lineWidth = 5;
+    cx.lineCap = 'round';
+    cx.stroke();
+
+    cx.textAlign = 'center';
+    cx.fillStyle = col;
+    cx.font = '700 12px Menlo, monospace';
+    cx.fillText(Math.round(frac * 100) + '%', cx_, cy_ + 4);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 10px -apple-system, Helvetica, Arial';
+    cx.fillText('GAP', cx_, cy_ + 16);
+    cx.restore();
+  }
+
+  function drawLives() {
+    for (var i = 0; i < 3; i++) {
+      cx.fillStyle = i < lives ? VERM : 'rgba(255,255,255,0.12)';
+      cx.beginPath();
+      cx.arc(W - 30 - i * 22, 24, 6, 0, Math.PI * 2);
+      cx.fill();
+    }
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // gap wave — only advance when playing
+    if (phase === 'play') {
+      gapPhase += (Math.PI * 2 * dt * 16.667) / gapPeriod;
+      if (demoGapOverride >= 0) {
+        currentGapFraction = demoGapOverride;
+      } else {
+        currentGapFraction = 0.5 + 0.5 * Math.sin(gapPhase);
+        if (vibAmp > 0.02) {
+          currentGapFraction += (rng() - 0.5) * vibAmp * 0.28;
+          currentGapFraction = Math.max(0.03, Math.min(1, currentGapFraction));
+        }
+      }
+    }
+
+    // hit-stop decay
+    if (hitStop > 0) hitStop -= dt;
+
+    // demo transition: challenge → play
+    if (DEMO && phase === 'challenge' && now - challengeAt > 1200) {
+      startRun();
+    }
+
+    // bot autopilot
+    if (BOT) botAutopilot(dt);
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.13 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.08)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // play / over rendering
+    if (phase === 'play' || phase === 'over') {
+      drawNeedle(now);
+      drawThread(now);
+      drawGapMeter(now);
+      if (!DEMO && !BOT) drawLives();
+
+      // score counter
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 62px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 635);
+      cx.fillStyle = 'rgba(255,255,255,0.32)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 660);
+
+      // combo bubble
+      if (combo >= 3 && phase === 'play') {
+        var cSize = Math.min(34, 16 + combo * 1.5);
+        cx.textAlign = 'center';
+        cx.fillStyle = combo >= 7 ? GOLD : TEAL;
+        cx.font = '900 ' + cSize + 'px -apple-system, Helvetica, Arial';
+        cx.globalAlpha = 0.88;
+        cx.fillText('\xd7' + combo, W / 2, 695);
+        cx.globalAlpha = 1;
+      }
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓'
+          : ('BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : '')),
+          W / 2, 155);
+      }
+
+      // tap prompt
+      if (phase === 'play' && !threadInFlight && !DEMO && !BOT) {
+        var pulse = 0.35 + 0.65 * Math.abs(Math.sin(now / 420));
+        cx.globalAlpha = pulse;
+        cx.fillStyle = currentGapFraction > GOOD_PCT ? TEAL : 'rgba(255,255,255,0.5)';
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP', W / 2, 595);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // title screen
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('THREAD NEEDLE', W / 2, 275);
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      var p = 0.45 + 0.55 * Math.abs(Math.sin(now / 340));
+      cx.globalAlpha = p;
+      cx.fillText('TAP WHEN THE GAP IS WIDEST', W / 2, 325);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.28)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("thread it. don’t miss.", W / 2, 358);
+      // static needle hint
+      cx.strokeStyle = 'rgba(255,255,255,0.5)';
+      cx.lineWidth = 4; cx.lineCap = 'round';
+      cx.beginPath(); cx.moveTo(W / 2, 390); cx.lineTo(W / 2, 560); cx.stroke();
+    }
+
+    // challenge card (demo beat 1)
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 295);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('31', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today’s top run", W / 2, 430);
+    }
+
+    // game over card
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('MISSED.', W / 2, 278);
+      cx.fillStyle = '#fff';
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' threads', W / 2, 328);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 378);
+      cx.fillStyle = 'rgba(255,255,255,0.48)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 403);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.5 + 0.5 * Math.abs(Math.sin(now / 290));
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 450);
+        cx.globalAlpha = 1;
+
+        // share pill
+        cx.fillStyle  = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          (window.SHARE && SHARE.dare !== null && dareBeaten) ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W / 2, SHARE_R.y + 30
+        );
+      }
+    }
+
+    // demo CTA card
+    if (phase === 'cta') {
+      var t2  = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t2 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('THREAD NEEDLE', W / 2, 278);
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they hit ' + (window.__demoScore || 31) + '. can you thread it?', W / 2, 322);
+      var p3 = 0.6 + 0.4 * Math.abs(Math.sin(now / 255));
+      cx.fillStyle  = VERM;
+      cx.globalAlpha = ease * p3;
+      cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 31), W / 2, 395);
+      cx.globalAlpha = ease;
+      cx.fillStyle  = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 428);
+      cx.globalAlpha = 1;
+    }
+
+    // floating reward text
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 36);
+      cx.globalAlpha = fa;
+      cx.textAlign   = 'center';
+      cx.fillStyle   = fl.color;
+      cx.font = '900 ' + Math.round(fl.size + fl.t * 0.35) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 245 - fl.t * 0.9);
+      cx.globalAlpha = 1;
+      if (fl.t > 36) flashes.splice(k, 1);
+    }
+
+    // mute button (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign   = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font        = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle   = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

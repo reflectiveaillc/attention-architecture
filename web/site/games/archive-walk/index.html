@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Archive Walk — Tilt</title>
+<!--
+  LOOP / attention-architecture — Archive Walk
+  Circuits: 07-timing, 05-ease, 08-garden.
+  Engine: calm.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'archive-walk';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- card data ----
+  // A "walk" is a fixed deck of 12 archive cards (months/memories).
+  // Each card has: a label (Month Year), a soft background tint, and a
+  // generated mosaic of "photo slots" (coloured rectangles simulating a grid
+  // of photos). Pace-locked: one card lingers ~1.4s then eases out upward.
+  var MONTHS = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'
+  ];
+  var YEARS = [2022, 2023, 2024];
+
+  function makeDeck() {
+    var deck = [];
+    // Build 12 cards in reverse-chronological order (most recent first)
+    var y = 2024, m = 11; // start at Dec 2024 and walk back
+    for (var i = 0; i < 12; i++) {
+      var photos = [];
+      var count = 4 + Math.floor(rng() * 5); // 4-8 photos
+      for (var j = 0; j < count; j++) {
+        photos.push({
+          hue: Math.floor(rng() * 360),
+          sat: 28 + Math.floor(rng() * 28),
+          lit: 32 + Math.floor(rng() * 22),
+          slot: j
+        });
+      }
+      deck.push({
+        label: MONTHS[m] + ' ' + y,
+        photos: photos,
+        hue: (160 + i * 22) % 360,
+        memories: Math.floor(rng() * 40) + 3
+      });
+      m--;
+      if (m < 0) { m = 11; y--; }
+    }
+    return deck;
+  }
+
+  // ---- game state ----
+  var phase = 'walk';       // walk | done | cta
+  var deck, deckIdx;
+  var cardY = 0;            // current card's Y offset (0 = fully visible center)
+  var cardEntrance = 0;     // 0..1 ease-in progress
+  var cardLinger = 0;       // frames spent in "linger" (fully visible)
+  var cardDrift = 0;        // upward drift progress 0..1
+  var LINGER_FRAMES = 84;   // ~1.4s at 60fps
+  var ENTRANCE_SPEED = 0.045;
+  var DRIFT_SPEED = 0.032;
+  var stepCount = 0;        // total cards walked (score)
+  var walkStartTs = 0;
+  var doneAt = 0;
+  var ctaAt = 0;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+
+  // Bot state
+  var botRunsDone = 0;
+  var botPassCount = 0;     // how many cards bot has let pass — bot loses after K passes
+  var BOT_MAX_PASSES = 6;   // bot goes passive after 6 cards, natural end fires
+
+  // Demo state
+  var demoIdx = 0;
+  var demoWait = 0;
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color || TEAL, size: size || 28, t: 0 }); }
+
+  function initWalk() {
+    rng = mulberry32(SEED);
+    deck = makeDeck();
+    deckIdx = 0;
+    cardY = H + 80;         // start below screen
+    cardEntrance = 0;
+    cardLinger = 0;
+    cardDrift = 0;
+    phase = 'walk';
+    stepCount = 0;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    flashes = [];
+    botPassCount = 0;
+    demoIdx = 0; demoWait = 0;
+    walkStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function advanceCard() {
+    deckIdx++;
+    stepCount++;
+    // calm bell on each memory card — step cycles through 6 tones
+    if (window.J) J.calm(stepCount % 6);
+    // floating reward text every few cards
+    if (stepCount % 3 === 0) flash(deck[deckIdx - 1] ? deck[deckIdx - 1].memories + ' memories' : '', TEAL, 22);
+    cardY = H + 60;
+    cardEntrance = 0;
+    cardLinger = 0;
+    cardDrift = 0;
+  }
+
+  function endWalk() {
+    phase = 'done';
+    doneAt = performance.now();
+    var dur = (Date.now() - walkStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: stepCount, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = stepCount;
+      // After score card lingers, show CTA
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () {
+          initWalk();
+        }, 600);
+      }
+    }
+  }
+
+  // ---- MUTE zone ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- input ----
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    // Calm game: no explicit tapping mechanic; pace is automatic
+    // (presence of the tap listener is a no-op for the player — the walk sets its own pace)
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilot ----
+  // Bot: let the walk run to completion (endWalk fires naturally after all cards pass)
+  // After BOT_MAX_PASSES cards the bot stops intervening; the remaining cards
+  // auto-flow until the deck empties → endWalk.
+  function autopilot() {
+    if (DEMO) {
+      // Demo: same pacing as natural walk, no special intervention needed
+      // The walk auto-paces; demo just rides it.
+    }
+    if (BOT) {
+      botPassCount++;
+      // Bot naturally lets all cards advance; game ends when deck runs out
+    }
+  }
+
+  // ---- draw helpers ----
+  function drawCard(card, y, alpha) {
+    if (!card) return;
+    var cx2 = cx;
+    var CW = 330, CH = 420;
+    var cx_ = W / 2, cy_ = y;
+    cx2.save();
+    cx2.globalAlpha = alpha;
+
+    // Card shadow
+    cx2.shadowColor = 'rgba(0,0,0,0.38)';
+    cx2.shadowBlur = 28;
+    cx2.shadowOffsetY = 6;
+
+    // Card background
+    var grad = cx2.createLinearGradient(cx_ - CW/2, cy_ - CH/2, cx_ + CW/2, cy_ + CH/2);
+    grad.addColorStop(0, 'hsl(' + card.hue + ',18%,14%)');
+    grad.addColorStop(1, 'hsl(' + card.hue + ',14%,10%)');
+    cx2.fillStyle = grad;
+    cx2.beginPath();
+    if (cx2.roundRect) {
+      cx2.roundRect(cx_ - CW/2, cy_ - CH/2, CW, CH, 16);
+    } else {
+      cx2.rect(cx_ - CW/2, cy_ - CH/2, CW, CH);
+    }
+    cx2.fill();
+    cx2.shadowColor = 'transparent'; cx2.shadowBlur = 0; cx2.shadowOffsetY = 0;
+
+    // Subtle border
+    cx2.strokeStyle = 'hsla(' + card.hue + ',30%,60%,0.18)';
+    cx2.lineWidth = 1;
+    cx2.stroke();
+
+    // Photo mosaic (top area of card)
+    var photos = card.photos;
+    var cols = photos.length <= 4 ? 2 : 3;
+    var rows = Math.ceil(photos.length / cols);
+    var pW = (CW - 24 - (cols - 1) * 6) / cols;
+    var pH = Math.min(82, (220 - (rows - 1) * 6) / rows);
+    var mosLeft = cx_ - CW/2 + 12;
+    var mosTop  = cy_ - CH/2 + 20;
+    for (var pi = 0; pi < photos.length; pi++) {
+      var p = photos[pi];
+      var pr = Math.floor(pi / cols), pc = pi % cols;
+      var px = mosLeft + pc * (pW + 6);
+      var py = mosTop  + pr * (pH + 6);
+      var pg = cx2.createLinearGradient(px, py, px + pW, py + pH);
+      pg.addColorStop(0, 'hsl(' + p.hue + ',' + p.sat + '%,' + p.lit + '%)');
+      pg.addColorStop(1, 'hsl(' + ((p.hue + 30) % 360) + ',' + p.sat + '%,' + (p.lit - 8) + '%)');
+      cx2.fillStyle = pg;
+      cx2.beginPath();
+      if (cx2.roundRect) cx2.roundRect(px, py, pW, pH, 6); else cx2.rect(px, py, pW, pH);
+      cx2.fill();
+    }
+
+    // Month label
+    var labelY = mosTop + rows * (pH + 6) + 22;
+    cx2.fillStyle = 'rgba(255,255,255,0.92)';
+    cx2.font = '700 22px -apple-system, Helvetica, Arial';
+    cx2.textAlign = 'center';
+    cx2.fillText(card.label, cx_, labelY);
+
+    // Memories count
+    cx2.fillStyle = 'hsla(' + card.hue + ',55%,72%,0.7)';
+    cx2.font = '400 13px -apple-system, Helvetica, Arial';
+    cx2.fillText(card.memories + ' photos', cx_, labelY + 24);
+
+    // Decorative divider
+    var divY = labelY + 42;
+    cx2.strokeStyle = 'hsla(' + card.hue + ',30%,50%,0.25)';
+    cx2.lineWidth = 1;
+    cx2.beginPath();
+    cx2.moveTo(cx_ - 60, divY); cx2.lineTo(cx_ + 60, divY);
+    cx2.stroke();
+
+    // Soft "on this day" echo line
+    cx2.fillStyle = 'rgba(255,255,255,0.28)';
+    cx2.font = '300 11px -apple-system, Helvetica, Arial';
+    cx2.fillText('on this day', cx_, divY + 18);
+
+    cx2.restore();
+  }
+
+  function easeInOut(t) {
+    return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+  }
+
+  function easeOut(t) {
+    return 1 - (1 - t) * (1 - t);
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+    requestAnimationFrame(frame);
+
+    // Juice decay
+    if (hitStop > 0) hitStop -= dt; else doUpdate(dt, now);
+    shakeAmt *= Math.pow(0.88, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // Draw
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W/2 + sx, H/2 + sy); cx.scale(zoom, zoom); cx.translate(-W/2, -H/2);
+    }
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    if (phase === 'walk') {
+      drawWalkPhase(now);
+    } else if (phase === 'done') {
+      drawDonePhase(now);
+    } else if (phase === 'cta') {
+      drawCtaPhase(now);
+    }
+
+    // Floating text flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '600 ' + fl.size + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, H / 2 + 70 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.textAlign = 'center';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+  }
+
+  function doUpdate(dt, now) {
+    if (phase !== 'walk') return;
+    var card = deck[deckIdx];
+    if (!card) { endWalk(); return; }
+
+    if (cardEntrance < 1) {
+      // Card slides in from bottom
+      cardEntrance = Math.min(1, cardEntrance + ENTRANCE_SPEED * dt);
+    } else if (cardLinger < LINGER_FRAMES) {
+      // Card lingers in center
+      cardLinger += dt;
+      // Autopilot hook during linger (for bot pacing)
+      if (BOT && cardLinger > 10 && cardLinger < 12) autopilot();
+    } else {
+      // Card drifts up and out
+      cardDrift = Math.min(1, cardDrift + DRIFT_SPEED * dt);
+      if (cardDrift >= 1) {
+        // Done with this card — advance
+        advanceCard();
+      }
+    }
+  }
+
+  function getCardY() {
+    if (cardEntrance < 1) {
+      // Ease in from below
+      var e = easeOut(cardEntrance);
+      return H/2 + (1 - e) * 260;
+    } else if (cardLinger < LINGER_FRAMES) {
+      // Resting gently at center
+      return H/2 + Math.sin(cardLinger * 0.018) * 3;
+    } else {
+      // Drift upward
+      var e2 = easeInOut(cardDrift);
+      return H/2 - e2 * 340;
+    }
+  }
+
+  function getCardAlpha() {
+    if (cardEntrance < 1) {
+      return easeOut(cardEntrance);
+    } else if (cardLinger < LINGER_FRAMES) {
+      return 1;
+    } else {
+      // Fade slightly as it drifts out
+      return Math.max(0, 1 - cardDrift * 1.4);
+    }
+  }
+
+  function drawWalkPhase(now) {
+    var card = deck[deckIdx];
+    if (!card) return;
+
+    var cy_ = getCardY();
+    var alpha = getCardAlpha();
+    drawCard(card, cy_, alpha);
+
+    // Progress dots at bottom
+    var total = deck.length;
+    var dotR = 3, dotSpacing = 10;
+    var dotsW = total * (dotR * 2 + dotSpacing) - dotSpacing;
+    var dotStartX = W/2 - dotsW/2 + dotR;
+    var dotY = H - 40;
+    for (var i = 0; i < total; i++) {
+      cx.beginPath();
+      cx.arc(dotStartX + i * (dotR * 2 + dotSpacing), dotY, dotR, 0, Math.PI * 2);
+      if (i < deckIdx) {
+        cx.fillStyle = 'rgba(46,197,182,0.65)'; // walked
+      } else if (i === deckIdx) {
+        cx.fillStyle = TEAL; // current
+      } else {
+        cx.fillStyle = 'rgba(255,255,255,0.18)'; // upcoming
+      }
+      cx.fill();
+    }
+
+    // Gentle title at top
+    cx.fillStyle = 'rgba(255,255,255,0.22)';
+    cx.font = '400 12px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.fillText('your archive', W/2, 28);
+  }
+
+  function drawDonePhase(now) {
+    var t = (now - doneAt) / 1000;
+    var ease = Math.min(1, t * 1.8);
+
+    cx.globalAlpha = 0.65 * ease;
+    cx.fillStyle = INK; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL;
+    cx.font = '300 16px -apple-system, Helvetica, Arial';
+    cx.fillText('a quiet walk through', W/2, H/2 - 90);
+
+    cx.fillStyle = '#fff';
+    cx.font = '700 38px -apple-system, Helvetica, Arial';
+    cx.fillText(stepCount + ' months', W/2, H/2 - 44);
+
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '300 14px -apple-system, Helvetica, Arial';
+    cx.fillText('yours is waiting', W/2, H/2 + 8);
+
+    cx.globalAlpha = 1;
+  }
+
+  function drawCtaPhase(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2);
+
+    cx.fillStyle = INK; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+
+    cx.fillStyle = '#fff';
+    cx.font = '800 36px -apple-system, Helvetica, Arial';
+    cx.fillText('ARCHIVE WALK', W/2, H/2 - 80);
+
+    cx.fillStyle = 'rgba(255,255,255,0.6)';
+    cx.font = '300 16px -apple-system, Helvetica, Arial';
+    cx.fillText('scroll your story, at your pace', W/2, H/2 - 40);
+
+    var p = 0.7 + 0.3 * Math.sin(now / 700);
+    cx.globalAlpha = ease * p;
+    cx.fillStyle = TEAL;
+    cx.font = '700 20px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ GROW YOURS', W/2, H/2 + 20);
+
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '400 13px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W/2, H/2 + 56);
+
+    cx.globalAlpha = 1;
+  }
+
+  // ---- start ----
+  initWalk();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

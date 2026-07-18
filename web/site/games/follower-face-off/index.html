@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Follower Face-Off — Tilt</title>
+<!--
+  LOOP / attention-architecture — Follower Face-Off
+  Circuits: 01 RPE, 03 social, 04 loss.
+  Modes:
+    ?demo=1&seed=7        scripted run for clip capture, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay for traffic simulation, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'follower-face-off';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 14;
+  var SEED = +qs.get('seed') || 42;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134';
+  var CARD_W = 280, CARD_H = 114, SWIPE_THR = 46;
+  var TIME_LIMIT = 60, LIVES_MAX = 3;
+
+  var names = ['maya','jordan','taylor','casey','riley','alex','dakota','quinn','avery','skyler','kendall','morgan','peyton','sage','remi','jules','noor','ellis','finley','harper'];
+  var handles = ['mayax','jordy.wav','taylurks','caseyd','rileycams','alexdaily','dakotaxo','qdot','aveonline','skylertok','kenrun','morgmoves','peytonpics','sagefeed','remii','julesjams','noorlight','ellisloop','finloops','harperscrolls'];
+
+  var state, flashes, runStartTs, best = 0, dareBeaten = false;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, challengeAt = 0, ctaAt = 0;
+  try { best = +localStorage.getItem('ffo_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      score: 0, combo: 0, lives: LIVES_MAX, timeLeft: TIME_LIMIT,
+      card: null, nextSpawn: 0
+    };
+    flashes = []; dareBeaten = false; hitStop = 0; zoom = 1; shakeAmt = 0;
+    if (DEMO) {
+      prebuildDemo();
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) {
+      state.lives = 1;
+      state.timeLeft = 18;
+      startRun();
+    }
+  }
+
+  var DEMO_TARGET = 31;
+  var demoScript = [
+    { act: 'accept', wait: 0.45 },
+    { act: 'reject', wait: 0.50 },
+    { act: 'accept', wait: 0.85, style: 'hesitate' },
+    { act: 'reject', wait: 1.05, style: 'hesitate' },
+    { act: 'accept', wait: 1.45, style: 'near' },
+    { act: 'reject', wait: 0.45 },
+    { act: 'accept', wait: 0.70 },
+    { act: 'reject', wait: 0.95 },
+    { act: 'accept', wait: 0.40 },
+    { act: 'accept', wait: 0.25 } // wrong accept of a bot → fail
+  ];
+  var demoCards = [
+    { type: 'follow' },
+    { type: 'bot' },
+    { type: 'follow' },
+    { type: 'bot' },
+    { type: 'follow' },
+    { type: 'bot' },
+    { type: 'follow', verified: true },
+    { type: 'bot' },
+    { type: 'follow' },
+    { type: 'bot' }
+  ];
+  var demoIdx = 0, demoWait = 0, demoCardIdx = 0;
+
+  function prebuildDemo() {
+    state.score = 22;
+    state.lives = 1;
+    state.timeLeft = 16;
+    state.combo = 2;
+    best = Math.max(best, 47);
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    demoIdx = 0; demoCardIdx = 0;
+    demoWait = demoScript[0] ? demoScript[0].wait : 0;
+    scheduleSpawn();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 13))));
+  }
+
+  function scheduleSpawn() {
+    var base = DEMO ? 0.50 : (BOT ? 0.35 : 0.80);
+    var range = DEMO ? 0.30 : (BOT ? 0.25 : 0.55);
+    var pressure = DEMO ? (state.timeLeft / 16) : (state.timeLeft / TIME_LIMIT);
+    state.nextSpawn = performance.now() / 1000 + base + range * pressure;
+  }
+
+  function spawnCard() {
+    if (DEMO && demoCardIdx < demoCards.length) {
+      var d = demoCards[demoCardIdx++];
+      var nameIdx = Math.floor(rng() * names.length);
+      state.card = {
+        type: d.type, name: names[nameIdx], handle: handles[nameIdx], verified: !!d.verified,
+        life: 2.0, t: 0, dragX: 0, dragY: 0, dragging: false,
+        gone: false, outDir: 0, outT: 0
+      };
+      return;
+    }
+    var type = rng() < 0.40 ? 'bot' : 'follow';
+    var verified = type === 'follow' && rng() < 0.08;
+    var idx = Math.floor(rng() * names.length);
+    var life = 2.4 - (1 - state.timeLeft / TIME_LIMIT) * 0.9;
+    if (BOT) life = 1.6;
+    state.card = {
+      type: type, name: names[idx], handle: handles[idx], verified: verified,
+      life: life, t: 0, dragX: 0, dragY: 0, dragging: false,
+      gone: false, outDir: 0, outT: 0
+    };
+  }
+
+  function decide(action) {
+    var card = state.card;
+    if (!card || card.gone) return;
+    var correct = (card.type === 'follow' && action === 'accept') || (card.type === 'bot' && action === 'reject');
+    var perfect = correct && card.t < 0.32;
+    var near = correct && card.t / card.life > 0.78;
+    card.outDir = action === 'accept' ? 1 : -1;
+    card.gone = true; card.outT = 0;
+    if (correct) {
+      var add = card.verified ? 3 : (perfect ? 2 : 1);
+      state.score += add;
+      state.combo++;
+      if (window.J) {
+        J.hit(state.combo);
+        if (perfect) J.perfect(state.combo);
+        if (card.verified) J.gold();
+        if (near) J.near();
+        J.tension(Math.min((TIME_LIMIT - state.timeLeft) / TIME_LIMIT * 0.7 + state.combo / 20, 1));
+      }
+      if (perfect) { hitStop = 0.055; zoom = 1.03; flash('PERFECT', TEAL, 44); }
+      else if (card.verified) { hitStop = 0.07; zoom = 1.04; flash('VERIFIED', GOLD, 46); }
+      else flash('+' + add, '#fff', 36);
+      if (near) { flash('SO CLOSE', VERM, 38); if (window.LOOP) LOOP.emit('near_miss', { n: state.score, ratio: +(card.t / card.life).toFixed(2) }); }
+      if (window.LOOP) LOOP.emit(card.verified ? 'verified_hit' : (action === 'accept' ? 'follower_accepted' : 'bot_rejected'), { n: state.score, add: add, perfect: perfect, near: near });
+      checkDare();
+    } else {
+      state.score = Math.max(0, state.score - 1);
+      state.lives--;
+      state.combo = 0;
+      shakeAmt = 8;
+      if (window.J) {
+        J.death(Math.min(0.25 + state.score / 60, 1));
+        J.tension(0);
+      }
+      flash('BOT!', VERM, 42);
+      if (window.LOOP) LOOP.emit('mistake', { n: state.score, lives: state.lives });
+      if (state.lives <= 0) { gameOver(); return; }
+    }
+    scheduleSpawn();
+  }
+
+  function missCard() {
+    var card = state.card;
+    if (!card) return;
+    card.gone = true; card.outDir = 0; card.outT = 0;
+    state.combo = 0;
+    state.lives--;
+    shakeAmt = 5;
+    if (window.J) J.death(0.18);
+    flash('TOO SLOW', VERM, 38);
+    if (window.LOOP) LOOP.emit('missed', { n: state.score, lives: state.lives });
+    if (state.lives <= 0) { gameOver(); return; }
+    scheduleSpawn();
+  }
+
+  function checkDare() {
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+  }
+
+  var botRunsDone = 0, botTargetAction = null, botWait = 0;
+  function autopilot() {
+    if (state.phase !== 'play' || !state.card || state.card.gone) return;
+    if (DEMO) {
+      var cmd = demoScript[demoIdx];
+      if (!cmd) return;
+      if (cmd.style === 'near') {
+        if (state.card.t / state.card.life < 0.82) return;
+      } else {
+        if (demoWait > 0) { demoWait -= dt; return; }
+      }
+      decide(cmd.act);
+      demoIdx++;
+      if (demoIdx < demoScript.length) demoWait = demoScript[demoIdx].wait;
+      return;
+    }
+    if (BOT) {
+      if (botWait > 0) { botWait -= dt; return; }
+      var correct = state.card.type === 'follow' ? 'accept' : 'reject';
+      var err = Math.min(0.38, BOT_ERR / 100 + (1 - state.timeLeft / 18) * 0.18);
+      var action = rng() < err ? (correct === 'accept' ? 'reject' : 'accept') : correct;
+      botWait = 0.22 + rng() * 0.55;
+      decide(action);
+    }
+  }
+
+  function gameOver() {
+    if (state.phase === 'over' || state.phase === 'cta') return;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (newBest) { best = state.score; try { localStorage.setItem('ffo_best', String(best)); } catch (_) {} }
+    if (window.J) { J.death(Math.min(0.3 + state.score / 60, 1)); if (newBest || dareBeaten) setTimeout(function () { J.fanfare(); }, 450); }
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now(); setTimeout(function () { window.__demoDone = true; }, 3500); }, 2200);
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) window.__botDone = true;
+      else setTimeout(resetRun, 800);
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.combo = 0; state.lives = BOT ? 1 : LIVES_MAX;
+    state.timeLeft = BOT ? 18 : TIME_LIMIT;
+    state.card = null; dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 48, y: 12, w: 40, h: 40 };
+  var SHARE_R = { x: W / 2 - 125, y: 502, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  var pointer = { id: null, down: false, active: false, sx: 0, dx: 0 };
+  function tapFrom(e) {
+    var r = cv.getBoundingClientRect();
+    return { x: (e.clientX - r.left) / scale, y: (e.clientY - r.top) / scale };
+  }
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var p = tapFrom(e);
+    pointer.id = e.pointerId; pointer.down = true; pointer.active = false; pointer.sx = p.x; pointer.dx = 0;
+    if (inR(MUTE_R, p.x, p.y) && window.J) { J.toggleMute(); pointer.down = false; pointer.id = null; return; }
+    if (state.phase === 'title') { startRun(); pointer.down = false; pointer.id = null; return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (inR(SHARE_R, p.x, p.y) && window.SHARE) { SHARE.send({ score: state.score, unit: 'followers' }); pointer.down = false; pointer.id = null; return; }
+      resetRun(); pointer.down = false; pointer.id = null; return;
+    }
+    if (state.phase === 'play' && state.card && !state.card.gone) { pointer.active = true; state.card.dragging = true; }
+  });
+  window.addEventListener('pointermove', function (e) {
+    if (DEMO || BOT || pointer.id !== e.pointerId || !pointer.active) return;
+    var p = tapFrom(e);
+    pointer.dx = p.x - pointer.sx;
+    if (state.card && state.card.dragging) state.card.dragX = pointer.dx;
+  });
+  function release() {
+    if (DEMO || BOT) return;
+    var wasActive = pointer.active;
+    pointer.down = false; pointer.id = null; pointer.active = false;
+    var card = state.card;
+    if (!wasActive || !card || card.gone) return;
+    if (Math.abs(pointer.dx) > SWIPE_THR) decide(pointer.dx > 0 ? 'accept' : 'reject');
+    else decide(pointer.sx > W / 2 ? 'accept' : 'reject');
+    if (card) card.dragging = false;
+    pointer.dx = 0;
+  }
+  window.addEventListener('pointerup', release);
+  window.addEventListener('pointercancel', release);
+  window.addEventListener('keydown', function (e) {
+    if (DEMO || BOT) return;
+    if (state.phase === 'title' && e.code === 'Space') { startRun(); return; }
+    if (state.phase === 'play' && state.card && !state.card.gone) {
+      if (e.code === 'ArrowRight' || e.code === 'KeyD') decide('accept');
+      if (e.code === 'ArrowLeft' || e.code === 'KeyA') decide('reject');
+    }
+    if (state.phase === 'over' && e.code === 'Space') resetRun();
+  });
+
+  // ---- render helpers ----
+  function rrPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    cx.beginPath();
+    cx.moveTo(x + r, y);
+    cx.lineTo(x + w - r, y); cx.quadraticCurveTo(x + w, y, x + w, y + r);
+    cx.lineTo(x + w, y + h - r); cx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    cx.lineTo(x + r, y + h); cx.quadraticCurveTo(x, y + h, x, y + h - r);
+    cx.lineTo(x, y + r); cx.quadraticCurveTo(x, y, x + r, y);
+    cx.closePath();
+  }
+
+  function drawCard(card) {
+    var outX = card.gone ? card.outDir * 220 * Math.min(1, card.outT / 0.35) : 0;
+    var outY = card.gone ? -40 * Math.min(1, card.outT / 0.35) : 0;
+    var alpha = card.gone ? Math.max(0, 1 - card.outT / 0.35) : 1;
+    var cx2 = W / 2 + card.dragX + outX;
+    var cy2 = H / 2 - 20 + card.dragY * 0.2 + outY;
+    var rot = (card.dragX / W) * 0.35;
+    cx.save();
+    cx.globalAlpha = alpha;
+    cx.translate(cx2, cy2);
+    cx.rotate(rot);
+    rrPath(-CARD_W / 2, -CARD_H / 2, CARD_W, CARD_H, 18);
+    var g = cx.createLinearGradient(0, -CARD_H / 2, 0, CARD_H / 2);
+    if (card.type === 'bot') { g.addColorStop(0, 'rgba(232,80,46,0.26)'); g.addColorStop(1, 'rgba(232,80,46,0.09)'); }
+    else if (card.verified) { g.addColorStop(0, 'rgba(242,177,52,0.26)'); g.addColorStop(1, 'rgba(242,177,52,0.09)'); }
+    else { g.addColorStop(0, 'rgba(46,197,182,0.24)'); g.addColorStop(1, 'rgba(46,197,182,0.08)'); }
+    cx.fillStyle = g; cx.fill();
+    cx.strokeStyle = card.type === 'bot' ? VERM : (card.verified ? GOLD : TEAL);
+    cx.lineWidth = 2; cx.stroke();
+    // avatar
+    cx.beginPath(); cx.arc(-CARD_W / 2 + 42, 0, 26, 0, Math.PI * 2);
+    cx.fillStyle = card.type === 'bot' ? VERM : (card.verified ? GOLD : TEAL); cx.fill();
+    cx.fillStyle = INK; cx.font = '900 24px -apple-system, Helvetica, Arial'; cx.textAlign = 'center'; cx.textBaseline = 'middle';
+    cx.fillText(card.name[0].toUpperCase(), -CARD_W / 2 + 42, 0);
+    // text
+    cx.textAlign = 'left'; cx.textBaseline = 'alphabetic';
+    cx.fillStyle = '#fff'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+    cx.fillText(card.name, -CARD_W / 2 + 82, -10);
+    cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '500 14px -apple-system, Helvetica, Arial';
+    cx.fillText('@' + card.handle, -CARD_W / 2 + 82, 14);
+    // badge
+    cx.textAlign = 'right';
+    if (card.verified) { cx.fillStyle = GOLD; cx.font = '800 13px -apple-system, Helvetica, Arial'; cx.fillText('★ VERIFIED', CARD_W / 2 - 14, -10); }
+    cx.fillStyle = card.type === 'bot' ? VERM : TEAL; cx.font = '700 13px -apple-system, Helvetica, Arial';
+    cx.fillText(card.type === 'bot' ? 'BOT' : 'FOLLOW', CARD_W / 2 - 14, card.verified ? 16 : -10);
+    // hint
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '500 12px -apple-system, Helvetica, Arial';
+    cx.fillText('← reject        accept →', 0, CARD_H / 2 - 14);
+    // timer ring on card
+    var ratio = Math.min(1, card.t / card.life);
+    cx.strokeStyle = ratio > 0.8 ? VERM : (ratio > 0.55 ? GOLD : 'rgba(255,255,255,0.2)');
+    cx.lineWidth = 3;
+    cx.beginPath(); cx.arc(CARD_W / 2 - 18, -CARD_H / 2 + 18, 10, -Math.PI / 2, -Math.PI / 2 + ratio * Math.PI * 2);
+    cx.stroke();
+    cx.restore();
+  }
+
+  var last = performance.now(), dt = 0;
+  function frame(now) {
+    dt = Math.min((now - last) / 1000, 0.05); last = now;
+
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') {
+      state.timeLeft -= dt;
+      if (state.timeLeft <= 0) { state.timeLeft = 0; gameOver(); }
+      else {
+        var nowSec = now / 1000;
+        if (!state.card && nowSec >= state.nextSpawn) spawnCard();
+        if (state.card && !state.card.gone) {
+          state.card.t += dt;
+          if (state.card.t >= state.card.life) missCard();
+        }
+        if (state.card && state.card.gone) {
+          state.card.outT += dt;
+          if (state.card.outT > 0.38) state.card = null;
+        }
+        autopilot();
+      }
+    }
+
+    // decay juice
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      cx.save();
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt * 60); zoom += (1 - zoom) * 0.14 * dt * 60;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)'); bg.addColorStop(1, 'rgba(232,80,46,0.08)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // timer bar
+    var tRatio = state.phase === 'title' ? 1 : (state.timeLeft / (DEMO ? 16 : (BOT ? 18 : TIME_LIMIT)));
+    var barW = W * 0.86, barX = (W - barW) / 2;
+    cx.fillStyle = 'rgba(255,255,255,0.12)';
+    rrPath(barX, 14, barW, 6, 3); cx.fill();
+    var fillW = barW * Math.max(0, Math.min(1, tRatio));
+    cx.fillStyle = tRatio > 0.5 ? TEAL : (tRatio > 0.25 ? GOLD : VERM);
+    rrPath(barX, 14, fillW, 6, 3); cx.fill();
+
+    // lives
+    for (var i = 0; i < LIVES_MAX; i++) {
+      var lx = 18 + i * 22, ly = 36;
+      cx.beginPath(); cx.arc(lx, ly, 7, 0, Math.PI * 2);
+      if (i < state.lives) { cx.fillStyle = VERM; cx.fill(); }
+      else { cx.strokeStyle = 'rgba(255,255,255,0.25)'; cx.lineWidth = 1.5; cx.stroke(); }
+    }
+
+    // score
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 72px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score, W / 2, 118);
+    cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('FOLLOWERS', W / 2, 144);
+    if (state.combo > 1) {
+      cx.fillStyle = GOLD; cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText('×' + state.combo, W / 2, 172);
+    }
+
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && (state.phase === 'play' || state.phase === 'over')) {
+      cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 198);
+    }
+
+    // card
+    if (state.card) drawCard(state.card);
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt * 60;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 270 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('FOLLOWER', W / 2, 310);
+      cx.fillText('FACE-OFF', W / 2, 356);
+      cx.fillStyle = TEAL; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO START', W / 2, 420); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('swipe right for real followers.', W / 2, 450);
+      cx.fillText('left for bots. 60 seconds.', W / 2, 470);
+    }
+
+    // challenge card (demo beat 1)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT — ' + DEMO_TARGET, W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 84px -apple-system, Helvetica, Arial';
+      cx.fillText(DEMO_TARGET, W / 2, 396);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 426);
+    }
+
+    // game over
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText(state.lives <= 0 ? 'BOT GOT YOU.' : 'TIME’S UP.', W / 2, 330);
+      cx.fillStyle = '#fff'; cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' followers', W / 2, 380);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 422);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 446);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 492);
+        cx.globalAlpha = 1;
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        rrPath(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('FOLLOWER FACE-OFF', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('she got ' + (window.__demoScore || DEMO_TARGET) + '. your move.', W / 2, 342);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || DEMO_TARGET), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.55;
+      cx.font = '18px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    if (shakeAmt > 0.2 || zoom > 1.001) cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

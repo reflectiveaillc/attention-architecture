@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Clout Ladder — Tilt</title>
+<!--
+  LOOP / attention-architecture — Clout Ladder
+  Circuits: 01 RPE (variable clout per rung), 04 loss (the rank you'll lose),
+            08 investment (each rung sunk-cost raises the fall).
+  Conditioned path: the thumb already knows the climb — tap-tap-tap up the
+    feed becomes tap-tap-tap up the ladder. The game IS that gesture.
+  Mechanic: 10-rung ladder, one-shot micro-challenge per rung. Lock the sweep in
+    the sweet zone to climb; miss the rung and you fall — loss aversion is the
+    hook clip. Top the ladder, then dare a friend to knock you off in one try.
+  Modes (query params):
+    ?demo=1&seed=7        scripted run for clip capture (climb → sliver save → fall → CTA),
+                          sets window.__demoDone when finished
+    ?bot=1&runs=3&seed=7  imperfect autoplay for traffic simulation, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'clout-ladder';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 46;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var RUNGS = 10, SP = 52, BOTTOM_Y = H - 116;
+  function rungY(n) { return BOTTOM_Y - (n - 1) * SP; }            // n: 1..10
+  function rungW(n) { return 250 - (n - 1) * 13; }                  // 250 .. 133
+  function perfectR(w) { return w * 0.06; }
+  function goodR(w) { return w * 0.22; }
+
+  var state, marker, climberY, fallers, debris, flashes, runStartTs, best = 0;
+  var hitStop = 0, zoom = 1, dareBeaten = false, shakeAmt = 0, challengeAt = 0, ctaAt = 0;
+  try { best = +localStorage.getItem('cl_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',              // title | challenge | play | over | cta
+      rung: 1, score: 0, combo: 0, perfectCount: 0, overAt: 0, won: false
+    };
+    marker = null; climberY = rungY(1); fallers = []; debris = []; flashes = [];
+    dareBeaten = false;
+    setMarker(1);
+    if (DEMO) {
+      // mirror-neuron beat 1: the challenge card primes "score to beat"
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function setMarker(n) {
+    var w = rungW(n), r = w / 2 + 28;
+    marker = { x: W / 2, cx: W / 2, w: w, range: r, dir: rng() < 0.5 ? 1 : -1,
+               speed: 2.0 + (n - 1) * 0.22 };
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 220))));
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    climberY = rungY(state.rung);
+    setMarker(state.rung);
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function lock() {                                   // tap → lock the sweep
+    var m = marker, off = m.x - m.cx, dist = Math.abs(off), w = m.w;
+    var half = w / 2;
+    if (dist > half) {                                // MISS → fall off the ladder
+      miss(off);
+      return;
+    }
+    var perfect = dist <= perfectR(w);
+    var near = dist > goodR(w);                        // edge of the rung — the sliver
+    var base = state.rung * 10;
+    var gain;
+    if (perfect) {
+      gain = base * 2; state.combo++; state.perfectCount++;
+      if (window.J) { J.perfect(state.combo); if (state.combo >= 3 && state.combo % 3 === 0) J.gold(); }
+      hitStop = 4; zoom = 1.03;
+      flash('PERFECT', GOLD, 40);
+    } else if (near) {
+      gain = base; state.combo = 0;
+      if (window.J) J.near();
+      shakeAmt = 5;
+      flash('SO CLOSE', VERM, 36);
+      if (window.LOOP) LOOP.emit('near_miss', { rung: state.rung, dist: +dist.toFixed(1) });
+    } else {
+      gain = base; state.combo = 0;
+      if (window.J) J.hit(state.rung);
+    }
+    state.score += gain;
+    flash('+' + gain, perfect ? GOLD : TEAL, 30);
+    if (window.J) J.tension(Math.min(state.rung / RUNGS, 1));
+    if (window.LOOP) LOOP.emit('rung_climbed', { rung: state.rung, score: state.score, perfect: perfect, near: near });
+
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 42);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+
+    state.rung++;
+    if (state.rung > RUNGS) { topped(); return; }
+    climberHop = 1;
+    setMarker(state.rung);
+  }
+
+  var climberHop = 0;
+  function topped() {
+    state.won = true;
+    state.rung = RUNGS;
+    if (window.J) { J.fanfare(); J.gold(); }
+    flash('TOPPED IT', GOLD, 46);
+    gameOver();
+  }
+
+  function miss(off) {
+    // death spectacle: the climber falls the whole way down
+    var y = rungY(state.rung);
+    fallers.push({ x: marker.cx, y: y - 16, vy: -2.2, r: 0, vr: 0.06, c: VERM, rad: 9 });
+    for (var i = 0; i < 6; i++) {
+      debris.push({ x: marker.cx + (rng() - 0.5) * 30, y: y, vx: (rng() - 0.5) * 4,
+                    vy: -1 - rng() * 2, r: 0, vr: (rng() - 0.5) * 0.2,
+                    c: i % 2 ? TEAL : GOLD, s: 3 + rng() * 4, life: 0 });
+    }
+    marker = null;
+    gameOver();
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = state.won ? 5 : 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) {
+      if (!state.won) J.death(Math.min(0.3 + state.rung / RUNGS, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('cl_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), rung: state.rung, won: state.won });
+    if (DEMO) setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+      setTimeout(function () { window.__demoDone = true; }, 3600); }, 2800);
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 900);
+    }
+  }
+
+  function resetRun() {
+    state.rung = 1; state.score = 0; state.combo = 0; state.perfectCount = 0; state.won = false;
+    fallers = []; debris = []; flashes = []; climberY = rungY(1); climberHop = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;                 // scripted modes ignore human taps
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play' && marker) { lock(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'rungs' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  // demo script: desired lock offsets (px from rung center). 'sliver' = right at
+  // the rung edge (the near-fail recovery); 'miss' = let it sweep past the rung.
+  // mirror-neuron arc: hesitant climb → sliver SAVE at rung 6 (60%, "it's over… no")
+  // → settle → perfect save → the real fall at rung 9. Varied demoWait = human.
+  var demoScript = [30, -45, 20, -8, 38, 'sliver', 25, -12, 'miss'], demoIdx = 0, demoWait = 34;
+  var demoWaits = [28, 34, 22, 44, 30, 62, 26, 40, 24]; // beats of hesitation before each lock
+  var botRunsDone = 0, botTarget = null;
+
+  function autopilot() {
+    if (!marker || state.phase !== 'play') return;
+    var off = marker.x - marker.cx, v = marker.speed * marker.dir, w = marker.w;
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      var want = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      if (want === 'miss') { if (Math.abs(off) > w / 2 + 10) { demoIdx++; demoWait = 20; lock(); } return; }
+      var target = want === 'sliver' ? (w / 2 - 5) : want;
+      if (Math.abs(off - target) <= Math.abs(v) * 0.65) {
+        lock();
+        demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 30;
+        demoIdx++;
+      }
+    } else if (BOT) {
+      if (botTarget === null) botTarget = gauss() * BOT_ERR;
+      if (Math.abs(off - botTarget) <= Math.abs(v) * 0.65) { botTarget = null; lock(); }
+    }
+  }
+
+  // ---- render ----
+  function rungColor(n) {
+    if (n < state.rung) return TEAL;          // climbed
+    if (n === state.rung && state.phase === 'play') return VERM; // current
+    return 'rgba(255,255,255,0.10)';          // unreached
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // climber eases toward the current rung (with a hop impulse on climb)
+    var wantCY = rungY(state.rung) - (state.won ? 18 : 16);
+    climberY += (wantCY - climberY) * 0.22 * dt;
+    if (climberHop > 0) climberHop -= 0.06 * dt;
+
+    // sweep the marker (frozen during hit-stop — the impact "bites")
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play' && marker) {
+      marker.x += marker.speed * marker.dir * dt;
+      if (marker.x > marker.cx + marker.range) { marker.x = marker.cx + marker.range; marker.dir = -1; }
+      if (marker.x < marker.cx - marker.range) { marker.x = marker.cx - marker.range; marker.dir = 1; }
+      autopilot();
+    }
+
+    // juice transforms: decaying shake + zoom-pulse
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)'); bg.addColorStop(1, 'rgba(232,80,46,0.08)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ladder rails (two faint verticals)
+    cx.strokeStyle = 'rgba(255,255,255,0.06)'; cx.lineWidth = 2;
+    cx.beginPath(); cx.moveTo(W / 2 - 64, rungY(RUNGS) - 8); cx.lineTo(W / 2 - 64, BOTTOM_Y + 8);
+    cx.moveTo(W / 2 + 64, rungY(RUNGS) - 8); cx.lineTo(W / 2 + 64, BOTTOM_Y + 8); cx.stroke();
+
+    // rungs
+    for (var n = 1; n <= RUNGS; n++) {
+      var y = rungY(n), w = rungW(n), col = rungColor(n);
+      cx.fillStyle = col;
+      cx.globalAlpha = (n < state.rung) ? 0.85 : 1;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(W / 2 - w / 2, y - 7, w, 14, 5); else cx.rect(W / 2 - w / 2, y - 7, w, 14);
+      cx.fill();
+      cx.globalAlpha = 1;
+      // rung number tag
+      cx.fillStyle = (n < state.rung) ? 'rgba(11,13,18,0.55)' : 'rgba(255,255,255,0.30)';
+      cx.font = '700 9px Menlo, monospace'; cx.textAlign = 'center';
+      cx.fillText(String(n), W / 2, y + 3);
+    }
+
+    // current rung: sweet zones + sweeping marker
+    if (state.phase === 'play' && marker) {
+      var cy = rungY(state.rung), cw = marker.w;
+      // good zone band
+      cx.fillStyle = 'rgba(46,197,182,0.18)';
+      cx.fillRect(marker.cx - goodR(cw), cy - 7, goodR(cw) * 2, 14);
+      // perfect zone band
+      cx.fillStyle = 'rgba(242,177,52,0.35)';
+      cx.fillRect(marker.cx - perfectR(cw), cy - 7, perfectR(cw) * 2, 14);
+      // sweeping marker
+      cx.strokeStyle = GOLD; cx.lineWidth = 3; cx.globalAlpha = 0.9;
+      cx.beginPath(); cx.moveTo(marker.x, cy - 24); cx.lineTo(marker.x, cy + 24); cx.stroke();
+      cx.globalAlpha = 0.25; cx.lineWidth = 9; cx.beginPath();
+      cx.moveTo(marker.x, cy - 24); cx.lineTo(marker.x, cy + 24); cx.stroke(); cx.globalAlpha = 1;
+      // marker head dot
+      cx.fillStyle = GOLD; cx.beginPath(); cx.arc(marker.x, cy, 4, 0, Math.PI * 2); cx.fill();
+
+      // climber on current rung (with hop offset)
+      var hopOff = Math.max(0, climberHop) * 14;
+      drawClimber(marker.cx, climberY - hopOff);
+    } else if (state.phase === 'play' && !marker) {
+      // between rungs: climber mid-transition
+      drawClimber(W / 2, climberY);
+    } else if (state.rung >= 1 && state.phase !== 'play' && !state.won && state.phase !== 'title') {
+      // resting climber for over-screen (unless it fell)
+      if (fallers.length === 0) drawClimber(W / 2, rungY(state.rung) - 16);
+    }
+
+    // falling climber (death spectacle)
+    for (var f = fallers.length - 1; f >= 0; f--) {
+      var p = fallers[f];
+      p.vy += 0.42 * dt; p.y += p.vy * dt; p.r += p.vr * dt;
+      cx.save(); cx.translate(p.x, p.y); cx.rotate(p.r); cx.globalAlpha = 0.95;
+      cx.fillStyle = p.c; cx.beginPath(); cx.arc(0, 0, p.rad, 0, Math.PI * 2); cx.fill();
+      cx.restore(); cx.globalAlpha = 1;
+      if (p.y > H + 60) fallers.splice(f, 1);
+    }
+    // debris
+    for (var d = debris.length - 1; d >= 0; d--) {
+      var b = debris[d];
+      b.vy += 0.35 * dt; b.x += b.vx * dt; b.y += b.vy * dt; b.r += b.vr * dt; b.life += dt;
+      cx.save(); cx.translate(b.x, b.y); cx.rotate(b.r); cx.globalAlpha = Math.max(0, 1 - b.life / 50);
+      cx.fillStyle = b.c; cx.fillRect(-b.s / 2, -b.s / 2, b.s, b.s);
+      cx.restore(); cx.globalAlpha = 1;
+      if (b.life > 50) debris.splice(d, 1);
+    }
+
+    // score + rung readout
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 58px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 92);
+      cx.fillStyle = 'rgba(255,255,255,0.42)';
+      cx.font = '700 12px Menlo, monospace';
+      cx.fillText('CLOUT · RUNG ' + Math.min(state.rung, RUNGS) + '/' + RUNGS, W / 2, 112);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 132);
+      // combo escalation
+      if (state.combo >= 2) {
+        var cs = 18 + Math.min(state.combo, 8) * 2.2;
+        cx.fillStyle = GOLD; cx.font = '900 ' + cs + 'px -apple-system, Helvetica, Arial';
+        cx.fillText('×' + state.combo, W / 2, 168);
+      }
+      // incoming dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 188);
+      }
+    }
+
+    // challenge card (demo beat 1)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('400', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top climb", W / 2, 430);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 240 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('CLOUT LADDER', W / 2, 280);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO CLIMB', W / 2, 330); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('climb 10. don’t slip.', W / 2, 360);
+    }
+
+    // game over
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = state.won ? GOLD : VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText(state.won ? 'TOPPED IT.' : 'FELL OFF.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' clout', W / 2, 345);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of climbers', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE CLIMB', W / 2, 462);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('CLOUT LADDER', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('he hit ' + (window.__demoScore || 400) + '. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 400), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  function drawClimber(x, y) {
+    // glowing vermillion dot — the "you" climbing the feed
+    cx.save();
+    cx.shadowColor = VERM; cx.shadowBlur = 14;
+    cx.fillStyle = VERM;
+    cx.beginPath(); cx.arc(x, y, 9, 0, Math.PI * 2); cx.fill();
+    cx.restore();
+    cx.fillStyle = '#fff'; cx.globalAlpha = 0.7;
+    cx.beginPath(); cx.arc(x - 2, y - 2, 2.4, 0, Math.PI * 2); cx.fill();
+    cx.globalAlpha = 1;
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

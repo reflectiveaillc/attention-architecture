@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Sort Rush — Tilt</title>
+<!--
+  LOOP / attention-architecture — Sort Rush
+  Circuits: 01 RPE (variable reward per sort), 06 Zeigarnik (one more try), 04 loss (lane clog).
+  Modes:
+    ?demo=1&seed=7        scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N&seed=M  imperfect autoplay N runs, sets window.__botDone
+    ?dare=N               incoming challenge banner
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'sort-rush';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- Item types ----
+  // Each item has a label (category) and must go to the matching bin.
+  // Categories: SHAPE (circle, square, triangle) and COLOR (red, teal, gold)
+  // Bins are on the left and right sides.
+  // Left bin = category A, Right bin = category B
+  // We alternate which category A/B is per round to keep it fresh.
+
+  var CATEGORIES = ['CIRCLE', 'SQUARE', 'TRIANGLE', 'RED', 'TEAL', 'GOLD'];
+  var CAT_COLORS = {
+    CIRCLE:   '#2ec5b6',
+    SQUARE:   '#e8502e',
+    TRIANGLE: '#f2b134',
+    RED:      '#e8502e',
+    TEAL:     '#2ec5b6',
+    GOLD:     '#f2b134'
+  };
+
+  // Bin layout
+  var BIN_Y    = 590;   // top of bins
+  var BIN_H    = 100;
+  var BIN_W    = 160;
+  var BIN_GAP  = 20;
+  var BIN_L_X  = BIN_GAP;                      // left bin left edge
+  var BIN_R_X  = W - BIN_GAP - BIN_W;          // right bin left edge
+
+  // Item dimensions
+  var ITEM_W = 80, ITEM_H = 80;
+  var LANE_X = W / 2;   // items fall down center-ish
+
+  // Physics
+  var BASE_FALL_SPEED = 2.5;  // px per frame at dt=1
+  var SPEED_INC       = 0.06; // added per correct sort
+
+  // ---- Game state ----
+  var state, flashes, particles;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var dareBeaten = false;
+  var best = 0;
+  try { best = +localStorage.getItem('srt_best') || 0; } catch (_) {}
+  var runStartTs = 0, ctaAt = 0, challengeAt = 0;
+  var botRunsDone = 0;
+  var last = performance.now();
+
+  // Input rects
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 490, w: 250, h: 46 };
+
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- Item factory ----
+  function makeItem() {
+    // pick a random category from the two active bins
+    var cat = rng() < 0.5 ? state.binL : state.binR;
+    // add occasional wrong-category item (more tension)
+    if (rng() < 0.15 && state.score > 3) {
+      // pick from other categories
+      var others = CATEGORIES.filter(function(c){ return c !== state.binL && c !== state.binR; });
+      if (others.length) cat = others[Math.floor(rng() * others.length)];
+    }
+    // x position varies slightly
+    var x = LANE_X + (rng() - 0.5) * 80;
+    return {
+      cat: cat,
+      x: x,
+      y: -ITEM_H - 10,
+      vy: BASE_FALL_SPEED + state.score * SPEED_INC,
+      active: true,
+      swipeDir: 0,    // -1 = left, 1 = right (while swiping)
+      swipeX: x,
+      swipeProgress: 0,
+      isDud: (cat !== state.binL && cat !== state.binR),  // wrong-cat item = dud
+      wobble: 0
+    };
+  }
+
+  function pickBinPair() {
+    var shuffled = CATEGORIES.slice().sort(function(){ return rng() - 0.5; });
+    state.binL = shuffled[0];
+    state.binR = shuffled[1];
+  }
+
+  function newGame() {
+    state = {
+      phase: 'title',   // title | challenge | play | over | cta
+      score: 0,
+      combo: 0,
+      streak: 0,        // longest combo this run
+      lives: 3,         // wrong sort or missed item costs a life
+      speed: BASE_FALL_SPEED,
+      items: [],
+      spawnTimer: 0,
+      spawnInterval: 95,  // frames between spawns (decreases with score)
+      binL: 'CIRCLE',
+      binR: 'SQUARE',
+      swipeItem: null,    // item currently being dragged
+      overAt: 0,
+      dudsRemaining: 0    // duds on screen to handle
+    };
+    pickBinPair();
+    flashes = [];
+    particles = [];
+    dareBeaten = false;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1300);
+      return;
+    }
+    if (BOT) { startRun(); return; }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    state.items = [];
+    state.spawnTimer = 0;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 14))));
+  }
+
+  // ---- Sort logic ----
+  function sortItem(item, dir) {
+    // dir: -1 = left, 1 = right
+    var correct = (dir === -1 && item.cat === state.binL) ||
+                  (dir ===  1 && item.cat === state.binR);
+
+    if (item.isDud) {
+      // duds are never "correct" — hitting them always costs a life
+      correct = false;
+    }
+
+    if (correct) {
+      state.score++;
+      state.combo++;
+      if (state.combo > state.streak) state.streak = state.combo;
+      // sound
+      if (window.J) {
+        if (state.combo >= 5) J.perfect(state.combo);
+        else J.hit(state.combo);
+        J.tension(Math.min(state.score / 30, 1));
+      }
+      if (state.combo >= 5) {
+        hitStop = 4; zoom = 1.03;
+        flash('×' + state.combo + ' STREAK!', GOLD, 36);
+        if (window.J) J.gold();
+      } else if (state.combo >= 3) {
+        flash('COMBO ' + state.combo, TEAL, 32);
+      }
+      spawnParticles(item.x, item.y, CAT_COLORS[item.cat]);
+
+      // dare check
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score);
+      }
+
+      // new best flash
+      if (state.score > best && !DEMO && !BOT) {
+        flash('NEW BEST!', GOLD, 38);
+        if (window.J) J.fanfare();
+      }
+
+      if (window.LOOP) LOOP.emit('sort_correct', { n: state.score, combo: state.combo, cat: item.cat });
+    } else {
+      // wrong sort or dud hit
+      state.combo = 0;
+      state.lives--;
+      shakeAmt = 6;
+      flash('WRONG!', VERM, 36);
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('sort_wrong', { n: state.score, cat: item.cat });
+      if (state.lives <= 0) {
+        item.active = false;
+        gameOver();
+        return;
+      }
+    }
+    item.active = false;
+  }
+
+  function itemMissed(item) {
+    // item fell off bottom without being sorted
+    item.active = false;
+    state.combo = 0;
+    state.lives--;
+    shakeAmt = 5;
+    flash('MISSED!', VERM, 34);
+    if (window.J) J.near();
+    if (window.LOOP) LOOP.emit('near_miss', { n: state.score });
+    if (state.lives <= 0) gameOver();
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    shakeAmt = 10;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + state.score / 30, 1));
+      if (newBest) setTimeout(function(){ J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) {
+      best = state.score;
+      try { localStorage.setItem('srt_best', String(best)); } catch(_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function() {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function(){ window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function(){ resetRun(); }, 800);
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.combo = 0; state.streak = 0;
+    state.lives = 3;
+    state.items = [];
+    state.spawnTimer = 0;
+    state.spawnInterval = 95;
+    flashes = []; particles = [];
+    dareBeaten = false;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    pickBinPair();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- Particles ----
+  function spawnParticles(x, y, color) {
+    for (var i = 0; i < 8; i++) {
+      var angle = rng() * Math.PI * 2;
+      var speed = 2 + rng() * 4;
+      particles.push({
+        x: x, y: y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 2,
+        color: color,
+        life: 1,
+        r: 3 + rng() * 3
+      });
+    }
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0,
+                   x: W / 2 + (rng() - 0.5) * 40 });
+  }
+
+  // ---- Spawn logic ----
+  function spawnInterval() {
+    // gets faster as score climbs
+    return Math.max(35, 95 - state.score * 2.5);
+  }
+
+  // ---- Input ----
+  var dragStart = null;
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'streak' }); return;
+      }
+      resetRun(); return;
+    }
+  }
+
+  function pointerDown(x, y) {
+    if (DEMO || BOT) return;
+    tap(x, y);
+    if (state.phase !== 'play') return;
+    // find closest active item to touch
+    var best = null, bestDist = 999;
+    for (var i = 0; i < state.items.length; i++) {
+      var it = state.items[i];
+      if (!it.active) continue;
+      var dx = x - it.x, dy = y - it.y;
+      var dist = Math.sqrt(dx*dx + dy*dy);
+      if (dist < bestDist && dist < 80) { bestDist = dist; best = it; }
+    }
+    if (best) {
+      state.swipeItem = best;
+      dragStart = { x: x, y: y };
+    }
+  }
+
+  function pointerMove(x, y) {
+    if (DEMO || BOT) return;
+    if (!state.swipeItem || !dragStart) return;
+    var dx = x - dragStart.x;
+    state.swipeItem.swipeX = state.swipeItem.x + dx;
+  }
+
+  function pointerUp(x, y) {
+    if (DEMO || BOT) return;
+    if (!state.swipeItem || !dragStart) return;
+    var dx = x - dragStart.x;
+    if (Math.abs(dx) > 40) {
+      sortItem(state.swipeItem, dx > 0 ? 1 : -1);
+    } else {
+      // snap back
+      state.swipeItem.swipeX = state.swipeItem.x;
+    }
+    state.swipeItem = null;
+    dragStart = null;
+  }
+
+  cv.addEventListener('pointerdown', function(e) {
+    var r = cv.getBoundingClientRect();
+    pointerDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointermove', function(e) {
+    var r = cv.getBoundingClientRect();
+    pointerMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', function(e) {
+    var r = cv.getBoundingClientRect();
+    pointerUp((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function(e) {
+    if (e.code === 'ArrowLeft' && state.phase === 'play') {
+      var it = state.items.find(function(i){ return i.active; });
+      if (it) sortItem(it, -1);
+    }
+    if (e.code === 'ArrowRight' && state.phase === 'play') {
+      var it = state.items.find(function(i){ return i.active; });
+      if (it) sortItem(it, 1);
+    }
+    if (e.code === 'Space') tap();
+  });
+
+  // ---- Demo / Bot autopilot ----
+  // Demo script: sequence of {delay(ms), dir, cat-override}
+  // We script specific moments: good run → near-miss → save → fail
+  var demoQueue = [], demoQueueIdx = 0;
+  var demoPhase = 'warmup';  // warmup | nearfail | recovery | fail
+  var demoCorrectCount = 0;
+  var demoLastActionTime = 0;
+  // Hesitation waits (ms) per action — varied to feel human
+  var demoWaits = [520, 480, 610, 440, 580, 390, 720, 450, 500, 340, 660, 480, 400, 350, 280];
+  var demoWaitIdx = 0;
+  var demoPending = false;   // waiting for next action
+  var demoNextAt = 0;        // absolute time for next demo action
+  var botSortTimer = 0;
+
+  function demoPick(now) {
+    // Only act on one item at a time
+    var candidates = state.items.filter(function(i){ return i.active; });
+    if (!candidates.length) return;
+    var item = candidates[0];
+
+    if (demoPending && now < demoNextAt) return;
+    demoPending = false;
+
+    // Determine action based on demo phase
+    var dir;
+    if (demoPhase === 'warmup') {
+      demoCorrectCount++;
+      // mostly correct, one intentional wrong at count 4 for near-miss tension
+      if (demoCorrectCount === 4) {
+        // near-miss: do WRONG sort — costs a life (tension!)
+        dir = (item.cat === state.binL) ? 1 : -1;  // wrong direction
+        demoPhase = 'nearfail';
+      } else if (demoCorrectCount === 6) {
+        // recovery: correct again
+        dir = (item.cat === state.binL) ? -1 : 1;
+        demoPhase = 'recovery';
+      } else {
+        dir = (item.cat === state.binL) ? -1 : 1;
+      }
+    } else if (demoPhase === 'nearfail') {
+      // correct to recover
+      dir = (item.cat === state.binL) ? -1 : 1;
+      if (demoCorrectCount < 9) demoCorrectCount++;
+      else demoPhase = 'recovery';
+    } else if (demoPhase === 'recovery') {
+      // one more correct then let item fall (fail)
+      demoCorrectCount++;
+      if (demoCorrectCount >= 11) {
+        // let next item fall for the fail — don't act
+        demoPhase = 'fail';
+        demoPending = true;
+        demoNextAt = now + 1200;
+        return;
+      }
+      dir = (item.cat === state.binL) ? -1 : 1;
+    } else {
+      // fail: do nothing — item falls off
+      return;
+    }
+
+    sortItem(item, dir);
+    // human hesitation wait
+    var wait = demoWaits[demoWaitIdx % demoWaits.length];
+    demoWaitIdx++;
+    // vary wait slightly
+    wait += (rng() - 0.5) * 120;
+    demoPending = true;
+    demoNextAt = now + wait;
+  }
+
+  function botAct(now) {
+    if (botSortTimer > now) return;
+    var candidates = state.items.filter(function(i){ return i.active; });
+    if (!candidates.length) return;
+    var item = candidates[0];
+    // imperfect: 80% correct
+    var correct = rng() < 0.80;
+    var dir;
+    if (correct) {
+      if (!item.isDud) {
+        dir = (item.cat === state.binL) ? -1 : 1;
+      } else {
+        // skip dud items (let them fall)
+        botSortTimer = now + 400;
+        return;
+      }
+    } else {
+      dir = (item.cat === state.binL) ? 1 : -1;
+    }
+    sortItem(item, dir);
+    var wait = 300 + rng() * 400;
+    botSortTimer = now + wait;
+  }
+
+  // ---- Draw helpers ----
+  function drawItem(item, now) {
+    var sx = (item === state.swipeItem) ? item.swipeX : item.x;
+    var sy = item.y;
+    var col = CAT_COLORS[item.cat] || TEAL;
+    // wobble
+    sx += Math.sin(now * 0.008 + item.x) * (item.isDud ? 3 : 0);
+
+    cx.save();
+    cx.translate(sx, sy);
+
+    // glow on combo
+    if (state.combo >= 3 && !item.isDud) {
+      cx.shadowColor = col;
+      cx.shadowBlur = 18;
+    }
+
+    // shape
+    cx.fillStyle = item.isDud ? '#444' : col;
+    cx.globalAlpha = item.isDud ? 0.6 : 1;
+
+    if (item.cat === 'CIRCLE' || item.cat === 'TEAL') {
+      cx.beginPath();
+      cx.arc(0, 0, ITEM_W / 2 - 4, 0, Math.PI * 2);
+      cx.fill();
+    } else if (item.cat === 'SQUARE' || item.cat === 'RED') {
+      cx.fillRect(-ITEM_W/2 + 4, -ITEM_H/2 + 4, ITEM_W - 8, ITEM_H - 8);
+    } else {
+      // TRIANGLE or GOLD
+      cx.beginPath();
+      cx.moveTo(0, -ITEM_H/2 + 4);
+      cx.lineTo(ITEM_W/2 - 4, ITEM_H/2 - 4);
+      cx.lineTo(-ITEM_W/2 + 4, ITEM_H/2 - 4);
+      cx.closePath();
+      cx.fill();
+    }
+
+    // label
+    cx.shadowBlur = 0;
+    cx.globalAlpha = 1;
+    cx.fillStyle = '#fff';
+    cx.font = '800 14px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    cx.fillText(item.isDud ? '?' : item.cat, 0, 0);
+
+    cx.restore();
+  }
+
+  function drawBin(x, label, color, highlight) {
+    cx.save();
+    cx.globalAlpha = highlight ? 1 : 0.75;
+    // bin body
+    cx.fillStyle = color + '22';
+    cx.strokeStyle = color;
+    cx.lineWidth = highlight ? 3 : 1.5;
+    if (cx.roundRect) cx.roundRect(x, BIN_Y, BIN_W, BIN_H, 12);
+    else cx.rect(x, BIN_Y, BIN_W, BIN_H);
+    cx.fill(); cx.stroke();
+    // label
+    cx.fillStyle = color;
+    cx.font = '800 15px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    cx.fillText(label, x + BIN_W / 2, BIN_Y + BIN_H / 2);
+    cx.restore();
+  }
+
+  function drawLives(n) {
+    cx.textAlign = 'left';
+    cx.font = '18px -apple-system, Helvetica, Arial';
+    for (var i = 0; i < 3; i++) {
+      cx.globalAlpha = i < n ? 1 : 0.2;
+      cx.fillStyle = VERM;
+      cx.fillText('♥', 16 + i * 26, 36);
+    }
+    cx.globalAlpha = 1;
+  }
+
+  function drawComboMeter() {
+    if (state.combo < 2) return;
+    var pct = Math.min(state.combo / 10, 1);
+    var barW = 160;
+    var bx = W / 2 - barW / 2, by = 58;
+    cx.fillStyle = 'rgba(255,255,255,0.1)';
+    cx.fillRect(bx, by, barW, 6);
+    var grad = cx.createLinearGradient(bx, 0, bx + barW * pct, 0);
+    grad.addColorStop(0, TEAL);
+    grad.addColorStop(1, GOLD);
+    cx.fillStyle = grad;
+    cx.fillRect(bx, by, barW * pct, 6);
+    cx.fillStyle = GOLD;
+    cx.font = '700 12px Menlo, monospace';
+    cx.textAlign = 'center';
+    cx.fillText('×' + state.combo, W / 2, 54);
+  }
+
+  // ---- Main loop ----
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // STEP: hitStop gate — decay every frame then run autopilot
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      // sim step only when not frozen
+      if (state.phase === 'play') {
+        // spawn
+        state.spawnTimer -= dt;
+        if (state.spawnTimer <= 0) {
+          state.items.push(makeItem());
+          state.spawnTimer = spawnInterval();
+        }
+
+        // update items
+        for (var i = state.items.length - 1; i >= 0; i--) {
+          var it = state.items[i];
+          if (!it.active) { state.items.splice(i, 1); continue; }
+          it.y += (BASE_FALL_SPEED + state.score * SPEED_INC) * dt;
+          // check if past the bins (missed)
+          if (it.y > BIN_Y + BIN_H + 20) {
+            itemMissed(it);
+            state.items.splice(i, 1);
+          }
+        }
+
+        // autopilots
+        if (DEMO) demoPick(now);
+        if (BOT) botAct(now);
+      }
+    }
+
+    // particles always update
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pt = particles[p];
+      pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.vy += 0.15 * dt;
+      pt.life -= 0.03 * dt;
+      if (pt.life <= 0) particles.splice(p, 1);
+    }
+
+    // ---- DRAW ----
+    cx.save();
+    // juice transforms
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- TITLE ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('SORT RUSH', W / 2, 280);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillText('swipe to sort', W / 2, 330);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('left or right — fast.', W / 2, 360);
+      // draw static bins to orient player
+      drawBin(BIN_L_X, 'CIRCLE', TEAL, false);
+      drawBin(BIN_R_X, 'SQUARE', VERM, false);
+    }
+
+    // ---- CHALLENGE CARD (demo beat 1) ----
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('21', W / 2, 405);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top sort", W / 2, 435);
+    }
+
+    // ---- PLAY ----
+    if (state.phase === 'play') {
+      // falling item guide line
+      cx.strokeStyle = 'rgba(255,255,255,0.06)';
+      cx.lineWidth = 1;
+      cx.setLineDash([6, 8]);
+      cx.beginPath(); cx.moveTo(W/2, 0); cx.lineTo(W/2, BIN_Y); cx.stroke();
+      cx.setLineDash([]);
+
+      // bin highlight: if swiping, highlight relevant bin
+      var swipeDir = 0;
+      if (state.swipeItem) {
+        swipeDir = (state.swipeItem.swipeX - state.swipeItem.x) > 20 ? 1 :
+                   (state.swipeItem.swipeX - state.swipeItem.x) < -20 ? -1 : 0;
+      }
+      drawBin(BIN_L_X, state.binL, TEAL, swipeDir === -1);
+      drawBin(BIN_R_X, state.binR, VERM, swipeDir === 1);
+
+      // items
+      for (var i = 0; i < state.items.length; i++) {
+        drawItem(state.items[i], now);
+      }
+
+      // HUD
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 58px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 88);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 110);
+
+      drawLives(state.lives);
+      drawComboMeter();
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 132);
+      }
+    }
+
+    // ---- GAME OVER ----
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.60)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('CLOGGED.', W / 2, 296);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' sorted', W / 2, 342);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('best streak: ×' + state.streak, W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — SORT FASTER', W / 2, 460);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- DEMO CTA ----
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('SORT RUSH', W / 2, 296);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they sorted ' + (window.__demoScore || 21) + '. your thumbs?', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 21), W / 2, 408);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- particles ----
+    for (var p = 0; p < particles.length; p++) {
+      var pt = particles[p];
+      cx.globalAlpha = pt.life;
+      cx.fillStyle = pt.color;
+      cx.beginPath();
+      cx.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2);
+      cx.fill();
+    }
+    cx.globalAlpha = 1;
+
+    // ---- flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, 230 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(k, 1);
+    }
+
+    // ---- mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

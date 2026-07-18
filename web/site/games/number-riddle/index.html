@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Number Riddle — Tilt</title>
+<!--
+  LOOP / attention-architecture — Number Riddle (docs/game-contract-v2.md)
+  Circuits: 01 RPE (variable reward per solve), 02 novelty (meta-pattern reveal),
+            06 Zeigarnik (one more sequence).
+  Modes:
+    ?demo=1&seed=7        scripted run for clip capture, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay for validation, sets window.__botDone
+    ?dare=<n>[&by=name]   challenge mode
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'number-riddle';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134';
+  var PATTERN_REVEAL_COUNT = 5;
+  var PRIMES = [2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,73,79,83,89,97];
+
+  var PATTERNS = [
+    { key: 'multiples', name: 'MULTIPLES OF N', fn: genMultiples },
+    { key: 'powers2', name: 'POWERS OF 2', fn: genPowers2 },
+    { key: 'squares', name: 'SQUARE NUMBERS', fn: genSquares },
+    { key: 'primes', name: 'PRIME NUMBERS', fn: genPrimes },
+    { key: 'fibonacci', name: 'FIBONACCI', fn: genFibonacci },
+    { key: 'arithmetic', name: '+N EACH TIME', fn: genArithmetic }
+  ];
+
+  function genArithmetic() {
+    var start = 3 + Math.floor(rng() * 18);
+    var step = 2 + Math.floor(rng() * 8);
+    var seq = [];
+    for (var i = 0; i < 5; i++) seq.push(start + i * step);
+    var miss = 1 + Math.floor(rng() * 3);
+    return { seq: seq, miss: miss, ans: seq[miss] };
+  }
+  function genMultiples() {
+    var base = 3 + Math.floor(rng() * 8);
+    var seq = [];
+    for (var i = 1; i <= 5; i++) seq.push(base * i);
+    var miss = 1 + Math.floor(rng() * 3);
+    return { seq: seq, miss: miss, ans: seq[miss] };
+  }
+  function genPowers2() {
+    var seq = [2, 4, 8, 16, 32, 64].slice(0, 5);
+    var miss = 1 + Math.floor(rng() * 3);
+    return { seq: seq, miss: miss, ans: seq[miss] };
+  }
+  function genSquares() {
+    var start = 2 + Math.floor(rng() * 4);
+    var seq = [];
+    for (var i = 0; i < 5; i++) seq.push((start + i) * (start + i));
+    var miss = 1 + Math.floor(rng() * 3);
+    return { seq: seq, miss: miss, ans: seq[miss] };
+  }
+  function genPrimes() {
+    var start = Math.floor(rng() * (PRIMES.length - 6));
+    var seq = PRIMES.slice(start, start + 5);
+    var miss = 1 + Math.floor(rng() * 3);
+    return { seq: seq, miss: miss, ans: seq[miss] };
+  }
+  function genFibonacci() {
+    var a = 2 + Math.floor(rng() * 4);
+    var b = a + 2 + Math.floor(rng() * 5);
+    var seq = [a, b];
+    for (var i = 2; i < 5; i++) seq.push(seq[i - 1] + seq[i - 2]);
+    var miss = 1 + Math.floor(rng() * 3);
+    return { seq: seq, miss: miss, ans: seq[miss] };
+  }
+
+  function makeChoices(correct) {
+    var choices = [correct];
+    var attempts = 0;
+    while (choices.length < 4 && attempts < 30) {
+      attempts++;
+      var delta = Math.max(1, Math.round(Math.abs(correct) * (0.15 + rng() * 0.45)));
+      if (correct < 10) delta = 1 + Math.floor(rng() * 4);
+      var wrong = correct + (rng() < 0.5 ? -delta : delta);
+      if (wrong > 0 && wrong !== correct && choices.indexOf(wrong) === -1) choices.push(wrong);
+    }
+    while (choices.length < 4) choices.push(correct + choices.length);
+    choices.sort(function (a, b) { return a - b; });
+    return choices;
+  }
+
+  var state, runStartTs, best = 0, patternIndex, patternRevealed = false;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  var flashes = [], challengeAt = 0, ctaAt = 0, lastAnswerIdx = -1;
+  try { best = +localStorage.getItem('nr_best') || 0; } catch (_) {}
+
+  function newGame() {
+    patternIndex = Math.floor(rng() * PATTERNS.length);
+    patternRevealed = false;
+    state = {
+      phase: 'title',
+      score: 0, combo: 0, streak: 0, overAt: 0,
+      current: null, choices: [], showChoices: false, answered: false,
+      timer: 0, maxTimer: 0, flashTimer: 0, maxFlash: 0,
+      missIndex: -1
+    };
+    flashes = []; dareBeaten = false;
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 8))));
+  }
+
+  function difficulty() {
+    return Math.min(12, Math.floor(state.score / 1.5));
+  }
+
+  function flashTime() {
+    return Math.max(0.28, 0.9 - difficulty() * 0.05);
+  }
+  function answerWindow() {
+    return Math.max(1.45, 3.6 - difficulty() * 0.18);
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED, pattern: PATTERNS[patternIndex].key });
+    nextSequence();
+  }
+
+  function nextSequence() {
+    lastAnswerIdx = -1;
+    var diff = difficulty();
+    var gen = PATTERNS[patternIndex].fn;
+    var q = gen();
+    state.current = q;
+    state.choices = makeChoices(q.ans);
+    state.missIndex = q.miss;
+    state.showChoices = false;
+    state.answered = false;
+    state.maxFlash = flashTime();
+    state.flashTimer = state.maxFlash;
+    state.maxTimer = answerWindow();
+    state.timer = state.maxTimer;
+  }
+
+  function answer(idx) {
+    if (state.phase !== 'play' || !state.showChoices || state.answered) return;
+    state.answered = true;
+    lastAnswerIdx = idx;
+    var correct = state.choices[idx] === state.current.ans;
+    var timeLeft = state.timer / state.maxTimer;
+    if (correct) {
+      state.score++;
+      state.streak++;
+      state.combo++;
+      var fast = timeLeft > 0.65;
+      var near = timeLeft < 0.22;
+      if (window.J) {
+        if (fast) J.perfect(state.streak);
+        else if (near) J.near();
+        else J.hit(state.combo);
+        J.tension(Math.min(1, state.score / 12));
+      }
+      hitStop = fast ? 5 : 3;
+      zoom = fast ? 1.03 : 1.015;
+      if (near) {
+        shakeAmt = 4;
+        flash('SO CLOSE', VERM, 38);
+        if (window.LOOP) LOOP.emit('near_miss', { n: state.score, time_left: +timeLeft.toFixed(2) });
+      } else {
+        flash(fast ? 'PERFECT' : '+' + state.score, fast ? TEAL : GOLD, fast ? 44 : 36);
+      }
+      if (window.LOOP) LOOP.emit('sequence_solved', { n: state.score, fast: fast, near: near, pattern: PATTERNS[patternIndex].key });
+
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score);
+      }
+
+      if (state.score === PATTERN_REVEAL_COUNT && !patternRevealed) {
+        patternRevealed = true;
+        flash('PATTERN REVEALED', GOLD, 48);
+        if (window.J) J.fanfare();
+        if (window.LOOP) LOOP.emit('pattern_revealed', { pattern: PATTERNS[patternIndex].key, name: PATTERNS[patternIndex].name });
+      }
+
+      setTimeout(nextSequence, fast ? 260 : 420);
+    } else {
+      // wrong answer — visual penalty then game over (death sound at gameOver)
+      shakeAmt = 6;
+      flash('WRONG', VERM, 42);
+      setTimeout(gameOver, 280);
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) {
+      J.tension(0);
+      J.death(Math.min(0.3 + state.score / 25, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('nr_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), pattern: PATTERNS[patternIndex].key });
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) window.__botDone = true;
+      else setTimeout(function () { resetRun(); }, 900);
+    }
+  }
+
+  function resetRun() {
+    patternIndex = Math.floor(rng() * PATTERNS.length);
+    patternRevealed = false;
+    lastAnswerIdx = -1;
+    botPlan = null;
+    state.score = 0; state.combo = 0; state.streak = 0;
+    state.current = null; state.choices = []; state.showChoices = false; state.answered = false;
+    state.timer = 0; state.maxTimer = 0; state.flashTimer = 0; state.maxFlash = 0;
+    dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 516, w: 250, h: 46 };
+  var choiceRects = [];
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function choiceHit(x, y) {
+    for (var i = 0; i < choiceRects.length; i++) {
+      if (inR(choiceRects[i], x, y)) return i;
+    }
+    return -1;
+  }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play' && state.showChoices && !state.answered) {
+      var idx = choiceHit(x, y);
+      if (idx >= 0) { answer(idx); return; }
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'sequences' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') tap();
+    if (state.phase === 'play' && state.showChoices && !state.answered) {
+      if (e.key === '1') answer(0);
+      if (e.key === '2') answer(1);
+      if (e.key === '3') answer(2);
+      if (e.key === '4') answer(3);
+    }
+  });
+
+  // ---- demo / bot autopilots ----
+  var botRunsDone = 0;
+  var demoStep = 0, demoWait = 0;
+  // scripted beats: correct solves with varied timing, one near-fail, one wrong-answer fail
+  var demoScript = [
+    { wait: 18, near: false, wrong: false },
+    { wait: 14, near: false, wrong: false },
+    { wait: 22, near: false, wrong: false },
+    { wait: 30, near: false, wrong: false },
+    { wait: 16, near: false, wrong: false },   // pattern reveal after this
+    { wait: 48, near: true, wrong: false },    // near-fail + recovery ~60%
+    { wait: 20, near: false, wrong: false },
+    { wait: 26, near: false, wrong: true }     // real fail
+  ];
+  var botPlan = null;
+
+  function autopilot() {
+    if (state.phase !== 'play' || !state.showChoices || state.answered) return;
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      var step = demoScript[Math.min(demoStep, demoScript.length - 1)];
+      var deadlineFrames = (state.timer / 16.667);
+      if (step.near) {
+        // wait until the last moment (timer nearly gone)
+        if (deadlineFrames > 12) return;
+      }
+      var correctIdx = state.choices.indexOf(state.current.ans);
+      if (step.wrong) {
+        // choose a wrong answer (but not the correct one)
+        var wrongIdx = (correctIdx + 1 + Math.floor(rng() * 3)) % 4;
+        answer(wrongIdx);
+      } else {
+        answer(correctIdx);
+      }
+      demoStep++;
+      demoWait = step.wait;
+    } else if (BOT) {
+      if (botPlan === null) {
+        // imperfect bot: occasional wrong answer, occasional timeout
+        var errRoll = rng();
+        var willErr = errRoll < 0.22;
+        var willTimeout = errRoll > 0.78;
+        botPlan = {
+          delay: 8 + Math.floor(rng() * 35),
+          wrong: willErr,
+          timeout: willTimeout
+        };
+      }
+      if (botPlan.delay > 0) { botPlan.delay--; return; }
+      var cidx = state.choices.indexOf(state.current.ans);
+      if (botPlan.timeout) {
+        if (state.timer <= 0.05) { botPlan = null; return; } // timeout handled by update
+        return;
+      }
+      if (botPlan.wrong) {
+        var widx = (cidx + 1 + Math.floor(rng() * 3)) % 4;
+        answer(widx);
+      } else {
+        answer(cidx);
+      }
+      botPlan = null;
+    }
+  }
+
+  // ---- render helpers ----
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    cx.beginPath();
+    cx.moveTo(x + r, y);
+    cx.lineTo(x + w - r, y);
+    cx.quadraticCurveTo(x + w, y, x + w, y + r);
+    cx.lineTo(x + w, y + h - r);
+    cx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    cx.lineTo(x + r, y + h);
+    cx.quadraticCurveTo(x, y + h, x, y + h - r);
+    cx.lineTo(x, y + r);
+    cx.quadraticCurveTo(x, y, x + r, y);
+    cx.closePath();
+  }
+
+  function drawChoiceRect(r, label, selected, correct, wrong) {
+    var bg = INK;
+    if (selected && correct) bg = 'rgba(46,197,182,0.25)';
+    else if (selected && wrong) bg = 'rgba(232,80,46,0.25)';
+    else bg = 'rgba(255,255,255,0.06)';
+    cx.fillStyle = bg;
+    roundRectPath(r.x, r.y, r.w, r.h, 14);
+    cx.fill();
+    cx.strokeStyle = selected ? (correct ? TEAL : VERM) : 'rgba(255,255,255,0.18)';
+    cx.lineWidth = selected ? 2.5 : 1.5;
+    cx.stroke();
+    cx.fillStyle = '#fff';
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    cx.font = '800 28px Menlo, monospace';
+    cx.fillText(String(label), r.x + r.w / 2, r.y + r.h / 2);
+  }
+
+  var ctaAt = 0, last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // update timers
+    if (state.phase === 'play' && state.current) {
+      if (hitStop > 0) { hitStop -= dt; }
+      else {
+        if (state.flashTimer > 0) {
+          state.flashTimer -= dt * 16.667 / 1000;
+          if (state.flashTimer <= 0) state.showChoices = true;
+        } else {
+          state.showChoices = true;
+          state.timer -= dt * 16.667 / 1000;
+          if (state.timer <= 0 && !state.answered) {
+            state.answered = true;
+            if (window.J) J.death(0.35);
+            shakeAmt = 6;
+            flash('TIME UP', VERM, 42);
+            if (window.LOOP) LOOP.emit('sequence_timeout', { n: state.score + 1, pattern: PATTERNS[patternIndex].key });
+            setTimeout(gameOver, 280);
+          }
+        }
+        autopilot();
+      }
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)'); bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('NUMBER RIDDLE', W / 2, 260);
+      cx.fillStyle = TEAL; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO START', W / 2, 310); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('spot the missing number.', W / 2, 340);
+      cx.fillStyle = 'rgba(255,255,255,0.25)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('solve 5 to reveal the hidden pattern.', W / 2, 358);
+    }
+
+    // challenge card
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('7', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // play field
+    if (state.phase === 'play' || state.phase === 'over') {
+      // score / combo
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = '#fff'; cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 120);
+
+      // combo ring
+      if (state.combo > 1) {
+        cx.strokeStyle = TEAL;
+        cx.lineWidth = 2 + Math.min(state.combo, 10) * 0.5;
+        cx.globalAlpha = 0.25 + Math.min(state.combo / 10, 0.5);
+        cx.beginPath();
+        var radius = 46 + Math.min(state.combo, 12) * 2;
+        cx.arc(W / 2, 76, radius, 0, Math.PI * 2);
+        cx.stroke(); cx.globalAlpha = 1;
+      }
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 148);
+      }
+
+      if (state.current) {
+        // sequence slots
+        var seqY = 240, slotW = 64, gap = 10;
+        var totalW = state.current.seq.length * slotW + (state.current.seq.length - 1) * gap;
+        var startX = (W - totalW) / 2;
+        for (var i = 0; i < state.current.seq.length; i++) {
+          var x = startX + i * (slotW + gap);
+          var hidden = (i === state.missIndex && state.showChoices);
+          cx.fillStyle = hidden ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.14)';
+          roundRectPath(x, seqY, slotW, slotW, 12);
+          cx.fill();
+          cx.strokeStyle = hidden ? VERM : 'rgba(255,255,255,0.22)';
+          cx.lineWidth = hidden ? 2 : 1;
+          cx.stroke();
+          cx.fillStyle = hidden ? VERM : '#fff';
+          cx.textAlign = 'center'; cx.textBaseline = 'middle';
+          cx.font = '800 22px Menlo, monospace';
+          cx.fillText(hidden ? '?' : String(state.current.seq[i]), x + slotW / 2, seqY + slotW / 2);
+        }
+
+        // pattern hint label
+        cx.fillStyle = 'rgba(255,255,255,0.3)';
+        cx.font = '600 12px Menlo, monospace';
+        cx.textAlign = 'center';
+        cx.fillText(patternRevealed ? PATTERNS[patternIndex].name : 'PATTERN HIDDEN', W / 2, seqY + slotW + 28);
+
+        // timer bar
+        if (state.showChoices) {
+          var barW = 300, barH = 6;
+          var ratio = Math.max(0, state.timer / state.maxTimer);
+          cx.fillStyle = 'rgba(255,255,255,0.12)';
+          roundRectPath((W - barW) / 2, 190, barW, barH, 3);
+          cx.fill();
+          var barColor = ratio > 0.5 ? TEAL : (ratio > 0.22 ? GOLD : VERM);
+          cx.fillStyle = barColor;
+          roundRectPath((W - barW) / 2, 190, barW * ratio, barH, 3);
+          cx.fill();
+        } else {
+          // flash progress
+          var flashRatio = Math.max(0, state.flashTimer / state.maxFlash);
+          cx.fillStyle = 'rgba(255,255,255,0.12)';
+          roundRectPath((W - 300) / 2, 190, 300, 6, 3);
+          cx.fill();
+          cx.fillStyle = TEAL;
+          roundRectPath((W - 300) / 2, 190, 300 * (1 - flashRatio), 6, 3);
+          cx.fill();
+          cx.fillStyle = 'rgba(255,255,255,0.4)';
+          cx.font = '700 13px -apple-system, Helvetica, Arial';
+          cx.textAlign = 'center';
+          cx.fillText('MEMORIZE', W / 2, 178);
+        }
+
+        // choices
+        if (state.showChoices) {
+          choiceRects = [];
+          var cw = 140, ch = 66, cgap = 14;
+          var cols = 2, rows = 2;
+          var gridW = cols * cw + (cols - 1) * cgap;
+          var gx = (W - gridW) / 2;
+          var gy = 420;
+          for (var c = 0; c < 4; c++) {
+            var col = c % 2, row = Math.floor(c / 2);
+            var rx = gx + col * (cw + cgap);
+            var ry = gy + row * (ch + cgap);
+            choiceRects.push({ x: rx, y: ry, w: cw, h: ch });
+            var isSelected = state.answered && c === lastAnswerIdx;
+            var isCorrect = state.choices[c] === state.current.ans;
+            drawChoiceRect(choiceRects[c], state.choices[c], isSelected, isCorrect, isSelected && !isCorrect);
+          }
+        }
+      }
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 360 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // game over card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('MISSED IT.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' sequences', W / 2, 345);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 462);
+        cx.globalAlpha = 1;
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        roundRectPath(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('NUMBER RIDDLE', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('she solved ' + (window.__demoScore || 7) + '. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 7), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.textBaseline = 'middle';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + MUTE_R.h / 2);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

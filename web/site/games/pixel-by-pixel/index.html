@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Pixel by Pixel — Tilt</title>
+<!--
+  LOOP / attention-architecture — Pixel by Pixel
+  Engine: calm. Circuits: 06-zeigarnik, 05-ease, 08-investment.
+  Mechanic: field of lit pixels; each tap extinguishes a cluster.
+             Clear all pixels → screen goes dark → sleep as surrender.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'pixel-by-pixel';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- pixel grid config ----
+  var CELL = 9;                        // px per cluster cell (internal coords)
+  var COLS = Math.floor(W / CELL);     // 45
+  var ROWS = Math.floor((H - 120) / CELL); // ~66 rows, leave top for score
+
+  var GRID_X0 = Math.floor((W - COLS * CELL) / 2);
+  var GRID_Y0 = 100;
+
+  // Game state
+  var grid = [];          // 1 = lit, 0 = dark
+  var totalCells, litCount, score, runStartTs;
+  var phase;              // 'title' | 'play' | 'over' | 'cta'
+  var flashes = [];
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var overAt = 0, ctaAt = 0;
+  var botRunsDone = 0;
+  var stepCount = 0;      // total clusters extinguished this run
+
+  // --- bot state ---
+  var botNextTap = 0;     // timestamp when bot should tap
+  var BOT_MAX_TAPS = 40;  // bot goes passive after K taps so lose-path fires naturally
+  var botTapsLeft = 0;
+
+  function initGrid(litFraction) {
+    litFraction = litFraction === undefined ? 0.72 : litFraction;
+    grid = [];
+    litCount = 0;
+    for (var i = 0; i < ROWS * COLS; i++) {
+      var on = rng() < litFraction ? 1 : 0;
+      grid.push(on);
+      if (on) litCount++;
+    }
+    totalCells = litCount;
+  }
+
+  function newGame() {
+    phase = DEMO ? 'play' : (BOT ? 'play' : 'title');
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    score = 0; stepCount = 0;
+    botRunsDone = 0;
+    initGrid();
+    if (DEMO || BOT) startRun();
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    score = 0; stepCount = 0;
+    botTapsLeft = BOT_MAX_TAPS;
+    botNextTap = performance.now() + (BOT ? 300 : 800);
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function resetRun() {
+    rng = mulberry32(SEED + botRunsDone * 99);
+    initGrid();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // Extinguish cluster at grid cell (col, row), radius r cells
+  function extinguish(col, row, radius) {
+    var r2 = radius * radius;
+    var extinguished = 0;
+    for (var dr = -radius; dr <= radius; dr++) {
+      for (var dc = -radius; dc <= radius; dc++) {
+        if (dc*dc + dr*dr > r2) continue;
+        var c = col + dc, ro = row + dr;
+        if (c < 0 || c >= COLS || ro < 0 || ro >= ROWS) continue;
+        var idx = ro * COLS + c;
+        if (grid[idx]) { grid[idx] = 0; litCount--; extinguished++; }
+      }
+    }
+    return extinguished;
+  }
+
+  function tapAt(px, py) {
+    // convert canvas coords to grid cell
+    var col = Math.floor((px - GRID_X0) / CELL);
+    var row = Math.floor((py - GRID_Y0) / CELL);
+    if (col < 0 || col >= COLS || row < 0 || row >= ROWS) return;
+    // only act if there are lit pixels nearby (3-cell radius)
+    var radius = 3;
+    var ext = extinguish(col, row, radius);
+    if (ext === 0) return;   // nothing to extinguish here
+    stepCount++;
+    score = stepCount;
+    if (window.J) J.calm(stepCount);
+
+    // juice: small shake every tap
+    shakeAmt = 1.2;
+    // bigger effect every 10 taps
+    if (stepCount % 10 === 0) {
+      zoom = 1.012;
+      shakeAmt = 2.5;
+      flash('+' + stepCount, TEAL, 22 + Math.min(stepCount, 20));
+    }
+    // small floating text occasionally
+    if (stepCount % 3 === 0) {
+      var pct = 100 - Math.round(litCount / totalCells * 100);
+      // emit percentage milestones
+      if (pct % 25 === 0 && pct > 0) {
+        flash(pct + '% dark', TEAL, 26);
+        hitStop = 3;
+        zoom = 1.018;
+      }
+    }
+
+    if (window.LOOP) LOOP.emit('cluster_cleared', { step: stepCount, lit_remaining: litCount });
+
+    if (litCount <= 0) {
+      // win! all pixels dark
+      gameOver(true);
+    }
+  }
+
+  function gameOver(won) {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (won) {
+      shakeAmt = 3; zoom = 1.025;
+      flash('DARK', TEAL, 40);
+      if (window.J) J.calm(99);
+    } else {
+      shakeAmt = 2;
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(resetRun, 600);
+      }
+    }
+  }
+
+  // Bot "loses" by going passive — litCount never reaches 0, so we force game_over
+  function botGiveUp() {
+    gameOver(false);
+  }
+
+  // ---- flash text ----
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 28, t: 0,
+                   x: W / 2, y: H / 2 });
+  }
+
+  // ---- DEMO arc ----
+  // Demo paces itself: tap rhythmically, hesitate in the middle, resolve gently.
+  // Arc: fast taps (settle) → slower taps (deepen) → very slow (resolve) → done.
+  var demoTick = 0;
+  var demoPhase = 0; // 0=settle,1=deepen,2=resolve
+  var demoNextTap = 0;
+  var demoTapIntervals = [280, 380, 550]; // ms per tap for each demo phase
+  var demoPhaseChanges = [12, 24];        // tap counts to switch phase
+
+  function demoFindLitCell() {
+    // find a random lit cell to tap
+    var candidates = [];
+    for (var i = 0; i < grid.length; i++) {
+      if (grid[i]) candidates.push(i);
+    }
+    if (candidates.length === 0) return null;
+    var idx = candidates[Math.floor(rng() * candidates.length)];
+    return { col: idx % COLS, row: Math.floor(idx / COLS) };
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 120, y: 500, w: 240, h: 44 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function humanTap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && py !== undefined && inR(MUTE_R, px, py) && window.J) {
+      J.toggleMute(); return;
+    }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') {
+      if (px !== undefined) tapAt(px, py);
+      return;
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'taps' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    humanTap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') humanTap();
+  });
+
+  // ---- autopilots ----
+  function autopilot(now) {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      if (now < demoNextTap) return;
+      // switch demo phase
+      if (demoPhase === 0 && stepCount >= demoPhaseChanges[0]) demoPhase = 1;
+      if (demoPhase === 1 && stepCount >= demoPhaseChanges[1]) demoPhase = 2;
+      var interval = demoTapIntervals[demoPhase];
+      // add some human hesitation variance
+      interval += (rng() - 0.5) * 120;
+      demoNextTap = now + interval;
+      var cell = demoFindLitCell();
+      if (cell) {
+        var px = GRID_X0 + cell.col * CELL + CELL / 2;
+        var py = GRID_Y0 + cell.row * CELL + CELL / 2;
+        tapAt(px, py);
+      }
+      // Demo ends after ~16s: stop tapping and let the arc resolve via timeout
+      if (stepCount >= 36 && demoPhase === 2) {
+        // still lit pixels remain (screen not fully dark) — that's the "resolve" moment
+        // we call gameOver with whatever is left — the arc completes
+        if (litCount > 0) gameOver(false);
+      }
+      return;
+    }
+
+    if (BOT) {
+      if (botTapsLeft <= 0) {
+        // bot is passive — remaining lit pixels stay; game_over fires via botGiveUp
+        if (phase === 'play') botGiveUp();
+        return;
+      }
+      if (now < botNextTap) return;
+      // find a lit cell to tap
+      var candidates2 = [];
+      for (var i = 0; i < grid.length; i++) {
+        if (grid[i]) candidates2.push(i);
+      }
+      if (candidates2.length > 0) {
+        var idx2 = candidates2[Math.floor(rng() * candidates2.length)];
+        var col2 = idx2 % COLS, row2 = Math.floor(idx2 / COLS);
+        var bpx = GRID_X0 + col2 * CELL + CELL / 2 + (rng() - 0.5) * CELL;
+        var bpy = GRID_Y0 + row2 * CELL + CELL / 2 + (rng() - 0.5) * CELL;
+        tapAt(bpx, bpy);
+        botTapsLeft--;
+        botNextTap = now + 200 + rng() * 300;
+      } else {
+        gameOver(true);
+      }
+      return;
+    }
+  }
+
+  // ---- render ----
+  // Pixel glow colour varies with darkness progress
+  function pixelColor(progress) {
+    // progress 0..1 (how much has been cleared)
+    // start: soft warm white; end: deep teal hint before going dark
+    var r = Math.round(200 - progress * 80);
+    var g = Math.round(210 - progress * 50);
+    var b = Math.round(230 - progress * 20);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // juice: decay
+    if (hitStop > 0) { hitStop -= dt; }
+    else { autopilot(now); }
+
+    zoom += (1 - zoom) * 0.10 * dt;
+    shakeAmt *= Math.pow(0.80, dt);
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.15 || zoom > 1.001) {
+      var sx = (rng() - 0.5) * shakeAmt;
+      var sy = (rng() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+
+    var progress = totalCells > 0 ? 1 - litCount / totalCells : 0;
+
+    // ---- draw pixel grid ----
+    if (phase === 'play' || phase === 'over') {
+      var baseColor = pixelColor(progress);
+      // subtle glow behind the grid
+      var glowAlpha = (1 - progress) * 0.06;
+      if (glowAlpha > 0) {
+        cx.fillStyle = 'rgba(200,220,255,' + glowAlpha + ')';
+        cx.fillRect(GRID_X0 - 4, GRID_Y0 - 4, COLS * CELL + 8, ROWS * CELL + 8);
+      }
+      for (var i = 0; i < grid.length; i++) {
+        if (!grid[i]) continue;
+        var gc = i % COLS, gr = Math.floor(i / COLS);
+        var gx = GRID_X0 + gc * CELL;
+        var gy = GRID_Y0 + gr * CELL;
+        cx.fillStyle = baseColor;
+        cx.globalAlpha = 0.55 + (rng() * 0.04); // slight shimmer
+        cx.fillRect(gx + 1, gy + 1, CELL - 2, CELL - 2);
+      }
+      cx.globalAlpha = 1;
+    }
+
+    // ---- score / progress bar ----
+    if (phase === 'play') {
+      // progress bar across top
+      var barW = W - 60;
+      var barX = 30, barY = 60, barH = 6;
+      cx.fillStyle = 'rgba(255,255,255,0.08)';
+      cx.fillRect(barX, barY, barW, barH);
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = 0.7 + 0.3 * progress;
+      cx.fillRect(barX, barY, barW * progress, barH);
+      cx.globalAlpha = 1;
+
+      // tap count
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText(stepCount + ' taps', W / 2, 50);
+
+      // percentage label
+      var pct = Math.round(progress * 100);
+      cx.fillStyle = TEAL;
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.globalAlpha = 0.8 + 0.2 * progress;
+      cx.fillText(pct + '%', W / 2, 90);
+      cx.globalAlpha = 1;
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = GOLD;
+        cx.font = '700 13px -apple-system, Helvetica, Arial';
+        cx.fillText('BEAT ' + SHARE.dare + ' taps' + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 40);
+      }
+    }
+
+    // ---- title screen ----
+    if (phase === 'title') {
+      // show dim grid behind
+      cx.fillStyle = 'rgba(180,200,240,0.12)';
+      for (var ti = 0; ti < grid.length; ti++) {
+        if (!grid[ti]) continue;
+        var tc = ti % COLS, tr2 = Math.floor(ti / COLS);
+        cx.fillRect(GRID_X0 + tc * CELL + 1, GRID_Y0 + tr2 * CELL + 1, CELL - 2, CELL - 2);
+      }
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(11,13,18,0.6)';
+      cx.fillRect(W / 2 - 160, H / 2 - 90, 320, 180);
+      cx.fillStyle = '#fff'; cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('pixel by pixel', W / 2, H / 2 - 30);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '400 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to turn off the screen', W / 2, H / 2 + 10);
+      var pulse = 0.5 + 0.4 * Math.sin(now / 700);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('tap anywhere to begin', W / 2, H / 2 + 50);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- game over screen ----
+    if (phase === 'over') {
+      var isWin = litCount <= 0;
+      cx.fillStyle = 'rgba(11,13,18,0.65)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      if (isWin) {
+        cx.fillStyle = TEAL; cx.font = '900 36px -apple-system, Helvetica, Arial';
+        cx.fillText('screen dark.', W / 2, H / 2 - 60);
+        cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '400 18px -apple-system, Helvetica, Arial';
+        cx.fillText(stepCount + ' taps to silence', W / 2, H / 2 - 20);
+      } else {
+        cx.fillStyle = TEAL; cx.font = '900 36px -apple-system, Helvetica, Arial';
+        cx.fillText('still lit.', W / 2, H / 2 - 60);
+        var remPct = Math.round(litCount / totalCells * 100);
+        cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '400 18px -apple-system, Helvetica, Arial';
+        cx.fillText(remPct + '% still on — ' + stepCount + ' taps', W / 2, H / 2 - 20);
+      }
+      cx.fillStyle = GOLD; cx.font = '800 20px -apple-system, Helvetica, Arial';
+      cx.fillText(stepCount + ' taps', W / 2, H / 2 + 20);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 500);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('tap to go again', W / 2, H / 2 + 65);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 22);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 28);
+      }
+    }
+
+    // ---- demo CTA card ----
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t * 1.8);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('pixel by pixel', W / 2, H / 2 - 70);
+      cx.fillStyle = 'rgba(255,255,255,0.65)'; cx.font = '400 17px -apple-system, Helvetica, Arial';
+      cx.fillText('turn off the screen. one tap at a time.', W / 2, H / 2 - 28);
+      var p3 = 0.75 + 0.25 * Math.sin(now / 380);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, H / 2 + 30);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, H / 2 + 68);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- floating flash texts ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + fl.size + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // ---- mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.globalAlpha = 0.45;
+      cx.textAlign = 'center';
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

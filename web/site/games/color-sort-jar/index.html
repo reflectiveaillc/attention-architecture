@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Color Sort Jar — Tilt</title>
+<!--
+  LOOP / attention-architecture — Color Sort Jar
+  Engine: calm. Circuits: 06-zeigarnik, 05-ease, 08-investment.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone=true
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone=true
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'color-sort-jar';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = Math.max(1, +qs.get('runs') || 3);
+  var SEED = +qs.get('seed') || 42;
+
+  // Mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // Palette — calm, no vermillion
+  var INK   = '#0b0d12';
+  var TEAL  = '#2ec5b6';
+  var GOLD  = '#f2b134';
+
+  // Bead colors (calm, soft)
+  var COLORS = [
+    { name:'rose',  fill:'#d4748a', glow:'rgba(212,116,138,0.45)' },
+    { name:'sky',   fill:'#5ab4d8', glow:'rgba(90,180,216,0.45)' },
+    { name:'mint',  fill:'#52c9a0', glow:'rgba(82,201,160,0.45)' },
+    { name:'amber', fill:'#e8b84b', glow:'rgba(232,184,75,0.45)' }
+  ];
+  var NUM_COLORS = 4;
+  var BEADS_PER_COLOR = 4;
+  var TOTAL_BEADS = NUM_COLORS * BEADS_PER_COLOR;  // 16
+  var JAR_CAPACITY = 5;
+  var NUM_JARS = 4;  // 3 filled + 1 empty
+
+  // Jar layout positions
+  var JAR_W = 64, JAR_H = 150, JAR_R = 10;
+  var BEAD_R = 11, BEAD_SPACING = 24;
+  var JAR_POSITIONS = [
+    { x: 72,  y: 330 },
+    { x: 171, y: 330 },
+    { x: 270, y: 330 },
+    { x: 369, y: 330 }
+  ];
+
+  // Juice vars
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var ctaAt = 0, ctaPhase = 0;
+
+  // Bot / demo state
+  var botRunsDone = 0;
+  var botMoveDelay = 0;
+  var botMoveCount = 0;
+  var BOT_MAX_MOVES = 80; // give up and fire game_over after this many moves
+
+  var demoMoves = null, demoMoveIdx = 0, demoMoveDelay = 0, demoSafetyFired = false;
+  var demoWaits = [52, 44, 60, 40, 64, 46, 54, 38, 68, 50, 42, 56, 48, 40, 58, 46];
+
+  // Game state
+  var state, flashes, runStartTs;
+
+  // ---- Puzzle solver — offline BFS for small state ----
+  // Returns array of [fromJar, toJar] moves to solve puzzle, or null if too complex.
+  function solvePuzzle(jarsInit) {
+    // We represent state as array of arrays (beads bottom→top).
+    // Use a simple greedy approach: at each step, pick the move that
+    // moves a bead to a jar where all top beads match, or to empty jar.
+    // This won't always produce a perfect solution but will progress.
+    var jars = jarsInit.map(function(j) { return j.slice(); });
+    var moves = [];
+    var maxIter = 200;
+    for (var iter = 0; iter < maxIter; iter++) {
+      // Check if solved
+      if (isSolved(jars)) break;
+
+      var moved = false;
+      // Priority 1: move bead to a jar where top matches and isn't full
+      for (var from = 0; from < jars.length && !moved; from++) {
+        if (jars[from].length === 0) continue;
+        var topBead = jars[from][jars[from].length - 1];
+        for (var to = 0; to < jars.length && !moved; to++) {
+          if (to === from) continue;
+          if (jars[to].length >= JAR_CAPACITY) continue;
+          if (jars[to].length > 0 && jars[to][jars[to].length - 1] === topBead) {
+            jars[to].push(topBead); jars[from].pop();
+            moves.push([from, to]); moved = true;
+          }
+        }
+      }
+      // Priority 2: move to empty jar if source is mixed
+      if (!moved) {
+        for (var from2 = 0; from2 < jars.length && !moved; from2++) {
+          if (jars[from2].length <= 1) continue;
+          // Check if jar is already uniform
+          var uniform = true;
+          var tc = jars[from2][0];
+          for (var b = 1; b < jars[from2].length; b++) {
+            if (jars[from2][b] !== tc) { uniform = false; break; }
+          }
+          if (uniform) continue; // skip already-uniform jars
+          var top2 = jars[from2][jars[from2].length - 1];
+          for (var to2 = 0; to2 < jars.length && !moved; to2++) {
+            if (to2 === from2) continue;
+            if (jars[to2].length === 0) {
+              jars[to2].push(top2); jars[from2].pop();
+              moves.push([from2, to2]); moved = true;
+            }
+          }
+        }
+      }
+      // Priority 3: any valid move
+      if (!moved) {
+        for (var from3 = 0; from3 < jars.length && !moved; from3++) {
+          if (jars[from3].length === 0) continue;
+          var top3 = jars[from3][jars[from3].length - 1];
+          for (var to3 = 0; to3 < jars.length && !moved; to3++) {
+            if (to3 === from3) continue;
+            if (jars[to3].length >= JAR_CAPACITY) continue;
+            jars[to3].push(top3); jars[from3].pop();
+            moves.push([from3, to3]); moved = true;
+          }
+        }
+      }
+      if (!moved) break; // truly stuck
+    }
+    return moves;
+  }
+
+  function isSolved(jars) {
+    var total = 0;
+    for (var j = 0; j < jars.length; j++) {
+      if (jars[j].length === 0) continue;
+      var f = jars[j][0];
+      for (var b = 1; b < jars[j].length; b++) {
+        if (jars[j][b] !== f) return false;
+      }
+      total += jars[j].length;
+    }
+    return total === TOTAL_BEADS;
+  }
+
+  // ---- Build puzzle ----
+  function buildPuzzle() {
+    var pool = [];
+    for (var c = 0; c < NUM_COLORS; c++) {
+      for (var b = 0; b < BEADS_PER_COLOR; b++) pool.push(c);
+    }
+    // Fisher-Yates shuffle
+    for (var i = pool.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+    }
+    var jars = [];
+    for (var k = 0; k < NUM_JARS; k++) jars.push([]);
+    // Fill first 3 jars
+    var idx = 0;
+    for (var jar = 0; jar < 3; jar++) {
+      for (var slot = 0; slot < JAR_CAPACITY && idx < pool.length; slot++, idx++) {
+        jars[jar].push(pool[idx]);
+      }
+    }
+    // jar[3] stays empty
+    return jars;
+  }
+
+  // ---- Game state init ----
+  function newGame() {
+    rng = mulberry32(SEED);
+    var jarArrays = buildPuzzle();
+
+    state = {
+      phase: 'play',
+      jars: jarArrays.map(function(b) { return { beads: b, capacity: JAR_CAPACITY }; }),
+      selected: null,
+      score: 0,
+      moves: 0,
+      overAt: 0,
+      complete: false
+    };
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    ctaPhase = 0; ctaAt = 0;
+    demoMoves = null; demoMoveIdx = 0; demoMoveDelay = 0;
+    demoSafetyFired = false;
+    botMoveDelay = 0; botMoveCount = 0;
+
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+
+    // Safety: demo must finish within 18s regardless
+    if (DEMO) {
+      setTimeout(function() {
+        if (!window.__demoDone && state.phase === 'play' && !demoSafetyFired) {
+          demoSafetyFired = true;
+          gameOver();
+        }
+      }, 18000);
+    }
+  }
+
+  // ---- Jar helpers ----
+  function isJarSorted(jar) {
+    if (jar.beads.length === 0) return false;
+    var f = jar.beads[0];
+    for (var i = 1; i < jar.beads.length; i++) {
+      if (jar.beads[i] !== f) return false;
+    }
+    return true;
+  }
+
+  function isJarComplete(jar) {
+    return jar.beads.length >= BEADS_PER_COLOR && isJarSorted(jar);
+  }
+
+  function checkWin() {
+    var total = 0;
+    for (var j = 0; j < state.jars.length; j++) {
+      if (state.jars[j].beads.length === 0) continue;
+      if (!isJarSorted(state.jars[j])) return false;
+      total += state.jars[j].beads.length;
+    }
+    return total === TOTAL_BEADS;
+  }
+
+  // ---- Move ----
+  function doMove(fromJarIdx, toJarIdx) {
+    var fromJar = state.jars[fromJarIdx];
+    var toJar   = state.jars[toJarIdx];
+    if (fromJar.beads.length === 0) return false;
+    if (toJar.beads.length >= toJar.capacity) return false;
+
+    var bead = fromJar.beads[fromJar.beads.length - 1];
+    toJar.beads.push(bead);
+    fromJar.beads.pop();
+    state.moves++;
+
+    var complete = isJarComplete(toJar);
+    if (complete) {
+      state.score += 10;
+      hitStop = 3;
+      zoom = 1.025;
+      flash('SORTED!', TEAL, 38);
+      if (window.J) J.calm(state.score / 40);
+    } else {
+      state.score += 1;
+      if (window.J) J.calm(0.2);
+    }
+
+    if (window.LOOP) LOOP.emit('bead_moved', {
+      from: fromJarIdx, to: toJarIdx, color: COLORS[bead].name, score: state.score
+    });
+    return true;
+  }
+
+  // ---- Human tap ----
+  function handleJarTap(jarIdx) {
+    if (state.phase !== 'play') return;
+    if (state.selected === null) {
+      if (state.jars[jarIdx].beads.length === 0) return;
+      state.selected = jarIdx;
+    } else {
+      if (state.selected === jarIdx) {
+        state.selected = null;
+        return;
+      }
+      var ok = doMove(state.selected, jarIdx);
+      state.selected = null;
+      if (!ok) { shakeAmt = 2; return; }
+      if (checkWin()) { state.complete = true; gameOver(); }
+    }
+  }
+
+  // ---- Game over ----
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+
+    if (state.complete) {
+      shakeAmt = 3; zoom = 1.04;
+      flash('COMPLETE', TEAL, 44);
+    } else {
+      shakeAmt = 2;
+    }
+    window.__demoScore = state.score;
+    if (window.J) J.calm(state.complete ? 1.0 : 0.4);
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), complete: state.complete });
+
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        ctaPhase = 0;
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2500);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { restartGame(); }, 500);
+      }
+    }
+  }
+
+  function restartGame() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    newGame();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color || TEAL, size: size || 36, t: 0 });
+  }
+
+  // ---- Input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function jarHitTest(x, y) {
+    for (var i = 0; i < JAR_POSITIONS.length; i++) {
+      var jp = JAR_POSITIONS[i];
+      var jx = jp.x - JAR_W / 2;
+      if (x >= jx - 10 && x <= jx + JAR_W + 10 && y >= jp.y - 10 && y <= jp.y + JAR_H + 10) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'play') {
+      var jarIdx = jarHitTest(x, y);
+      if (jarIdx >= 0) handleJarTap(jarIdx);
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      restartGame();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(W / 2, H / 2); });
+
+  // ---- Autopilots ----
+  // Demo autopilot: pre-solve the puzzle, play moves with human-feeling delays
+  function demoPilot(dt) {
+    if (state.phase !== 'play') return;
+    if (!demoMoves) {
+      // Build solution from current jar state (deep copy)
+      var initArrays = state.jars.map(function(j) { return j.beads.slice(); });
+      demoMoves = solvePuzzle(initArrays);
+      demoMoveIdx = 0;
+      demoMoveDelay = 55; // initial pause before first move
+    }
+    demoMoveDelay -= dt;
+    if (demoMoveDelay > 0) return;
+
+    if (demoMoveIdx >= demoMoves.length) {
+      // Done with scripted moves — end run
+      if (!state.complete && !demoSafetyFired) {
+        demoSafetyFired = true;
+        // Check if actually won
+        if (checkWin()) { state.complete = true; }
+        gameOver();
+      }
+      return;
+    }
+
+    var mv = demoMoves[demoMoveIdx];
+    // Validate move is still legal (jars may differ if solver was imperfect)
+    if (mv[0] < state.jars.length && mv[1] < state.jars.length) {
+      var ok = doMove(mv[0], mv[1]);
+      if (ok && checkWin()) {
+        state.complete = true;
+        gameOver();
+        return;
+      }
+    }
+    demoMoveIdx++;
+    // Human-feeling delay with variance (no rng() to avoid state drift)
+    var base = demoWaits[demoMoveIdx % demoWaits.length] || 48;
+    demoMoveDelay = base;
+  }
+
+  // Bot autopilot: greedy + stuck detection + max-moves safety
+  function botPilot(dt) {
+    if (state.phase !== 'play') return;
+    botMoveDelay -= dt;
+    if (botMoveDelay > 0) return;
+
+    // Safety: if too many moves, end run
+    if (botMoveCount >= BOT_MAX_MOVES) {
+      gameOver(); return;
+    }
+
+    // Greedy move: prefer matching-top, then empty
+    var moved = false;
+    // Pass 1: top-matching
+    outer:
+    for (var from = 0; from < state.jars.length; from++) {
+      if (state.jars[from].beads.length === 0) continue;
+      if (isJarComplete(state.jars[from])) continue;
+      var top = state.jars[from].beads[state.jars[from].beads.length - 1];
+      for (var to = 0; to < state.jars.length; to++) {
+        if (to === from) continue;
+        if (state.jars[to].beads.length >= state.jars[to].capacity) continue;
+        var tTop = state.jars[to].beads.length > 0 ? state.jars[to].beads[state.jars[to].beads.length - 1] : -1;
+        if (tTop === top) {
+          var ok = doMove(from, to);
+          if (ok) { moved = true; botMoveCount++; break outer; }
+        }
+      }
+    }
+    // Pass 2: any valid move (includes empty)
+    if (!moved) {
+      outer2:
+      for (var from2 = 0; from2 < state.jars.length; from2++) {
+        if (state.jars[from2].beads.length === 0) continue;
+        if (isJarComplete(state.jars[from2])) continue;
+        for (var to2 = 0; to2 < state.jars.length; to2++) {
+          if (to2 === from2) continue;
+          if (state.jars[to2].beads.length >= state.jars[to2].capacity) continue;
+          var ok2 = doMove(from2, to2);
+          if (ok2) { moved = true; botMoveCount++; break outer2; }
+        }
+      }
+    }
+
+    if (!moved) {
+      // Truly stuck — fire game_over
+      gameOver(); return;
+    }
+
+    if (checkWin()) { state.complete = true; gameOver(); return; }
+    botMoveDelay = 14 + rng() * 10;
+  }
+
+  // ---- Render ----
+  function drawJar(jp, jar, jarIdx) {
+    var jx = jp.x - JAR_W / 2;
+    var jy = jp.y;
+    var isSel = (state.selected === jarIdx);
+    var complete = isJarComplete(jar);
+
+    // Jar shadow / glow
+    if (isSel) {
+      cx.shadowBlur = 20; cx.shadowColor = TEAL;
+    } else if (complete) {
+      cx.shadowBlur = 14; cx.shadowColor = jar.beads.length > 0 ? COLORS[jar.beads[0]].glow : TEAL;
+    } else {
+      cx.shadowBlur = 0;
+    }
+
+    cx.fillStyle = 'rgba(255,255,255,0.05)';
+    cx.strokeStyle = isSel ? TEAL : (complete && jar.beads.length > 0 ? COLORS[jar.beads[0]].fill : 'rgba(255,255,255,0.18)');
+    cx.lineWidth = isSel ? 2.5 : 1.5;
+    cx.beginPath();
+    if (cx.roundRect) { cx.roundRect(jx, jy, JAR_W, JAR_H, JAR_R); }
+    else { cx.rect(jx, jy, JAR_W, JAR_H); }
+    cx.fill(); cx.stroke();
+    cx.shadowBlur = 0;
+
+    // Beads stacked from bottom
+    var startY = jy + JAR_H - 18;
+    for (var b = 0; b < jar.beads.length; b++) {
+      var col = COLORS[jar.beads[b]];
+      var bx = jp.x, by = startY - b * BEAD_SPACING;
+      if (by < jy + BEAD_R + 4) break;
+
+      if (isSel && b === jar.beads.length - 1) {
+        cx.shadowBlur = 12; cx.shadowColor = col.glow;
+      }
+      cx.fillStyle = col.fill;
+      cx.beginPath(); cx.arc(bx, by, BEAD_R, 0, Math.PI * 2); cx.fill();
+      // Highlight
+      cx.fillStyle = 'rgba(255,255,255,0.28)';
+      cx.beginPath(); cx.arc(bx - 3, by - 3, BEAD_R * 0.45, 0, Math.PI * 2); cx.fill();
+      cx.shadowBlur = 0;
+    }
+  }
+
+  function drawProgress() {
+    var complete = 0;
+    for (var j = 0; j < state.jars.length; j++) {
+      if (isJarComplete(state.jars[j])) complete++;
+    }
+    var total = NUM_COLORS, dotR = 5, spacing = 20;
+    var sx = W / 2 - ((total - 1) * spacing) / 2;
+    for (var d = 0; d < total; d++) {
+      cx.fillStyle = d < complete ? TEAL : 'rgba(255,255,255,0.2)';
+      cx.beginPath(); cx.arc(sx + d * spacing, 60, dotR, 0, Math.PI * 2); cx.fill();
+    }
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Juice decay + autopilot
+    if (hitStop > 0) { hitStop -= dt; }
+    else {
+      if (DEMO) demoPilot(dt);
+      if (BOT)  botPilot(dt);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx2 = (Math.random() - 0.5) * shakeAmt;
+      var sy2 = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx2, H / 2 + sy2);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // Background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // Ambient radial
+    var bg = cx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, H * 0.7);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // Title
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.7)';
+    cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('COLOR SORT', W / 2, 36);
+
+    // Score
+    cx.fillStyle = 'rgba(255,255,255,0.92)';
+    cx.font = '800 52px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score, W / 2, 98);
+
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('moves: ' + state.moves, W / 2, 118);
+
+    drawProgress();
+
+    // Instruction
+    cx.fillStyle = 'rgba(255,255,255,0.25)';
+    cx.font = '600 11px Menlo, monospace';
+    cx.fillText('tap jar to select · tap again to pour', W / 2, 300);
+
+    // Jars
+    for (var j = 0; j < JAR_POSITIONS.length; j++) {
+      drawJar(JAR_POSITIONS[j], state.jars[j], j);
+    }
+
+    // Hint at bottom
+    cx.fillStyle = 'rgba(255,255,255,0.2)';
+    cx.font = '600 11px -apple-system, Helvetica, Arial';
+    cx.fillText('sort each color into its own jar', W / 2, 510);
+
+    // Flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 210 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(k, 1);
+    }
+
+    // Game over overlay
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      if (state.complete) {
+        cx.fillStyle = TEAL; cx.font = '900 42px -apple-system, Helvetica, Arial';
+        cx.fillText('SORTED ✓', W / 2, 280);
+        cx.fillStyle = '#fff'; cx.font = '700 22px -apple-system, Helvetica, Arial';
+        cx.fillText(state.score + ' pts · ' + state.moves + ' moves', W / 2, 320);
+      } else {
+        cx.fillStyle = TEAL; cx.font = '900 36px -apple-system, Helvetica, Arial';
+        cx.fillText('PAUSED', W / 2, 280);
+        cx.fillStyle = '#fff'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+        cx.fillText(state.score + ' points', W / 2, 316);
+      }
+      if (!DEMO && !BOT) {
+        var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+        cx.globalAlpha = pulse; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP TO SORT AGAIN', W / 2, 388);
+        cx.globalAlpha = 1;
+        // Share pill
+        var SR = { x: W / 2 - 120, y: 420, w: 240, h: 44 };
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SR.x, SR.y, SR.w, SR.h, 22);
+        else cx.rect(SR.x, SR.y, SR.w, SR.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SR.y + 29);
+      }
+    }
+
+    // Demo CTA card
+    if (state.phase === 'cta') {
+      ctaPhase = Math.min(ctaPhase + dt / 60, 1);
+      var ease = ctaPhase;
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('COLOR SORT', W / 2, 288);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('find the stillness', W / 2, 326);
+      var p2 = 0.7 + 0.3 * Math.sin(now / 280);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p2;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 394);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 428);
+      cx.globalAlpha = 1;
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial'; cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

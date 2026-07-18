@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Caption Rest — Tilt</title>
+<!--
+  LOOP / attention-architecture — Caption Rest
+  Engine: calm. Circuits: 06-zeigarnik, 05-ease, 07-timing.
+  Conditioned path: caption-writing anxiety. Hold the screen; the right words
+  surface gently. The post button stays disabled; the thought dissolves.
+  Modes:
+    ?demo=1&seed=7        calm arc ~16s → soft CTA → window.__demoDone=true
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, window.__botDone=true
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'caption-rest';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var SOFT_WHITE = 'rgba(255,255,255,0.88)';
+
+  // --- word pools (calm, poetic, honest) ---
+  var WORD_POOLS = [
+    ['still here', 'finally breathing', 'softer now', 'just existing', 'no filter needed'],
+    ['light kept coming in', 'didn\'t need to explain', 'stayed anyway', 'let it be', 'enough as is'],
+    ['noticed the quiet', 'found the rhythm', 'nothing to prove', 'present', 'here'],
+    ['small moments', 'unhurried', 'it was enough', 'softly landed', 'no words needed'],
+    ['let go a little', 'breathed through it', 'chose peace', 'gentle exit', 'just me']
+  ];
+
+  // pick a random pool per run
+  function pickWords() {
+    var pool = WORD_POOLS[Math.floor(rng() * WORD_POOLS.length)];
+    var out = [];
+    for (var i = 0; i < pool.length; i++) out.push(pool[i]);
+    // shuffle
+    for (var j = out.length - 1; j > 0; j--) {
+      var k = Math.floor(rng() * (j + 1));
+      var tmp = out[j]; out[j] = out[k]; out[k] = tmp;
+    }
+    return out;
+  }
+
+  // --- game state ---
+  var phase; // 'idle' | 'hold' | 'dissolve' | 'over' | 'cta'
+  var holdStart, holdDuration, dissolveStart, dissolveDuration;
+  var wordList, wordFadeProgress, currentWordIdx, wordDisplayTime;
+  var score, botRunsDone, runStartTs;
+  var hitStop, shakeAmt, zoom;
+  var floats; // floating reward text
+  var isHolding; // human holds state
+  var overAt, ctaAt;
+  var cursorBlink;
+  var phaseStartTs;
+  var calStep;
+
+  // demo scripted timing (ms from demo start)
+  // arc: settle(0-5s) → deepen(5-10s) → resolve(10-14s) → fade(14-16s)
+  var DEMO_HOLD_START  = 1800;  // ms after demo begins, user "holds"
+  var DEMO_HOLD_DUR    = 13500; // hold duration (ms) for full word reveal
+  var DEMO_AUTO_DONE   = false;
+  var demoStartTs      = 0;
+  var demoPhase        = 'pre'; // pre | holding | dissolving | done
+
+  function newGame() {
+    phase         = 'idle';
+    wordList      = pickWords();
+    wordFadeProgress = 0;
+    currentWordIdx   = 0;
+    wordDisplayTime  = 0;
+    score         = 0;
+    hitStop       = 0;
+    shakeAmt      = 0;
+    zoom          = 1;
+    floats        = [];
+    isHolding     = false;
+    overAt        = 0;
+    ctaAt         = 0;
+    cursorBlink   = 0;
+    calStep       = 0;
+    holdStart     = 0;
+    holdDuration  = 0;
+    dissolveStart = 0;
+    dissolveDuration = 1600;
+    phaseStartTs  = performance.now();
+    DEMO_AUTO_DONE = false;
+    demoPhase      = 'pre';
+    demoStartTs    = performance.now();
+  }
+
+  function startRun() {
+    phase = 'idle';
+    runStartTs = Date.now();
+    wordList = pickWords();
+    wordFadeProgress = 0;
+    currentWordIdx   = 0;
+    wordDisplayTime  = 0;
+    calStep = 0;
+    isHolding = false;
+    hitStop = 0; shakeAmt = 0; zoom = 1; floats = [];
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // how many words revealed (0..wordList.length) based on hold progress 0..1
+  function wordsRevealed(progress) {
+    return Math.floor(progress * wordList.length);
+  }
+
+  // --- score: count of words fully surfaced ---
+  function calcScore() {
+    return Math.min(wordsRevealed(wordFadeProgress), wordList.length);
+  }
+
+  function beginHold(now) {
+    if (phase !== 'idle') return;
+    phase = 'hold';
+    holdStart = now;
+    holdDuration = BOT ? 3000 + rng() * 2000 : 6000 + rng() * 2000; // human comfortable hold
+    isHolding = true;
+    if (window.J) J.calm(calStep++);
+  }
+
+  function releaseHold(now) {
+    if (phase !== 'hold') return;
+    isHolding = false;
+    // compute score from how far we got
+    score = calcScore();
+    // if we released early (before all words), game ends quickly
+    if (score < wordList.length) {
+      startDissolve(now, 'partial');
+    } else {
+      // full hold — complete calm resolution
+      startDissolve(now, 'complete');
+    }
+  }
+
+  function startDissolve(now, kind) {
+    phase = 'dissolve';
+    dissolveStart = now;
+    dissolveDuration = kind === 'complete' ? 2200 : 1200;
+    if (window.J) J.calm(calStep++);
+    addFloat(kind === 'complete' ? 'it was enough' : 'still something', TEAL, 22);
+    if (kind === 'complete') {
+      hitStop = 60; // gentle visual pause
+      zoom = 1.015;
+    }
+  }
+
+  function gameOver(now) {
+    phase = 'over';
+    overAt = now;
+    score = calcScore();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (window.J) J.calm(calStep++);
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2000);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () {
+          startRun();
+        }, 600);
+      }
+    }
+  }
+
+  function addFloat(txt, color, size) {
+    floats.push({ txt: txt, color: color, size: size, t: 0,
+                  x: W / 2 + (rng() - 0.5) * 60, y: 340 });
+  }
+
+  // --- input ---
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function onDown(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'idle') {
+      beginHold(performance.now());
+    }
+    if (phase === 'over' && performance.now() - overAt > 400) {
+      startRun();
+      if (window.LOOP) LOOP.emit('restart', {});
+    }
+  }
+  function onUp() {
+    if (DEMO || BOT) return;
+    if (phase === 'hold') {
+      releaseHold(performance.now());
+    }
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    onDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', onUp);
+  cv.addEventListener('pointerleave', onUp);
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') { e.preventDefault(); onDown(); }
+  });
+  window.addEventListener('keyup', function (e) {
+    if (e.code === 'Space') { e.preventDefault(); onUp(); }
+  });
+
+  // --- autopilot ---
+  function autopilot(now) {
+    if (DEMO) {
+      var elapsed = now - demoStartTs;
+      if (demoPhase === 'pre' && elapsed > DEMO_HOLD_START) {
+        demoPhase = 'holding';
+        beginHold(now);
+        holdDuration = DEMO_HOLD_DUR;
+        isHolding = true;
+        phase = 'hold';
+        holdStart = now;
+      }
+      if (demoPhase === 'holding') {
+        var holdElapsed = now - holdStart;
+        var prog = Math.min(holdElapsed / holdDuration, 1);
+        wordFadeProgress = prog;
+        if (prog >= 1) {
+          demoPhase = 'dissolving';
+          isHolding = false;
+          startDissolve(now, 'complete');
+        }
+      }
+      if (demoPhase === 'dissolving') {
+        var dElapsed = now - dissolveStart;
+        if (dElapsed > dissolveDuration + 300 && phase === 'over') {
+          // already in over, nothing to do
+        } else if (dElapsed > dissolveDuration && phase === 'dissolve') {
+          demoPhase = 'done';
+          gameOver(now);
+        }
+      }
+    } else if (BOT) {
+      if (phase === 'idle') {
+        // Bot starts holding immediately with slight variance
+        beginHold(now);
+        holdDuration = 1500 + rng() * 2000;
+        isHolding = true;
+        phase = 'hold';
+        holdStart = now;
+      }
+      if (phase === 'hold') {
+        var hElapsed = now - holdStart;
+        var hProg = Math.min(hElapsed / holdDuration, 1);
+        wordFadeProgress = hProg;
+        if (hProg >= 1) {
+          isHolding = false;
+          startDissolve(now, 'complete');
+        }
+      }
+      if (phase === 'dissolve') {
+        var dsElapsed = now - dissolveStart;
+        if (dsElapsed > dissolveDuration) {
+          gameOver(now);
+        }
+      }
+    }
+  }
+
+  // --- render helpers ---
+  function drawRoundRect(x, y, w, h, r) {
+    cx.beginPath();
+    if (cx.roundRect) {
+      cx.roundRect(x, y, w, h, r);
+    } else {
+      cx.moveTo(x + r, y);
+      cx.lineTo(x + w - r, y);
+      cx.quadraticCurveTo(x + w, y, x + w, y + r);
+      cx.lineTo(x + w, y + h - r);
+      cx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      cx.lineTo(x + r, y + h);
+      cx.quadraticCurveTo(x, y + h, x, y + h - r);
+      cx.lineTo(x, y + r);
+      cx.quadraticCurveTo(x, y, x + r, y);
+      cx.closePath();
+    }
+  }
+
+  // phone UI dimensions
+  var PHONE_X = 30, PHONE_Y = 90, PHONE_W = W - 60, PHONE_H = 520;
+  var CAPTION_Y = PHONE_Y + 60, CAPTION_H = 140;
+  var FIELD_X = PHONE_X + 14, FIELD_Y = CAPTION_Y + 10;
+  var FIELD_W = PHONE_W - 28, FIELD_H = 110;
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+    cursorBlink = (cursorBlink + dt * 0.04) % (Math.PI * 2);
+
+    // human hold: update word fade progress
+    if (!DEMO && !BOT && phase === 'hold') {
+      var hElapsed = now - holdStart;
+      wordFadeProgress = Math.min(hElapsed / holdDuration, 1);
+      if (wordFadeProgress >= 1 && isHolding) {
+        isHolding = false;
+        startDissolve(now, 'complete');
+      }
+    }
+
+    // dissolve phase: tick toward game over
+    if (phase === 'dissolve' && !DEMO && !BOT) {
+      var dsEl = now - dissolveStart;
+      if (dsEl > dissolveDuration) {
+        gameOver(now);
+      }
+    }
+
+    // run autopilot for demo/bot
+    if (DEMO || BOT) autopilot(now);
+
+    // hit-stop decays (never gates autopilot — autopilot runs above separately)
+    if (hitStop > 0) hitStop -= dt;
+    // zoom-pulse decay
+    zoom += (1 - zoom) * 0.10 * dt;
+    // shake decay
+    shakeAmt *= Math.pow(0.88, dt);
+
+    // --- draw ---
+    cx.save();
+
+    // juice transform
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bgGrad = cx.createLinearGradient(0, 0, 0, H);
+    bgGrad.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bgGrad.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bgGrad; cx.fillRect(0, 0, W, H);
+
+    if (phase === 'cta') {
+      drawCTA(now);
+    } else {
+      drawPhone(now);
+      drawHoldZone(now);
+      drawFloats(dt);
+      drawUI(now);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.4;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawPhone(now) {
+    // phone silhouette
+    cx.save();
+    cx.globalAlpha = 0.08;
+    drawRoundRect(PHONE_X, PHONE_Y, PHONE_W, PHONE_H, 28);
+    cx.fillStyle = '#fff'; cx.fill();
+    cx.globalAlpha = 0.12;
+    cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+    cx.stroke();
+    cx.restore();
+
+    // avatar + username strip
+    var avatarX = PHONE_X + 20, avatarY = PHONE_Y + 20, avatarR = 18;
+    cx.save();
+    cx.globalAlpha = 0.55;
+    cx.beginPath(); cx.arc(avatarX + avatarR, avatarY + avatarR, avatarR, 0, Math.PI * 2);
+    cx.fillStyle = 'rgba(46,197,182,0.35)'; cx.fill();
+    cx.restore();
+    cx.save();
+    cx.globalAlpha = 0.5;
+    cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'left';
+    cx.fillText('you', avatarX + avatarR * 2 + 8, avatarY + avatarR + 4);
+    cx.restore();
+
+    // post image area (blurred rectangle)
+    var imgY = PHONE_Y + 65, imgH = 200;
+    cx.save();
+    cx.globalAlpha = 0.09;
+    drawRoundRect(PHONE_X + 4, imgY, PHONE_W - 8, imgH, 12);
+    cx.fillStyle = TEAL; cx.fill();
+    cx.restore();
+    // subtle gradient on image area
+    var imgGrad = cx.createLinearGradient(PHONE_X, imgY, PHONE_X, imgY + imgH);
+    imgGrad.addColorStop(0, 'rgba(46,197,182,0.06)');
+    imgGrad.addColorStop(1, 'rgba(46,197,182,0.02)');
+    cx.fillStyle = imgGrad;
+    cx.save();
+    drawRoundRect(PHONE_X + 4, imgY, PHONE_W - 8, imgH, 12);
+    cx.fill(); cx.restore();
+
+    // caption field
+    var fieldY = imgY + imgH + 14;
+    cx.save();
+    cx.globalAlpha = 0.07;
+    drawRoundRect(FIELD_X, fieldY, FIELD_W, FIELD_H, 10);
+    cx.fillStyle = '#fff'; cx.fill();
+    cx.restore();
+    cx.save();
+    cx.globalAlpha = 0.15;
+    cx.strokeStyle = TEAL; cx.lineWidth = 1;
+    drawRoundRect(FIELD_X, fieldY, FIELD_W, FIELD_H, 10);
+    cx.stroke();
+    cx.restore();
+
+    // placeholder label
+    cx.save();
+    cx.globalAlpha = 0.25;
+    cx.fillStyle = '#fff'; cx.font = '400 11px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'left';
+    cx.fillText('Add a caption...', FIELD_X + 12, fieldY + 22);
+    cx.restore();
+
+    // blinking cursor when idle
+    if (phase === 'idle') {
+      var cursorAlpha = 0.5 + 0.4 * Math.sin(cursorBlink * 3);
+      cx.save();
+      cx.globalAlpha = cursorAlpha;
+      cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+      cx.beginPath();
+      cx.moveTo(FIELD_X + 12, fieldY + 10);
+      cx.lineTo(FIELD_X + 12, fieldY + 28);
+      cx.stroke();
+      cx.restore();
+    }
+
+    // word fade-in during hold
+    if (phase === 'hold' || phase === 'dissolve') {
+      var revealed = Math.min(wordFadeProgress * wordList.length, wordList.length);
+      var lineH = 22, lineY = fieldY + 18;
+      for (var i = 0; i < wordList.length; i++) {
+        var wAlpha = Math.max(0, Math.min(1, revealed - i));
+        // dissolve phase: fade out
+        if (phase === 'dissolve') {
+          var dsP = (now - dissolveStart) / dissolveDuration;
+          wAlpha *= Math.max(0, 1 - dsP * 1.1);
+        }
+        if (wAlpha <= 0.001) continue;
+        cx.save();
+        cx.globalAlpha = wAlpha * 0.88;
+        cx.fillStyle = SOFT_WHITE;
+        cx.font = '400 13px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'left';
+        cx.fillText(wordList[i], FIELD_X + 12, lineY + i * lineH);
+        cx.restore();
+      }
+    }
+
+    // post button — always disabled
+    var btnX = FIELD_X, btnY = fieldY + FIELD_H + 12, btnW = FIELD_W, btnH = 38;
+    cx.save();
+    cx.globalAlpha = 0.18;
+    drawRoundRect(btnX, btnY, btnW, btnH, 19);
+    cx.fillStyle = TEAL; cx.fill();
+    cx.restore();
+    cx.save();
+    cx.globalAlpha = 0.3;
+    cx.fillStyle = '#fff'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.fillText('Share', btnX + btnW / 2, btnY + 24);
+    cx.restore();
+  }
+
+  function drawHoldZone(now) {
+    // bottom area: the hold instruction / progress arc
+    var cx_center = W / 2, cy_center = 660;
+    var ringR = 30;
+
+    if (phase === 'idle') {
+      // pulsing invitation
+      var pulse = 0.55 + 0.35 * Math.sin(now / 700);
+      cx.save();
+      cx.globalAlpha = pulse;
+      cx.beginPath(); cx.arc(cx_center, cy_center, ringR, 0, Math.PI * 2);
+      cx.strokeStyle = TEAL; cx.lineWidth = 1.5; cx.stroke();
+      cx.restore();
+      cx.save();
+      cx.globalAlpha = pulse * 0.85;
+      cx.fillStyle = TEAL; cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('hold', cx_center, cy_center + 4);
+      cx.restore();
+    } else if (phase === 'hold') {
+      // progress arc
+      var prog = wordFadeProgress;
+      cx.save();
+      cx.beginPath(); cx.arc(cx_center, cy_center, ringR, -Math.PI / 2, -Math.PI / 2 + prog * Math.PI * 2);
+      cx.strokeStyle = TEAL; cx.lineWidth = 2.5;
+      cx.globalAlpha = 0.7;
+      cx.stroke();
+      // track ring
+      cx.beginPath(); cx.arc(cx_center, cy_center, ringR, 0, Math.PI * 2);
+      cx.strokeStyle = 'rgba(46,197,182,0.15)'; cx.lineWidth = 1.5; cx.stroke();
+      cx.restore();
+      // calm step sound on word reveal
+      var revealedCount = wordsRevealed(prog);
+      if (revealedCount > currentWordIdx) {
+        for (var wi = currentWordIdx; wi < revealedCount; wi++) {
+          if (window.J) J.calm(calStep++);
+        }
+        currentWordIdx = revealedCount;
+      }
+    } else if (phase === 'dissolve') {
+      var dsP2 = Math.min((now - dissolveStart) / dissolveDuration, 1);
+      cx.save();
+      cx.globalAlpha = Math.max(0, 1 - dsP2 * 2);
+      cx.beginPath(); cx.arc(cx_center, cy_center, ringR, 0, Math.PI * 2);
+      cx.strokeStyle = TEAL; cx.lineWidth = 2; cx.stroke();
+      cx.restore();
+    } else if (phase === 'over') {
+      // gentle ripple on completion
+      var overElapsed = (now - overAt) / 1000;
+      for (var ri = 0; ri < 2; ri++) {
+        var rp = (overElapsed * 0.6 + ri * 0.5) % 1;
+        cx.save();
+        cx.globalAlpha = Math.max(0, (1 - rp) * 0.3);
+        cx.beginPath(); cx.arc(cx_center, cy_center, ringR + rp * 40, 0, Math.PI * 2);
+        cx.strokeStyle = TEAL; cx.lineWidth = 1; cx.stroke();
+        cx.restore();
+      }
+    }
+  }
+
+  function drawUI(now) {
+    // score / words surfaced — shown during and after
+    if (phase === 'hold' || phase === 'dissolve' || phase === 'over') {
+      var s = calcScore();
+      cx.save();
+      cx.globalAlpha = 0.65;
+      cx.fillStyle = TEAL; cx.font = '700 13px Menlo, monospace';
+      cx.textAlign = 'center';
+      cx.fillText(s + ' / ' + wordList.length + ' surfaced', W / 2, PHONE_Y - 10);
+      cx.restore();
+    }
+
+    // over card
+    if (phase === 'over') {
+      var overA = Math.min(1, (now - overAt) / 600);
+      cx.save();
+      cx.globalAlpha = overA * 0.6;
+      cx.fillStyle = INK; cx.fillRect(0, 0, W, H);
+      cx.restore();
+      cx.save();
+      cx.globalAlpha = overA;
+      cx.textAlign = 'center';
+      if (score >= wordList.length) {
+        cx.fillStyle = TEAL; cx.font = '300 22px -apple-system, Helvetica, Arial';
+        cx.fillText('the caption was enough.', W / 2, 310);
+        cx.globalAlpha = overA * 0.7;
+        cx.fillStyle = SOFT_WHITE; cx.font = '400 14px -apple-system, Helvetica, Arial';
+        cx.fillText('it never needed to publish.', W / 2, 342);
+      } else {
+        cx.fillStyle = TEAL; cx.font = '300 22px -apple-system, Helvetica, Arial';
+        cx.fillText(score + ' words surfaced.', W / 2, 310);
+        cx.globalAlpha = overA * 0.6;
+        cx.fillStyle = SOFT_WHITE; cx.font = '400 14px -apple-system, Helvetica, Arial';
+        cx.fillText('still something.', W / 2, 342);
+      }
+      if (!DEMO && !BOT) {
+        var tapPulse = 0.4 + 0.4 * Math.sin(now / 600);
+        cx.globalAlpha = overA * tapPulse;
+        cx.fillStyle = 'rgba(46,197,182,0.8)'; cx.font = '500 13px -apple-system, Helvetica, Arial';
+        cx.fillText('hold again', W / 2, 390);
+      }
+      cx.restore();
+    }
+
+    // title (idle)
+    if (phase === 'idle') {
+      cx.save();
+      cx.globalAlpha = 0.55;
+      cx.fillStyle = SOFT_WHITE; cx.font = '300 18px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('the right words are already there.', W / 2, PHONE_Y - 12);
+      cx.restore();
+    }
+  }
+
+  function drawFloats(dt) {
+    for (var k = floats.length - 1; k >= 0; k--) {
+      var fl = floats[k]; fl.t += dt;
+      var alpha = Math.max(0, 1 - fl.t / 60);
+      cx.save();
+      cx.globalAlpha = alpha;
+      cx.fillStyle = fl.color;
+      cx.font = '400 ' + fl.size + 'px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.5);
+      cx.restore();
+      if (fl.t > 60) floats.splice(k, 1);
+    }
+  }
+
+  function drawCTA(now) {
+    var ctaElapsed = now - ctaAt;
+    var ease = Math.min(1, ctaElapsed / 800);
+    cx.save();
+    cx.globalAlpha = ease * 0.8;
+    cx.fillStyle = INK; cx.fillRect(0, 0, W, H);
+    cx.restore();
+    cx.save();
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    // game name
+    cx.fillStyle = TEAL; cx.font = '300 28px -apple-system, Helvetica, Arial';
+    cx.fillText('CAPTION REST', W / 2, 290);
+    // soft invitation
+    cx.globalAlpha = ease * 0.75;
+    cx.fillStyle = SOFT_WHITE; cx.font = '400 15px -apple-system, Helvetica, Arial';
+    cx.fillText('the words were already there.', W / 2, 328);
+    cx.fillText('yours too.', W / 2, 350);
+    // CTA button
+    var p = 0.7 + 0.28 * Math.sin(now / 400);
+    cx.globalAlpha = ease * p;
+    cx.fillStyle = TEAL; cx.font = '600 18px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 410);
+    cx.globalAlpha = ease * 0.45;
+    cx.fillStyle = 'rgba(255,255,255,0.6)'; cx.font = '400 12px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 438);
+    cx.restore();
+  }
+
+  // --- boot ---
+  botRunsDone = 0;
+  newGame();
+  startRun();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

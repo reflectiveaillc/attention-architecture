@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Zoom Find — Tilt</title>
+<!--
+  LOOP / attention-architecture — Zoom Find
+  Circuits: 01-RPE (variable reward per find), 02-novelty (new scene each round),
+            06-Zeigarnik (one more try).
+  Modes:
+    ?demo=1&seed=7       scripted run for clip capture, sets window.__demoDone
+    ?bot=1&runs=N&seed=M imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:none; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'zoom-find';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ── constants ──
+  var SCENE_SIZE = 1200;          // the large procedural canvas we zoom into
+  var INIT_ZOOM  = W / SCENE_SIZE; // 0.3375 — full scene fits in view
+  var MIN_ZOOM   = INIT_ZOOM;
+  var MAX_ZOOM   = 6;
+  var ROUND_TIME = 12;            // seconds per round (counts down)
+  var HIT_RADIUS = 34;            // px in scene space to count as "found"
+
+  // ── state ──
+  var phase;       // 'title' | 'challenge' | 'play' | 'over' | 'cta'
+  var score, combo, round, lives, runStartTs;
+  var timeLeft, roundStartTs;
+  var panX, panY, zoom;            // viewport into scene
+  var targetX, targetY, targetR;   // target in scene coords
+  var dareBeaten = false;
+  var hitStop = 0, shakeAmt = 0, zoomPulse = 1;
+  var flashes = [];
+  var overAt = 0, ctaAt = 0, challengeAt = 0;
+  var loseLifePending = false;
+  var best = 0;
+  try { best = +localStorage.getItem('zf_best') || 0; } catch (_) {}
+
+  // off-screen scene canvas
+  var sc = document.createElement('canvas');
+  sc.width = SCENE_SIZE; sc.height = SCENE_SIZE;
+  var sx = sc.getContext('2d');
+
+  // ── scene generation ──
+  var PALETTE = [
+    '#e8502e','#2ec5b6','#f2b134','#6a3de8','#e83d9c',
+    '#3de8a0','#e8c13d','#3d7ae8','#e86b3d','#3de8d4'
+  ];
+
+  function pickColor(exclude) {
+    var c;
+    do { c = PALETTE[Math.floor(rng() * PALETTE.length)]; } while (c === exclude);
+    return c;
+  }
+
+  function buildScene() {
+    // background
+    sx.fillStyle = '#1a1c24';
+    sx.fillRect(0, 0, SCENE_SIZE, SCENE_SIZE);
+
+    // grid lines
+    sx.strokeStyle = 'rgba(255,255,255,0.04)';
+    sx.lineWidth = 1;
+    for (var g = 0; g < SCENE_SIZE; g += 80) {
+      sx.beginPath(); sx.moveTo(g, 0); sx.lineTo(g, SCENE_SIZE); sx.stroke();
+      sx.beginPath(); sx.moveTo(0, g); sx.lineTo(SCENE_SIZE, g); sx.stroke();
+    }
+
+    // lots of noise shapes — make it busy
+    var count = 120 + Math.floor(rng() * 60);
+    for (var i = 0; i < count; i++) {
+      var type = Math.floor(rng() * 4);
+      var x = rng() * SCENE_SIZE, y = rng() * SCENE_SIZE;
+      var sz = 18 + rng() * 80;
+      var col = PALETTE[Math.floor(rng() * PALETTE.length)];
+      sx.globalAlpha = 0.12 + rng() * 0.22;
+      sx.fillStyle = col;
+      sx.strokeStyle = col;
+      sx.lineWidth = 1 + rng() * 2;
+      if (type === 0) {
+        sx.fillRect(x - sz / 2, y - sz / 2, sz, sz * (0.5 + rng() * 1.5));
+      } else if (type === 1) {
+        sx.beginPath(); sx.arc(x, y, sz / 2, 0, Math.PI * 2); sx.fill();
+      } else if (type === 2) {
+        sx.beginPath();
+        sx.moveTo(x, y - sz / 2);
+        sx.lineTo(x + sz / 2, y + sz / 2);
+        sx.lineTo(x - sz / 2, y + sz / 2);
+        sx.closePath(); sx.fill();
+      } else {
+        // line cluster
+        for (var j = 0; j < 5; j++) {
+          sx.beginPath();
+          sx.moveTo(x + (rng() - 0.5) * sz * 2, y + (rng() - 0.5) * sz * 2);
+          sx.lineTo(x + (rng() - 0.5) * sz * 2, y + (rng() - 0.5) * sz * 2);
+          sx.stroke();
+        }
+      }
+    }
+    sx.globalAlpha = 1;
+
+    // text noise
+    var words = ['#','@','!','?','&','0','1','%','*','+'];
+    for (var w = 0; w < 40; w++) {
+      sx.globalAlpha = 0.08 + rng() * 0.1;
+      sx.fillStyle = PALETTE[Math.floor(rng() * PALETTE.length)];
+      sx.font = Math.floor(10 + rng() * 30) + 'px -apple-system, Helvetica, Arial';
+      sx.fillText(words[Math.floor(rng() * words.length)], rng() * SCENE_SIZE, rng() * SCENE_SIZE);
+    }
+    sx.globalAlpha = 1;
+  }
+
+  function placeTarget() {
+    // Target: a small distinctive shape. Difficulty increases per round.
+    // radius shrinks and gets placed further from center.
+    var difficulty = Math.min(round - 1, 6);
+    var baseR = 16 - difficulty * 1.5;  // 16..7
+    targetR = Math.max(7, baseR);
+
+    // placement: avoid edges, placed pseudo-randomly
+    var margin = 100;
+    targetX = margin + rng() * (SCENE_SIZE - margin * 2);
+    targetY = margin + rng() * (SCENE_SIZE - margin * 2);
+
+    // draw distractors first (look similar but wrong color)
+    var distCount = 3 + difficulty;
+    var targetCol = GOLD;  // always gold star
+    for (var d = 0; d < distCount; d++) {
+      var dx = margin + rng() * (SCENE_SIZE - margin * 2);
+      var dy = margin + rng() * (SCENE_SIZE - margin * 2);
+      // keep distractors away from real target
+      if (Math.abs(dx - targetX) < 80 && Math.abs(dy - targetY) < 80) continue;
+      var dCol = pickColor(targetCol);
+      drawStar(sx, dx, dy, targetR * (0.8 + rng() * 0.4), dCol, 0.55 + rng() * 0.3);
+    }
+
+    // draw the actual target (slightly brighter)
+    drawStar(sx, targetX, targetY, targetR, targetCol, 1);
+    // subtle ring
+    sx.globalAlpha = 0.4;
+    sx.strokeStyle = targetCol;
+    sx.lineWidth = 1.5;
+    sx.beginPath();
+    sx.arc(targetX, targetY, targetR + 4, 0, Math.PI * 2);
+    sx.stroke();
+    sx.globalAlpha = 1;
+  }
+
+  function drawStar(ctx, x, y, r, col, alpha) {
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    for (var i = 0; i < 5; i++) {
+      var a = (i * 4 * Math.PI / 5) - Math.PI / 2;
+      var b = (i * 4 * Math.PI / 5) - Math.PI / 2 + Math.PI / 5;
+      if (i === 0) ctx.moveTo(x + r * Math.cos(a), y + r * Math.sin(a));
+      else ctx.lineTo(x + r * Math.cos(a), y + r * Math.sin(a));
+      ctx.lineTo(x + (r * 0.45) * Math.cos(b), y + (r * 0.45) * Math.sin(b));
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function buildRound() {
+    // rebuild scene offscreen
+    rng = mulberry32(SEED + round * 997);  // deterministic per round
+    buildScene();
+    placeTarget();
+    // reset viewport to show full scene
+    panX = W / 2;
+    panY = H / 2;
+    zoom = INIT_ZOOM;
+    timeLeft = ROUND_TIME;
+    roundStartTs = Date.now();
+  }
+
+  // ── game lifecycle ──
+  function newGame() {
+    score = 0; combo = 0; round = 1; lives = 3;
+    dareBeaten = false; flashes = [];
+    overAt = 0; ctaAt = 0;
+
+    if (DEMO) {
+      buildRound();
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) {
+      buildRound();
+      startRun();
+      return;
+    }
+    phase = 'title';
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function nextRound() {
+    botFoundThisRound = false;
+    round++;
+    buildRound();
+    if (window.J) J.tension(Math.min((round - 1) / 8, 1));
+    if (window.LOOP) LOOP.emit('round_start', { round: round, score: score });
+  }
+
+  function foundTarget() {
+    combo++;
+    var pts = 10 + combo * 5;
+    score += pts;
+    if (BOT) {
+      botRoundCount++;
+      if (botRoundCount >= BOT_FIND_ROUNDS) {
+        botPassive = true;  // stop finding — expire timer immediately next round
+      }
+    }
+    if (window.J) {
+      if (combo >= 3) J.perfect(combo);
+      else J.hit(combo);
+    }
+    hitStop = 6; zoomPulse = 1.03; shakeAmt = 2;
+    flash('+' + pts, GOLD, 52);
+    if (combo >= 3) flash('×' + combo + ' COMBO', TEAL, 38);
+
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(score);
+    }
+
+    if (window.LOOP) LOOP.emit('target_found', { round: round, score: score, combo: combo, time_left: +timeLeft.toFixed(1) });
+    if (window.J) J.gold();
+    nextRound();
+  }
+
+  function loseLife() {
+    lives--;
+    combo = 0;
+    shakeAmt = 7;
+    flash('TIME!', VERM, 48);
+    if (window.J) J.near();
+    if (window.LOOP) LOOP.emit('near_miss', { round: round, lives_left: lives });
+    if (lives <= 0) {
+      gameOver();
+    } else {
+      botFoundThisRound = false;
+      round++;
+      buildRound();
+      if (window.J) J.tension(Math.min((round - 1) / 8, 1));
+    }
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + score / 80, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (newBest) { best = score; try { localStorage.setItem('zf_best', String(best)); } catch (_) {} }
+    if (DEMO) window.__demoScore = score;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1), rounds: round });
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    score = 0; combo = 0; round = 1; lives = 3;
+    dareBeaten = false; flashes = [];
+    botRoundCount = 0; botPassive = false; botFoundThisRound = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    buildRound();
+    startRun();
+  }
+
+  function pctTop(s) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 35))));
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ── input: pinch + drag + tap ──
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  var pointers = {};   // id → {x,y}
+  var lastPinchDist = null;
+  var dragStart = null;  // {panX,panY,x,y}
+
+  function scenePt(cx_, cy_) {
+    // canvas point → scene point
+    return {
+      x: (cx_ - panX) / zoom + SCENE_SIZE / 2,
+      y: (cy_ - panY) / zoom + SCENE_SIZE / 2
+    };
+  }
+
+  function clampPan() {
+    // keep scene in reasonable bounds
+    var hw = (SCENE_SIZE * zoom) / 2;
+    var hh = (SCENE_SIZE * zoom) / 2;
+    panX = Math.max(W - hw - SCENE_SIZE * zoom * 0.1, Math.min(hw + SCENE_SIZE * zoom * 0.1 - W, panX));
+    // simpler: just clamp so some scene always visible
+    var minPX = W / 2 - SCENE_SIZE * zoom * 0.9;
+    var maxPX = W / 2 + SCENE_SIZE * zoom * 0.9;
+    panX = Math.max(minPX, Math.min(maxPX, panX));
+    var minPY = H / 2 - SCENE_SIZE * zoom * 0.9;
+    var maxPY = H / 2 + SCENE_SIZE * zoom * 0.9;
+    panY = Math.max(minPY, Math.min(maxPY, panY));
+  }
+
+  function onPointerDown(e) {
+    if (DEMO || BOT) return;
+    e.preventDefault();
+    var r = cv.getBoundingClientRect();
+    var cx_ = (e.clientX - r.left) / scale;
+    var cy_ = (e.clientY - r.top) / scale;
+    pointers[e.pointerId] = { x: cx_, y: cy_ };
+
+    if (inR(MUTE_R, cx_, cy_) && window.J) { J.toggleMute(); return; }
+
+    if (phase === 'title') { buildRound(); startRun(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (inR(SHARE_R, cx_, cy_) && window.SHARE) { SHARE.send({ score: score, unit: 'finds' }); return; }
+      resetRun(); return;
+    }
+
+    var ids = Object.keys(pointers);
+    if (ids.length === 1) {
+      dragStart = { panX: panX, panY: panY, x: cx_, y: cy_ };
+    }
+    if (ids.length === 2) {
+      var p1 = pointers[ids[0]], p2 = pointers[ids[1]];
+      lastPinchDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      dragStart = null;
+    }
+  }
+
+  function onPointerMove(e) {
+    if (DEMO || BOT) return;
+    e.preventDefault();
+    if (!pointers[e.pointerId]) return;
+    var r = cv.getBoundingClientRect();
+    var cx_ = (e.clientX - r.left) / scale;
+    var cy_ = (e.clientY - r.top) / scale;
+    pointers[e.pointerId] = { x: cx_, y: cy_ };
+
+    var ids = Object.keys(pointers);
+    if (ids.length === 2 && lastPinchDist !== null) {
+      var p1 = pointers[ids[0]], p2 = pointers[ids[1]];
+      var dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      var ratio = dist / lastPinchDist;
+      var oldZoom = zoom;
+      zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * ratio));
+      // zoom toward midpoint
+      var midX = (p1.x + p2.x) / 2;
+      var midY = (p1.y + p2.y) / 2;
+      panX = midX - (midX - panX) * (zoom / oldZoom);
+      panY = midY - (midY - panY) * (zoom / oldZoom);
+      clampPan();
+      lastPinchDist = dist;
+    } else if (ids.length === 1 && dragStart) {
+      panX = dragStart.panX + (cx_ - dragStart.x);
+      panY = dragStart.panY + (cy_ - dragStart.y);
+      clampPan();
+    }
+  }
+
+  function onPointerUp(e) {
+    if (DEMO || BOT) return;
+    e.preventDefault();
+    var r = cv.getBoundingClientRect();
+    var cx_ = (e.clientX - r.left) / scale;
+    var cy_ = (e.clientY - r.top) / scale;
+    var wasSinglePointer = Object.keys(pointers).length === 1;
+    var moved = dragStart ? Math.hypot(cx_ - dragStart.x, cy_ - dragStart.y) : 99;
+    delete pointers[e.pointerId];
+    lastPinchDist = null;
+
+    // tap = single pointer, barely moved → check target
+    if (phase === 'play' && wasSinglePointer && moved < 8) {
+      var sp = scenePt(cx_, cy_);
+      var dist = Math.hypot(sp.x - targetX, sp.y - targetY);
+      if (dist <= HIT_RADIUS + (8 / zoom)) {
+        foundTarget();
+      } else {
+        flash('NOPE', VERM, 32);
+        shakeAmt = 3;
+      }
+    }
+    dragStart = null;
+  }
+
+  // scroll to zoom (desktop)
+  function onWheel(e) {
+    if (DEMO || BOT) return;
+    e.preventDefault();
+    var r = cv.getBoundingClientRect();
+    var mx = (e.clientX - r.left) / scale;
+    var my = (e.clientY - r.top) / scale;
+    var factor = e.deltaY < 0 ? 1.1 : 0.91;
+    var oldZoom = zoom;
+    zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * factor));
+    panX = mx - (mx - panX) * (zoom / oldZoom);
+    panY = my - (my - panY) * (zoom / oldZoom);
+    clampPan();
+  }
+
+  cv.addEventListener('pointerdown', onPointerDown);
+  cv.addEventListener('pointermove', onPointerMove);
+  cv.addEventListener('pointerup', onPointerUp);
+  cv.addEventListener('pointercancel', function (e) { delete pointers[e.pointerId]; });
+  cv.addEventListener('wheel', onWheel, { passive: false });
+
+  // ── bot/demo autopilots ──
+  var botRunsDone = 0;
+  // demo script: a series of autopilot actions
+  var DEMO_SCRIPT = [
+    { action: 'find',   delay: 1.8 },   // round 1: find it (after hesitation)
+    { action: 'find',   delay: 1.4 },   // round 2: find it faster
+    { action: 'search', delay: 2.5 },   // round 3: near fail — approach wrong area, then correct
+    { action: 'find',   delay: 1.0 },   // round 3 recovery: find after panic
+    { action: 'miss',   delay: 0 },     // run out of time → die
+  ];
+  var demoScriptIdx = 0;
+  var demoActionTimer = 0;
+  var demoTapped = false;
+
+  // bot: finds targets for BOT_FIND_ROUNDS rounds, then goes passive and dies
+  var BOT_FIND_ROUNDS = 4;   // finds per run before deliberately failing
+  var botRoundCount = 0;     // rounds found in current bot run
+  var botPassive = false;    // when true: pan away, let timer expire
+  var botFoundThisRound = false;  // guard: only find once per round
+
+  function autopilotTick(dt) {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      demoTick(dt);
+    } else if (BOT) {
+      botTick(dt);
+    }
+  }
+
+  function demoZoomToward(tx, ty, targetZoom, speed) {
+    // smooth pan + zoom toward scene point (tx, ty) at targetZoom
+    var destPanX = W / 2 - (tx - SCENE_SIZE / 2) * targetZoom;
+    var destPanY = H / 2 - (ty - SCENE_SIZE / 2) * targetZoom;
+    panX += (destPanX - panX) * speed;
+    panY += (destPanY - panY) * speed;
+    zoom += (targetZoom - zoom) * speed;
+    clampPan();
+  }
+
+  function demoTick(dt) {
+    demoActionTimer += dt / 60; // convert frames to seconds
+    var step = DEMO_SCRIPT[Math.min(demoScriptIdx, DEMO_SCRIPT.length - 1)];
+
+    if (step.action === 'find') {
+      // zoom to target with hesitation wobble, then tap
+      var frac = Math.min(demoActionTimer / step.delay, 1);
+      var wobble = (1 - frac) * 12;
+      var wx = targetX + (rng() - 0.5) * wobble;
+      var wy = targetY + (rng() - 0.5) * wobble;
+      demoZoomToward(wx, wy, 2.5 + frac * 1.5, 0.04 + frac * 0.04);
+      if (frac >= 1 && !demoTapped) {
+        demoTapped = true;
+        // simulate tap
+        var sp = {
+          x: W / 2 - (targetX - SCENE_SIZE / 2) * zoom,
+          y: H / 2 - (targetY - SCENE_SIZE / 2) * zoom
+        };
+        demoTapped = false;
+        foundTarget();
+        demoScriptIdx++;
+        demoActionTimer = 0;
+      }
+    } else if (step.action === 'search') {
+      // drift to wrong area, then panic and swing to real target
+      var frac2 = Math.min(demoActionTimer / step.delay, 1);
+      if (frac2 < 0.45) {
+        // wrong area
+        var wrongX = (targetX + SCENE_SIZE * 0.3) % SCENE_SIZE;
+        var wrongY = (targetY + SCENE_SIZE * 0.3) % SCENE_SIZE;
+        demoZoomToward(wrongX, wrongY, 2.0 + frac2, 0.025);
+      } else {
+        // swing back toward real target — the "recovery"
+        demoZoomToward(targetX, targetY, 3.5, 0.07);
+        if (frac2 >= 1) {
+          demoScriptIdx++;
+          demoActionTimer = 0;
+        }
+      }
+    } else if (step.action === 'miss') {
+      // let timer run out naturally — do nothing productive
+      // pan away slowly
+      panX += 0.3 * dt;
+      panY += 0.2 * dt;
+      clampPan();
+    }
+  }
+
+  function botTick(dt) {
+    if (botPassive) {
+      // immediately expire the round timer so loseLife fires
+      roundStartTs = Date.now() - (ROUND_TIME + 1) * 1000;
+      return;
+    }
+    if (botFoundThisRound) return;
+    // approach target
+    var targetZoom = 3.0 + (round - 1) * 0.2;
+    var speed = 0.05;
+    demoZoomToward(targetX, targetY, targetZoom, speed);
+    // tap when close enough
+    var curSp = scenePt(W / 2, H / 2);
+    var dist = Math.hypot(curSp.x - targetX, curSp.y - targetY);
+    var viewDist = dist * zoom;  // in canvas px
+    if (viewDist < 18) {
+      botFoundThisRound = true;
+      foundTarget();
+    }
+  }
+
+  // ── render ──
+  var last = performance.now();
+  function frame(ts) {
+    var dt = Math.min((ts - last) / 16.667, 3); last = ts;
+
+    // countdown timer
+    if (phase === 'play') {
+      var elapsed = (Date.now() - roundStartTs) / 1000;
+      timeLeft = Math.max(0, ROUND_TIME - elapsed);
+      if (timeLeft <= 0 && !loseLifePending) {
+        loseLifePending = true;
+        loseLife();
+        loseLifePending = false;
+      }
+    }
+
+    // hit-stop: freeze sim, decay every frame
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      autopilotTick(dt);
+    }
+
+    // juice: decaying shake + zoom pulse
+    cx.save();
+    var sx_ = 0, sy_ = 0;
+    if (shakeAmt > 0.3) {
+      sx_ = (Math.random() - 0.5) * shakeAmt;
+      sy_ = (Math.random() - 0.5) * shakeAmt;
+    }
+    if (shakeAmt > 0.3 || zoomPulse > 1.001) {
+      cx.translate(W / 2 + sx_, H / 2 + sy_);
+      cx.scale(zoomPulse, zoomPulse);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoomPulse += (1 - zoomPulse) * 0.14 * dt;
+
+    // ── draw ──
+    cx.fillStyle = INK; cx.fillRect(0, 0, W, H);
+
+    // scene viewport
+    if (phase === 'play' || phase === 'over') {
+      cx.save();
+      cx.beginPath(); cx.rect(0, 88, W, H - 160); cx.clip();
+      // draw scene scaled
+      var offX = panX - (SCENE_SIZE / 2) * zoom;
+      var offY = panY - (SCENE_SIZE / 2) * zoom;
+      cx.drawImage(sc, offX + W / 2 - W / 2, offY + H / 2 - H / 2, SCENE_SIZE * zoom, SCENE_SIZE * zoom);
+      // target hint pulse (outer ring, visible at low zoom)
+      if (zoom < 1.2) {
+        var tx = panX + (targetX - SCENE_SIZE / 2) * zoom;
+        var ty = panY + (targetY - SCENE_SIZE / 2) * zoom;
+        cx.globalAlpha = 0.15 + 0.1 * Math.sin(ts / 300);
+        cx.strokeStyle = GOLD;
+        cx.lineWidth = 2;
+        cx.beginPath();
+        cx.arc(tx, ty, 24 + 6 * Math.sin(ts / 200), 0, Math.PI * 2);
+        cx.stroke();
+        cx.globalAlpha = 1;
+      }
+      cx.restore();
+    }
+
+    // HUD
+    if (phase === 'play' || phase === 'over') {
+      // top bar bg
+      cx.fillStyle = 'rgba(11,13,18,0.88)';
+      cx.fillRect(0, 0, W, 88);
+
+      // score
+      cx.textAlign = 'left';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '800 36px -apple-system, Helvetica, Arial';
+      cx.fillText(score, 24, 52);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, 24, 72);
+
+      // round + lives
+      cx.textAlign = 'right';
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '700 13px -apple-system, Helvetica, Arial';
+      cx.fillText('FIND ' + round, W - 24, 46);
+      var hearts = '';
+      for (var h = 0; h < 3; h++) hearts += h < lives ? '♥ ' : '♡ ';
+      cx.fillStyle = lives <= 1 ? VERM : TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText(hearts.trim(), W - 24, 68);
+
+      // timer bar
+      var timerFrac = timeLeft / ROUND_TIME;
+      cx.fillStyle = 'rgba(255,255,255,0.08)';
+      cx.fillRect(0, 84, W, 4);
+      var timerColor = timerFrac > 0.4 ? TEAL : (timerFrac > 0.2 ? GOLD : VERM);
+      cx.fillStyle = timerColor;
+      cx.fillRect(0, 84, W * timerFrac, 4);
+
+      // zoom level indicator
+      if (phase === 'play') {
+        cx.textAlign = 'center';
+        cx.fillStyle = 'rgba(255,255,255,0.22)';
+        cx.font = '600 11px Menlo, monospace';
+        cx.fillText(zoom.toFixed(1) + '×', W / 2, 82);
+      }
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+        cx.textAlign = 'center';
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 13px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 105);
+      }
+    }
+
+    // instruction overlay at game start
+    if (phase === 'play' && round === 1 && timeLeft > 10) {
+      var instrAlpha = Math.min(1, (ROUND_TIME - timeLeft) < 2 ? 1 - Math.max(0, (ROUND_TIME - timeLeft - 1)) : 1);
+      instrAlpha = instrAlpha * Math.max(0, Math.min(1, (timeLeft - (ROUND_TIME - 2.5))));
+      if (instrAlpha > 0.02) {
+        cx.globalAlpha = instrAlpha * 0.85;
+        cx.fillStyle = INK;
+        cx.fillRect(40, H / 2 - 44, W - 80, 88);
+        cx.globalAlpha = instrAlpha;
+        cx.textAlign = 'center';
+        cx.fillStyle = '#fff';
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('FIND THE GOLD STAR ★', W / 2, H / 2 - 14);
+        cx.fillStyle = TEAL;
+        cx.font = '600 12px -apple-system, Helvetica, Arial';
+        cx.fillText('pinch to zoom · drag to pan · tap to find', W / 2, H / 2 + 10);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // challenge card (demo beat 1)
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = INK; cx.fillRect(0, 0, W, H);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('45', W / 2, 405);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 435);
+    }
+
+    // title screen
+    if (phase === 'title') {
+      cx.fillStyle = INK; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('ZOOM FIND', W / 2, 290);
+      cx.fillStyle = GOLD;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(ts / 300);
+      cx.globalAlpha = pulse;
+      cx.fillText('★ find the star ★', W / 2, 336);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('zoom in. look closer.', W / 2, 368);
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.globalAlpha = pulse;
+      cx.fillText('TAP TO START', W / 2, 420);
+      cx.globalAlpha = 1;
+    }
+
+    // flashes (floating reward text)
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 280 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // game over card
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.72)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('TIMES UP.', W / 2, 298);
+      cx.fillStyle = '#fff';
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' found', W / 2, 344);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 414);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(ts / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 460);
+        cx.globalAlpha = 1;
+        // share zone
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (phase === 'cta') {
+      var t = (ts - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('ZOOM FIND', W / 2, 294);
+      cx.fillStyle = 'rgba(255,255,255,0.72)';
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they found ' + (window.__demoScore || 45) + '. your turn.', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(ts / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 45), W / 2, 406);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

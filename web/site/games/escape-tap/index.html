@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Escape Tap — Tilt</title>
+<!--
+  LOOP / attention-architecture — Escape Tap
+  Circuits: 06 Zeigarnik (unfinished room), 01 RPE (variable reward per find),
+            08 investment (each clue unlocks the next).
+  Modes:
+    ?demo=1&seed=7        scripted run for clip capture, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay, sets window.__botDone
+    ?dare=N[&by=name]     incoming challenge
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'escape-tap';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || (DEMO ? 7 : (BOT ? 5 : 42));
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function randInt(n) { return Math.floor(rng() * n); }
+  function shuffle(arr) {
+    var a = arr.slice();
+    for (var i = a.length - 1; i > 0; i--) { var j = randInt(i + 1); var t = a[i]; a[i] = a[j]; a[j] = t; }
+    return a;
+  }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134';
+  var OBJ_W = 120, OBJ_H = 95;
+  var SLOTS = [
+    { x: 45,  y: 340 }, { x: 240, y: 340 },
+    { x: 45,  y: 470 }, { x: 240, y: 470 },
+    { x: 45,  y: 600 }, { x: 240, y: 600 }
+  ];
+  var DOOR = { x: 132, y: 70, w: 140, h: 195 };
+  var TYPES = [
+    { icon: '🛋️', label: 'SOFA',     hue: 18 },
+    { icon: '🖼️', label: 'FRAME',    hue: 38 },
+    { icon: '🪴', label: 'PLANT',    hue: 95 },
+    { icon: '📚', label: 'SHELF',    hue: 205 },
+    { icon: '🗄️', label: 'DRAWER',   hue: 260 },
+    { icon: '🧸', label: 'TOY',      hue: 320 },
+    { icon: '🕰️', label: 'CLOCK',    hue: 45 },
+    { icon: '📦', label: 'BOX',      hue: 150 }
+  ];
+
+  function makeRoom(roomIndex) {
+    var types = shuffle(TYPES).slice(0, 6);
+    var seq = shuffle([0, 1, 2, 3, 4, 5]);
+    var objs = [];
+    for (var i = 0; i < 6; i++) {
+      objs.push({
+        type: types[i], slot: i,
+        x: SLOTS[i].x, y: SLOTS[i].y,
+        w: OBJ_W, h: OBJ_H,
+        found: false
+      });
+    }
+    return { index: roomIndex, objects: objs, sequence: seq };
+  }
+
+  var state, runStartTs, overAt, ctaAt, best = 0;
+  var flashes = [];
+  var hitStop = 0, shakeAmt = 0, zoom = 1, dareBeaten = false;
+  var challengeScore = 4;
+  try { best = +localStorage.getItem('et_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      room: null, roomsEscaped: 0,
+      stage: 0, targetIdx: 0,
+      timeLeft: 0, maxTime: 0,
+      combo: 0
+    };
+    flashes = []; hitStop = 0; shakeAmt = 0; zoom = 1; dareBeaten = false;
+    if (DEMO) {
+      state.phase = 'challenge';
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function roomMaxTime() { return Math.max(5, 12 - state.roomsEscaped * 2); }
+
+  function spawnRoom() {
+    var roomIndex = (state.roomsEscaped || 0) + 1;
+    state.room = makeRoom(roomIndex);
+    state.stage = 0;
+    state.targetIdx = state.room.sequence[0];
+    state.maxTime = roomMaxTime();
+    state.timeLeft = state.maxTime;
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.roomsEscaped = 0;
+    state.combo = 0;
+    runStartTs = performance.now();
+    spawnRoom();
+    if (DEMO) { demoIdx = 0; demoNextAt = runStartTs + demoActions[0].t * 1000; }
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function objectCenter(idx) {
+    var o = state.room.objects[idx];
+    return { x: o.x + o.w / 2, y: o.y + o.h / 2 };
+  }
+  function doorCenter() { return { x: DOOR.x + DOOR.w / 2, y: DOOR.y + DOOR.h / 2 }; }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 3.5))));
+  }
+
+  function isAdjacentSlot(a, b) {
+    var ax = a % 2, ay = Math.floor(a / 2);
+    var bx = b % 2, by = Math.floor(b / 2);
+    return Math.abs(ax - bx) + Math.abs(ay - by) === 1;
+  }
+
+  function tryObject(idx, tapX, tapY) {
+    if (state.stage === 3) {
+      flash('LOCKED', VERM, 28);
+      if (window.J) J.near();
+      return;
+    }
+    if (idx === state.targetIdx) {
+      foundClue(idx);
+    } else {
+      var near = isAdjacentSlot(idx, state.targetIdx) || (tapX !== undefined && tapY !== undefined && Math.hypot(tapX - objectCenter(state.targetIdx).x, tapY - objectCenter(state.targetIdx).y) < 60);
+      wrongTap(idx, near ? 'near' : 'wrong');
+    }
+  }
+
+  function foundClue(idx) {
+    var o = state.room.objects[idx];
+    o.found = true;
+    state.combo++;
+    if (window.J) { J.hit(state.combo); J.tension(1 - state.timeLeft / state.maxTime); }
+    hitStop = 5; zoom = 1.03;
+    flash('+' + o.type.label, TEAL, 38);
+    if (window.LOOP) LOOP.emit('clue_found', { room: state.room.index, stage: state.stage, object: o.type.label });
+
+    if (state.stage < 2) {
+      state.stage++;
+      state.targetIdx = state.room.sequence[state.stage];
+    } else {
+      state.stage = 3; // key found -> door open
+      state.targetIdx = -1;
+    }
+  }
+
+  function wrongTap(idx, kind) {
+    state.timeLeft = Math.max(0, state.timeLeft - 2);
+    state.combo = 0;
+    shakeAmt = 5;
+    if (kind === 'near') {
+      flash('SO CLOSE', VERM, 34);
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { room: state.room.index, stage: state.stage });
+    } else {
+      flash('NOPE', VERM, 32);
+      if (window.J) J.near();
+    }
+    if (window.LOOP) LOOP.emit('wrong_tap', { room: state.room.index, stage: state.stage, kind: kind });
+  }
+
+  function tryDoor() {
+    if (state.stage === 3) {
+      state.roomsEscaped++;
+      if (window.J) { J.gold(); J.tension(0); }
+      hitStop = 7; zoom = 1.04;
+      flash('ESCAPED', GOLD, 48);
+      if (window.LOOP) LOOP.emit('door_opened', { room: state.room.index, score: state.roomsEscaped });
+      if (window.LOOP) LOOP.emit('room_cleared', { room: state.room.index, score: state.roomsEscaped });
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.roomsEscaped > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 40);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.roomsEscaped);
+      }
+      spawnRoom();
+    } else {
+      flash('LOCKED', VERM, 30);
+      if (window.J) J.near();
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 12;
+    var dur = (performance.now() - runStartTs) / 1000;
+    var newBest = state.roomsEscaped > best;
+    if (newBest) { best = state.roomsEscaped; try { localStorage.setItem('et_best', String(best)); } catch (_) {} }
+    if (window.J) { J.death(Math.min(0.4 + state.roomsEscaped / 10, 1)); if (newBest) setTimeout(function () { J.fanfare(); }, 500); }
+    if (DEMO) window.__demoScore = state.roomsEscaped;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.roomsEscaped, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else { setTimeout(function () { resetRun(); }, 900); }
+    }
+  }
+
+  function resetRun() {
+    state.roomsEscaped = 0; state.combo = 0; flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function hitObject(x, y) {
+    for (var i = 0; i < state.room.objects.length; i++) {
+      var o = state.room.objects[i];
+      if (x >= o.x && x <= o.x + o.w && y >= o.y && y <= o.y + o.h) return i;
+    }
+    return -1;
+  }
+  function hitDoor(x, y) { return x >= DOOR.x && x <= DOOR.x + DOOR.w && y >= DOOR.y && y <= DOOR.y + DOOR.h; }
+
+  function doTap(x, y) {
+    if (state.phase !== 'play' || !state.room) return;
+    var obj = hitObject(x, y);
+    if (obj >= 0) tryObject(obj, x, y);
+    else if (hitDoor(x, y)) tryDoor();
+  }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && y !== undefined && window.J && inR(MUTE_R, x, y)) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { doTap(x, y); return; }
+    if (state.phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && y !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.roomsEscaped, unit: 'rooms' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(W / 2, H - 120); });
+
+  // ---- demo / bot autopilots ----
+  // human-feeling demo: fast escapes, one near-fail recovery, then a real timeout
+  var demoActions = [
+    { t: 0.4, act: 'target' }, { t: 1.0, act: 'target' }, { t: 1.6, act: 'target' }, { t: 2.1, act: 'door' },
+    { t: 2.9, act: 'target' }, { t: 3.5, act: 'target' }, { t: 4.1, act: 'target' }, { t: 4.6, act: 'door' },
+    { t: 5.6, act: 'wrong' }, { t: 6.6, act: 'wrong' },
+    { t: 8.0, act: 'target' }, { t: 8.5, act: 'door' },
+    { t: 9.3, act: 'target' }, { t: 10.1, act: 'wrong' }
+    // then idle until the timer runs out for the spectacle fail
+  ];
+  var demoIdx = 0, demoNextAt = 0;
+  var botRunsDone = 0, botWait = 0;
+
+  function autopilot(now, dt) {
+    if (!state.room || state.phase !== 'play') return;
+    if (DEMO) {
+      if (demoIdx >= demoActions.length) return; // let timer expire
+      if (now >= demoNextAt) {
+        var a = demoActions[demoIdx++];
+        var p;
+        if (a.act === 'door') p = doorCenter();
+        else if (a.act === 'target') {
+          if (state.stage === 3) p = doorCenter();
+          else p = objectCenter(state.targetIdx);
+        } else { // wrong: tap an object that is not the current target
+          var wrong = (state.targetIdx + 1) % 6;
+          p = objectCenter(wrong);
+        }
+        doTap(p.x, p.y);
+        var next = demoActions[demoIdx];
+        if (next) demoNextAt = runStartTs + next.t * 1000;
+      }
+    } else if (BOT) {
+      var frameSec = (16.667 * dt) / 1000;
+      if (botWait > 0) { botWait -= frameSec; return; }
+      botWait = 0.25 + rng() * 0.7;
+      var choices = [];
+      for (var i = 0; i < 6; i++) choices.push(objectCenter(i));
+      if (state.stage === 3) choices.push(doorCenter());
+      var p = choices[randInt(choices.length)];
+      doTap(p.x, p.y);
+    }
+  }
+
+  // ---- render ----
+  function objFill(hue, y) {
+    var g = cx.createLinearGradient(0, y, 0, y + OBJ_H);
+    g.addColorStop(0, 'hsl(' + hue + ',58%,52%)');
+    g.addColorStop(1, 'hsl(' + hue + ',62%,38%)');
+    return g;
+  }
+  function roundRectPath(x, y, w, h, r) {
+    var rr = Math.min(r, w / 2, h / 2);
+    cx.beginPath();
+    cx.moveTo(x + rr, y);
+    cx.lineTo(x + w - rr, y);
+    cx.quadraticCurveTo(x + w, y, x + w, y + rr);
+    cx.lineTo(x + w, y + h - rr);
+    cx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+    cx.lineTo(x + rr, y + h);
+    cx.quadraticCurveTo(x, y + h, x, y + h - rr);
+    cx.lineTo(x, y + rr);
+    cx.quadraticCurveTo(x, y, x + rr, y);
+    cx.closePath();
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') {
+      state.timeLeft -= (16.667 * dt) / 1000;
+      if (state.timeLeft <= 0) { state.timeLeft = 0; gameOver(); }
+      else if (window.J) J.tension(1 - state.timeLeft / state.maxTime);
+      autopilot(now, dt);
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // room
+    cx.fillStyle = 'rgba(255,255,255,0.04)'; // floor
+    cx.fillRect(0, H - 110, W, 110);
+    cx.strokeStyle = 'rgba(255,255,255,0.12)';
+    cx.beginPath(); cx.moveTo(0, H - 110); cx.lineTo(W, H - 110); cx.stroke();
+
+    // door
+    var doorOpen = state.phase === 'play' && state.stage === 3;
+    cx.fillStyle = doorOpen ? 'rgba(46,197,182,0.18)' : 'rgba(255,255,255,0.06)';
+    roundRectPath(DOOR.x, DOOR.y, DOOR.w, DOOR.h, 6);
+    cx.fill();
+    cx.lineWidth = doorOpen ? 3 : 2;
+    cx.strokeStyle = doorOpen ? TEAL : 'rgba(255,255,255,0.25)';
+    cx.stroke();
+    // door frame / handle
+    cx.fillStyle = doorOpen ? GOLD : 'rgba(255,255,255,0.25)';
+    cx.beginPath(); cx.arc(DOOR.x + DOOR.w - 18, DOOR.y + DOOR.h / 2, 5, 0, Math.PI * 2); cx.fill();
+    cx.textAlign = 'center';
+    cx.fillStyle = doorOpen ? TEAL : 'rgba(255,255,255,0.35)';
+    cx.font = '800 14px -apple-system, Helvetica, Arial';
+    cx.fillText(doorOpen ? 'OPEN' : 'LOCKED', DOOR.x + DOOR.w / 2, DOOR.y + DOOR.h - 14);
+
+    // objects
+    if (state.room) {
+      for (var i = 0; i < state.room.objects.length; i++) {
+        var o = state.room.objects[i];
+        roundRectPath(o.x, o.y, o.w, o.h, 10);
+        cx.fillStyle = objFill(o.type.hue, o.y);
+        cx.fill();
+        cx.lineWidth = 2; cx.strokeStyle = 'rgba(255,255,255,0.18)';
+        cx.stroke();
+        cx.textAlign = 'center';
+        cx.font = '34px -apple-system, Helvetica, Arial';
+        cx.fillText(o.type.icon, o.x + o.w / 2, o.y + o.h / 2 + 6);
+        cx.fillStyle = 'rgba(255,255,255,0.55)';
+        cx.font = '700 12px Menlo, monospace';
+        cx.fillText(o.type.label, o.x + o.w / 2, o.y + o.h - 12);
+        if (o.found) {
+          cx.fillStyle = TEAL;
+          cx.beginPath(); cx.arc(o.x + o.w - 14, o.y + 14, 6, 0, Math.PI * 2); cx.fill();
+        }
+      }
+    }
+
+    // timer bar + score (play / over)
+    if (state.phase === 'play' || state.phase === 'over') {
+      var ratio = state.maxTime ? state.timeLeft / state.maxTime : 0;
+      var barW = 365, barX = 20, barY = 55;
+      cx.fillStyle = 'rgba(255,255,255,0.12)';
+      roundRectPath(barX, barY, barW, 10, 5); cx.fill();
+      var barColor = ratio > 0.5 ? TEAL : (ratio > 0.22 ? GOLD : VERM);
+      cx.fillStyle = barColor;
+      roundRectPath(barX, barY, Math.max(0, barW * ratio), 10, 5); cx.fill();
+
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '800 56px -apple-system, Helvetica, Arial';
+      cx.fillText(state.roomsEscaped, W / 2, 120);
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('ROOMS ESCAPED', W / 2, 144);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px Menlo, monospace';
+      cx.fillText('BEST ' + best, W / 2, 164);
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 190);
+      }
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 280 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('ESCAPE TAP', W / 2, 280);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO SEARCH', W / 2, 330); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('find clues. unlock the door.', W / 2, 360);
+    }
+
+    // challenge card (demo)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText(String(challengeScore), W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // game over
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('TRAPPED.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.roomsEscaped + ' rooms', W / 2, 345);
+      var pt = pctTop(state.roomsEscaped);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 462);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        roundRectPath(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('ESCAPE TAP', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('she escaped ' + (window.__demoScore || 0) + '. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 0), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Streak Tightrope — Tilt</title>
+<!--
+  LOOP / attention-architecture — Streak Tightrope
+  Circuits: 04-loss (burn anxiety), 01-rpe (random clock), 08-investment (streak climb).
+  Mechanic: streak number climbs toward midnight. Tap once to 'send' and bank it.
+  Clock randomly speeds up or stalls. Miss the window → number burns to zero.
+  Modes:
+    ?demo=1&seed=7        mirror-neuron arc: challenge card → climb → near-miss save → real fail → CTA
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'streak-tightrope';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // Game constants
+  // Streak number climbs from 0 toward DANGER_ZONE (midnight).
+  // The player must tap to "send" while the streak is inside the SAFE WINDOW.
+  // The safe window is 20..95 (out of 100). Miss it → burn.
+  // After each safe send, the streak resets and the next round is faster/harder.
+  var MAX_VAL = 100;     // 0..100 scale; 100 = midnight, streak dies
+  var SAFE_MIN = 20;     // can't send too early (below this = not enough)
+  var SAFE_MAX = 95;     // above this = burns at midnight
+  // Clock speed: starts at ~8 units/s, ramps per round
+  var BASE_SPEED = 8;
+
+  // State
+  var phase; // 'title' | 'challenge' | 'play' | 'burn' | 'over' | 'cta'
+  var streakVal;       // current clock value 0..100
+  var streakSpeed;     // units/second
+  var banked;          // successful sends this run
+  var best = 0;
+  var runStartTs;
+  var overAt = 0, ctaAt = 0, challengeAt = 0;
+  var dareBeaten = false;
+
+  // Juice
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  // flame particles for burn effect
+  var flames = [];
+
+  // Clock chaos: speed multiplier that randomly surges or stalls
+  var chaosTimer = 0;         // countdown frames until next chaos event
+  var chaosMult = 1;          // current speed multiplier
+  var CHAOS_INTERVAL_MIN = 90, CHAOS_INTERVAL_MAX = 220; // frames
+  var nextChaosDuration = 0;
+  var chaosActive = false;
+  var botRunsDone = 0;
+
+  try { best = +localStorage.getItem('st_best') || 0; } catch (_) {}
+
+  // --------------- helpers ---------------
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 7))));
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 36, t: 0 });
+  }
+
+  function spawnFlames(cx_pos, cy_pos, count) {
+    for (var i = 0; i < count; i++) {
+      flames.push({
+        x: cx_pos + (rng() - 0.5) * 60,
+        y: cy_pos,
+        vx: (rng() - 0.5) * 4,
+        vy: -(2 + rng() * 5),
+        life: 0,
+        maxLife: 40 + rng() * 30,
+        size: 8 + rng() * 16
+      });
+    }
+  }
+
+  function resetChaos() {
+    chaosTimer = Math.floor(CHAOS_INTERVAL_MIN + rng() * (CHAOS_INTERVAL_MAX - CHAOS_INTERVAL_MIN));
+    chaosMult = 1;
+    chaosActive = false;
+    nextChaosDuration = 0;
+  }
+
+  // --------------- game logic ---------------
+  function newGame() {
+    phase = 'title';
+    streakVal = 0;
+    banked = 0;
+    dareBeaten = false;
+    flashes = [];
+    flames = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    resetChaos();
+    streakSpeed = BASE_SPEED;
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    phase = 'play';
+    streakVal = 0;
+    banked = 0;
+    streakSpeed = BASE_SPEED;
+    flashes = []; flames = [];
+    resetChaos();
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function doSend() {
+    if (phase !== 'play') return;
+    var v = streakVal;
+
+    if (v < SAFE_MIN) {
+      // too early — mini-punish: lose 5 points of progress
+      streakVal = Math.max(0, streakVal - 5);
+      flash('TOO EARLY', VERM, 30);
+      shakeAmt = 3;
+      if (window.J) J.near();
+      return;
+    }
+
+    if (v >= SAFE_MIN && v < SAFE_MAX) {
+      // SAFE SEND — bank it
+      banked++;
+      var perfect = v >= 80 && v < SAFE_MAX;
+      if (window.J) {
+        if (perfect) J.perfect(banked);
+        else J.hit(banked);
+      }
+      if (perfect) { hitStop = 5; zoom = 1.03; flash('PERFECT SEND', TEAL, 42); }
+      else flash('+' + banked + ' BANKED', TEAL, 36);
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && banked > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', GOLD, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(banked);
+      }
+      if (window.LOOP) LOOP.emit('streak_sent', { banked: banked, val: Math.round(v), perfect: perfect });
+      // reset streak, speed up next round
+      streakVal = 0;
+      streakSpeed = BASE_SPEED + banked * 2.5;
+      resetChaos();
+      if (window.J) J.tension(Math.min(banked / 15, 1));
+    }
+    // v >= SAFE_MAX: handled by the natural burn (clock reaching midnight)
+    // — but if somehow called mid-burn, ignore
+  }
+
+  function burnStreak() {
+    // Streak crossed 100 — burn animation + game over
+    phase = 'burn';
+    streakVal = 100;
+    shakeAmt = 10;
+    if (window.J) J.death(Math.min(0.3 + banked / 20, 1));
+    spawnFlames(W / 2, H / 2 - 40, 40);
+    if (window.LOOP) LOOP.emit('near_miss', { banked: banked });
+    setTimeout(function () { gameOver(); }, 1400);
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = banked > best;
+    if (newBest) {
+      best = banked;
+      try { localStorage.setItem('st_best', String(best)); } catch (_) {}
+      if (window.J) setTimeout(function () { J.fanfare(); }, 400);
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: banked, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = banked;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2500);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    streakVal = 0;
+    banked = 0;
+    dareBeaten = false;
+    flashes = []; flames = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    streakSpeed = BASE_SPEED;
+    resetChaos();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // --------------- input ---------------
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') { doSend(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: banked, unit: 'days' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // --------------- autopilots ---------------
+  // Demo arc: human-feeling with hesitation
+  // Beat 1 (challenge card 1.2s) → handled in newGame
+  // Beat 2: human play, a few safe sends
+  // Beat 3: near-fail (let clock reach ~96, hesitate, then save it)
+  // Beat 4: real fail (miss the window)
+  // demoWaits = frame-counts of hesitation before each action
+  var demoPhaseIdx = 0;
+  // Demo states: 0=first send (early),1=second,2=near-fail hesitation,3=real fail (miss)
+  // We'll script by tracking banked count and streakVal thresholds
+  var demoHesitate = 0;
+  var demoNearFailDone = false;
+  var demoMissing = false; // in the "real fail" miss
+  var DEMO_HESITATION = [18, 25, 0, 0]; // frames to wait after each trigger
+
+  function demoPilot() {
+    if (phase !== 'play') return;
+    if (demoHesitate > 0) { demoHesitate--; return; }
+
+    var v = streakVal;
+
+    if (!demoNearFailDone) {
+      // Phase A: bank 2 sends normally (target ~60-70), then do near-fail
+      if (banked < 2) {
+        // send when streak is in 58-72 range (good but not perfect)
+        if (v >= 60 && v < 73) {
+          doSend();
+          demoHesitate = 22 + Math.floor(rng() * 14);
+        }
+      } else {
+        // Near-fail: let clock climb to ~92 (scary), then save it
+        if (v >= 89 && v < SAFE_MAX) {
+          // the save — very close to burn
+          demoNearFailDone = true;
+          flash('SO CLOSE!', VERM, 38);
+          if (window.LOOP) LOOP.emit('near_miss', { banked: banked, val: Math.round(v) });
+          if (window.J) J.near();
+          doSend();
+          demoHesitate = 30; // pause dramatically after the save
+        }
+      }
+    } else if (!demoMissing) {
+      // Phase B: the real fail — let clock climb past 95 without tapping
+      if (v >= SAFE_MAX) {
+        demoMissing = true;
+        // burn fires naturally via update loop
+      }
+      // We deliberately do NOT tap — let it burn
+    }
+    // Once demoMissing, just let the burn happen naturally
+  }
+
+  // Bot: imperfect autopilot that will EVENTUALLY lose
+  // Bot taps in valid range with some randomness, then on round K goes passive and burns
+  var BOT_PASSIVE_ROUND = 3; // after this many banks, stop tapping → eventual burn
+  var botPassive = false;
+  var botWait = 0;
+
+  function botPilot() {
+    if (phase !== 'play') return;
+    if (botWait > 0) { botWait--; return; }
+
+    // Go passive after enough banks so the clock burns
+    if (banked >= BOT_PASSIVE_ROUND) {
+      botPassive = true;
+    }
+
+    if (botPassive) return; // let clock reach 100 → burn → game_over
+
+    var v = streakVal;
+    // Target range 40..85 with some randomness
+    var target = 40 + rng() * 45; // 40..85
+    if (v >= target && v < SAFE_MAX) {
+      doSend();
+      botWait = Math.floor(15 + rng() * 20);
+    }
+  }
+
+  // --------------- render helpers ---------------
+  function drawClockArc(cx2, cy2, radius, value, color, lineW) {
+    // full background arc
+    cx.save();
+    cx.beginPath();
+    cx.arc(cx2, cy2, radius, -Math.PI / 2, Math.PI * 3 / 2);
+    cx.strokeStyle = 'rgba(255,255,255,0.08)';
+    cx.lineWidth = lineW;
+    cx.lineCap = 'round';
+    cx.stroke();
+
+    // filled arc proportional to value
+    var endAngle = -Math.PI / 2 + (value / MAX_VAL) * Math.PI * 2;
+    cx.beginPath();
+    cx.arc(cx2, cy2, radius, -Math.PI / 2, endAngle);
+    cx.strokeStyle = color;
+    cx.lineWidth = lineW;
+    cx.stroke();
+    cx.restore();
+  }
+
+  function drawSafeZone(cx2, cy2, radius, lineW) {
+    // draw the safe window arc (SAFE_MIN..SAFE_MAX)
+    var startA = -Math.PI / 2 + (SAFE_MIN / MAX_VAL) * Math.PI * 2;
+    var endA   = -Math.PI / 2 + (SAFE_MAX / MAX_VAL) * Math.PI * 2;
+    cx.save();
+    cx.beginPath();
+    cx.arc(cx2, cy2, radius, startA, endA);
+    cx.strokeStyle = 'rgba(46,197,182,0.22)';
+    cx.lineWidth = lineW + 6;
+    cx.lineCap = 'butt';
+    cx.stroke();
+    cx.restore();
+  }
+
+  // --------------- main loop ---------------
+  var last = performance.now();
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // ---- sim update ----
+    if (phase === 'play') {
+      // chaos clock
+      if (chaosActive) {
+        nextChaosDuration -= dt;
+        if (nextChaosDuration <= 0) {
+          chaosActive = false;
+          chaosMult = 1;
+          chaosTimer = Math.floor(CHAOS_INTERVAL_MIN + rng() * (CHAOS_INTERVAL_MAX - CHAOS_INTERVAL_MIN));
+        }
+      } else {
+        chaosTimer -= dt;
+        if (chaosTimer <= 0) {
+          chaosActive = true;
+          // surge (2x-4x) or stall (0.1x-0.4x)
+          var surge = rng() > 0.38;
+          chaosMult = surge ? (2 + rng() * 2) : (0.1 + rng() * 0.3);
+          nextChaosDuration = 30 + rng() * 50;
+          if (surge && window.J) J.tension(Math.min(0.5 + banked / 20, 1));
+        }
+      }
+
+      // advance streak
+      if (hitStop > 0) {
+        hitStop -= dt;
+      } else {
+        streakVal += streakSpeed * chaosMult * (dt / 60);
+        if (streakVal >= MAX_VAL) {
+          streakVal = MAX_VAL;
+          burnStreak();
+        }
+
+        // autopilots
+        if (DEMO) demoPilot();
+        else if (BOT) botPilot();
+      }
+    }
+
+    // ---- juice transforms ----
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // ---- background ----
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.08)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- main clock arc ----
+    var CX = W / 2, CY = H / 2 - 40;
+    var RING_R = 130, RING_W = 18;
+
+    if (phase === 'play' || phase === 'burn') {
+      // danger gradient color: teal → gold → vermillion
+      var danger = streakVal / MAX_VAL;
+      var r_col, g_col, b_col;
+      if (danger < 0.5) {
+        var t2 = danger * 2;
+        r_col = Math.round(46 + (242 - 46) * t2);
+        g_col = Math.round(197 + (177 - 197) * t2);
+        b_col = Math.round(182 + (52 - 182) * t2);
+      } else {
+        var t3 = (danger - 0.5) * 2;
+        r_col = Math.round(242 + (232 - 242) * t3);
+        g_col = Math.round(177 + (80 - 177) * t3);
+        b_col = Math.round(52 + (46 - 52) * t3);
+      }
+      var arcColor = 'rgb(' + r_col + ',' + g_col + ',' + b_col + ')';
+
+      drawSafeZone(CX, CY, RING_R, RING_W);
+      drawClockArc(CX, CY, RING_R, streakVal, arcColor, RING_W);
+
+      // pulsing glow when in safe zone
+      if (streakVal >= SAFE_MIN && streakVal < SAFE_MAX) {
+        var gPulse = 0.3 + 0.3 * Math.sin(now / 180);
+        cx.save();
+        cx.shadowColor = TEAL;
+        cx.shadowBlur = 20 + gPulse * 14;
+        drawClockArc(CX, CY, RING_R, streakVal, 'rgba(46,197,182,' + (0.25 + gPulse * 0.15) + ')', RING_W + 8);
+        cx.restore();
+      }
+
+      // danger glow near midnight
+      if (streakVal > 80) {
+        var dGlow = (streakVal - 80) / 20;
+        cx.save();
+        cx.shadowColor = VERM;
+        cx.shadowBlur = 10 + dGlow * 30;
+        drawClockArc(CX, CY, RING_R, streakVal, 'rgba(232,80,46,' + dGlow * 0.4 + ')', RING_W + 10);
+        cx.restore();
+      }
+
+      // streak number in center
+      cx.textAlign = 'center';
+      var numFontSize = 88 + Math.min(banked * 2, 20);
+      cx.font = '900 ' + numFontSize + 'px -apple-system, Helvetica, Arial';
+      // color shifts to red when approaching midnight
+      cx.fillStyle = streakVal > 80 ? VERM : (streakVal >= SAFE_MIN ? TEAL : 'rgba(255,255,255,0.85)');
+      cx.fillText(banked, CX, CY + 32);
+
+      cx.font = '600 14px Menlo, monospace';
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.fillText('STREAK', CX, CY + 56);
+
+      // SEND label below number
+      if (streakVal >= SAFE_MIN && streakVal < SAFE_MAX && phase === 'play') {
+        var sp = 0.55 + 0.45 * Math.sin(now / 200);
+        cx.globalAlpha = sp;
+        cx.font = '800 22px -apple-system, Helvetica, Arial';
+        cx.fillStyle = TEAL;
+        cx.fillText('TAP TO SEND', CX, CY + 90);
+        cx.globalAlpha = 1;
+      } else if (streakVal < SAFE_MIN && phase === 'play') {
+        cx.fillStyle = 'rgba(255,255,255,0.28)';
+        cx.font = '600 14px -apple-system, Helvetica, Arial';
+        cx.fillText('WAIT...', CX, CY + 90);
+      } else if (streakVal > SAFE_MAX * 0.9 && phase === 'play') {
+        cx.fillStyle = VERM;
+        cx.font = '800 20px -apple-system, Helvetica, Arial';
+        cx.fillText('TOO LATE...', CX, CY + 90);
+      }
+
+      // midnight marker (top of ring)
+      cx.save();
+      cx.translate(CX, CY);
+      cx.fillStyle = 'rgba(232,80,46,0.8)';
+      cx.fillRect(-2, -(RING_R + RING_W / 2 + 6), 4, 12);
+      cx.restore();
+
+      // chaos speed indicator — blinking surge/stall label
+      if (chaosActive) {
+        var cLabel = chaosMult > 1 ? 'SURGE' : 'STALL';
+        var cColor = chaosMult > 1 ? VERM : GOLD;
+        var cAlpha = 0.6 + 0.4 * Math.sin(now / 120);
+        cx.globalAlpha = cAlpha;
+        cx.font = '700 13px Menlo, monospace';
+        cx.fillStyle = cColor;
+        cx.fillText(cLabel, CX, CY - RING_R - 30);
+        cx.globalAlpha = 1;
+      }
+
+      // banked best display
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, CX, 660);
+
+      // incoming dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          dareBeaten ? 'DARE BEATEN ✓' : ('BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : '')),
+          CX, 80
+        );
+      }
+
+      // score label top
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.fillText('DAYS BANKED', CX, 56);
+    }
+
+    // flames (burn effect)
+    for (var fi = flames.length - 1; fi >= 0; fi--) {
+      var fl = flames[fi];
+      fl.life += dt;
+      fl.x += fl.vx * dt;
+      fl.y += fl.vy * dt;
+      fl.vy += 0.08 * dt;
+      var flife = fl.life / fl.maxLife;
+      if (flife >= 1) { flames.splice(fi, 1); continue; }
+      var fa = (1 - flife) * 0.85;
+      cx.globalAlpha = fa;
+      var fhue = flife < 0.5 ? GOLD : VERM;
+      cx.fillStyle = fhue;
+      var fs2 = fl.size * (1 - flife * 0.6);
+      cx.beginPath();
+      cx.arc(fl.x, fl.y, fs2 / 2, 0, Math.PI * 2);
+      cx.fill();
+      cx.globalAlpha = 1;
+    }
+
+    // floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var flsh = flashes[k]; flsh.t += dt;
+      var fa2 = Math.max(0, 1 - flsh.t / 45);
+      cx.globalAlpha = fa2;
+      cx.textAlign = 'center';
+      cx.fillStyle = flsh.color;
+      cx.font = '900 ' + (flsh.size + flsh.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(flsh.txt, W / 2, 260 - flsh.t * 0.7);
+      cx.globalAlpha = 1;
+      if (flsh.t > 45) flashes.splice(k, 1);
+    }
+
+    // ---- title screen ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('STREAK', W / 2, 270);
+      cx.fillStyle = VERM;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('TIGHTROPE', W / 2, 316);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('tap inside the window. miss it.', W / 2, 356);
+      cx.fillText('burn it.', W / 2, 378);
+      var pulse = 0.55 + 0.45 * Math.sin(now / 320);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '800 19px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 430);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- challenge card (demo beat 1) ----
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '800 15px Menlo, monospace';
+      cx.fillText('STREAK TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD;
+      cx.font = '900 104px -apple-system, Helvetica, Arial';
+      cx.fillText('12', W / 2, 415);
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 445);
+    }
+
+    // ---- burn / game over screen ----
+    if (phase === 'burn') {
+      cx.fillStyle = 'rgba(11,13,18,0.4)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('BURNED.', W / 2, 310);
+    }
+
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.62)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('STREAK BURNED', W / 2, 300);
+      cx.fillStyle = '#fff';
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(banked + ' days banked', W / 2, 346);
+      var pt = pctTop(banked);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('longer than ' + (100 - pt) + '% of streaks', W / 2, 414);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 270);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — TRY AGAIN', W / 2, 458);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.13)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) { cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23); }
+        else { cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h); }
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          (window.SHARE && SHARE.dare !== null && dareBeaten) ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W / 2, SHARE_R.y + 30
+        );
+      }
+    }
+
+    // ---- demo CTA card ----
+    if (phase === 'cta') {
+      var elapsed = (now - ctaAt) / 1000;
+      var ease = Math.min(1, elapsed * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('STREAK', W / 2, 286);
+      cx.fillStyle = VERM;
+      cx.fillText('TIGHTROPE', W / 2, 336);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('they banked ' + (window.__demoScore || 3) + '. beat it.', W / 2, 376);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 230);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = VERM;
+      cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 3), W / 2, 432);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 464);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

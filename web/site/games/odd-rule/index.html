@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Odd Rule — Tilt</title>
+<!--
+  LOOP / attention-architecture — Odd Rule
+  Circuits: 02-novelty (rule shifts every round), 01-rpe (variable rule discovery),
+            06-zeigarnik (15 rounds, unfinished business).
+  The mechanic: spot the odd tile in a 4x4 grid. The rule changes each round:
+    color → shape → count → rotation. You rediscover it every ~5s.
+  Modes:
+    ?demo=1&seed=7    mirror-neuron arc, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+    ?clip=ID&src=... attribution
+    ?sink=URL         event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'odd-rule';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // Mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+  function rngInt(n) { return Math.floor(rng() * n); }
+  function shuffle(arr) {
+    for (var i = arr.length - 1; i > 0; i--) {
+      var j = rngInt(i + 1);
+      var tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+    }
+    return arr;
+  }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  var TOTAL_ROUNDS = 15;
+  var ROUND_TIME   = 5.0;    // seconds per round (display countdown)
+  var COLS = 4, ROWS = 4;
+  var CELL = 72;             // tile size px
+  var GRID_X = (W - COLS * CELL) / 2;  // left edge of grid
+  var GRID_Y = 200;                      // top edge of grid
+
+  // rule types cycling
+  var RULES = ['color', 'shape', 'count', 'rotation'];
+
+  // palette for color rule
+  var COLORS = ['#e8502e', '#2ec5b6', '#f2b134', '#8B5CF6', '#34D399'];
+  // shapes for shape rule
+  var SHAPES = ['circle', 'square', 'triangle', 'diamond'];
+
+  // ---- state ----
+  var phase, round, score, roundTimer, flashes, tiles, oddIdx;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var dareBeaten = false, runStartTs = 0;
+  var ctaAt = 0, challengeAt = 0;
+  var overAt = 0;
+  var botRunsDone = 0, botActed = false, botDelay = 0;
+  var currentRule = 'color';
+  var wrongFlash = 0;
+  var roundStartTime = 0;
+  var bestScore = 0;
+  try { bestScore = +localStorage.getItem('or_best') || 0; } catch (_) {}
+
+  // demo script: which tile index the demo "player" taps (odd or wrong)
+  // arc: correct (hesitate), correct (quick), WRONG (near-fail), recover (correct), ...
+  var demoScript = [
+    { wait: 1400, correct: true },   // round 1 correct
+    { wait: 900,  correct: true },   // round 2 correct (fast)
+    { wait: 1600, correct: true },   // round 3 correct
+    { wait: 800,  correct: true },   // round 4 correct
+    { wait: 1200, correct: false },  // round 5 WRONG (near-fail at ~60%)
+    { wait: 700,  correct: true },   // round 6 recovery
+    { wait: 1000, correct: true },   // round 7
+    { wait: 1500, correct: false },  // round 8 WRONG → timeout → game over
+  ];
+  var demoIdx = 0, demoWaiting = false, demoActAt = 0;
+
+  // ---- round generation ----
+  function generateRound(r) {
+    // rule cycles: 0=color, 1=shape, 2=count, 3=rotation
+    currentRule = RULES[r % RULES.length];
+    var n = COLS * ROWS; // 16 tiles
+    tiles = [];
+    oddIdx = rngInt(n);
+
+    if (currentRule === 'color') {
+      var majorColor = COLORS[rngInt(COLORS.length)];
+      var oddColor;
+      do { oddColor = COLORS[rngInt(COLORS.length)]; } while (oddColor === majorColor);
+      for (var i = 0; i < n; i++) {
+        tiles.push({ color: i === oddIdx ? oddColor : majorColor, shape: 'circle', count: 1, rotation: 0 });
+      }
+    } else if (currentRule === 'shape') {
+      var majorShape = SHAPES[rngInt(SHAPES.length)];
+      var oddShape;
+      do { oddShape = SHAPES[rngInt(SHAPES.length)]; } while (oddShape === majorShape);
+      var shapeColor = COLORS[rngInt(COLORS.length)];
+      for (var i = 0; i < n; i++) {
+        tiles.push({ color: shapeColor, shape: i === oddIdx ? oddShape : majorShape, count: 1, rotation: 0 });
+      }
+    } else if (currentRule === 'count') {
+      var majorCount = 1 + rngInt(3);  // 1..3
+      var oddCount;
+      do { oddCount = 1 + rngInt(3); } while (oddCount === majorCount);
+      var countColor = COLORS[rngInt(COLORS.length)];
+      for (var i = 0; i < n; i++) {
+        tiles.push({ color: countColor, shape: 'circle', count: i === oddIdx ? oddCount : majorCount, rotation: 0 });
+      }
+    } else { // rotation
+      var majorRot = Math.floor(rng() * 4) * 45;  // 0,45,90,135
+      var oddRot;
+      do { oddRot = Math.floor(rng() * 4) * 45; } while (oddRot === majorRot);
+      var rotColor = COLORS[rngInt(COLORS.length)];
+      for (var i = 0; i < n; i++) {
+        tiles.push({ color: rotColor, shape: 'arrow', count: 1, rotation: i === oddIdx ? oddRot : majorRot });
+      }
+    }
+
+    // scatter oddIdx randomly via shuffle of index array
+    var indices = [];
+    for (var i = 0; i < n; i++) indices.push(i);
+    var perm = shuffle(indices.slice());
+    // rebuild tiles in shuffled order, track where odd ended up
+    var oldTiles = tiles.slice();
+    for (var i = 0; i < n; i++) {
+      tiles[i] = oldTiles[perm[i]];
+    }
+    // find where oddIdx landed
+    for (var i = 0; i < n; i++) {
+      if (perm[i] === oddIdx) { oddIdx = i; break; }
+    }
+  }
+
+  function startRound() {
+    generateRound(round);
+    roundTimer = ROUND_TIME;
+    roundStartTime = performance.now();
+    wrongFlash = 0;
+    botActed = false;
+    // bot delay: varies per round
+    botDelay = 400 + rng() * 2000;
+  }
+
+  function newGame() {
+    phase = DEMO ? 'challenge' : (BOT ? 'play' : 'title');
+    round = 0;
+    score = 0;
+    flashes = [];
+    dareBeaten = false;
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    wrongFlash = 0;
+    demoIdx = 0; demoWaiting = false;
+
+    if (DEMO) {
+      challengeAt = performance.now();
+      startRound();
+      setTimeout(function () { phase = 'play'; runStartTs = Date.now(); if (window.LOOP) LOOP.emit('play_start', { seed: SEED }); }, 1250);
+    } else if (BOT) {
+      startRound();
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+  }
+
+  function pctTop(s) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 6))));
+  }
+
+  function startHuman() {
+    phase = 'play';
+    round = 0; score = 0;
+    startRound();
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function tapTile(idx) {
+    if (phase !== 'play') return;
+    if (hitStop > 0) return;  // frozen during hit-stop
+    if (idx === oddIdx) {
+      // correct!
+      score++;
+      var combo = score;
+      if (window.J) {
+        if (score % 5 === 0) { J.perfect(combo); hitStop = 5; zoom = 1.04; }
+        else J.hit(combo);
+        J.tension(Math.min(round / TOTAL_ROUNDS, 1));
+      }
+      if (score % 5 === 0) {
+        flash('STREAK!', GOLD, 42);
+        shakeAmt = 3;
+      } else {
+        flash('+1', TEAL, 34);
+      }
+      if (window.J) J.tension(Math.min(round / TOTAL_ROUNDS, 1));
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(score);
+      }
+      if (window.LOOP) LOOP.emit('round_solved', { round: round, score: score, rule: currentRule });
+      round++;
+      if (round >= TOTAL_ROUNDS) {
+        endGame(true);
+      } else {
+        startRound();
+      }
+    } else {
+      // wrong tile!
+      wrongFlash = 1.0;
+      shakeAmt = 5;
+      if (window.J) J.near();
+      flash('WRONG!', VERM, 36);
+      if (window.LOOP) LOOP.emit('near_miss', { round: round, rule: currentRule });
+    }
+  }
+
+  function endGame(completed) {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = score > bestScore;
+    if (window.J) {
+      J.death(0.6);
+      if (newBest && completed) setTimeout(function () { J.fanfare(); }, 400);
+    }
+    shakeAmt = 7;
+    if (newBest) { bestScore = score; try { localStorage.setItem('or_best', String(bestScore)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    window.__demoScore = score;
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2300);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    round = 0; score = 0; flashes = [];
+    dareBeaten = false; hitStop = 0; zoom = 1; shakeAmt = 0;
+    wrongFlash = 0; demoIdx = 0; demoWaiting = false;
+    startRound();
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('restart', {});
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    phase = 'play';
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, px, py) { return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h; }
+
+  function tileAt(px, py) {
+    var gx = px - GRID_X, gy = py - GRID_Y;
+    if (gx < 0 || gy < 0 || gx >= COLS * CELL || gy >= ROWS * CELL) return -1;
+    var col = Math.floor(gx / CELL), row = Math.floor(gy / CELL);
+    return row * COLS + col;
+  }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startHuman(); return; }
+    if (phase === 'play') {
+      var idx = tileAt(px, py);
+      if (idx >= 0) tapTile(idx);
+      return;
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'rounds' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') tap(undefined, undefined);
+  });
+
+  // ---- autopilots ----
+  function autopilot(now) {
+    if (phase !== 'play') return;
+    if (hitStop > 0) return;
+
+    if (DEMO) {
+      if (demoIdx >= demoScript.length) {
+        // time ran out → game over
+        endGame(false);
+        return;
+      }
+      var beat = demoScript[demoIdx];
+      if (!demoWaiting) {
+        demoActAt = now + beat.wait;
+        demoWaiting = true;
+      }
+      if (now >= demoActAt) {
+        demoWaiting = false;
+        demoIdx++;
+        if (beat.correct) {
+          tapTile(oddIdx);
+        } else {
+          // tap a wrong tile
+          var wrongI = (oddIdx + 1 + rngInt(COLS * ROWS - 1)) % (COLS * ROWS);
+          tapTile(wrongI);
+        }
+      }
+    } else if (BOT) {
+      if (!botActed) {
+        // bot acts after a random delay
+        botDelay -= 16.667;
+        if (botDelay <= 0) {
+          botActed = true;
+          // bot is imperfect: ~80% chance correct
+          if (rng() < 0.8) {
+            tapTile(oddIdx);
+          } else {
+            var wIdx = (oddIdx + 1 + rngInt(COLS * ROWS - 1)) % (COLS * ROWS);
+            tapTile(wIdx);
+          }
+        }
+      }
+    }
+  }
+
+  // ---- tile drawing ----
+  function drawShape(shape, color, cx2, ty, rotation, count, cellSize) {
+    var r = cellSize * 0.28;
+    var spacing = cellSize * 0.18;
+    cx2.save();
+    cx2.translate(ty.x, ty.y);
+
+    if (count > 1) {
+      // draw multiple dots
+      var offsets = [];
+      if (count === 2) { offsets = [[-spacing, 0], [spacing, 0]]; }
+      else { offsets = [[-spacing, -spacing * 0.6], [spacing, -spacing * 0.6], [0, spacing * 0.7]]; }
+      for (var k = 0; k < offsets.length; k++) {
+        cx2.save();
+        cx2.translate(offsets[k][0], offsets[k][1]);
+        drawSingleShape('circle', color, cx2, r * 0.7, rotation);
+        cx2.restore();
+      }
+    } else {
+      drawSingleShape(shape, color, cx2, r, rotation);
+    }
+    cx2.restore();
+  }
+
+  function drawSingleShape(shape, color, cx2, r, rotation) {
+    cx2.save();
+    cx2.rotate(rotation * Math.PI / 180);
+    cx2.fillStyle = color;
+    cx2.beginPath();
+    if (shape === 'circle') {
+      cx2.arc(0, 0, r, 0, Math.PI * 2);
+    } else if (shape === 'square') {
+      cx2.rect(-r * 0.85, -r * 0.85, r * 1.7, r * 1.7);
+    } else if (shape === 'triangle') {
+      cx2.moveTo(0, -r);
+      cx2.lineTo(r * 0.87, r * 0.5);
+      cx2.lineTo(-r * 0.87, r * 0.5);
+      cx2.closePath();
+    } else if (shape === 'diamond') {
+      cx2.moveTo(0, -r);
+      cx2.lineTo(r * 0.7, 0);
+      cx2.lineTo(0, r);
+      cx2.lineTo(-r * 0.7, 0);
+      cx2.closePath();
+    } else if (shape === 'arrow') {
+      // arrow pointing up, rotation applied
+      cx2.moveTo(0, -r);
+      cx2.lineTo(r * 0.6, 0);
+      cx2.lineTo(r * 0.25, 0);
+      cx2.lineTo(r * 0.25, r);
+      cx2.lineTo(-r * 0.25, r);
+      cx2.lineTo(-r * 0.25, 0);
+      cx2.lineTo(-r * 0.6, 0);
+      cx2.closePath();
+    }
+    cx2.fill();
+    cx2.restore();
+  }
+
+  function drawGrid(now) {
+    if (!tiles || tiles.length === 0) return;
+    for (var row = 0; row < ROWS; row++) {
+      for (var col = 0; col < COLS; col++) {
+        var idx = row * COLS + col;
+        var tile = tiles[idx];
+        var tx = GRID_X + col * CELL + CELL / 2;
+        var ty = GRID_Y + row * CELL + CELL / 2;
+
+        // tile background
+        var isOdd = (idx === oddIdx);
+        // subtle pulse on odd tile when wrongFlash is active (hint after error)
+        var bgAlpha = 0.13;
+        cx.fillStyle = 'rgba(255,255,255,' + bgAlpha + ')';
+        cx.strokeStyle = 'rgba(255,255,255,0.18)';
+        cx.lineWidth = 1;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(GRID_X + col * CELL + 4, GRID_Y + row * CELL + 4, CELL - 8, CELL - 8, 10);
+        else cx.rect(GRID_X + col * CELL + 4, GRID_Y + row * CELL + 4, CELL - 8, CELL - 8);
+        cx.fill();
+        cx.stroke();
+
+        drawShape(tile.shape, tile.color, cx, { x: tx, y: ty }, tile.rotation, tile.count, CELL);
+      }
+    }
+  }
+
+  function ruleName(r) {
+    switch (r) {
+      case 'color':    return 'ODD COLOR';
+      case 'shape':    return 'ODD SHAPE';
+      case 'count':    return 'ODD COUNT';
+      case 'rotation': return 'ODD ANGLE';
+      default:         return 'ODD ONE';
+    }
+  }
+
+  // ---- render ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // hit-stop decay
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      // tick round timer
+      if (phase === 'play') {
+        roundTimer -= dt * 16.667 / 1000;
+        if (roundTimer <= 0) {
+          roundTimer = 0;
+          if (window.J) J.tension(1);
+          // time out on a round → game over
+          if (DEMO) {
+            // demo: time out triggers game over spectacle
+            endGame(false);
+          } else if (BOT) {
+            // bot ran out of time
+            endGame(false);
+          } else {
+            // human ran out of time
+            flash('TIME!', VERM, 40);
+            endGame(false);
+          }
+        }
+        // autopilot
+        autopilot(now);
+      }
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // CHALLENGE CARD (demo beat 1)
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 15px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('11', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 432);
+    }
+
+    // TITLE SCREEN
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('ODD RULE', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('the rule changes every round', W / 2, 296);
+      cx.fillText('spot the one that doesn\'t belong', W / 2, 316);
+
+      // draw a mini grid preview
+      cx.fillStyle = VERM;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('15 rounds', W / 2, 350);
+
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO PLAY', W / 2, 410);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('can you find it before round 8?', W / 2, 440);
+    }
+
+    // PLAY SCREEN
+    if (phase === 'play') {
+      // rule label at top
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.95)';
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText(ruleName(currentRule), W / 2, 60);
+
+      // round progress
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('ROUND ' + (round + 1) + ' / ' + TOTAL_ROUNDS, W / 2, 84);
+
+      // score
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 52px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 148);
+
+      // timer bar
+      var barW = W - 80;
+      var barX = 40, barY = 165, barH = 6;
+      cx.fillStyle = 'rgba(255,255,255,0.1)';
+      cx.fillRect(barX, barY, barW, barH);
+      var frac = Math.max(0, roundTimer / ROUND_TIME);
+      var barColor = frac > 0.4 ? TEAL : VERM;
+      if (frac <= 0.2 && window.J) J.tension(1 - frac);
+      cx.fillStyle = barColor;
+      cx.fillRect(barX, barY, barW * frac, barH);
+
+      // wrong flash overlay
+      if (wrongFlash > 0) {
+        cx.fillStyle = 'rgba(232,80,46,' + (wrongFlash * 0.18) + ')';
+        cx.fillRect(0, 0, W, H);
+        wrongFlash -= 0.05 * dt;
+        if (wrongFlash < 0) wrongFlash = 0;
+      }
+
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 185);
+      }
+
+      // grid
+      drawGrid(now);
+    }
+
+    // GAME OVER
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+
+      // big score
+      cx.fillStyle = '#fff';
+      cx.font = '900 72px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 290);
+
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('rounds solved', W / 2, 320);
+
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 360);
+
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + bestScore + ' rounds', W / 2, 384);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 430);
+        cx.globalAlpha = 1;
+
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // DEMO CTA CARD
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('ODD RULE', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they got ' + (window.__demoScore || 11) + '. can you beat it?', W / 2, 330);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 11), W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // floating reward flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 170 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

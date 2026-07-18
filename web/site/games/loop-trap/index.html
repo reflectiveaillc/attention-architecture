@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Loop Trap — Tilt</title>
+<!--
+  LOOP / attention-architecture — Loop Trap (docs/game-contract-v2.md)
+  Circuits: 02 novelty (the glitch), 01 RPE (variable timing), 06 Zeigarnik (one more loop).
+  Modes:
+    ?demo=1&seed=7        scripted run for clip capture, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'loop-trap';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 12;          // frames of bot inaccuracy
+  var SEED = +qs.get('seed') || 42;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134';
+
+  var state, pendingNext, runStartTs, best = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  var flashes = [], debris = [];
+  var challengeAt = 0, ctaAt = 0, challengeScore = 14;
+  var last = performance.now(), dt = 1;
+  try { best = +localStorage.getItem('lt_best') || 0; } catch (_) {}
+
+  function newGame() {
+    state = {
+      phase: 'title', score: 0, combo: 0,
+      loopDur: 0, loopT: 0, glitchStart: 0, glitchEnd: 0, glitchIdx: 0,
+      caught: false, overAt: 0
+    };
+    pendingNext = null; hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    flashes = []; debris = [];
+    if (DEMO) {
+      prebuildDemo();
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1200);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function prebuildDemo() {
+    // open mid-run: the loop is already spinning, viewer braces for the miss
+    state.score = 2;
+    resetLoop();
+    // land just before the first glitch so the demo can react naturally
+    state.loopT = Math.max(0, state.glitchStart - demoWaits[0] - 4 - rng() * 6);
+  }
+
+  function resetLoop() {
+    var s = state.score;
+    state.loopDur = Math.max(45, 110 - s * 4);
+    var half = Math.max(5, 13 - s * 0.8);
+    var mid = (rng() * 0.5 + 0.25) * state.loopDur;
+    state.glitchStart = Math.max(2, mid - half);
+    state.glitchEnd = Math.min(state.loopDur - 2, mid + half);
+    state.glitchIdx = Math.floor(rng() * 8);
+    state.loopT = 0;
+    state.caught = false;
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (state.loopDur === 0) resetLoop();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 11))));
+  }
+
+  function attempt(t) {
+    if (state.phase !== 'play' || state.caught) return;
+    if (t >= state.glitchStart && t <= state.glitchEnd) catchAt(t);
+    else gameOver();
+  }
+
+  function catchAt(t) {
+    state.caught = true;
+    var half = (state.glitchEnd - state.glitchStart) / 2;
+    var center = state.glitchStart + half;
+    var dist = t - center;
+    var ratio = half > 0 ? Math.abs(dist) / half : 0;
+    var perfect = ratio <= 0.35;
+    var near = !perfect && (t >= state.glitchEnd - 0.3 * half);
+    state.score++;
+    if (perfect) {
+      state.combo++;
+      hitStop = 5;
+      zoom = 1.04;
+      if (window.J) J.perfect(state.combo);
+      flash('PERFECT', TEAL, 46);
+    } else if (near) {
+      state.combo = 0;
+      shakeAmt = 4;
+      if (window.J) J.near();
+      flash('SO CLOSE', VERM, 40);
+      if (window.LOOP) LOOP.emit('near_miss', { n: state.score, ratio: +ratio.toFixed(2) });
+    } else {
+      state.combo = 0;
+      if (window.J) J.hit(state.score);
+      flash('+1 LOOP', GOLD, 36);
+    }
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+    if (window.LOOP) LOOP.emit('loop_caught', { n: state.score, perfect: perfect, near: near, ratio: +ratio.toFixed(2) });
+    if (window.J) J.tension(Math.min(state.score / 25, 1));
+    prepareNextLoop();
+  }
+
+  function prepareNextLoop() {
+    var s = state.score;
+    var dur = Math.max(42, 110 - s * 4);
+    var half = Math.max(5, 13 - s * 0.8);
+    var mid = (rng() * 0.5 + 0.25) * dur;
+    pendingNext = {
+      loopDur: dur,
+      glitchStart: Math.max(2, mid - half),
+      glitchEnd: Math.min(dur - 2, mid + half),
+      glitchIdx: Math.floor(rng() * 8)
+    };
+  }
+
+  function applyPending() {
+    if (!pendingNext) return;
+    state.loopDur = pendingNext.loopDur;
+    state.glitchStart = pendingNext.glitchStart;
+    state.glitchEnd = pendingNext.glitchEnd;
+    state.glitchIdx = pendingNext.glitchIdx;
+    state.loopT = 0;
+    state.caught = false;
+    pendingNext = null;
+  }
+
+  function gameOver() {
+    if (state.phase === 'over' || state.phase === 'cta') return;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 9;
+    zoom = 1.05;
+    createDebris();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) { J.tension(0); J.death(Math.min(0.3 + state.score / 40, 1)); }
+    if (DEMO) window.__demoScore = state.score;
+    var newBest = state.score > best && !DEMO && !BOT;
+    if (newBest) {
+      best = state.score;
+      try { localStorage.setItem('lt_best', String(best)); } catch (_) {}
+      if (window.J) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (window.LOOP) LOOP.emit('loop_missed', { n: state.score });
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else { setTimeout(resetRun, 900); }
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.combo = 0; state.loopDur = 0;
+    state.caught = false; pendingNext = null; dareBeaten = false;
+    flashes = []; debris = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  function createDebris() {
+    var cx_ = W / 2, cy_ = H / 2 - 20, R = 110;
+    var rot = (state.loopT / state.loopDur) * Math.PI * 2;
+    for (var i = 0; i < 16; i++) {
+      var a = i * (Math.PI * 2 / 16) + rot;
+      var sp = 2 + rng() * 4;
+      debris.push({
+        x: cx_ + Math.cos(a) * R, y: cy_ + Math.sin(a) * R,
+        vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1
+      });
+    }
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { attempt(state.loopT); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'loops' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  var demoScript = [0.2, -0.3, 0.45, 0, 0.1, 'sliver', -0.1, 0.2, 'miss'];
+  var demoWaits = [5, 40, 28, 52, 36, 60, 34, 90, 160];
+  var demoIdx = 0, demoWait = 0;
+  var botRunsDone = 0, botTarget = null;
+
+  function autopilot() {
+    if (state.phase !== 'play' || state.caught) return;
+    if (DEMO) {
+      if (demoWait > 0) { demoWait -= dt; return; }
+      var want = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      if (want === 'miss') {
+        // wait it out and let the loop expire for a clean spectacle fail
+        return;
+      }
+      var half = (state.glitchEnd - state.glitchStart) / 2;
+      var center = state.glitchStart + half;
+      var target = (want === 'sliver') ? state.glitchEnd - 1.5 : center + want * half;
+      if (state.loopT >= target && state.loopT <= state.glitchEnd) {
+        attempt(state.loopT);
+        demoIdx++;
+        demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 30;
+      }
+    } else if (BOT) {
+      if (botTarget === null) botTarget = (state.glitchStart + state.glitchEnd) / 2 + gauss() * BOT_ERR;
+      if (state.loopT >= botTarget) { botTarget = null; attempt(state.loopT); }
+    }
+  }
+
+  // ---- render ----
+  function frame(now) {
+    dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // sim
+    if (state.phase === 'play') {
+      if (hitStop > 0) {
+        hitStop -= dt;
+      } else {
+        if (pendingNext) applyPending();
+        else {
+          state.loopT += dt;
+          autopilot();
+          if (state.loopT >= state.loopDur && !state.caught) gameOver();
+        }
+      }
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)'); bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // loop ring
+    var cx_ = W / 2, cy_ = H / 2 - 20, R = 110, beads = 8;
+    var rot = (state.loopT / (state.loopDur || 1)) * Math.PI * 2;
+    var inGlitch = state.phase === 'play' && state.loopT >= state.glitchStart && state.loopT <= state.glitchEnd;
+    // subtle track
+    cx.strokeStyle = 'rgba(255,255,255,0.10)'; cx.lineWidth = 3;
+    cx.beginPath(); cx.arc(cx_, cy_, R, 0, Math.PI * 2); cx.stroke();
+    // progress arc
+    var prog = Math.min(1, state.loopT / (state.loopDur || 1));
+    cx.strokeStyle = 'rgba(255,255,255,0.18)'; cx.lineWidth = 3;
+    cx.beginPath(); cx.arc(cx_, cy_, R + 26, -Math.PI / 2, -Math.PI / 2 + prog * Math.PI * 2); cx.stroke();
+
+    for (var i = 0; i < beads; i++) {
+      var a = i * (Math.PI * 2 / beads) + rot;
+      var bx = cx_ + Math.cos(a) * R;
+      var by = cy_ + Math.sin(a) * R;
+      var isGlitch = i === state.glitchIdx && inGlitch;
+      cx.beginPath();
+      cx.arc(bx, by, isGlitch ? 20 : 13, 0, Math.PI * 2);
+      cx.fillStyle = isGlitch ? VERM : TEAL;
+      cx.globalAlpha = isGlitch ? 1 : 0.72;
+      cx.fill();
+      if (isGlitch) {
+        cx.strokeStyle = 'rgba(255,255,255,0.8)'; cx.lineWidth = 2; cx.stroke();
+        // chromatic flicker halo
+        cx.beginPath(); cx.arc(bx, by, 28, 0, Math.PI * 2);
+        cx.strokeStyle = 'rgba(232,80,46,0.35)'; cx.lineWidth = 4; cx.stroke();
+      }
+      cx.globalAlpha = 1;
+    }
+
+    // center label
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.18)';
+    cx.font = '700 14px Menlo, monospace';
+    cx.fillText('LOOP', cx_, cy_ + 4);
+
+    // debris on death
+    for (var d = debris.length - 1; d >= 0; d--) {
+      var p = debris[d];
+      p.x += p.vx * dt; p.y += p.vy * dt; p.life -= 0.015 * dt;
+      cx.globalAlpha = Math.max(0, p.life);
+      cx.fillStyle = d % 2 ? VERM : TEAL;
+      cx.beginPath(); cx.arc(p.x, p.y, 5, 0, Math.PI * 2); cx.fill();
+      if (p.life <= 0) debris.splice(d, 1);
+    }
+    cx.globalAlpha = 1;
+
+    // score / combo / dare
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 120);
+      if (state.combo > 0) {
+        var comboSize = 20 + Math.min(state.combo * 2, 20);
+        cx.fillStyle = TEAL;
+        cx.font = '800 ' + comboSize + 'px -apple-system, Helvetica, Arial';
+        cx.fillText('×' + state.combo, W / 2, 154);
+      }
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 184);
+      }
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('LOOP TRAP', W / 2, 280);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP THE GLITCH', W / 2, 330); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('one bead glitches before the loop resets', W / 2, 360);
+    }
+
+    // challenge card (demo)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText(String(challengeScore), W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 430);
+    }
+
+    // floating rewards
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 270 - fl.t * 0.6);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // game over
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('MISSED THE GLITCH', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' loops', W / 2, 345);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 416);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE LOOP', W / 2, 462);
+        cx.globalAlpha = 1;
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('LOOP TRAP', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('they caught ' + (window.__demoScore || 0) + '. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 0), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

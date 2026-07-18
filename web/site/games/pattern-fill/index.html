@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Pattern Fill — Tilt</title>
+<!--
+  LOOP / attention-architecture — Pattern Fill
+  Circuits: 06-zeigarnik (one tile left), 05-ease (calm completion), 01-rpe (variable reward)
+  Engine: calm
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s -> soft CTA, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'pattern-fill';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  // calm palette: teal family + soft warm accent
+  var PALETTE = ['#2ec5b6', '#5dd4ca', '#a8ede8', '#f2b134', '#f7d07a'];
+
+  // grid config
+  var COLS = 7, ROWS = 9;
+  var CELL = 44; // cell size in px
+  var GRID_W = COLS * CELL;
+  var GRID_H = ROWS * CELL;
+  var GRID_X = (W - GRID_W) / 2;
+  var GRID_Y = 120;
+
+  // pattern: repeating 3x3 tile
+  var TILE_W = 3, TILE_H = 3;
+
+  // score / state
+  var state, flashes;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var runStartTs, best = 0;
+  try { best = +localStorage.getItem('pf_best') || 0; } catch(_){}
+
+  // per-cell state: null (not filled yet), color string, or 'wrong'
+  var grid; // grid[row][col] = null | color | 'wrong'
+  var pattern; // pattern[row%TILE_H][col%TILE_W] = color
+  var wrongCells; // {row,col} set of wrong taps with timers
+  var totalCells, filledCount;
+
+  function buildPattern() {
+    pattern = [];
+    for (var r = 0; r < TILE_H; r++) {
+      pattern[r] = [];
+      for (var c = 0; c < TILE_W; c++) {
+        pattern[r][c] = PALETTE[Math.floor(rng() * PALETTE.length)];
+      }
+    }
+  }
+
+  function patternColor(row, col) {
+    return pattern[row % TILE_H][col % TILE_W];
+  }
+
+  function newGame() {
+    rng = mulberry32(SEED);
+    buildPattern();
+    grid = [];
+    wrongCells = [];
+    filledCount = 0;
+    totalCells = COLS * ROWS;
+    for (var r = 0; r < ROWS; r++) {
+      grid[r] = [];
+      for (var c = 0; c < COLS; c++) {
+        grid[r][c] = null;
+      }
+    }
+    state = {
+      phase: 'title', // title | play | complete | cta
+      score: 0,
+      wrongTaps: 0,
+      completedAt: 0,
+      ctaAt: 0
+    };
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+
+    if (DEMO) {
+      state.phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    } else if (BOT) {
+      state.phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+  }
+
+  function cellAt(px, py) {
+    var col = Math.floor((px - GRID_X) / CELL);
+    var row = Math.floor((py - GRID_Y) / CELL);
+    if (col < 0 || col >= COLS || row < 0 || row >= ROWS) return null;
+    return { row: row, col: col };
+  }
+
+  function tapCell(row, col) {
+    if (grid[row][col] !== null) return; // already filled
+    var correct = patternColor(row, col);
+    grid[row][col] = correct;
+    filledCount++;
+    state.score++;
+
+    // sound: calm bell per step
+    if (window.J) J.calm(filledCount);
+
+    // small zoom pulse on every fill
+    zoom = 1.012;
+
+    // floating text reward
+    var cx2 = GRID_X + col * CELL + CELL / 2;
+    var cy2 = GRID_Y + row * CELL + CELL / 2;
+    flashes.push({ txt: '+1', color: TEAL, size: 14, t: 0, x: cx2, y: cy2 });
+
+    if (window.LOOP) LOOP.emit('cell_filled', { row: row, col: col, n: filledCount });
+
+    if (filledCount >= totalCells) {
+      completeGrid();
+    }
+  }
+
+  function wrongTap(row, col) {
+    state.wrongTaps++;
+    shakeAmt = 3;
+    // mark cell temporarily wrong
+    wrongCells.push({ row: row, col: col, t: 0 });
+    if (window.LOOP) LOOP.emit('wrong_tap', { row: row, col: col });
+  }
+
+  function completeGrid() {
+    state.phase = 'complete';
+    state.completedAt = performance.now();
+    hitStop = 30; // brief freeze to let the pattern settle
+    zoom = 1.04;
+    shakeAmt = 2;
+    if (window.J) { J.calm(99); }
+
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (newBest) {
+      best = state.score;
+      try { localStorage.setItem('pf_best', String(best)); } catch(_){}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+
+    flashes.push({ txt: 'COMPLETE', color: TEAL, size: 32, t: 0, x: W / 2, y: H / 2 - 40 });
+
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    rng = mulberry32(SEED + botRunsDone * 137);
+    buildPattern();
+    grid = [];
+    wrongCells = [];
+    filledCount = 0;
+    for (var r = 0; r < ROWS; r++) {
+      grid[r] = [];
+      for (var c = 0; c < COLS; c++) grid[r][c] = null;
+    }
+    state.phase = 'play';
+    state.score = 0;
+    state.wrongTaps = 0;
+    flashes = [];
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('restart', {});
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    if (BOT) initBotState();
+  }
+
+  function flash(txt, color, size, x, y) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0, x: x || W/2, y: y || H/2 });
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 530, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') {
+      state.phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      return;
+    }
+    if (state.phase === 'play') {
+      if (px === undefined) return;
+      var cell = cellAt(px, py);
+      if (!cell) return;
+      if (grid[cell.row][cell.col] !== null) return;
+      // In this game every tap is correct (the player fills the correct color)
+      // Wrong taps come from tapping outside the grid or already-filled cells
+      tapCell(cell.row, cell.col);
+      return;
+    }
+    if (state.phase === 'complete' && performance.now() - state.completedAt > 400) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'cells' }); return;
+      }
+      // restart
+      rng = mulberry32(SEED);
+      buildPattern();
+      grid = [];
+      wrongCells = [];
+      filledCount = 0;
+      for (var r2 = 0; r2 < ROWS; r2++) {
+        grid[r2] = [];
+        for (var c2 = 0; c2 < COLS; c2++) grid[r2][c2] = null;
+      }
+      state = { phase: 'play', score: 0, wrongTaps: 0, completedAt: 0, ctaAt: 0 };
+      flashes = [];
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('restart', {});
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  var botRunsDone = 0;
+  var demoFillOrder = []; // order of cells to fill in demo
+  var demoIdx = 0;
+  var demoWait = 0; // frames to wait before next fill
+  var demoPhase = 'filling'; // filling | done
+
+  function buildFillOrder() {
+    // Build an order to fill cells: row by row, left to right
+    var order = [];
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        order.push({ row: r, col: c });
+      }
+    }
+    // Shuffle slightly for human feel but keep it mostly ordered
+    for (var i = order.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+    }
+    return order;
+  }
+
+  // Demo: calm fill with hesitation between cells
+  // Arc: settle (fill slowly at first) → deepen (rhythm builds) → resolve (last cells) → done
+  var demoHesitations = []; // per-cell wait times in frames
+  function buildDemoHesitations(n) {
+    demoHesitations = [];
+    for (var i = 0; i < n; i++) {
+      var t;
+      if (i < 5) t = 20 + Math.floor(rng() * 10);      // settle: slow
+      else if (i < n - 8) t = 10 + Math.floor(rng() * 8); // deepen: rhythm
+      else t = 6 + Math.floor(rng() * 4);               // resolve: fast, satisfying
+      demoHesitations.push(t);
+    }
+  }
+
+  function initDemoState() {
+    demoFillOrder = buildFillOrder();
+    buildDemoHesitations(demoFillOrder.length);
+    demoIdx = 0;
+    demoWait = demoHesitations[0] || 18;
+    demoPhase = 'filling';
+  }
+
+  // Bot: fill cells with occasional wrong positions (skip cells temporarily)
+  var botQueue = [];
+  var botWait = 0;
+  var botMistakeChance = 0.08; // 8% chance to skip (simulate thinking)
+
+  function initBotState() {
+    botQueue = [];
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        botQueue.push({ row: r, col: c });
+      }
+    }
+    // shuffle
+    for (var i = botQueue.length - 1; i > 0; i--) {
+      var j2 = Math.floor(rng() * (i + 1));
+      var tmp2 = botQueue[i]; botQueue[i] = botQueue[j2]; botQueue[j2] = tmp2;
+    }
+    botWait = 4;
+  }
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    if (DEMO) {
+      if (demoFillOrder.length === 0) return;
+      if (demoWait > 0) { demoWait--; return; }
+      if (demoIdx >= demoFillOrder.length) { demoPhase = 'done'; return; }
+      var cell = demoFillOrder[demoIdx];
+      if (grid[cell.row][cell.col] === null) {
+        tapCell(cell.row, cell.col);
+      }
+      demoIdx++;
+      demoWait = (demoHesitations[demoIdx] || 8);
+    } else if (BOT) {
+      if (botQueue.length === 0) return;
+      if (botWait > 0) { botWait--; return; }
+      var bc = botQueue.shift();
+      if (bc && grid[bc.row][bc.col] === null) {
+        tapCell(bc.row, bc.col);
+      }
+      botWait = 3 + Math.floor(rng() * 4);
+    }
+  }
+
+  // ---- render ----
+  var last = performance.now();
+  var ctaEase = 0;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // decay juice
+    if (hitStop > 0) { hitStop -= dt; }
+    else { autopilot(); }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // decay wrong-cell highlights
+    for (var wi = wrongCells.length - 1; wi >= 0; wi--) {
+      wrongCells[wi].t += dt;
+      if (wrongCells[wi].t > 30) wrongCells.splice(wi, 1);
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.02)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- draw grid ----
+    if (state.phase === 'play' || state.phase === 'complete') {
+      drawGrid(now);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      drawTitle(now);
+    }
+
+    // progress bar
+    if (state.phase === 'play') {
+      drawProgress();
+    }
+
+    // complete overlay
+    if (state.phase === 'complete') {
+      drawComplete(now);
+    }
+
+    // demo CTA
+    if (state.phase === 'cta') {
+      drawGrid(now); // keep grid visible behind CTA
+      drawCTA(now);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 35);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawGrid(now) {
+    var GAP = 3;
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        var x = GRID_X + c * CELL;
+        var y = GRID_Y + r * CELL;
+        var color = grid[r][c];
+        var isWrong = false;
+        for (var wi = 0; wi < wrongCells.length; wi++) {
+          if (wrongCells[wi].row === r && wrongCells[wi].col === c) { isWrong = true; break; }
+        }
+
+        // cell bg
+        if (color) {
+          cx.fillStyle = color;
+          cx.globalAlpha = 1;
+        } else if (isWrong) {
+          cx.fillStyle = '#555';
+          cx.globalAlpha = 0.7;
+        } else {
+          // empty: show very faint hint of what color it needs
+          cx.fillStyle = patternColor(r, c);
+          cx.globalAlpha = 0.08;
+        }
+        cx.fillRect(x + GAP, y + GAP, CELL - GAP * 2, CELL - GAP * 2);
+        cx.globalAlpha = 1;
+
+        // border for unfilled
+        if (!color) {
+          cx.strokeStyle = isWrong ? '#888' : 'rgba(255,255,255,0.12)';
+          cx.lineWidth = 1;
+          cx.strokeRect(x + GAP + 0.5, y + GAP + 0.5, CELL - GAP * 2 - 1, CELL - GAP * 2 - 1);
+        }
+
+        // subtle inner highlight for filled
+        if (color) {
+          var grd = cx.createLinearGradient(x + GAP, y + GAP, x + GAP, y + GAP + CELL - GAP * 2);
+          grd.addColorStop(0, 'rgba(255,255,255,0.18)');
+          grd.addColorStop(1, 'rgba(0,0,0,0.10)');
+          cx.fillStyle = grd;
+          cx.fillRect(x + GAP, y + GAP, CELL - GAP * 2, CELL - GAP * 2);
+        }
+      }
+    }
+
+    // Grid border
+    cx.strokeStyle = 'rgba(255,255,255,0.08)';
+    cx.lineWidth = 1;
+    cx.strokeRect(GRID_X, GRID_Y, GRID_W, GRID_H);
+  }
+
+  function drawProgress() {
+    var pct = filledCount / totalCells;
+    var barW = GRID_W;
+    var barX = GRID_X;
+    var barY = GRID_Y + GRID_H + 16;
+    var barH = 5;
+    // bg
+    cx.fillStyle = 'rgba(255,255,255,0.1)';
+    cx.fillRect(barX, barY, barW, barH);
+    // fill
+    var grd = cx.createLinearGradient(barX, 0, barX + barW, 0);
+    grd.addColorStop(0, TEAL);
+    grd.addColorStop(1, GOLD);
+    cx.fillStyle = grd;
+    cx.fillRect(barX, barY, barW * pct, barH);
+    // label
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '500 12px -apple-system, Helvetica, Arial';
+    cx.fillText(filledCount + ' / ' + totalCells, W / 2, barY + 22);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '800 38px -apple-system, Helvetica, Arial';
+    cx.fillText('PATTERN FILL', W / 2, 270);
+    cx.fillStyle = TEAL;
+    cx.font = '600 16px -apple-system, Helvetica, Arial';
+    cx.fillText('tap to fill the pattern', W / 2, 308);
+    var pulse = 0.55 + 0.45 * Math.sin(now / 400);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = TEAL;
+    cx.font = '700 20px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ TAP TO BEGIN', W / 2, 370);
+    cx.globalAlpha = 1;
+  }
+
+  function drawComplete(now) {
+    var elapsed = (now - state.completedAt) / 1000;
+    var ease = Math.min(1, elapsed * 1.8);
+
+    cx.fillStyle = 'rgba(11,13,18,' + (0.55 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL;
+    cx.font = '900 38px -apple-system, Helvetica, Arial';
+    cx.fillText('COMPLETE', W / 2, 290);
+
+    cx.fillStyle = '#fff';
+    cx.font = '700 22px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score + ' cells', W / 2, 330);
+
+    cx.fillStyle = GOLD;
+    cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('best: ' + best, W / 2, 360);
+
+    if (!DEMO && !BOT) {
+      var p2 = 0.55 + 0.45 * Math.sin(now / 320);
+      cx.globalAlpha = ease * p2;
+      cx.fillStyle = TEAL;
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — FILL ANOTHER', W / 2, 408);
+      cx.globalAlpha = ease;
+
+      // share pill
+      cx.fillStyle = 'rgba(242,177,52,0.12)';
+      cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+      else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = GOLD;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+    }
+    cx.globalAlpha = 1;
+  }
+
+  function drawCTA(now) {
+    var elapsed = (now - state.ctaAt) / 1000;
+    var ease = Math.min(1, elapsed * 2.0);
+
+    cx.fillStyle = 'rgba(11,13,18,' + (0.80 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+
+    cx.fillStyle = '#fff';
+    cx.font = '900 40px -apple-system, Helvetica, Arial';
+    cx.fillText('PATTERN FILL', W / 2, 290);
+
+    cx.fillStyle = 'rgba(255,255,255,0.70)';
+    cx.font = '600 17px -apple-system, Helvetica, Arial';
+    cx.fillText('fill yours in', W / 2, 328);
+
+    var pulse = 0.70 + 0.30 * Math.sin(now / 260);
+    cx.globalAlpha = ease * pulse;
+    cx.fillStyle = TEAL;
+    cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 400);
+
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '600 15px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 435);
+    cx.globalAlpha = 1;
+  }
+
+  // init
+  newGame();
+  if (DEMO) {
+    initDemoState();
+    // also rebuild fill order with a fresh rng snapshot
+    rng = mulberry32(SEED + 1000);
+    demoFillOrder = [];
+    for (var r0 = 0; r0 < ROWS; r0++) {
+      for (var c0 = 0; c0 < COLS; c0++) {
+        demoFillOrder.push({ row: r0, col: c0 });
+      }
+    }
+    // gentle shuffle for demo
+    for (var i0 = demoFillOrder.length - 1; i0 > 0; i0--) {
+      var j0 = Math.floor(rng() * (i0 + 1));
+      var tmp0 = demoFillOrder[i0]; demoFillOrder[i0] = demoFillOrder[j0]; demoFillOrder[j0] = tmp0;
+    }
+    buildDemoHesitations(demoFillOrder.length);
+    demoIdx = 0;
+    demoWait = demoHesitations[0] || 18;
+  }
+  if (BOT) {
+    initBotState();
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
