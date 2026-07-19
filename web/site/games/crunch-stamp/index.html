@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Crunch Stamp — Tilt</title>
+<!--
+  LOOP / attention-architecture — Crunch Stamp (CALM engine, contract v2)
+  Circuits: 05-ease, 06-zeigarnik, 01-rpe.
+  Conditioned path: packing-foam / crunch-squish ASMR — the thumb press is the whole satisfaction.
+  Mechanic: press and release each packing-foam cell; depth sets the crunch softness.
+  Modes:
+    ?demo=1&seed=7        scripted calm clip (settle → deepen → resolve → CTA),
+                          sets window.__demoDone + __demoScore
+    ?bot=1&runs=N&seed=5  imperfect autoplay traffic simulation, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'crunch-stamp';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo clips are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  // canvas + fit
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134';
+  var FOAM = '#e4e7ec', FOAM_DARK = '#c9ced7';
+
+  // grid of 20 foam cells
+  var COLS = 4, ROWS = 5, TOTAL = 20;
+  var CSIZE = 74, GAP = 12, RADIUS = 14;
+  var gridW = COLS * CSIZE + (COLS - 1) * GAP;
+  var gridH = ROWS * CSIZE + (ROWS - 1) * GAP;
+  var GX = (W - gridW) / 2;
+  var GY = 180;
+
+  var cells = [];
+  function buildCells() {
+    cells = [];
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        var idx = r * COLS + c;
+        cells.push({
+          index: idx, r: r, c: c,
+          x: GX + c * (CSIZE + GAP),
+          y: GY + r * (CSIZE + GAP),
+          w: CSIZE, h: CSIZE,
+          depth: 0, done: false, active: false
+        });
+      }
+    }
+  }
+
+  var state = 'title', score = 0, runStartTs = 0, overAt = 0, ctaAt = 0, best = 0;
+  var activeIdx = -1, activeDepth = 0, pressStartY = 0, pressStartTime = 0, pointerId = null;
+  var thumb = { x: 0, y: 0, visible: false };
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var flashes = [];
+  var dareBeaten = false, botRunsDone = 0;
+
+  try { best = +localStorage.getItem('cs_best') || 0; } catch (_) {}
+
+  function roundRectPath(x, y, w, h, r) {
+    var rr = Math.min(r, w / 2, h / 2);
+    cx.beginPath();
+    cx.moveTo(x + rr, y);
+    cx.lineTo(x + w - rr, y); cx.quadraticCurveTo(x + w, y, x + w, y + rr);
+    cx.lineTo(x + w, y + h - rr); cx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+    cx.lineTo(x + rr, y + h); cx.quadraticCurveTo(x, y + h, x, y + h - rr);
+    cx.lineTo(x, y + rr); cx.quadraticCurveTo(x, y, x + rr, y);
+    cx.closePath();
+  }
+
+  function newGame() {
+    buildCells();
+    state = 'title';
+    score = 0; activeIdx = -1; activeDepth = 0; pointerId = null;
+    hitStop = 0; zoom = 1; shakeAmt = 0; flashes = [];
+    dareBeaten = false; thumb.visible = false;
+    if (DEMO) {
+      setTimeout(startRun, 900);
+    } else if (BOT) {
+      startRun();
+    }
+  }
+
+  function startRun() {
+    state = 'play';
+    runStartTs = Date.now();
+    score = 0;
+    buildCells();
+    activeIdx = -1; activeDepth = 0; dareBeaten = false; flashes = [];
+    if (DEMO) {
+      demoIdx = 0; demoState = 'idle'; demoWait = 40;
+      thumb.visible = true; thumb.x = GX - 30; thumb.y = GY - 30;
+    }
+    if (BOT) {
+      botIdx = 0; botState = 'move'; botWait = 0;
+      botRunTargetDepths = cells.map(function () { return Math.max(0.35, Math.min(1, 0.55 + rng() * 0.45 + gauss() * 0.12)); });
+      thumb.visible = true; thumb.x = GX - 30; thumb.y = GY - 30;
+    }
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function stampCell(idx, depth) {
+    var cell = cells[idx];
+    if (!cell || cell.done) return;
+    cell.done = true;
+    cell.depth = depth;
+    cell.active = false;
+    var pts = Math.round(depth * 100);
+    score += pts;
+
+    var label, color, size;
+    if (depth >= 0.82) { label = 'DEEP +' + pts; color = TEAL; size = 36; hitStop = 5; zoom = 1.025; shakeAmt = 1.2; }
+    else if (depth >= 0.5) { label = 'CRUNCH +' + pts; color = TEAL; size = 30; hitStop = 3; zoom = 1.015; shakeAmt = 0.6; }
+    else { label = 'SOFT +' + pts; color = GOLD; size = 26; hitStop = 2; zoom = 1.01; shakeAmt = 0.3; }
+    flash(label, color, size);
+
+    if (window.J) J.calm(Math.round(depth * 5));
+    if (window.LOOP) LOOP.emit('cell_stamp', { n: idx + 1, depth: +depth.toFixed(2), pts: pts, score: score });
+  }
+
+  function doneCount() {
+    var n = 0;
+    for (var i = 0; i < cells.length; i++) if (cells[i].done) n++;
+    return n;
+  }
+
+  function completeSession() {
+    if (state !== 'play') return;
+    state = 'completing';
+    hitStop = 12; zoom = 1.04; shakeAmt = 1.5;
+    flash('SHEET DONE', TEAL, 52);
+    if (window.J) { J.calm(7); setTimeout(function () { J.calm(9); }, 220); }
+    if (window.LOOP) LOOP.emit('sheet_complete', { score: score });
+    setTimeout(function () { gameOver(score); }, 700);
+  }
+
+  function gameOver(finalScore) {
+    if (state === 'over' || state === 'cta') return;
+    var dur = (Date.now() - runStartTs) / 1000;
+    state = 'over';
+    overAt = performance.now();
+    if (finalScore > best) {
+      best = finalScore;
+      try { localStorage.setItem('cs_best', String(best)); } catch (_) {}
+    }
+    if (DEMO) window.__demoScore = finalScore;
+    if (window.LOOP) LOOP.emit('game_over', { score: finalScore, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        state = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 1200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else {
+        if (window.LOOP) LOOP.emit('restart', {});
+        setTimeout(startRun, 900);
+      }
+    }
+  }
+
+  function resetRun() {
+    state = 'play';
+    score = 0;
+    buildCells();
+    activeIdx = -1; activeDepth = 0; dareBeaten = false; flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    runStartTs = Date.now();
+    if (DEMO) { demoIdx = 0; demoState = 'idle'; demoWait = 40; thumb.visible = true; thumb.x = GX - 30; thumb.y = GY - 30; }
+    if (BOT) { botIdx = 0; botState = 'move'; botWait = 0; botRunTargetDepths = cells.map(function () { return Math.max(0.35, Math.min(1, 0.55 + rng() * 0.45 + gauss() * 0.12)); }); thumb.visible = true; thumb.x = GX - 30; thumb.y = GY - 30; }
+    if (window.LOOP) LOOP.emit('restart', {});
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0, y: 250 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function screenToGame(ex, ey) {
+    var rect = cv.getBoundingClientRect();
+    return { x: (ex - rect.left) / scale, y: (ey - rect.top) / scale };
+  }
+  function cellAt(x, y) {
+    for (var i = 0; i < cells.length; i++) {
+      var c = cells[i];
+      if (x >= c.x && x <= c.x + c.w && y >= c.y && y <= c.y + c.h) return i;
+    }
+    return -1;
+  }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state === 'title') { startRun(); return; }
+    if (state === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'crunch' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var p = screenToGame(e.clientX, e.clientY);
+    if (inR(MUTE_R, p.x, p.y)) { if (window.J) J.toggleMute(); return; }
+    if (state === 'title') { startRun(); return; }
+    if (state === 'play') {
+      var i = cellAt(p.x, p.y);
+      if (i >= 0 && !cells[i].done) {
+        pointerId = e.pointerId;
+        activeIdx = i;
+        activeDepth = 0;
+        pressStartY = p.y;
+        pressStartTime = performance.now();
+        cells[i].active = true;
+        thumb.x = p.x; thumb.y = p.y; thumb.visible = true;
+      }
+    }
+    if (state === 'over' && performance.now() - overAt > 350) tap(p.x, p.y);
+  });
+  window.addEventListener('pointermove', function (e) {
+    if (DEMO || BOT || e.pointerId !== pointerId) return;
+    var p = screenToGame(e.clientX, e.clientY);
+    if (activeIdx < 0) return;
+    var travel = Math.max(0, p.y - pressStartY);
+    var time = (performance.now() - pressStartTime) / 850;
+    activeDepth = Math.min(1, Math.max(0, time + travel / 55));
+    thumb.x = p.x; thumb.y = p.y;
+  });
+  function releasePointer(e) {
+    if (e && e.pointerId !== pointerId) return;
+    pointerId = null; thumb.visible = false;
+    if (DEMO || BOT) return;
+    var idx = activeIdx; activeIdx = -1;
+    if (idx >= 0) {
+      cells[idx].active = false;
+      if (activeDepth > 0.08) { stampCell(idx, activeDepth); activeDepth = 0; }
+      else { activeDepth = 0; }
+    }
+  }
+  window.addEventListener('pointerup', releasePointer);
+  window.addEventListener('pointercancel', releasePointer);
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  var demoPlan = [
+    0.55, 0.75, 0.45, 0.90, 0.60,
+    0.80, 0.50, 1.00, 0.65, 0.55,
+    0.85, 0.45, 0.70, 0.95, 0.50,
+    0.60, 0.80, 0.40, 0.75, 0.90
+  ];
+  var demoIdx = 0, demoState = 'idle', demoWait = 0, demoTargetDepth = 0;
+  var botIdx = 0, botState = 'move', botWait = 0, botTargetDepth = 0;
+  var botRunTargetDepths = [];
+
+  function moveThumbToward(tx, ty, spd) {
+    var dx = tx - thumb.x, dy = ty - thumb.y;
+    var d = Math.hypot(dx, dy);
+    if (d <= spd) { thumb.x = tx; thumb.y = ty; return true; }
+    thumb.x += (dx / d) * spd;
+    thumb.y += (dy / d) * spd;
+    return false;
+  }
+
+  function autopilot(dt) {
+    if (state !== 'play') return;
+    if (DEMO) {
+      if (demoState === 'idle') {
+        demoWait -= dt;
+        if (demoWait <= 0) { demoState = 'move'; demoIdx = 0; }
+        return;
+      }
+      var idx = demoIdx;
+      var cell = cells[idx];
+      var tx = cell.x + cell.w / 2, ty = cell.y + cell.h / 2;
+      if (demoState === 'move') {
+        if (moveThumbToward(tx, ty, 12)) {
+          demoState = 'press';
+          activeIdx = idx;
+          cells[idx].active = true;
+          activeDepth = 0;
+          demoTargetDepth = demoPlan[idx];
+          demoWait = 18;
+        }
+      } else if (demoState === 'press') {
+        var rate = demoTargetDepth / demoWait;
+        activeDepth = Math.min(demoTargetDepth, activeDepth + rate * dt);
+        demoWait -= dt;
+        if (demoWait <= 0) {
+          activeDepth = demoTargetDepth;
+          stampCell(idx, activeDepth);
+          activeIdx = -1;
+          cells[idx].active = false;
+          demoIdx++;
+          if (demoIdx >= TOTAL) { thumb.visible = false; return; }
+          demoState = 'settleWait';
+          demoWait = 4;
+        }
+      } else if (demoState === 'settleWait') {
+        demoWait -= dt;
+        if (demoWait <= 0) demoState = 'move';
+      }
+    } else if (BOT) {
+      var cell = cells[botIdx];
+      var tx = cell.x + cell.w / 2, ty = cell.y + cell.h / 2;
+      if (botState === 'move') {
+        if (moveThumbToward(tx, ty, 8 + rng() * 3)) {
+          botState = 'press';
+          activeIdx = botIdx;
+          cells[botIdx].active = true;
+          activeDepth = 0;
+          botTargetDepth = botRunTargetDepths[botIdx];
+          botWait = 18 + Math.floor(rng() * 14);
+        }
+      } else if (botState === 'press') {
+        var brate = botTargetDepth / botWait;
+        activeDepth = Math.min(botTargetDepth, activeDepth + brate * dt);
+        botWait -= dt;
+        if (botWait <= 0) {
+          activeDepth = botTargetDepth;
+          stampCell(botIdx, activeDepth);
+          activeIdx = -1;
+          cells[botIdx].active = false;
+          botIdx++;
+          if (botIdx >= TOTAL) { thumb.visible = false; return; }
+          botState = 'settleWait';
+          botWait = 6 + Math.floor(rng() * 6);
+        }
+      } else if (botState === 'settleWait') {
+        botWait -= dt;
+        if (botWait <= 0) botState = 'move';
+      }
+    }
+  }
+
+  // ---- render helpers ----
+  function drawCell(cell) {
+    var d = cell.active ? activeDepth : (cell.done ? cell.depth : 0);
+
+    // base foam block
+    roundRectPath(cell.x, cell.y, cell.w, cell.h, RADIUS);
+    var base = cx.createLinearGradient(cell.x, cell.y, cell.x + cell.w, cell.y + cell.h);
+    base.addColorStop(0, FOAM);
+    base.addColorStop(1, FOAM_DARK);
+    cx.fillStyle = base; cx.fill();
+
+    // bevel highlight
+    cx.strokeStyle = 'rgba(255,255,255,0.28)';
+    cx.lineWidth = 1.5;
+    roundRectPath(cell.x + 1, cell.y + 1, cell.w - 2, cell.h - 2, RADIUS - 1);
+    cx.stroke();
+
+    if (d > 0.01) {
+      // crumpled inset
+      var inset = 4 + d * 12;
+      var iw = Math.max(2, cell.w - inset * 2);
+      var ih = Math.max(2, cell.h - inset * 2);
+      var ix = cell.x + inset;
+      var iy = cell.y + inset;
+
+      var inner = cx.createRadialGradient(
+        cell.x + cell.w / 2, cell.y + cell.h / 2, 2,
+        cell.x + cell.w / 2, cell.y + cell.h / 2, cell.w / 2
+      );
+      inner.addColorStop(0, 'rgba(0,0,0,' + (0.12 + 0.36 * d) + ')');
+      inner.addColorStop(1, 'rgba(0,0,0,' + (0.04 + 0.14 * d) + ')');
+      roundRectPath(ix, iy, iw, ih, Math.max(2, RADIUS - 4));
+      cx.fillStyle = inner; cx.fill();
+
+      // pressed edge shadows
+      cx.strokeStyle = 'rgba(0,0,0,' + (0.10 + 0.18 * d) + ')';
+      cx.lineWidth = 2;
+      roundRectPath(ix + 1, iy + 1, iw - 2, ih - 2, Math.max(2, RADIUS - 4));
+      cx.stroke();
+
+      // soft inner sheen (suggest foam thickness)
+      cx.strokeStyle = 'rgba(255,255,255,' + (0.08 + 0.16 * d) + ')';
+      cx.lineWidth = 1;
+      roundRectPath(ix + 3, iy + 3, iw - 6, ih - 6, Math.max(1, RADIUS - 5));
+      cx.stroke();
+    }
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // hit-stop decay — sim frozen, but timer still runs down
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state === 'play') {
+      autopilot(dt);
+      if (!DEMO && !BOT && activeIdx >= 0) {
+        var travel = Math.max(0, thumb.y - pressStartY);
+        var time = (now - pressStartTime) / 850;
+        activeDepth = Math.min(1, Math.max(0, time + travel / 55));
+      }
+    }
+
+    // sheet complete check
+    if (state === 'play') {
+      var allDone = true;
+      for (var i = 0; i < cells.length; i++) if (!cells[i].done) { allDone = false; break; }
+      if (allDone) completeSession();
+    }
+
+    // dare beaten
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && (state === 'play' || state === 'completing') && score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 38);
+      if (window.J) J.fanfare();
+      SHARE.beaten(score);
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.06)');
+    bg.addColorStop(1, 'rgba(242,177,52,0.04)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // foam grid
+    for (var c = 0; c < cells.length; c++) drawCell(cells[c]);
+
+    // thumb / finger indicator
+    if (thumb.visible || activeIdx >= 0) {
+      cx.beginPath();
+      cx.arc(thumb.x, thumb.y, 14, 0, Math.PI * 2);
+      cx.fillStyle = 'rgba(46,197,182,0.18)';
+      cx.fill();
+      cx.strokeStyle = TEAL;
+      cx.lineWidth = 1.5; cx.stroke();
+    }
+
+    // score / progress
+    if (state === 'play' || state === 'over' || state === 'completing') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText(doneCount() + ' / ' + TOTAL + ' cells  ·  best ' + best, W / 2, 120);
+
+      // incoming dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 150);
+      }
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, fl.y - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('CRUNCH STAMP', W / 2, 280);
+      cx.fillStyle = TEAL; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse; cx.fillText('PRESS & RELEASE', W / 2, 330); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('one soft crunch per cell.', W / 2, 360);
+    }
+
+    // game over
+    if (state === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('SHEET DONE', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' crunch', W / 2, 345);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('20 cells filled', W / 2, 390);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE SHEET', W / 2, 462);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card — soft invitation, no dare
+    if (state === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('CRUNCH STAMP', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.78)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText((window.__demoScore || score) + ' crunch — press every cell', W / 2, 332);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 260);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 398);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

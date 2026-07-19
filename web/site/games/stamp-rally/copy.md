@@ -1,10 +1,9 @@
 # STAMP RALLY — copy
+## TikTok (3 captions ≤100 chars, hook-first, completion-satisfaction — the final stamp, the card complete angle)
 
-## TikTok (3 captions ≤100 chars, hook-first, completion-satisfaction angle)
-
-one stamp away and it fades. every time. 🎟️
-that last stamp hit different when it finally clicked ✦
-the card flipped complete and my brain just exhaled 🏆
+that loyalty-card feeling, but it fades if you're slow 🎟️
+one stamp left and the timer started shrinking ✦
+the whole card lit up. that final stamp hit different 🏆
 
 ## Reels (3)
 

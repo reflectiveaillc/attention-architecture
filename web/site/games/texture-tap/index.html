@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Texture Tap — Tilt</title>
+<!--
+  LOOP / attention-architecture — Texture Tap (CALM engine, contract v2)
+  Conditioned path: random-texture ASMR scrolls. A new surface fills the screen
+  every fifteen seconds; tap anywhere to feel it. The thumb already knows this
+  move from Instagram/TikTok — the game IS that move.
+  Circuits: 02 novelty, 05 ease, 01 soft-RPE.
+  Modes:
+    ?demo=1&seed=7        scripted calm arc (settle → deepen → resolve → soft CTA),
+                          sets window.__demoDone + __demoScore
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N full sessions, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'texture-tap';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so textures and demos are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  // canvas + fit
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // calm palette — teal/soft tones, gold accent, no vermillion edge
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134', CREAM = '#f5efe6';
+
+  // ---- textures ----
+  // Each texture is a seeded procedural fill. We pass a fresh rng seeded from
+  // the main seed + texture index so every session's surfaces are stable.
+  var TEXTURES = [
+    { name: 'corduroy', hue: 34, draw: drawCorduroy },
+    { name: 'velvet', hue: 264, draw: drawVelvet },
+    { name: 'bark', hue: 26, draw: drawBark },
+    { name: 'mesh', hue: 172, draw: drawMesh },
+    { name: 'pebbles', hue: 196, draw: drawPebbles }
+  ];
+  var HUMAN_DUR = 15;     // seconds per texture
+  var HUMAN_TOTAL = 5;    // textures complete the session
+  var DEMO_DUR = 16;      // demo play phase length
+  var DEMO_TEX_DUR = 4.2; // faster texture cycle for the clip
+  var DEMO_TOTAL = 4;     // settle → deepen → resolve across 4 surfaces
+
+  function texRng(idx) { return mulberry32(SEED + idx * 741); }
+
+  function drawCorduroy(idx) {
+    var r = texRng(idx);
+    var hue = TEXTURES[idx].hue;
+    cx.fillStyle = 'hsl(' + hue + ',22%,22%)'; cx.fillRect(0, 0, W, H);
+    var x = -10;
+    while (x < W + 10) {
+      var w = 8 + r() * 18;
+      var g = cx.createLinearGradient(x, 0, x + w, 0);
+      g.addColorStop(0, 'hsl(' + hue + ',28%,18%)');
+      g.addColorStop(0.5, 'hsl(' + hue + ',34%,38%)');
+      g.addColorStop(1, 'hsl(' + hue + ',26%,16%)');
+      cx.fillStyle = g;
+      cx.fillRect(x, 0, w, H);
+      // ridge shadow
+      cx.fillStyle = 'rgba(0,0,0,0.22)';
+      cx.fillRect(x + w - 2, 0, 2, H);
+      x += w;
+    }
+  }
+
+  function drawVelvet(idx) {
+    var r = texRng(idx);
+    var hue = TEXTURES[idx].hue;
+    var g = cx.createLinearGradient(0, 0, W, H);
+    g.addColorStop(0, 'hsl(' + hue + ',30%,18%)');
+    g.addColorStop(0.5, 'hsl(' + hue + ',25%,28%)');
+    g.addColorStop(1, 'hsl(' + hue + ',32%,16%)');
+    cx.fillStyle = g; cx.fillRect(0, 0, W, H);
+    // sheen diagonal
+    var sg = cx.createLinearGradient(0, H * 0.35, W, H * 0.65);
+    sg.addColorStop(0, 'rgba(255,255,255,0)');
+    sg.addColorStop(0.5, 'rgba(255,255,255,0.10)');
+    sg.addColorStop(1, 'rgba(255,255,255,0)');
+    cx.fillStyle = sg; cx.fillRect(0, 0, W, H);
+    // soft noise piles
+    for (var i = 0; i < 60; i++) {
+      var px = r() * W, py = r() * H, pr = 1 + r() * 2.5;
+      cx.globalAlpha = 0.12;
+      cx.fillStyle = r() > 0.5 ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.4)';
+      cx.beginPath(); cx.arc(px, py, pr, 0, Math.PI * 2); cx.fill();
+    }
+    cx.globalAlpha = 1;
+  }
+
+  function drawBark(idx) {
+    var r = texRng(idx);
+    var hue = TEXTURES[idx].hue;
+    cx.fillStyle = 'hsl(' + hue + ',20%,20%)'; cx.fillRect(0, 0, W, H);
+    // vertical grain strokes
+    for (var i = 0; i < 90; i++) {
+      var x = r() * W;
+      var w = 1 + r() * 3;
+      var h = 40 + r() * 220;
+      var y = r() * (H - h);
+      var light = 18 + r() * 18;
+      cx.fillStyle = 'hsl(' + (hue + r() * 12) + ',22%,' + light + '%)';
+      cx.fillRect(x, y, w, h);
+    }
+    // cracks
+    for (var j = 0; j < 16; j++) {
+      var cx0 = r() * W, cy0 = r() * H;
+      cx.strokeStyle = 'rgba(0,0,0,0.45)'; cx.lineWidth = 1 + r();
+      cx.beginPath(); cx.moveTo(cx0, cy0);
+      for (var k = 0; k < 6; k++) {
+        cx0 += (r() - 0.5) * 40; cy0 += r() * 50;
+        cx.lineTo(cx0, cy0);
+      }
+      cx.stroke();
+    }
+  }
+
+  function drawMesh(idx) {
+    var r = texRng(idx);
+    var hue = TEXTURES[idx].hue;
+    cx.fillStyle = 'hsl(' + hue + ',26%,16%)'; cx.fillRect(0, 0, W, H);
+    var cell = 22 + r() * 10;
+    // vertical threads
+    cx.strokeStyle = 'hsl(' + hue + ',40%,34%)'; cx.lineWidth = 1.5;
+    for (var x = 0; x <= W; x += cell) {
+      cx.beginPath(); cx.moveTo(x, 0);
+      for (var y = 0; y <= H; y += 12) cx.lineTo(x + Math.sin(y * 0.04) * 2, y);
+      cx.stroke();
+    }
+    // horizontal threads
+    cx.strokeStyle = 'hsl(' + hue + ',35%,42%)'; cx.lineWidth = 1;
+    for (var y = 0; y <= H; y += cell) {
+      cx.beginPath(); cx.moveTo(0, y);
+      for (var x = 0; x <= W; x += 12) cx.lineTo(x, y + Math.sin(x * 0.05) * 2);
+      cx.stroke();
+    }
+    // knots
+    cx.fillStyle = 'hsl(' + hue + ',50%,28%)';
+    for (var i = 0; i < 200; i++) {
+      var px = Math.floor(r() * (W / cell)) * cell;
+      var py = Math.floor(r() * (H / cell)) * cell;
+      cx.beginPath(); cx.arc(px, py, 2.2, 0, Math.PI * 2); cx.fill();
+    }
+  }
+
+  function drawPebbles(idx) {
+    var r = texRng(idx);
+    var hue = TEXTURES[idx].hue;
+    cx.fillStyle = 'hsl(' + hue + ',24%,20%)'; cx.fillRect(0, 0, W, H);
+    var pebbles = [];
+    for (var i = 0; i < 130; i++) {
+      pebbles.push({ x: r() * W, y: r() * H, rx: 6 + r() * 16, ry: 5 + r() * 12, rot: r() * Math.PI * 2, light: 28 + r() * 22 });
+    }
+    // sort by implied depth so overlaps feel natural
+    pebbles.sort(function (a, b) { return a.y - b.y; });
+    for (var j = 0; j < pebbles.length; j++) {
+      var p = pebbles[j];
+      cx.save(); cx.translate(p.x, p.y); cx.rotate(p.rot);
+      var g = cx.createRadialGradient(-p.rx * 0.25, -p.ry * 0.25, 0, 0, 0, Math.max(p.rx, p.ry));
+      g.addColorStop(0, 'hsl(' + hue + ',18%,' + (p.light + 14) + '%)');
+      g.addColorStop(1, 'hsl(' + hue + ',20%,' + (p.light - 14) + '%)');
+      cx.fillStyle = g;
+      cx.beginPath(); cx.ellipse(0, 0, p.rx, p.ry, 0, 0, Math.PI * 2); cx.fill();
+      // tiny rim
+      cx.strokeStyle = 'rgba(255,255,255,0.08)'; cx.lineWidth = 1;
+      cx.beginPath(); cx.ellipse(0, 0, p.rx, p.ry, 0, 0, Math.PI * 2); cx.stroke();
+      cx.restore();
+    }
+  }
+
+  // ---- state ----
+  var state, runStartTs, best = 0, dareBeaten = false;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var floats = [], ripples = [];
+  var ctaAt = 0, last = performance.now();
+  var botRunsDone = 0, botNextTap = 0;
+  var demoTaps = [], demoIdx = 0, demoStart = 0;
+  try { best = +localStorage.getItem('tt_best') || 0; } catch (_) {}
+
+  function textureDur() { return DEMO ? DEMO_TEX_DUR : HUMAN_DUR; }
+  function textureTotal() { return DEMO ? DEMO_TOTAL : HUMAN_TOTAL; }
+  function totalDur() { return DEMO ? DEMO_DUR : (textureDur() * textureTotal()); }
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      t: 0, texIdx: 0,
+      taps: 0, touched: [],
+      score: 0, overAt: 0
+    };
+    floats = []; ripples = []; dareBeaten = false; hitStop = 0; zoom = 1; shakeAmt = 0;
+    botNextTap = 0; demoIdx = 0;
+    if (DEMO) {
+      // scripted tap cadence: human, with hesitation, 9 taps across 16s
+      demoTaps = [0.7, 2.4, 4.1, 6.2, 8.5, 10.3, 12.0, 13.6, 15.2];
+      startRun();
+      demoStart = performance.now();
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.t = 0; state.texIdx = 0; state.taps = 0; state.touched = []; state.score = 0;
+    floats = []; ripples = []; hitStop = 0; zoom = 1; shakeAmt = 0;
+    botNextTap = 0; demoIdx = 0;
+    if (DEMO) demoStart = performance.now();
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    if (window.J) J.calm(0);
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 35))));
+  }
+
+  function currentScore() {
+    // meaningful number: taps plus a bonus for every unique texture felt
+    var unique = 0;
+    for (var i = 0; i < state.touched.length; i++) if (state.touched[i]) unique++;
+    return state.taps * 2 + unique * 25;
+  }
+
+  function endSession() {
+    if (state.phase !== 'play') return;
+    state.phase = 'over'; state.overAt = performance.now();
+    state.score = currentScore();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (newBest) { best = state.score; try { localStorage.setItem('tt_best', String(best)); } catch (_) {} }
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      float('DARE BEATEN', TEAL, 42);
+      if (window.J) J.calm(5);
+      SHARE.beaten(state.score);
+    }
+    if (window.J) { J.calm(3); if (newBest) setTimeout(function () { J.calm && J.calm(5); }, 420); }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), textures: state.texIdx + 1 });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 1400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else { setTimeout(resetRun, 900); }
+    }
+  }
+
+  function resetRun() {
+    state.t = 0; state.texIdx = 0; state.taps = 0; state.touched = []; state.score = 0;
+    floats = []; ripples = []; dareBeaten = false; hitStop = 0; zoom = 1; shakeAmt = 0;
+    botNextTap = 0; demoIdx = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function float(txt, color, size) { floats.push({ txt: txt, color: color, size: size, t: 0, y: H / 2 + 30 }); }
+
+  function addRipple(x, y) {
+    ripples.push({ x: x, y: y, r: 0, alpha: 1, t: 0 });
+  }
+
+  function tapTexture(x, y) {
+    if (state.phase !== 'play') return;
+    var firstOnTexture = !state.touched[state.texIdx];
+    state.taps++;
+    state.touched[state.texIdx] = true;
+    if (firstOnTexture) float(TEXTURES[state.texIdx].name, CREAM, 34);
+    else float('+ touch', TEAL, 24);
+    if (x !== undefined && y !== undefined) addRipple(x, y);
+    if (window.J) J.calm((state.taps + state.texIdx) % 6);
+
+    // juice: every 5th tap and every first-touch of a texture gets a bigger pulse
+    var big = firstOnTexture || state.taps % 5 === 0;
+    if (big) { hitStop = 3; zoom = 1.025; shakeAmt = 1.8; }
+    else { zoom = Math.max(zoom, 1.008); }
+
+    if (window.LOOP) LOOP.emit('texture_tapped', { texture: TEXTURES[state.texIdx].name, idx: state.texIdx, taps: state.taps });
+  }
+
+  function nextTexture() {
+    state.texIdx++;
+    if (state.texIdx >= textureTotal()) { endSession(); return; }
+    shakeAmt = 2.5; zoom = 1.02;
+    float(TEXTURES[state.texIdx].name, GOLD, 38);
+    if (window.J) J.calm(3);
+    if (window.LOOP) LOOP.emit('texture_changed', { idx: state.texIdx, name: TEXTURES[state.texIdx].name });
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 516, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;                 // scripted modes ignore human taps
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { tapTexture(x, y); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'touches' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    if (DEMO) {
+      var t = (performance.now() - demoStart) / 1000;
+      while (demoIdx < demoTaps.length && t >= demoTaps[demoIdx]) {
+        tapTexture(W * 0.35 + rng() * W * 0.3, H * 0.35 + rng() * H * 0.35);
+        demoIdx++;
+      }
+      if (t >= totalDur()) endSession();
+    } else if (BOT) {
+      var now = performance.now();
+      if (botNextTap === 0) botNextTap = now + 400 + Math.abs(gauss()) * 500;
+      if (now >= botNextTap) {
+        tapTexture(W * 0.2 + rng() * W * 0.6, H * 0.25 + rng() * H * 0.55);
+        botNextTap = now + 600 + Math.abs(gauss()) * 900; // 0.6–1.5s gaps, imperfect
+      }
+    }
+  }
+
+  // ---- render ----
+  function drawTexture() {
+    var t = TEXTURES[state.texIdx];
+    if (t && t.draw) t.draw(state.texIdx);
+    // soft vignette
+    var v = cx.createRadialGradient(W / 2, H / 2, H * 0.25, W / 2, H / 2, H * 0.75);
+    v.addColorStop(0, 'rgba(0,0,0,0)');
+    v.addColorStop(1, 'rgba(0,0,0,0.35)');
+    cx.fillStyle = v; cx.fillRect(0, 0, W, H);
+  }
+
+  function drawUI() {
+    // top progress dots
+    if (state.phase === 'play' || state.phase === 'over') {
+      var total = textureTotal();
+      var gap = 22;
+      var startX = W / 2 - (total - 1) * gap / 2;
+      for (var i = 0; i < total; i++) {
+        var filled = i < state.texIdx || (i === state.texIdx && state.phase === 'over');
+        cx.beginPath();
+        cx.arc(startX + i * gap, 42, 4.5, 0, Math.PI * 2);
+        cx.fillStyle = filled ? TEAL : 'rgba(255,255,255,0.18)';
+        cx.fill();
+      }
+    }
+
+    // score / best
+    if (state.phase === 'play' || state.phase === 'over') {
+      var disp = currentScore();
+      cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 58px -apple-system, Helvetica, Arial';
+      cx.fillText(disp, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText(state.taps + ' touches · best ' + best, W / 2, 122);
+
+      // dare banner (only if a dare actually landed)
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 150);
+      }
+    }
+
+    // texture name / timer in play
+    if (state.phase === 'play') {
+      var tex = TEXTURES[state.texIdx];
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '700 15px Menlo, monospace';
+      cx.fillText(tex.name, W / 2, H - 54);
+      var remain = Math.max(0, totalDur() - state.t);
+      cx.fillStyle = 'rgba(255,255,255,0.25)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText(Math.ceil(remain) + 's', W / 2, H - 34);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('TEXTURE TAP', W / 2, 270);
+      cx.fillStyle = TEAL; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(performance.now() / 320);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO FEEL', W / 2, 320); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.38)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('five surfaces. fifteen seconds each.', W / 2, 350);
+      cx.fillStyle = 'rgba(255,255,255,0.28)'; cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('your thumb already knows this.', W / 2, 374);
+    }
+
+    // game over (calm resolve)
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('SESSION COMPLETE', W / 2, 286);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      var unique = 0;
+      for (var u = 0; u < state.touched.length; u++) if (state.touched[u]) unique++;
+      cx.fillText(state.taps + ' touches · ' + unique + ' textures felt', W / 2, 334);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 380);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('softer than ' + (100 - pt) + '% of scrollers', W / 2, 404);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(performance.now() / 300);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — FEEL AGAIN', W / 2, 454);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(46,197,182,0.14)';
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = TEAL; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ PASS IT ON', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card — soft invitation
+    if (state.phase === 'cta') {
+      var t = (performance.now() - ctaAt) / 1000, ease = Math.min(1, t * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('TEXTURE TAP', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.76)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText((window.__demoScore || 0) + ' touches felt. yours?', W / 2, 334);
+      var p3 = 0.7 + 0.3 * Math.sin(performance.now() / 260);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.60)'; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ GROW YOURS', W / 2, 434);
+      cx.fillStyle = GOLD; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 466);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.textBaseline = 'middle';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + MUTE_R.h / 2);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // hit-stop decays EVERY frame — never gate autopilot on hitStop without decaying it
+    if (hitStop > 0) hitStop -= dt;
+
+    var secDt = dt / 60; // dt is in frame-units; divide by 60 to get seconds
+
+    if (state.phase === 'play') {
+      state.t += secDt;
+      var boundary = (state.texIdx + 1) * textureDur();
+      if (state.t >= boundary && state.texIdx < textureTotal() - 1) nextTexture();
+      if (state.t >= totalDur()) endSession();
+      autopilot();
+    }
+
+    // decay juice
+    shakeAmt *= Math.pow(0.86, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // ripples age
+    for (var k = ripples.length - 1; k >= 0; k--) {
+      var rp = ripples[k];
+      rp.t += dt; rp.r += 4 * dt; rp.alpha = Math.max(0, 1 - rp.t / 28);
+      if (rp.t > 28) ripples.splice(k, 1);
+    }
+
+    // floats age
+    for (var f = floats.length - 1; f >= 0; f--) {
+      var fl = floats[f]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 42);
+      if (fl.t > 42) floats.splice(f, 1);
+    }
+
+    // ---- juice transforms: save → shake/zoom → restore ----
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // texture fill
+    if (state.phase !== 'title' && state.phase !== 'cta') {
+      drawTexture();
+    } else {
+      // title / cta background
+      var bg = cx.createLinearGradient(0, 0, 0, H);
+      bg.addColorStop(0, 'rgba(46,197,182,0.06)'); bg.addColorStop(1, 'rgba(242,177,52,0.05)');
+      cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+    }
+
+    // ripples
+    for (var rpi = 0; rpi < ripples.length; rpi++) {
+      var r = ripples[rpi];
+      cx.save();
+      cx.globalAlpha = r.alpha * 0.45;
+      cx.strokeStyle = '#fff'; cx.lineWidth = 2;
+      cx.beginPath(); cx.arc(r.x, r.y, r.r, 0, Math.PI * 2); cx.stroke();
+      cx.globalAlpha = r.alpha * 0.15;
+      cx.fillStyle = '#fff'; cx.beginPath(); cx.arc(r.x, r.y, r.r * 0.7, 0, Math.PI * 2); cx.fill();
+      cx.restore();
+    }
+    cx.globalAlpha = 1;
+
+    // floats
+    for (var fi = 0; fi < floats.length; fi++) {
+      var fl = floats[fi];
+      var a = Math.max(0, 1 - fl.t / 42);
+      cx.save(); cx.globalAlpha = a;
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.35) + 'px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText(fl.txt, W / 2, fl.y - fl.t * 1.1);
+      cx.restore();
+    }
+    cx.globalAlpha = 1;
+
+    drawUI();
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

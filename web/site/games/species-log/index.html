@@ -6,10 +6,13 @@
 <title>Species Log — Tilt</title>
 <!--
   LOOP / attention-architecture — Species Log
-  Engine: calm. Circuits: 06-zeigarnik, 05-ease, 02-novelty.
+  Circuits: 06 zeigarnik, 05 ease, 02 novelty.
+  Calm engine: no dares, no tension riser, no death. Complete the field guide.
   Modes:
-    ?demo=1&seed=7    scripted calm arc ~16s → soft CTA → window.__demoDone
-    ?bot=1&runs=N     imperfect autopilot, N runs → window.__botDone
+    ?demo=1&seed=7        scripted calm arc → soft CTA, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay, completes guide each run, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution
+    ?sink=URL             event sink override
 -->
 <style>
   html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
@@ -30,11 +33,12 @@
   var W = 405, H = 720;
   var qs = new URLSearchParams(location.search);
   var DEMO = qs.get('demo') === '1';
-  var BOT  = qs.get('bot')  === '1';
+  var BOT  = qs.get('bot') === '1';
   var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 22;
   var SEED = +qs.get('seed') || 42;
 
-  // mulberry32 seeded RNG
+  // deterministic RNG
   function mulberry32(a) {
     return function () {
       a |= 0; a = a + 0x6D2B79F5 | 0;
@@ -44,588 +48,281 @@
     };
   }
   var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
 
   var cv = document.getElementById('c'), cx = cv.getContext('2d');
   var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
   function fit() {
     var vw = window.innerWidth, vh = window.innerHeight;
     scale = Math.min(vw / W, vh / H);
-    cv.style.width  = (W * scale) + 'px';
-    cv.style.height = (H * scale) + 'px';
-    cv.width  = W * dpr;
-    cv.height = H * dpr;
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
     cx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
   window.addEventListener('resize', fit); fit();
 
-  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
-  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
-  var SHARE_R = { x: W / 2 - 130, y: 490, w: 260, h: 48 };
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134', MIST = 'rgba(255,255,255,0.12)';
+  var BAND_TOP = 170, BAND_H = 280, BAND_CY = BAND_TOP + BAND_H / 2;
 
-  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
-
-  // 15 species silhouettes — drawn with pure canvas paths
-  // Each has: name, drawFn(cx, cx_center, cy_center, size, alpha)
-  var SPECIES = [
-    { name: 'Great Blue Heron',  draw: drawHeron },
-    { name: 'Snowy Owl',         draw: drawOwl },
-    { name: 'Bald Eagle',        draw: drawEagle },
-    { name: 'Mallard Duck',      draw: drawDuck },
-    { name: 'Painted Bunting',   draw: drawBunting },
-    { name: 'Red Fox',           draw: drawFox },
-    { name: 'White-tail Deer',   draw: drawDeer },
-    { name: 'River Otter',       draw: drawOtter },
-    { name: 'Eastern Bluebird',  draw: drawBluebird },
-    { name: 'Wild Turkey',       draw: drawTurkey },
-    { name: 'Luna Moth',         draw: drawMoth },
-    { name: 'Black Bear Cub',    draw: drawBearCub },
-    { name: 'Monarch Butterfly', draw: drawButterfly },
-    { name: 'Roseate Spoonbill', draw: drawSpoonbill },
-    { name: 'Northern Cardinal', draw: drawCardinal }
+  // ---- species silhouettes (drawn with the caller's fillStyle) ----
+  var species = [
+    { name: 'Warbler', w: 48, h: 32,
+      draw: function (cx) {
+        cx.beginPath(); cx.ellipse(0, 4, 16, 10, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.arc(14, -2, 7, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.moveTo(20, -2); cx.lineTo(28, -6); cx.lineTo(20, 2); cx.closePath(); cx.fill();
+        cx.beginPath(); cx.moveTo(-6, 0); cx.quadraticCurveTo(4, -14, 16, -2); cx.quadraticCurveTo(6, -6, -6, 0); cx.fill();
+      } },
+    { name: 'Rabbit', w: 40, h: 56,
+      draw: function (cx) {
+        cx.beginPath(); cx.ellipse(0, 14, 17, 14, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(-8, -16, 6, 20, -0.15, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(8, -16, 6, 20, 0.15, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.arc(16, 18, 6, 0, Math.PI * 2); cx.fill();
+      } },
+    { name: 'Fox', w: 68, h: 42,
+      draw: function (cx) {
+        cx.beginPath(); cx.ellipse(0, 8, 28, 15, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(24, 2, 11, 10, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.moveTo(28, -6); cx.lineTo(36, -14); cx.lineTo(34, -2); cx.closePath(); cx.fill();
+        cx.beginPath(); cx.moveTo(22, -8); cx.lineTo(26, -16); cx.lineTo(30, -6); cx.closePath(); cx.fill();
+        cx.beginPath(); cx.moveTo(-24, 8); cx.quadraticCurveTo(-42, -18, -34, 24); cx.quadraticCurveTo(-26, 24, -18, 14); cx.fill();
+      } },
+    { name: 'Deer', w: 54, h: 78,
+      draw: function (cx) {
+        cx.beginPath(); cx.ellipse(0, 22, 20, 16, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(14, 2, 8, 16, -0.2, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(22, -12, 10, 9, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.moveTo(18, -20); cx.lineTo(14, -36); cx.lineTo(24, -22); cx.closePath(); cx.fill();
+        cx.beginPath(); cx.moveTo(26, -20); cx.lineTo(32, -34); cx.lineTo(36, -18); cx.closePath(); cx.fill();
+        cx.beginPath(); cx.ellipse(-2, -18, 4, 12, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(10, -18, 4, 12, 0, 0, Math.PI * 2); cx.fill();
+      } },
+    { name: 'Owl', w: 52, h: 58,
+      draw: function (cx) {
+        cx.beginPath(); cx.ellipse(0, 4, 22, 24, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.moveTo(-18, -18); cx.lineTo(-24, -30); cx.lineTo(-10, -22); cx.closePath(); cx.fill();
+        cx.beginPath(); cx.moveTo(18, -18); cx.lineTo(24, -30); cx.lineTo(10, -22); cx.closePath(); cx.fill();
+        var old = cx.fillStyle;
+        cx.fillStyle = INK;
+        cx.beginPath(); cx.arc(-10, 2, 7, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.arc(10, 2, 7, 0, Math.PI * 2); cx.fill();
+        cx.fillStyle = old;
+        cx.beginPath(); cx.moveTo(-4, 10); cx.lineTo(0, 16); cx.lineTo(4, 10); cx.closePath(); cx.fill();
+      } },
+    { name: 'Turtle', w: 66, h: 36,
+      draw: function (cx) {
+        cx.beginPath(); cx.ellipse(0, 0, 28, 15, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(28, 0, 9, 7, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(-22, -14, 7, 5, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(-22, 14, 7, 5, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(14, -14, 7, 5, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(14, 14, 7, 5, 0, 0, Math.PI * 2); cx.fill();
+      } },
+    { name: 'Heron', w: 50, h: 96,
+      draw: function (cx) {
+        cx.beginPath(); cx.moveTo(-4, 44); cx.lineTo(-4, -20); cx.quadraticCurveTo(-14, -34, -8, -44); cx.lineTo(8, -44); cx.quadraticCurveTo(14, -34, 4, -20); cx.lineTo(4, 44); cx.fill();
+        cx.beginPath(); cx.moveTo(-4, 44); cx.lineTo(-10, 72); cx.lineTo(-2, 72); cx.lineTo(-2, 44); cx.fill();
+        cx.beginPath(); cx.moveTo(4, 44); cx.lineTo(10, 72); cx.lineTo(2, 72); cx.lineTo(2, 44); cx.fill();
+        cx.beginPath(); cx.moveTo(8, -44); cx.lineTo(22, -50); cx.lineTo(12, -38); cx.closePath(); cx.fill();
+      } },
+    { name: 'Bear', w: 70, h: 54,
+      draw: function (cx) {
+        cx.beginPath(); cx.ellipse(0, 8, 30, 20, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(22, -6, 13, 12, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.arc(16, -18, 6, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.arc(30, -18, 6, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.arc(-26, 6, 9, 0, Math.PI * 2); cx.fill();
+      } },
+    { name: 'Frog', w: 56, h: 40,
+      draw: function (cx) {
+        cx.beginPath(); cx.ellipse(0, 4, 22, 16, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.arc(-14, -12, 8, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.arc(14, -12, 8, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(-24, 16, 9, 6, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(24, 16, 9, 6, 0, 0, Math.PI * 2); cx.fill();
+      } },
+    { name: 'Butterfly', w: 58, h: 46,
+      draw: function (cx) {
+        cx.beginPath(); cx.moveTo(0, -18); cx.bezierCurveTo(24, -34, 42, -10, 0, 6); cx.bezierCurveTo(-42, -10, -24, -34, 0, -18); cx.fill();
+        cx.beginPath(); cx.moveTo(0, 6); cx.bezierCurveTo(20, 28, 36, 18, 0, 26); cx.bezierCurveTo(-36, 18, -20, 28, 0, 6); cx.fill();
+        cx.beginPath(); cx.ellipse(0, 0, 2, 18, 0, 0, Math.PI * 2); cx.fill();
+      } },
+    { name: 'Fish', w: 68, h: 30,
+      draw: function (cx) {
+        cx.beginPath(); cx.ellipse(0, 0, 26, 12, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.moveTo(24, 0); cx.lineTo(40, -12); cx.lineTo(40, 12); cx.closePath(); cx.fill();
+        cx.beginPath(); cx.moveTo(-4, -10); cx.lineTo(8, -18); cx.lineTo(10, -8); cx.closePath(); cx.fill();
+      } },
+    { name: 'Squirrel', w: 56, h: 60,
+      draw: function (cx) {
+        cx.beginPath(); cx.ellipse(0, 12, 18, 16, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(16, 0, 11, 10, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.moveTo(22, -6); cx.lineTo(28, -14); cx.lineTo(26, -2); cx.closePath(); cx.fill();
+        cx.beginPath(); cx.moveTo(-14, 6); cx.quadraticCurveTo(-36, -26, -26, 28); cx.quadraticCurveTo(-18, 28, -10, 18); cx.fill();
+      } },
+    { name: 'Duck', w: 58, h: 42,
+      draw: function (cx) {
+        cx.beginPath(); cx.ellipse(0, 8, 24, 15, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(20, -4, 10, 10, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.moveTo(28, -4); cx.lineTo(40, -8); cx.lineTo(28, 0); cx.closePath(); cx.fill();
+        cx.beginPath(); cx.ellipse(-18, 4, 9, 5, 0.3, 0, Math.PI * 2); cx.fill();
+      } },
+    { name: 'Snake', w: 70, h: 22,
+      draw: function (cx) {
+        cx.beginPath();
+        cx.moveTo(-32, -4); cx.bezierCurveTo(-16, -14, -8, 6, 0, -4);
+        cx.bezierCurveTo(8, -12, 20, 4, 32, -4);
+        cx.bezierCurveTo(36, -8, 38, 0, 32, 6);
+        cx.bezierCurveTo(18, 12, 6, -2, -2, 6);
+        cx.bezierCurveTo(-14, 14, -24, 2, -32, 6);
+        cx.bezierCurveTo(-36, 2, -36, -6, -32, -4);
+        cx.fill();
+      } },
+    { name: 'Wolf', w: 72, h: 50,
+      draw: function (cx) {
+        cx.beginPath(); cx.ellipse(0, 10, 30, 18, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.ellipse(26, -2, 13, 11, 0, 0, Math.PI * 2); cx.fill();
+        cx.beginPath(); cx.moveTo(34, -8); cx.lineTo(42, -18); cx.lineTo(38, -2); cx.closePath(); cx.fill();
+        cx.beginPath(); cx.moveTo(24, -10); cx.lineTo(28, -20); cx.lineTo(32, -8); cx.closePath(); cx.fill();
+        cx.beginPath(); cx.moveTo(-26, 8); cx.quadraticCurveTo(-44, -14, -36, 22); cx.quadraticCurveTo(-28, 22, -20, 14); cx.fill();
+      } }
   ];
 
-  // --- silhouette draw functions (pure canvas, no images) ---
-  function drawHeron(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    cx2.beginPath();
-    // body
-    cx2.ellipse(cx2x, cy + sz * 0.1, sz * 0.18, sz * 0.32, -0.2, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // long neck + head
-    cx2.beginPath();
-    cx2.moveTo(cx2x - sz * 0.05, cy - sz * 0.15);
-    cx2.quadraticCurveTo(cx2x - sz * 0.25, cy - sz * 0.45, cx2x - sz * 0.1, cy - sz * 0.62);
-    cx2.lineTo(cx2x + sz * 0.05, cy - sz * 0.58);
-    cx2.lineTo(cx2x + sz * 0.18, cy - sz * 0.62); // beak
-    cx2.lineTo(cx2x + sz * 0.06, cy - sz * 0.56);
-    cx2.quadraticCurveTo(cx2x, cy - sz * 0.42, cx2x + sz * 0.05, cy - sz * 0.18);
-    cx2.closePath(); cx2.fill(); cx2.stroke();
-    // long legs
-    cx2.beginPath();
-    cx2.moveTo(cx2x - sz * 0.06, cy + sz * 0.4); cx2.lineTo(cx2x - sz * 0.08, cy + sz * 0.72);
-    cx2.moveTo(cx2x + sz * 0.06, cy + sz * 0.4); cx2.lineTo(cx2x + sz * 0.08, cy + sz * 0.72);
-    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 2; cx2.stroke();
-    cx2.restore();
-  }
-
-  function drawOwl(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    // round body
-    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.15, sz * 0.28, sz * 0.38, 0, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // round head
-    cx2.beginPath(); cx2.arc(cx2x, cy - sz * 0.2, sz * 0.22, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // ear tufts
-    cx2.beginPath();
-    cx2.moveTo(cx2x - sz * 0.1, cy - sz * 0.38); cx2.lineTo(cx2x - sz * 0.16, cy - sz * 0.52); cx2.lineTo(cx2x - sz * 0.04, cy - sz * 0.4);
-    cx2.fillStyle = '#2ec5b6'; cx2.fill();
-    cx2.beginPath();
-    cx2.moveTo(cx2x + sz * 0.1, cy - sz * 0.38); cx2.lineTo(cx2x + sz * 0.16, cy - sz * 0.52); cx2.lineTo(cx2x + sz * 0.04, cy - sz * 0.4);
-    cx2.fill();
-    // eyes
-    cx2.fillStyle = INK;
-    cx2.beginPath(); cx2.arc(cx2x - sz * 0.09, cy - sz * 0.18, sz * 0.06, 0, Math.PI * 2); cx2.fill();
-    cx2.beginPath(); cx2.arc(cx2x + sz * 0.09, cy - sz * 0.18, sz * 0.06, 0, Math.PI * 2); cx2.fill();
-    cx2.restore();
-  }
-
-  function drawEagle(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    // body
-    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.05, sz * 0.2, sz * 0.3, 0, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // wings spread wide
-    cx2.beginPath();
-    cx2.moveTo(cx2x, cy);
-    cx2.bezierCurveTo(cx2x - sz * 0.2, cy - sz * 0.15, cx2x - sz * 0.52, cy - sz * 0.08, cx2x - sz * 0.62, cy + sz * 0.08);
-    cx2.bezierCurveTo(cx2x - sz * 0.5, cy, cx2x - sz * 0.25, cy + sz * 0.05, cx2x, cy + sz * 0.1);
-    cx2.fill(); cx2.stroke();
-    cx2.beginPath();
-    cx2.moveTo(cx2x, cy);
-    cx2.bezierCurveTo(cx2x + sz * 0.2, cy - sz * 0.15, cx2x + sz * 0.52, cy - sz * 0.08, cx2x + sz * 0.62, cy + sz * 0.08);
-    cx2.bezierCurveTo(cx2x + sz * 0.5, cy, cx2x + sz * 0.25, cy + sz * 0.05, cx2x, cy + sz * 0.1);
-    cx2.fill(); cx2.stroke();
-    // head + beak
-    cx2.fillStyle = '#cceae8';
-    cx2.beginPath(); cx2.arc(cx2x, cy - sz * 0.3, sz * 0.14, 0, Math.PI * 2); cx2.fill(); cx2.stroke();
-    cx2.beginPath();
-    cx2.moveTo(cx2x + sz * 0.08, cy - sz * 0.28); cx2.lineTo(cx2x + sz * 0.22, cy - sz * 0.22); cx2.lineTo(cx2x + sz * 0.07, cy - sz * 0.18);
-    cx2.fill();
-    cx2.restore();
-  }
-
-  function drawDuck(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    // body on water
-    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.15, sz * 0.3, sz * 0.22, 0.15, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // head
-    cx2.beginPath(); cx2.arc(cx2x + sz * 0.18, cy - sz * 0.08, sz * 0.14, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // bill
-    cx2.beginPath();
-    cx2.moveTo(cx2x + sz * 0.29, cy - sz * 0.06); cx2.lineTo(cx2x + sz * 0.45, cy - sz * 0.04); cx2.lineTo(cx2x + sz * 0.3, cy + sz * 0.02);
-    cx2.fillStyle = GOLD; cx2.fill();
-    // tail curl
-    cx2.beginPath();
-    cx2.moveTo(cx2x - sz * 0.26, cy + sz * 0.04);
-    cx2.quadraticCurveTo(cx2x - sz * 0.38, cy - sz * 0.18, cx2x - sz * 0.22, cy - sz * 0.22);
-    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 2; cx2.stroke();
-    cx2.restore();
-  }
-
-  function drawBunting(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    // plump body
-    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.05, sz * 0.2, sz * 0.26, 0, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // head
-    cx2.beginPath(); cx2.arc(cx2x + sz * 0.08, cy - sz * 0.24, sz * 0.14, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // short beak
-    cx2.beginPath();
-    cx2.moveTo(cx2x + sz * 0.2, cy - sz * 0.25); cx2.lineTo(cx2x + sz * 0.32, cy - sz * 0.22); cx2.lineTo(cx2x + sz * 0.2, cy - sz * 0.18);
-    cx2.fillStyle = GOLD; cx2.fill();
-    // perching feet
-    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    cx2.beginPath(); cx2.moveTo(cx2x - sz * 0.04, cy + sz * 0.3); cx2.lineTo(cx2x - sz * 0.04, cy + sz * 0.42); cx2.stroke();
-    cx2.beginPath(); cx2.moveTo(cx2x + sz * 0.04, cy + sz * 0.3); cx2.lineTo(cx2x + sz * 0.04, cy + sz * 0.42); cx2.stroke();
-    cx2.restore();
-  }
-
-  function drawFox(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    // body
-    cx2.beginPath(); cx2.ellipse(cx2x - sz * 0.05, cy + sz * 0.12, sz * 0.28, sz * 0.2, 0.2, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // head
-    cx2.beginPath(); cx2.arc(cx2x + sz * 0.22, cy - sz * 0.1, sz * 0.18, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // pointed ears
-    cx2.beginPath();
-    cx2.moveTo(cx2x + sz * 0.12, cy - sz * 0.25); cx2.lineTo(cx2x + sz * 0.06, cy - sz * 0.46); cx2.lineTo(cx2x + sz * 0.2, cy - sz * 0.3);
-    cx2.fill();
-    cx2.beginPath();
-    cx2.moveTo(cx2x + sz * 0.28, cy - sz * 0.25); cx2.lineTo(cx2x + sz * 0.34, cy - sz * 0.46); cx2.lineTo(cx2x + sz * 0.38, cy - sz * 0.28);
-    cx2.fill();
-    // snout
-    cx2.beginPath();
-    cx2.moveTo(cx2x + sz * 0.36, cy - sz * 0.07); cx2.lineTo(cx2x + sz * 0.48, cy - sz * 0.04); cx2.lineTo(cx2x + sz * 0.36, cy + sz * 0.01);
-    cx2.fill();
-    // fluffy tail
-    cx2.beginPath();
-    cx2.moveTo(cx2x - sz * 0.3, cy + sz * 0.08);
-    cx2.bezierCurveTo(cx2x - sz * 0.55, cy + sz * 0.0, cx2x - sz * 0.6, cy - sz * 0.28, cx2x - sz * 0.44, cy - sz * 0.36);
-    cx2.bezierCurveTo(cx2x - sz * 0.32, cy - sz * 0.3, cx2x - sz * 0.38, cy - sz * 0.1, cx2x - sz * 0.26, cy + sz * 0.04);
-    cx2.fill(); cx2.stroke();
-    cx2.restore();
-  }
-
-  function drawDeer(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    // body
-    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.1, sz * 0.26, sz * 0.22, 0, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // neck + head
-    cx2.beginPath(); cx2.moveTo(cx2x + sz * 0.12, cy - sz * 0.1);
-    cx2.lineTo(cx2x + sz * 0.18, cy - sz * 0.38); cx2.arc(cx2x + sz * 0.18, cy - sz * 0.5, sz * 0.14, Math.PI / 2, -Math.PI / 2, true);
-    cx2.lineTo(cx2x + sz * 0.04, cy - sz * 0.38); cx2.closePath(); cx2.fill(); cx2.stroke();
-    // antlers
-    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 2;
-    cx2.beginPath(); cx2.moveTo(cx2x + sz * 0.08, cy - sz * 0.6);
-    cx2.lineTo(cx2x - sz * 0.04, cy - sz * 0.82); cx2.moveTo(cx2x - sz * 0.04, cy - sz * 0.75);
-    cx2.lineTo(cx2x - sz * 0.14, cy - sz * 0.78); cx2.stroke();
-    cx2.beginPath(); cx2.moveTo(cx2x + sz * 0.28, cy - sz * 0.6);
-    cx2.lineTo(cx2x + sz * 0.4, cy - sz * 0.82); cx2.moveTo(cx2x + sz * 0.4, cy - sz * 0.75);
-    cx2.lineTo(cx2x + sz * 0.5, cy - sz * 0.78); cx2.stroke();
-    // legs
-    cx2.lineWidth = 2;
-    [[-0.14, 0], [-0.06, 0], [0.06, 0], [0.14, 0]].forEach(function(l) {
-      cx2.beginPath(); cx2.moveTo(cx2x + l[0] * sz, cy + sz * 0.3); cx2.lineTo(cx2x + l[0] * sz, cy + sz * 0.62); cx2.stroke();
-    });
-    cx2.restore();
-  }
-
-  function drawOtter(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    // long body (streamlined)
-    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.05, sz * 0.36, sz * 0.18, 0.1, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // head
-    cx2.beginPath(); cx2.arc(cx2x + sz * 0.3, cy - sz * 0.04, sz * 0.15, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // nose dot
-    cx2.fillStyle = '#2ec5b6';
-    cx2.beginPath(); cx2.arc(cx2x + sz * 0.42, cy - sz * 0.04, sz * 0.04, 0, Math.PI * 2); cx2.fill();
-    // tail
-    cx2.fillStyle = '#cceae8';
-    cx2.beginPath();
-    cx2.moveTo(cx2x - sz * 0.34, cy + sz * 0.06);
-    cx2.bezierCurveTo(cx2x - sz * 0.54, cy + sz * 0.08, cx2x - sz * 0.58, cy + sz * 0.22, cx2x - sz * 0.46, cy + sz * 0.28);
-    cx2.bezierCurveTo(cx2x - sz * 0.4, cy + sz * 0.22, cx2x - sz * 0.44, cy + sz * 0.14, cx2x - sz * 0.3, cy + sz * 0.1);
-    cx2.fill(); cx2.stroke();
-    cx2.restore();
-  }
-
-  function drawBluebird(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    // perched body
-    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.05, sz * 0.16, sz * 0.22, 0, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // head
-    cx2.beginPath(); cx2.arc(cx2x, cy - sz * 0.2, sz * 0.13, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // wing fold
-    cx2.beginPath();
-    cx2.moveTo(cx2x - sz * 0.14, cy);
-    cx2.bezierCurveTo(cx2x - sz * 0.28, cy + sz * 0.05, cx2x - sz * 0.3, cy + sz * 0.18, cx2x - sz * 0.14, cy + sz * 0.2);
-    cx2.stroke();
-    // beak
-    cx2.beginPath();
-    cx2.moveTo(cx2x + sz * 0.11, cy - sz * 0.2); cx2.lineTo(cx2x + sz * 0.24, cy - sz * 0.18); cx2.lineTo(cx2x + sz * 0.11, cy - sz * 0.14);
-    cx2.fillStyle = GOLD; cx2.fill();
-    // feet
-    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    cx2.beginPath(); cx2.moveTo(cx2x - sz * 0.04, cy + sz * 0.26); cx2.lineTo(cx2x - sz * 0.04, cy + sz * 0.38); cx2.stroke();
-    cx2.beginPath(); cx2.moveTo(cx2x + sz * 0.04, cy + sz * 0.26); cx2.lineTo(cx2x + sz * 0.04, cy + sz * 0.38); cx2.stroke();
-    cx2.restore();
-  }
-
-  function drawTurkey(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    // fan tail
-    cx2.beginPath();
-    for (var i = -4; i <= 4; i++) {
-      var angle = (i / 4) * 0.7 - Math.PI / 2;
-      cx2.moveTo(cx2x - sz * 0.05, cy + sz * 0.1);
-      cx2.lineTo(cx2x - sz * 0.05 + Math.cos(angle) * sz * 0.45, cy + sz * 0.1 + Math.sin(angle) * sz * 0.45);
-    }
-    cx2.stroke();
-    // body
-    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.12, sz * 0.22, sz * 0.28, 0, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // small head on neck
-    cx2.beginPath(); cx2.arc(cx2x + sz * 0.15, cy - sz * 0.2, sz * 0.1, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // wattle
-    cx2.fillStyle = '#e07070';
-    cx2.beginPath(); cx2.ellipse(cx2x + sz * 0.22, cy - sz * 0.14, sz * 0.04, sz * 0.07, 0.3, 0, Math.PI * 2);
-    cx2.fill();
-    cx2.restore();
-  }
-
-  function drawMoth(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    // upper wings
-    cx2.beginPath();
-    cx2.moveTo(cx2x, cy);
-    cx2.bezierCurveTo(cx2x - sz * 0.1, cy - sz * 0.22, cx2x - sz * 0.42, cy - sz * 0.28, cx2x - sz * 0.48, cy + sz * 0.04);
-    cx2.bezierCurveTo(cx2x - sz * 0.36, cy + sz * 0.14, cx2x - sz * 0.14, cy + sz * 0.12, cx2x, cy);
-    cx2.fill(); cx2.stroke();
-    cx2.beginPath();
-    cx2.moveTo(cx2x, cy);
-    cx2.bezierCurveTo(cx2x + sz * 0.1, cy - sz * 0.22, cx2x + sz * 0.42, cy - sz * 0.28, cx2x + sz * 0.48, cy + sz * 0.04);
-    cx2.bezierCurveTo(cx2x + sz * 0.36, cy + sz * 0.14, cx2x + sz * 0.14, cy + sz * 0.12, cx2x, cy);
-    cx2.fill(); cx2.stroke();
-    // lower wings (smaller)
-    cx2.beginPath();
-    cx2.moveTo(cx2x, cy + sz * 0.04);
-    cx2.bezierCurveTo(cx2x - sz * 0.08, cy + sz * 0.1, cx2x - sz * 0.3, cy + sz * 0.28, cx2x - sz * 0.24, cy + sz * 0.36);
-    cx2.bezierCurveTo(cx2x - sz * 0.12, cy + sz * 0.3, cx2x - sz * 0.04, cy + sz * 0.18, cx2x, cy + sz * 0.06);
-    cx2.fill(); cx2.stroke();
-    cx2.beginPath();
-    cx2.moveTo(cx2x, cy + sz * 0.04);
-    cx2.bezierCurveTo(cx2x + sz * 0.08, cy + sz * 0.1, cx2x + sz * 0.3, cy + sz * 0.28, cx2x + sz * 0.24, cy + sz * 0.36);
-    cx2.bezierCurveTo(cx2x + sz * 0.12, cy + sz * 0.3, cx2x + sz * 0.04, cy + sz * 0.18, cx2x, cy + sz * 0.06);
-    cx2.fill(); cx2.stroke();
-    // body
-    cx2.fillStyle = '#2ec5b6';
-    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.14, sz * 0.04, sz * 0.2, 0, 0, Math.PI * 2); cx2.fill();
-    // antennae
-    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    cx2.beginPath(); cx2.moveTo(cx2x, cy - sz * 0.04);
-    cx2.quadraticCurveTo(cx2x - sz * 0.12, cy - sz * 0.28, cx2x - sz * 0.08, cy - sz * 0.4); cx2.stroke();
-    cx2.beginPath(); cx2.moveTo(cx2x, cy - sz * 0.04);
-    cx2.quadraticCurveTo(cx2x + sz * 0.12, cy - sz * 0.28, cx2x + sz * 0.08, cy - sz * 0.4); cx2.stroke();
-    cx2.restore();
-  }
-
-  function drawBearCub(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    // round body
-    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.14, sz * 0.26, sz * 0.3, 0, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // head
-    cx2.beginPath(); cx2.arc(cx2x, cy - sz * 0.18, sz * 0.22, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // round ears
-    cx2.beginPath(); cx2.arc(cx2x - sz * 0.18, cy - sz * 0.38, sz * 0.09, 0, Math.PI * 2); cx2.fill(); cx2.stroke();
-    cx2.beginPath(); cx2.arc(cx2x + sz * 0.18, cy - sz * 0.38, sz * 0.09, 0, Math.PI * 2); cx2.fill(); cx2.stroke();
-    // snout
-    cx2.beginPath(); cx2.ellipse(cx2x, cy - sz * 0.1, sz * 0.1, sz * 0.07, 0, 0, Math.PI * 2); cx2.fill(); cx2.stroke();
-    // eyes
-    cx2.fillStyle = INK;
-    cx2.beginPath(); cx2.arc(cx2x - sz * 0.09, cy - sz * 0.2, sz * 0.04, 0, Math.PI * 2); cx2.fill();
-    cx2.beginPath(); cx2.arc(cx2x + sz * 0.09, cy - sz * 0.2, sz * 0.04, 0, Math.PI * 2); cx2.fill();
-    // stubs legs
-    cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6';
-    cx2.beginPath(); cx2.ellipse(cx2x - sz * 0.16, cy + sz * 0.42, sz * 0.1, sz * 0.08, 0, 0, Math.PI * 2); cx2.fill(); cx2.stroke();
-    cx2.beginPath(); cx2.ellipse(cx2x + sz * 0.16, cy + sz * 0.42, sz * 0.1, sz * 0.08, 0, 0, Math.PI * 2); cx2.fill(); cx2.stroke();
-    cx2.restore();
-  }
-
-  function drawButterfly(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    // upper wings (large)
-    cx2.beginPath();
-    cx2.moveTo(cx2x, cy);
-    cx2.bezierCurveTo(cx2x - sz * 0.06, cy - sz * 0.18, cx2x - sz * 0.38, cy - sz * 0.32, cx2x - sz * 0.44, cy - sz * 0.06);
-    cx2.bezierCurveTo(cx2x - sz * 0.38, cy + sz * 0.1, cx2x - sz * 0.1, cy + sz * 0.08, cx2x, cy);
-    cx2.fill(); cx2.stroke();
-    cx2.beginPath();
-    cx2.moveTo(cx2x, cy);
-    cx2.bezierCurveTo(cx2x + sz * 0.06, cy - sz * 0.18, cx2x + sz * 0.38, cy - sz * 0.32, cx2x + sz * 0.44, cy - sz * 0.06);
-    cx2.bezierCurveTo(cx2x + sz * 0.38, cy + sz * 0.1, cx2x + sz * 0.1, cy + sz * 0.08, cx2x, cy);
-    cx2.fill(); cx2.stroke();
-    // lower wings (smaller, rounder)
-    cx2.beginPath();
-    cx2.moveTo(cx2x, cy + sz * 0.04);
-    cx2.bezierCurveTo(cx2x - sz * 0.06, cy + sz * 0.12, cx2x - sz * 0.32, cy + sz * 0.32, cx2x - sz * 0.22, cy + sz * 0.42);
-    cx2.bezierCurveTo(cx2x - sz * 0.1, cy + sz * 0.38, cx2x - sz * 0.02, cy + sz * 0.2, cx2x, cy + sz * 0.06);
-    cx2.fill(); cx2.stroke();
-    cx2.beginPath();
-    cx2.moveTo(cx2x, cy + sz * 0.04);
-    cx2.bezierCurveTo(cx2x + sz * 0.06, cy + sz * 0.12, cx2x + sz * 0.32, cy + sz * 0.32, cx2x + sz * 0.22, cy + sz * 0.42);
-    cx2.bezierCurveTo(cx2x + sz * 0.1, cy + sz * 0.38, cx2x + sz * 0.02, cy + sz * 0.2, cx2x, cy + sz * 0.06);
-    cx2.fill(); cx2.stroke();
-    // body
-    cx2.fillStyle = '#2ec5b6';
-    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.18, sz * 0.04, sz * 0.24, 0, 0, Math.PI * 2); cx2.fill();
-    cx2.restore();
-  }
-
-  function drawSpoonbill(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    // body
-    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.12, sz * 0.2, sz * 0.3, 0, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // long S-curve neck + head
-    cx2.beginPath();
-    cx2.moveTo(cx2x - sz * 0.02, cy - sz * 0.16);
-    cx2.bezierCurveTo(cx2x - sz * 0.18, cy - sz * 0.35, cx2x + sz * 0.1, cy - sz * 0.55, cx2x - sz * 0.02, cy - sz * 0.66);
-    cx2.lineTo(cx2x + sz * 0.06, cy - sz * 0.62);
-    cx2.bezierCurveTo(cx2x + sz * 0.2, cy - sz * 0.5, cx2x - sz * 0.06, cy - sz * 0.3, cx2x + sz * 0.08, cy - sz * 0.14);
-    cx2.closePath(); cx2.fill(); cx2.stroke();
-    // spatula bill
-    cx2.beginPath();
-    cx2.moveTo(cx2x - sz * 0.04, cy - sz * 0.64);
-    cx2.bezierCurveTo(cx2x - sz * 0.12, cy - sz * 0.78, cx2x - sz * 0.12, cy - sz * 0.86, cx2x, cy - sz * 0.86);
-    cx2.bezierCurveTo(cx2x + sz * 0.12, cy - sz * 0.86, cx2x + sz * 0.12, cy - sz * 0.78, cx2x + sz * 0.04, cy - sz * 0.64);
-    cx2.fill(); cx2.stroke();
-    // legs
-    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 2;
-    cx2.beginPath(); cx2.moveTo(cx2x - sz * 0.06, cy + sz * 0.4); cx2.lineTo(cx2x - sz * 0.08, cy + sz * 0.72); cx2.stroke();
-    cx2.beginPath(); cx2.moveTo(cx2x + sz * 0.06, cy + sz * 0.4); cx2.lineTo(cx2x + sz * 0.08, cy + sz * 0.72); cx2.stroke();
-    cx2.restore();
-  }
-
-  function drawCardinal(cx2, cx2x, cy, sz, a) {
-    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    // body
-    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.05, sz * 0.18, sz * 0.24, 0, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // head with crest
-    cx2.beginPath(); cx2.arc(cx2x + sz * 0.06, cy - sz * 0.2, sz * 0.15, 0, Math.PI * 2);
-    cx2.fill(); cx2.stroke();
-    // pointed crest
-    cx2.beginPath();
-    cx2.moveTo(cx2x + sz * 0.04, cy - sz * 0.32); cx2.lineTo(cx2x + sz * 0.08, cy - sz * 0.52); cx2.lineTo(cx2x + sz * 0.16, cy - sz * 0.34);
-    cx2.fill();
-    // cone beak
-    cx2.beginPath();
-    cx2.moveTo(cx2x + sz * 0.18, cy - sz * 0.22); cx2.lineTo(cx2x + sz * 0.32, cy - sz * 0.18); cx2.lineTo(cx2x + sz * 0.18, cy - sz * 0.13);
-    cx2.fillStyle = GOLD; cx2.fill();
-    // tail
-    cx2.fillStyle = '#cceae8';
-    cx2.beginPath();
-    cx2.moveTo(cx2x - sz * 0.12, cy + sz * 0.18);
-    cx2.bezierCurveTo(cx2x - sz * 0.28, cy + sz * 0.1, cx2x - sz * 0.32, cy + sz * 0.3, cx2x - sz * 0.18, cy + sz * 0.38);
-    cx2.bezierCurveTo(cx2x - sz * 0.1, cy + sz * 0.3, cx2x - sz * 0.08, cy + sz * 0.22, cx2x - sz * 0.04, cy + sz * 0.18);
-    cx2.fill(); cx2.stroke();
-    // feet
-    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
-    cx2.beginPath(); cx2.moveTo(cx2x - sz * 0.04, cy + sz * 0.28); cx2.lineTo(cx2x - sz * 0.04, cy + sz * 0.4); cx2.stroke();
-    cx2.beginPath(); cx2.moveTo(cx2x + sz * 0.04, cy + sz * 0.28); cx2.lineTo(cx2x + sz * 0.04, cy + sz * 0.4); cx2.stroke();
-    cx2.restore();
-  }
-
-  // --- game state ---
-  var TOTAL_SPECIES = 15;
-  var logged = [];       // indices of logged species (in order)
-  var loggedSet = {};    // fast lookup
-  var cards = [];        // drifting cards on screen
-  var flashes = [];
-  var shakeAmt = 0, zoom = 1, hitStop = 0;
-  var phase, runStartTs;
-  var botRunsDone = 0, botTarget = null;
-  var ctaAt = 0, overAt = 0;
-  var sessionScore = 0;   // = number of species logged in this run
-  var demoStep = 0, demoWait = 0;
-  var demoWaits = [30, 22, 34, 26, 40, 18, 28, 36, 20, 24, 32, 14, 28, 22, 18];
-  var demoLog = []; // which to log in demo
-  // card dimensions
-  var CARD_W = 260, CARD_H = 130;
-  var CARD_SPAWN_X_RANGE = [80, W - 80];
-  var CARD_MIN_DY = 0.35, CARD_MAX_DY = 0.75;  // drift speed
-  var GUIDE_Y_BASE = H - 200;  // field guide log strip at bottom
-
-  function shuffleSpecies() {
-    // shuffle a copy using seeded rng
-    var arr = SPECIES.map(function(s, i) { return i; });
-    for (var i = arr.length - 1; i > 0; i--) {
-      var j = Math.floor(rng() * (i + 1));
-      var tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
-    }
-    return arr;
-  }
-  var speciesOrder = shuffleSpecies(); // shuffled order for this seed
-
-  function spawnCard() {
-    // pick a not-yet-logged species to show
-    var available = speciesOrder.filter(function(idx) { return !loggedSet[idx]; });
-    if (available.length === 0) return;
-    // also avoid duplicating cards already on screen
-    var onScreen = {};
-    cards.forEach(function(c) { onScreen[c.sIdx] = true; });
-    var pool = available.filter(function(idx) { return !onScreen[idx]; });
-    if (pool.length === 0) pool = available;
-    var sIdx = pool[Math.floor(rng() * pool.length)];
-    var cx2 = CARD_SPAWN_X_RANGE[0] + rng() * (CARD_SPAWN_X_RANGE[1] - CARD_SPAWN_X_RANGE[0]);
-    var dy = CARD_MIN_DY + rng() * (CARD_MAX_DY - CARD_MIN_DY);
-    cards.push({
-      sIdx: sIdx,
-      x: cx2,
-      y: -CARD_H / 2,
-      dy: dy,
-      hitRadius: Math.max(CARD_W, CARD_H) / 2,
-      // tween on log
-      logAnim: 0,    // 0 = normal, >0 = zooming to guide
-      logTarget: null
-    });
-  }
+  var state, active, floats, runStartTs, overAt, spawnTimer, botRunsDone, dareBeaten;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, ctaAt = 0, demoWait = 0, demoIdx = 0;
+  var botTarget = null, botWait = 0;
+  var bestTime = 0;
+  try { bestTime = +localStorage.getItem('sl_best_time') || 0; } catch (_) {}
 
   function newGame() {
-    logged = []; loggedSet = {}; cards = []; flashes = [];
-    shakeAmt = 0; zoom = 1; hitStop = 0; sessionScore = 0;
-    demoStep = 0; demoWait = 0; botRunsDone = 0; botTarget = null;
-    phase = 'title';
-    speciesOrder = shuffleSpecies();
-    demoLog = speciesOrder.slice(0, TOTAL_SPECIES);
-    if (BOT) {
-      phase = 'play';
-      runStartTs = Date.now();
-      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
-      spawnCard(); spawnCard();
-    } else if (DEMO) {
-      phase = 'play';
-      runStartTs = Date.now();
-      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
-      spawnCard(); spawnCard();
-    }
-  }
-
-  function logCard(card) {
-    if (loggedSet[card.sIdx]) return;
-    loggedSet[card.sIdx] = true;
-    logged.push(card.sIdx);
-    sessionScore = logged.length;
-    hitStop = 3;
-    zoom = 1.015;
-    if (window.J) J.calm(logged.length);
-    flash('+1  ' + SPECIES[card.sIdx].name, TEAL, 22);
-    if (window.LOOP) LOOP.emit('species_logged', { species: SPECIES[card.sIdx].name, n: logged.length });
-    // remove card from active
-    var idx = cards.indexOf(card);
-    if (idx >= 0) cards.splice(idx, 1);
-    // spawn replacement if more to find
-    if (logged.length < TOTAL_SPECIES) {
-      spawnCard();
-      if (cards.length < 2) spawnCard();
-    } else {
-      // guide complete!
-      endRun();
-    }
-  }
-
-  function endRun() {
-    phase = 'over';
-    overAt = performance.now();
-    zoom = 1.025;
-    if (window.J) J.calm(TOTAL_SPECIES + 1);
-    var dur = (Date.now() - runStartTs) / 1000;
-    window.__demoScore = sessionScore;
-    if (window.LOOP) LOOP.emit('game_over', { score: sessionScore, dur_s: +dur.toFixed(1) });
+    state = { phase: 'title', score: 0 };
+    active = [];
+    floats = [];
+    spawnTimer = 0;
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    dareBeaten = false; demoWait = 0; demoIdx = 0;
+    botTarget = null; botWait = 0; botRunsDone = 0;
+    for (var i = 0; i < species.length; i++) species[i].logged = false;
     if (DEMO) {
-      setTimeout(function () {
-        phase = 'cta'; ctaAt = performance.now();
+      demoWait = 40;
+      setTimeout(startRun, 1500);
+    } else if (BOT) {
+      startRun();
+    }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    spawnTimer = 12;
+    active = [];
+    floats = [];
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function unlogged() {
+    var out = [];
+    for (var i = 0; i < species.length; i++) if (!species[i].logged) out.push(species[i]);
+    return out;
+  }
+
+  function spawn() {
+    var pool = unlogged();
+    if (pool.length === 0 || active.length >= 4) return;
+    var sp = pool[Math.floor(rng() * pool.length)];
+    var y = BAND_CY + (rng() - 0.5) * (BAND_H * 0.65);
+    var vx = -(0.75 + rng() * 0.85);
+    active.push({ sp: sp, x: W + 60, y: y, vx: vx, rx: sp.w / 2, ry: sp.h / 2, scale: 1.0, born: performance.now() });
+    spawnTimer = 22 + rng() * 38;
+  }
+
+  function floatText(txt, color, size, x, y) {
+    floats.push({ txt: txt, color: color, size: size, x: x, y: y, t: 0 });
+  }
+
+  function logSpecies(sp) {
+    if (sp.logged) return;
+    sp.logged = true;
+    state.score++;
+    hitStop = 3;
+    zoom = 1.025;
+    shakeAmt = 1.8;
+    floatText('+1 ' + sp.name, TEAL, 34, W / 2, BAND_CY - 40);
+    if (window.J) J.calm(state.score);
+    if (window.LOOP) LOOP.emit('species_logged', { id: sp.name, name: sp.name, n: state.score });
+    for (var i = active.length - 1; i >= 0; i--) if (active[i].sp === sp) active.splice(i, 1);
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      floatText('DARE BEATEN', TEAL, 42, W / 2, BAND_CY - 80);
+      if (window.J) J.calm(species.length);
+      SHARE.beaten(state.score);
+    }
+    if (state.score >= species.length) gameOver();
+  }
+
+  function attemptLog(x, y) {
+    if (state.phase !== 'play') return false;
+    for (var i = active.length - 1; i >= 0; i--) {
+      var a = active[i];
+      var dx = (x - a.x) / a.rx;
+      var dy = (y - a.y) / a.ry;
+      if (dx * dx + dy * dy <= 1) {
+        if (a.sp.logged) { floatText('already logged', 'rgba(255,255,255,0.5)', 22, a.x, a.y - 30); return false; }
+        logSpecies(a.sp);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (bestTime === 0 || dur < bestTime) {
+      bestTime = dur;
+      try { localStorage.setItem('sl_best_time', String(bestTime.toFixed(2))); } catch (_) {}
+    }
+    if (window.J) J.calm(species.length);
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
         setTimeout(function () { window.__demoDone = true; }, 3500);
-      }, 2200);
+      }, 900);
     }
     if (BOT) {
       botRunsDone++;
-      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
-      else {
-        setTimeout(function () {
-          logged = []; loggedSet = {}; cards = []; sessionScore = 0;
-          speciesOrder = shuffleSpecies();
-          phase = 'play'; runStartTs = Date.now();
-          if (window.LOOP) LOOP.emit('restart', {});
-          spawnCard(); spawnCard();
-        }, 600);
-      }
+      if (botRunsDone >= BOT_RUNS) window.__botDone = true;
+      else setTimeout(resetRun, 800);
     }
   }
 
-  function flash(txt, color, size) {
-    flashes.push({ txt: txt, color: color, size: size, t: 0, x: W / 2, y: H / 2 - 60 });
+  function resetRun() {
+    state.score = 0;
+    for (var i = 0; i < species.length; i++) species[i].logged = false;
+    active = []; floats = []; dareBeaten = false; botTarget = null; botWait = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
   }
 
   // ---- input ----
-  function tap(px, py) {
+  var MUTE_R = { x: W - 48, y: 12, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 120, y: 512, w: 240, h: 44 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
     if (DEMO || BOT) return;
-    if (!px && !py) return; // keyboard (not used here)
-    if (phase !== 'play' && phase !== 'over' && phase !== 'title') return;
-    if (inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
-    if (phase === 'title') {
-      phase = 'play';
-      runStartTs = Date.now();
-      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
-      spawnCard(); spawnCard();
-      return;
-    }
-    if (phase === 'over') {
-      if (performance.now() - overAt < 400) return;
-      if (inR(SHARE_R, px, py) && window.SHARE) {
-        SHARE.send({ score: sessionScore, unit: 'species' }); return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { attemptLog(x, y); return; }
+    if (state.phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'species', text: 'I logged ' + state.score + ' species in Species Log — grow your guide:' });
+        return;
       }
-      // restart
-      logged = []; loggedSet = {}; cards = []; sessionScore = 0;
-      speciesOrder = shuffleSpecies();
-      phase = 'play'; runStartTs = Date.now();
-      if (window.LOOP) LOOP.emit('restart', {});
-      spawnCard(); spawnCard();
-      return;
-    }
-    if (phase === 'play') {
-      // check if tap hits any card
-      for (var i = cards.length - 1; i >= 0; i--) {
-        var c = cards[i];
-        var dx = px - c.x, dy = py - c.y;
-        if (Math.abs(dx) < CARD_W / 2 && Math.abs(dy) < CARD_H / 2) {
-          logCard(c); return;
-        }
-      }
+      resetRun();
     }
   }
 
@@ -633,245 +330,247 @@
     var r = cv.getBoundingClientRect();
     tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
   });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') attemptLog(W / 2, BAND_CY); });
 
-  // ---- autopilot (demo + bot) ----
-  function autopilot(dt) {
-    if (phase !== 'play') return;
+  // ---- autopilots ----
+  var demoWaits = [34, 28, 46, 40, 32, 50, 36, 44, 30, 52, 38, 42, 34, 48, 30];
+  function autopilot() {
+    if (state.phase !== 'play' || active.length === 0) return;
     if (DEMO) {
-      if (demoWait > 0) { demoWait -= dt; return; }
-      // log one species at a time via demo script
-      if (demoStep >= TOTAL_SPECIES) return;
-      // find a card for the next species to log
-      var wantIdx = demoLog[demoStep];
-      var target = null;
-      for (var i = 0; i < cards.length; i++) {
-        if (cards[i].sIdx === wantIdx) { target = cards[i]; break; }
-      }
-      if (target) {
-        logCard(target);
-        demoStep++;
-        demoWait = demoWaits[demoStep % demoWaits.length] || 28;
-      }
-      return;
-    }
-    if (BOT) {
-      // bot: tap the first card available after short wait, but miss 1 in 6 (imperfect)
-      if (botTarget === null) {
-        botTarget = 20 + rng() * 40; // wait frames before tapping
-      }
-      botTarget -= dt;
-      if (botTarget <= 0) {
-        botTarget = null;
-        if (cards.length > 0 && rng() > 0.16) {
-          // tap it
-          logCard(cards[0]);
+      if (demoWait > 0) { demoWait--; return; }
+      var pick = null;
+      for (var i = 0; i < active.length; i++) {
+        var a = active[i];
+        if (a.x > W / 2 - 40 && a.x < W / 2 + 90) {
+          if (!pick || a.x < pick.x) pick = a;
         }
-        // else miss (imperfect bot)
+      }
+      if (!pick) return;
+      attemptLog(pick.x, pick.y);
+      demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 40;
+      demoIdx++;
+    } else if (BOT) {
+      if (botWait > 0) { botWait--; return; }
+      if (!botTarget || botTarget.dead || active.indexOf(botTarget.sp) < 0) pickBotTarget();
+      if (!botTarget) return;
+      var sp = botTarget.sp;
+      var wantX = W / 2 + botTarget.offsetX;
+      if (sp.x > 100 && sp.x < W - 60 && Math.abs(sp.x - wantX) <= Math.abs(sp.vx) * 0.8) {
+        attemptLog(sp.x, sp.y);
+        botTarget = null;
+        botWait = 8 + Math.abs(gauss()) * 18;
+      } else if (sp.x < -70 || sp.x > W + 70) {
+        botTarget = null;
       }
     }
   }
+  function pickBotTarget() {
+    var best = null, bestD = Infinity;
+    for (var i = 0; i < active.length; i++) {
+      var a = active[i];
+      var d = Math.abs(a.x - W / 2);
+      if (d < bestD) { bestD = d; best = a; }
+    }
+    if (!best) { botTarget = null; return; }
+    botTarget = { sp: best, offsetX: gauss() * BOT_ERR, dead: false };
+  }
 
-  // ---- draw guide strip ----
+  // ---- render helpers ----
+  function drawSpecies(cx, sp, x, y, sc, alpha) {
+    cx.save();
+    cx.globalAlpha = alpha;
+    cx.translate(x, y);
+    cx.scale(sc, sc);
+    sp.draw(cx);
+    cx.restore();
+  }
+
   function drawGuide() {
-    // Bottom strip: shows filled slots
-    var stripH = 80, stripY = H - stripH - 10, slotSize = 44, gap = 4;
-    var totalW = TOTAL_SPECIES * (slotSize + gap) - gap;
-    var startX = (W - totalW) / 2;
-    cx.fillStyle = 'rgba(46,197,182,0.06)';
-    cx.beginPath();
-    if (cx.roundRect) cx.roundRect(startX - 8, stripY - 6, totalW + 16, stripH + 10, 12);
-    else cx.rect(startX - 8, stripY - 6, totalW + 16, stripH + 10);
-    cx.fill();
-
-    for (var i = 0; i < TOTAL_SPECIES; i++) {
-      var sx = startX + i * (slotSize + gap);
-      var sy = stripY + 6;
-      var filled = i < logged.length;
-      cx.strokeStyle = filled ? TEAL : 'rgba(46,197,182,0.3)';
-      cx.lineWidth = 1.5;
-      cx.beginPath();
-      if (cx.roundRect) cx.roundRect(sx, sy, slotSize, slotSize, 6);
-      else cx.rect(sx, sy, slotSize, slotSize);
-      cx.stroke();
-      if (filled) {
-        // draw tiny silhouette in slot
-        cx.save();
-        cx.beginPath();
-        if (cx.roundRect) cx.roundRect(sx, sy, slotSize, slotSize, 6);
-        else cx.rect(sx, sy, slotSize, slotSize);
-        cx.clip();
-        SPECIES[logged[i]].draw(cx, sx + slotSize / 2, sy + slotSize / 2, slotSize * 0.55, 0.9);
-        cx.restore();
+    var cols = 5, rows = 3, gw = W - 30, gh = 150, gx = 15, gy = H - 165;
+    var cellW = gw / cols, cellH = gh / rows;
+    cx.textAlign = 'center';
+    for (var i = 0; i < species.length; i++) {
+      var sp = species[i];
+      var c = i % cols, r = Math.floor(i / cols);
+      var cx0 = gx + c * cellW + cellW / 2;
+      var cy0 = gy + r * cellH + cellH / 2;
+      cx.strokeStyle = MIST; cx.lineWidth = 1;
+      cx.strokeRect(gx + c * cellW, gy + r * cellH, cellW - 4, cellH - 4);
+      if (sp.logged) {
+        cx.fillStyle = 'rgba(46,197,182,0.18)';
+        cx.fillRect(gx + c * cellW, gy + r * cellH, cellW - 4, cellH - 4);
+        cx.fillStyle = TEAL;
+        drawSpecies(cx, sp, cx0, cy0 - 4, 0.34, 1);
+        cx.fillStyle = 'rgba(255,255,255,0.55)';
+        cx.font = '600 10px -apple-system, Helvetica, Arial';
+        cx.fillText(sp.name, cx0, cy0 + 18);
+      } else {
+        cx.fillStyle = 'rgba(255,255,255,0.15)';
+        cx.font = '700 14px -apple-system, Helvetica, Arial';
+        cx.fillText(String(i + 1), cx0, cy0 + 4);
       }
     }
-    // label
-    cx.textAlign = 'center';
-    cx.fillStyle = 'rgba(46,197,182,0.6)';
-    cx.font = '600 11px -apple-system, Helvetica, Arial';
-    cx.fillText(logged.length + ' / ' + TOTAL_SPECIES + ' SPECIES LOGGED', W / 2, H - 8);
   }
 
-  // ---- render frame ----
+  function drawSightWindow() {
+    cx.strokeStyle = 'rgba(46,197,182,0.18)';
+    cx.lineWidth = 1.5;
+    var m = 18;
+    cx.strokeRect(m, BAND_TOP, W - m * 2, BAND_H);
+    cx.beginPath();
+    cx.arc(W / 2, BAND_CY, 34, 0, Math.PI * 2);
+    cx.stroke();
+    cx.beginPath();
+    cx.moveTo(W / 2 - 44, BAND_CY); cx.lineTo(W / 2 + 44, BAND_CY);
+    cx.moveTo(W / 2, BAND_CY - 44); cx.lineTo(W / 2, BAND_CY + 44);
+    cx.stroke();
+  }
+
+  function drawActive() {
+    for (var i = 0; i < active.length; i++) {
+      var a = active[i];
+      cx.save();
+      cx.translate(a.x, a.y);
+      cx.globalAlpha = 0.9;
+      cx.shadowColor = TEAL; cx.shadowBlur = 10;
+      cx.fillStyle = TEAL;
+      drawSpecies(cx, a.sp, 0, 0, a.scale, 1);
+      cx.shadowBlur = 0;
+      cx.restore();
+    }
+  }
+
+  function elapsed() { return state.phase === 'play' ? (Date.now() - runStartTs) / 1000 : 0; }
+
   var last = performance.now();
   function frame(now) {
     var dt = Math.min((now - last) / 16.667, 3); last = now;
 
-    // manage card spawning — keep 2-3 cards on screen
-    if (phase === 'play') {
-      if (cards.length < 2 && logged.length < TOTAL_SPECIES) spawnCard();
-    }
-
-    // update cards
-    if (phase === 'play') {
-      for (var i = cards.length - 1; i >= 0; i--) {
-        var c = cards[i];
-        c.y += c.dy * dt;
-        if (c.y > H + CARD_H) {
-          // card drifted off — respawn it later
-          cards.splice(i, 1);
-          if (logged.length < TOTAL_SPECIES) spawnCard();
-        }
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') {
+      spawnTimer -= dt;
+      if (spawnTimer <= 0) spawn();
+      for (var i = active.length - 1; i >= 0; i--) {
+        var a = active[i];
+        a.x += a.vx * dt;
+        if (a.x < -90) active.splice(i, 1);
       }
-      // autopilot (only for demo/bot)
-      if (hitStop > 0) hitStop -= dt;
-      else autopilot(dt);
+      autopilot();
     }
 
-    // juice: shake + zoom
     cx.save();
     if (shakeAmt > 0.2 || zoom > 1.001) {
-      var sx2 = (Math.random() - 0.5) * shakeAmt, sy2 = (Math.random() - 0.5) * shakeAmt;
-      cx.translate(W / 2 + sx2, H / 2 + sy2);
-      cx.scale(zoom, zoom);
-      cx.translate(-W / 2, -H / 2);
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
     }
-    shakeAmt *= Math.pow(0.82, dt);
-    zoom += (1 - zoom) * 0.1 * dt;
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
 
-    // bg
     cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
-    // subtle gradient
     var bg = cx.createLinearGradient(0, 0, 0, H);
-    bg.addColorStop(0, 'rgba(46,197,182,0.04)'); bg.addColorStop(1, 'rgba(11,13,18,0)');
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(0.55, 'rgba(11,13,18,0)');
+    bg.addColorStop(1, 'rgba(242,177,52,0.05)');
     cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
 
-    if (phase === 'title') {
+    if (state.phase === 'title') {
       cx.textAlign = 'center';
-      cx.fillStyle = '#fff'; cx.font = '900 38px -apple-system, Helvetica, Arial';
-      cx.fillText('SPECIES LOG', W / 2, 290);
-      cx.fillStyle = 'rgba(46,197,182,0.85)'; cx.font = '500 16px -apple-system, Helvetica, Arial';
-      cx.fillText('tap each silhouette to log it', W / 2, 326);
-      cx.fillStyle = GOLD; cx.font = '400 14px -apple-system, Helvetica, Arial';
-      cx.fillText('15 species. one guide.', W / 2, 352);
-      var pulse = 0.5 + 0.5 * Math.sin(now / 380);
-      cx.globalAlpha = 0.6 + 0.4 * pulse;
-      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
-      cx.fillText('▶ TAP TO BEGIN', W / 2, 400);
-      cx.globalAlpha = 1;
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('SPECIES LOG', W / 2, 260);
+      cx.fillStyle = TEAL; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO START', W / 2, 310); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('log every silhouette you recognize', W / 2, 340);
     }
 
-    if (phase === 'play') {
-      // draw drifting cards
-      for (var ci = 0; ci < cards.length; ci++) {
-        var card = cards[ci];
-        // card bg
-        var alpha = 0.92;
-        cx.globalAlpha = alpha;
-        cx.fillStyle = 'rgba(46,197,182,0.1)';
-        cx.strokeStyle = 'rgba(46,197,182,0.55)';
-        cx.lineWidth = 1.5;
-        cx.beginPath();
-        if (cx.roundRect) cx.roundRect(card.x - CARD_W / 2, card.y - CARD_H / 2, CARD_W, CARD_H, 14);
-        else cx.rect(card.x - CARD_W / 2, card.y - CARD_H / 2, CARD_W, CARD_H);
-        cx.fill(); cx.stroke();
-        cx.globalAlpha = 1;
+    if (state.phase === 'play' || state.phase === 'over') {
+      drawSightWindow();
+      drawActive();
 
-        // silhouette in card
-        SPECIES[card.sIdx].draw(cx, card.x, card.y - CARD_H * 0.06, CARD_H * 0.46, 1.0);
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)'; cx.font = '800 54px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + '/' + species.length, W / 2, 88);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('SPECIES LOGGED', W / 2, 108);
+      var el = elapsed();
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '700 14px Menlo, monospace';
+      cx.textAlign = 'left';
+      cx.fillText(el.toFixed(1) + 's', 24, 60);
+      cx.textAlign = 'right';
+      cx.fillText('BEST ' + (bestTime ? bestTime.toFixed(1) + 's' : '—'), W - 24, 60);
 
-        // question mark at bottom of card (hint: tap to identify)
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
         cx.textAlign = 'center';
-        cx.fillStyle = 'rgba(46,197,182,0.55)';
-        cx.font = '600 11px -apple-system, Helvetica, Arial';
-        cx.fillText('TAP TO LOG', card.x, card.y + CARD_H / 2 - 10);
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'LOG ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 138);
       }
-
-      // progress in top-center
-      cx.textAlign = 'center';
-      cx.fillStyle = 'rgba(46,197,182,0.7)';
-      cx.font = '700 13px Menlo, monospace';
-      cx.fillText(logged.length + ' / ' + TOTAL_SPECIES, W / 2, 46);
-
-      drawGuide();
     }
 
-    // flashes
-    for (var k = flashes.length - 1; k >= 0; k--) {
-      var fl = flashes[k]; fl.t += dt;
-      var fa = Math.max(0, 1 - fl.t / 38);
-      cx.globalAlpha = fa;
-      cx.textAlign = 'center';
+    if (state.phase === 'play' || state.phase === 'over') drawGuide();
+
+    for (var k = floats.length - 1; k >= 0; k--) {
+      var fl = floats[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.save(); cx.globalAlpha = a; cx.textAlign = 'center';
       cx.fillStyle = fl.color;
-      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
-      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 1.2);
-      cx.globalAlpha = 1;
-      if (fl.t > 38) flashes.splice(k, 1);
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.7);
+      cx.restore();
+      if (fl.t > 40) floats.splice(k, 1);
     }
 
-    if (phase === 'over') {
-      cx.fillStyle = 'rgba(11,13,18,0.7)'; cx.fillRect(0, 0, W, H);
+    if (state.phase === 'over' && !DEMO && !BOT) {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
       cx.textAlign = 'center';
-      // guide complete visual
-      cx.fillStyle = TEAL; cx.font = '900 32px -apple-system, Helvetica, Arial';
-      cx.fillText('GUIDE COMPLETE', W / 2, 260);
-      cx.fillStyle = 'rgba(255,255,255,0.82)'; cx.font = '700 52px -apple-system, Helvetica, Arial';
-      cx.fillText(sessionScore + ' species', W / 2, 320);
-      cx.fillStyle = GOLD; cx.font = '500 16px -apple-system, Helvetica, Arial';
-      cx.fillText('every page filled', W / 2, 355);
-      // guide grid in completion
-      drawGuide();
-      if (!DEMO && !BOT) {
-        var p2 = 0.6 + 0.4 * Math.sin(now / 340);
-        cx.globalAlpha = p2;
-        cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
-        cx.fillText('TAP — KEEP YOUR LIST', W / 2, 440);
-        cx.globalAlpha = 1;
-        // share pill
-        cx.fillStyle = 'rgba(46,197,182,0.12)';
-        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
-        cx.beginPath();
-        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 24);
-        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
-        cx.fill(); cx.stroke();
-        cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
-        cx.fillText('⚡ GROW YOURS', W / 2, SHARE_R.y + 31);
-      }
+      cx.fillStyle = TEAL; cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('GUIDE CLOSED', W / 2, 290);
+      cx.fillStyle = '#fff'; cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' species logged', W / 2, 332);
+      var dur = (Date.now() - runStartTs) / 1000;
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText(dur.toFixed(2) + 's', W / 2, 372);
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('best ' + (bestTime ? bestTime.toFixed(2) + 's' : '—'), W / 2, 396);
+      var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+      cx.globalAlpha = p2; cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — OPEN A NEW GUIDE', W / 2, 456);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(46,197,182,0.14)';
+      cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+      cx.beginPath();
+      cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 22) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = TEAL; cx.font = '800 16px -apple-system, Helvetica, Arial';
+      cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ SHARE YOUR GUIDE', W / 2, SHARE_R.y + 29);
     }
 
-    if (phase === 'cta') {
-      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.0);
-      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')'; cx.fillRect(0, 0, W, H);
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
       cx.globalAlpha = ease; cx.textAlign = 'center';
-      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
-      cx.fillText('SPECIES LOG', W / 2, 300);
-      cx.fillStyle = 'rgba(255,255,255,0.72)'; cx.font = '500 18px -apple-system, Helvetica, Arial';
-      cx.fillText('15 species. nothing missing.', W / 2, 338);
-      var p3 = 0.7 + 0.3 * Math.sin(now / 280);
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('SPECIES LOG', W / 2, 286);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText((window.__demoScore || 15) + ' species. your life-list is waiting.', W / 2, 328);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 260);
       cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
-      cx.font = '800 24px -apple-system, Helvetica, Arial';
-      cx.fillText('▶ GROW YOURS', W / 2, 406);
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 394);
       cx.globalAlpha = ease;
-      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '500 14px -apple-system, Helvetica, Arial';
-      cx.fillText('link in bio', W / 2, 440);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 426);
       cx.globalAlpha = 1;
     }
 
-    // mute toggle (human only)
     if (!DEMO && !BOT && window.J) {
-      cx.globalAlpha = 0.5; cx.textAlign = 'center';
-      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '18px -apple-system, Helvetica, Arial';
       cx.fillStyle = '#fff';
-      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 27);
       cx.globalAlpha = 1;
     }
 

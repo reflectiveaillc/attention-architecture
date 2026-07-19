@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Peel Sheet — Tilt</title>
+<!--
+  LOOP / attention-architecture — Peel Sheet (calm engine)
+  Circuits: 05-ease, 06-zeigarnik, 08-investment.
+  Conditioned path: protective-film / screen-protector peeling ASMR.
+  Mechanic: drag the tab slowly across the canvas; keep it slow and unbroken.
+  Modes:
+    ?demo=1&seed=7        scripted calm peel → soft CTA, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'peel-sheet';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 22;
+  var SEED = +qs.get('seed') || 42;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134', VERM = '#e8502e';
+
+  // screen / film geometry
+  var SX = 35, SY = 130, SW = 335, SH = 500, RADIUS = 18;
+  var A = { x: SX, y: SY };
+  var C = { x: SX + SW, y: SY + SH };
+  var TAB_R = 34;
+  var TEAR_SPD = 18;           // px per normalized frame (16.67 ms)
+
+  var state, runStartTs, overAt, best = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var flashes = [], speckles = [];
+  var lastThumb = { x: A.x, y: A.y };
+  var thumb = { x: A.x, y: A.y, active: false };
+  var lastMilestone = 0, calmStep = 0, crinkleTimer = 0;
+  var ctaAt = 0, botRunsDone = 0, botTarget = null;
+
+  try { best = +localStorage.getItem('ps_best') || 0; } catch (_) {}
+
+  function roundRectPath(x, y, w, h, r) {
+    var rr = Math.min(r, w / 2, h / 2);
+    cx.beginPath();
+    cx.moveTo(x + rr, y);
+    cx.lineTo(x + w - rr, y); cx.quadraticCurveTo(x + w, y, x + w, y + rr);
+    cx.lineTo(x + w, y + h - rr); cx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+    cx.lineTo(x + rr, y + h); cx.quadraticCurveTo(x, y + h, x, y + h - rr);
+    cx.lineTo(x, y + rr); cx.quadraticCurveTo(x, y, x + rr, y);
+    cx.closePath();
+  }
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+  function polyArea(pts) {
+    var a = 0, n = pts.length;
+    for (var i = 0; i < n; i++) { var p = pts[i], q = pts[(i + 1) % n]; a += p.x * q.y - q.x * p.y; }
+    return Math.abs(a) / 2;
+  }
+
+  function makeSpeckles() {
+    speckles = [];
+    var n = 120;
+    for (var i = 0; i < n; i++) {
+      speckles.push({
+        x: SX + rng() * SW,
+        y: SY + rng() * SH,
+        r: 0.6 + rng() * 1.2,
+        a: 0.08 + rng() * 0.14
+      });
+    }
+  }
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      score: 0,
+      peeled: 0,
+      torn: false,
+      complete: false,
+      overAt: 0
+    };
+    thumb = { x: A.x, y: A.y, active: false };
+    lastThumb = { x: A.x, y: A.y };
+    lastMilestone = 0; calmStep = 0; crinkleTimer = 0; botTarget = null;
+    hitStop = 0; zoom = 1; shakeAmt = 0; flashes = [];
+    makeSpeckles();
+    if (DEMO) {
+      state.phase = 'title';
+      setTimeout(startRun, 1500);
+    } else if (BOT) {
+      startRun();
+    }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    thumb.x = A.x; thumb.y = A.y;
+    lastThumb.x = A.x; lastThumb.y = A.y;
+    lastMilestone = 0; calmStep = 0; crinkleTimer = 0; botTarget = null;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function emitProgress(pct, ratio) {
+    if (window.LOOP) LOOP.emit('peel_progress', { pct: pct, peeled_ratio: +ratio.toFixed(4) });
+  }
+
+  function completeSession() {
+    if (state.complete) return;
+    state.complete = true;
+    state.score = 100;
+    hitStop = 10; zoom = 1.04; shakeAmt = 1.5;
+    flash('CLEAN', TEAL, 52);
+    if (window.J) { J.calm(6); setTimeout(function () { J.calm(8); }, 220); }
+    if (window.LOOP) LOOP.emit('peel_complete', { score: 100 });
+    setTimeout(function () { gameOver(100); }, 650);
+  }
+
+  function gameOver(finalScore) {
+    if (state.phase === 'over' || state.phase === 'cta') return;
+    var dur = (Date.now() - runStartTs) / 1000;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    state.score = finalScore;
+    if (finalScore > best) {
+      best = finalScore;
+      try { localStorage.setItem('ps_best', String(best)); } catch (_) {}
+    }
+    if (DEMO) window.__demoScore = finalScore;
+    if (window.LOOP) LOOP.emit('game_over', { score: finalScore, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 1500);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else { setTimeout(resetRun, 900); }
+    }
+  }
+
+  function resetRun() {
+    state.phase = 'play';
+    state.score = 0; state.peeled = 0; state.torn = false; state.complete = false;
+    thumb.x = A.x; thumb.y = A.y; thumb.active = false;
+    lastThumb.x = A.x; lastThumb.y = A.y;
+    lastMilestone = 0; calmStep = 0; crinkleTimer = 0; botTarget = null;
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('restart', {});
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function inTab(x, y) { return Math.hypot(x - A.x, y - A.y) <= TAB_R; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      resetRun();
+    }
+  }
+
+  var pointerId = null;
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale;
+    if (inR(MUTE_R, x, y)) { if (window.J) J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); }
+    if (state.phase === 'play') {
+      if (inTab(x, y) || state.peeled > 0) {
+        pointerId = e.pointerId;
+        thumb.active = true;
+        thumb.x = clamp(x, SX, SX + SW); thumb.y = clamp(y, SY, SY + SH);
+        lastThumb.x = thumb.x; lastThumb.y = thumb.y;
+      }
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) resetRun();
+  });
+  window.addEventListener('pointermove', function (e) {
+    if (DEMO || BOT || !thumb.active || e.pointerId !== pointerId) return;
+    var r = cv.getBoundingClientRect();
+    thumb.x = clamp((e.clientX - r.left) / scale, SX, SX + SW);
+    thumb.y = clamp((e.clientY - r.top) / scale, SY, SY + SH);
+  });
+  window.addEventListener('pointerup', function (e) {
+    if (e.pointerId !== pointerId) return;
+    pointerId = null; thumb.active = false;
+    if (DEMO || BOT) return;
+    if (state.phase === 'play' && !state.complete) gameOver(state.score);
+  });
+  window.addEventListener('pointercancel', function (e) {
+    if (e.pointerId !== pointerId) return;
+    pointerId = null; thumb.active = false;
+    if (DEMO || BOT) return;
+    if (state.phase === 'play' && !state.complete) gameOver(state.score);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  // Scripted calm arc: settle (title) → deepen (slow peel with small hesitations)
+  // → resolve (clean screen) → soft invitation (CTA).
+  var demoPath = [
+    { x: SX + SW * 0.18, y: SY + SH * 0.08 },
+    { x: SX + SW * 0.40, y: SY + SH * 0.22 },
+    { x: SX + SW * 0.55, y: SY + SH * 0.42 },
+    { x: SX + SW * 0.68, y: SY + SH * 0.58 },
+    { x: SX + SW * 0.82, y: SY + SH * 0.78 },
+    { x: SX + SW * 0.95, y: SY + SH * 0.94 },
+    { x: C.x, y: C.y }
+  ];
+  var demoWaits = [22, 18, 34, 26, 30, 20, 16];
+  var demoIdx = 0, demoWait = 28, demoStarted = false;
+
+  function autopilot(dt) {
+    if (state.phase !== 'play' || state.complete) return;
+    var adt = Math.max(dt, 0.001);
+    if (DEMO) {
+      if (!demoStarted) { demoStarted = true; demoIdx = 0; demoWait = 28; }
+      if (demoWait > 0) { demoWait--; return; }
+      var target = demoIdx < demoPath.length ? demoPath[demoIdx] : C;
+      var step = 2.2 * adt; // gentle px/frame scaled to actual dt
+      var d = dist(thumb, target);
+      if (d <= step) {
+        thumb.x = target.x; thumb.y = target.y;
+        demoIdx++;
+        demoWait = demoIdx < demoWaits.length ? demoWaits[demoIdx] : 12;
+      } else {
+        var ang = Math.atan2(target.y - thumb.y, target.x - thumb.x);
+        thumb.x += Math.cos(ang) * step;
+        thumb.y += Math.sin(ang) * step;
+      }
+    } else if (BOT) {
+      if (botTarget === null || dist(thumb, botTarget) < 4) {
+        // noisy diagonal target ahead of current position
+        var along = (thumb.x - SX) / SW;
+        var nextAlong = clamp(along + 0.12 + rng() * 0.08, 0, 1);
+        var wobble = gauss() * (SW * 0.06);
+        botTarget = {
+          x: clamp(SX + nextAlong * SW + wobble, SX, SX + SW),
+          y: clamp(SY + nextAlong * SH + gauss() * (SH * 0.04), SY, SY + SH)
+        };
+      }
+      var bstep = (3.6 + gauss() * 0.8) * adt;
+      var bd = dist(thumb, botTarget);
+      if (bd < bstep) { thumb.x = botTarget.x; thumb.y = botTarget.y; botTarget = null; }
+      else {
+        var bang = Math.atan2(botTarget.y - thumb.y, botTarget.x - thumb.x);
+        thumb.x += Math.cos(bang) * bstep;
+        thumb.y += Math.sin(bang) * bstep;
+      }
+    }
+  }
+
+  // ---- render ----
+  function updatePhysics(dt) {
+    if (state.phase !== 'play' || state.complete) return;
+    var idt = Math.max(dt, 0.001);
+
+    var dx = thumb.x - lastThumb.x;
+    var dy = thumb.y - lastThumb.y;
+    var spd = Math.hypot(dx, dy) / idt; // px per normalized frame
+
+    // clamp thumb inside screen for geometry
+    thumb.x = clamp(thumb.x, SX, SX + SW);
+    thumb.y = clamp(thumb.y, SY, SY + SH);
+
+    // peeled polygon A -> F(top edge at thumb.x) -> thumb -> E(left edge at thumb.y) -> A
+    var F = { x: clamp(thumb.x, SX, SX + SW), y: SY };
+    var E = { x: SX, y: clamp(thumb.y, SY, SY + SH) };
+    var T = { x: thumb.x, y: thumb.y };
+    var peeledArea = polyArea([A, F, T, E]);
+    var totalArea = SW * SH;
+    state.peeled = clamp(peeledArea / totalArea, 0, 1);
+    state.score = Math.min(100, Math.round(state.peeled * 100));
+
+    // milestones & crinkle
+    var m = Math.floor(state.peeled * 100);
+    if (m > lastMilestone) {
+      lastMilestone = m;
+      if (m % 10 === 0) {
+        hitStop = 4; zoom = 1.015;
+        if (window.J) J.calm(calmStep++);
+        emitProgress(m, state.peeled);
+      }
+      if (m === 25) flash('+25%', TEAL, 28);
+      else if (m === 50) flash('HALFWAY', TEAL, 34);
+      else if (m === 75) flash('+75%', TEAL, 28);
+      else if (m === 90) flash('ALMOST', GOLD, 30);
+      else if (m % 10 === 0 && m < 100) flash('+' + m + '%', TEAL, 26);
+    }
+    if (spd > 0.3 && state.peeled < 1) {
+      crinkleTimer += idt;
+      if (crinkleTimer > 28) {
+        crinkleTimer = 0;
+        if (window.J) J.calm(calmStep++);
+      }
+    } else {
+      crinkleTimer = Math.max(0, crinkleTimer - idt);
+    }
+
+    // tear if yanked too fast (only human/bot input can trigger)
+    if (spd > TEAR_SPD) {
+      state.torn = true;
+      shakeAmt = 5;
+      flash('TOO FAST', GOLD, 34);
+      if (window.J) J.calm(0);
+      gameOver(state.score);
+      return;
+    }
+
+    // completion
+    if (state.peeled >= 0.995) { completeSession(); }
+
+    lastThumb.x = thumb.x; lastThumb.y = thumb.y;
+  }
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play' && !state.complete) {
+      autopilot(dt);
+      updatePhysics(dt);
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.10 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // clean screen base
+    roundRectPath(SX, SY, SW, SH, RADIUS);
+    var screenGrad = cx.createLinearGradient(SX, SY, SX, SY + SH);
+    screenGrad.addColorStop(0, '#151922'); screenGrad.addColorStop(1, '#0e1117');
+    cx.fillStyle = screenGrad; cx.fill();
+    cx.strokeStyle = 'rgba(255,255,255,0.10)'; cx.lineWidth = 1.5;
+    cx.stroke();
+
+    // compute peel geometry
+    var F = { x: clamp(thumb.x, SX, SX + SW), y: SY };
+    var E = { x: SX, y: clamp(thumb.y, SY, SY + SH) };
+    var T = { x: thumb.x, y: thumb.y };
+    var peeledPoly = [A, F, T, E];
+    var pullDx = T.x - A.x, pullDy = T.y - A.y;
+    var pullLen = Math.hypot(pullDx, pullDy) || 1;
+    var curlOffX = -(pullDx / pullLen) * 7;
+    var curlOffY = -(pullDy / pullLen) * 7;
+
+    // clip to screen
+    cx.save();
+    roundRectPath(SX, SY, SW, SH, RADIUS);
+    cx.clip();
+
+    // unpeeled film polygon = screen minus peeled corner
+    cx.beginPath();
+    cx.moveTo(F.x, F.y);
+    cx.lineTo(SX + SW, SY);
+    cx.lineTo(SX + SW, SY + SH);
+    cx.lineTo(SX, SY + SH);
+    cx.lineTo(E.x, E.y);
+    cx.lineTo(T.x, T.y);
+    cx.closePath();
+    var filmGrad = cx.createLinearGradient(SX, SY, SX + SW, SY + SH);
+    filmGrad.addColorStop(0, 'rgba(230,235,245,0.28)');
+    filmGrad.addColorStop(0.5, 'rgba(230,235,245,0.14)');
+    filmGrad.addColorStop(1, 'rgba(230,235,245,0.22)');
+    cx.fillStyle = filmGrad; cx.fill();
+
+    // film sheen
+    cx.beginPath();
+    cx.moveTo(F.x, F.y); cx.lineTo(SX + SW, SY); cx.lineTo(SX + SW, SY + SH);
+    cx.lineTo(SX, SY + SH); cx.lineTo(E.x, E.y); cx.lineTo(T.x, T.y); cx.closePath();
+    var sheen = cx.createLinearGradient(SX, SY, SX + SW, SY);
+    sheen.addColorStop(0, 'rgba(255,255,255,0.12)');
+    sheen.addColorStop(0.55, 'rgba(255,255,255,0.02)');
+    sheen.addColorStop(1, 'rgba(255,255,255,0.10)');
+    cx.fillStyle = sheen; cx.fill();
+
+    // dust speckles (only on unpeeled film)
+    cx.save();
+    cx.beginPath();
+    cx.moveTo(F.x, F.y); cx.lineTo(SX + SW, SY); cx.lineTo(SX + SW, SY + SH);
+    cx.lineTo(SX, SY + SH); cx.lineTo(E.x, E.y); cx.lineTo(T.x, T.y); cx.closePath();
+    cx.clip();
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    for (var i = 0; i < speckles.length; i++) {
+      var s = speckles[i];
+      cx.globalAlpha = s.a;
+      cx.beginPath(); cx.arc(s.x, s.y, s.r, 0, Math.PI * 2); cx.fill();
+    }
+    cx.globalAlpha = 1;
+    cx.restore();
+
+    // lifted film curl (peeled polygon)
+    cx.save();
+    cx.translate(curlOffX, curlOffY);
+    cx.beginPath();
+    cx.moveTo(A.x, A.y); cx.lineTo(F.x, F.y); cx.lineTo(T.x, T.y); cx.lineTo(E.x, E.y); cx.closePath();
+    cx.shadowColor = 'rgba(0,0,0,0.45)'; cx.shadowBlur = 14; cx.shadowOffsetX = 3; cx.shadowOffsetY = 5;
+    var curlGrad = cx.createLinearGradient(A.x, A.y, T.x, T.y);
+    curlGrad.addColorStop(0, 'rgba(210,220,235,0.18)');
+    curlGrad.addColorStop(1, 'rgba(180,190,210,0.08)');
+    cx.fillStyle = curlGrad; cx.fill();
+    cx.shadowColor = 'transparent';
+    // tear edge highlight
+    cx.strokeStyle = 'rgba(255,255,255,0.25)'; cx.lineWidth = 1.2;
+    cx.beginPath(); cx.moveTo(F.x, F.y); cx.quadraticCurveTo(T.x + curlOffX * 0.6, T.y + curlOffY * 0.6, E.x, E.y); cx.stroke();
+    cx.restore();
+
+    // hinge lines
+    cx.strokeStyle = 'rgba(255,255,255,0.18)'; cx.lineWidth = 1;
+    cx.beginPath(); cx.moveTo(A.x, A.y); cx.lineTo(F.x, F.y); cx.stroke();
+    cx.beginPath(); cx.moveTo(A.x, A.y); cx.lineTo(E.x, E.y); cx.stroke();
+
+    // tab at start corner
+    cx.fillStyle = 'rgba(46,197,182,0.22)';
+    cx.beginPath(); cx.arc(A.x, A.y, TAB_R, 0, Math.PI * 2); cx.fill();
+    cx.strokeStyle = 'rgba(255,255,255,0.35)'; cx.lineWidth = 1.5;
+    cx.beginPath(); cx.arc(A.x, A.y, TAB_R - 4, 0, Math.PI * 2); cx.stroke();
+    cx.strokeStyle = TEAL; cx.lineWidth = 2;
+    cx.beginPath(); cx.moveTo(A.x + 6, A.y - 8); cx.lineTo(A.x + 12, A.y - 14); cx.stroke();
+    cx.beginPath(); cx.moveTo(A.x + 10, A.y - 4); cx.lineTo(A.x + 18, A.y - 10); cx.stroke();
+
+    cx.restore(); // end screen clip
+
+    // thumb / finger indicator
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.beginPath();
+      cx.arc(T.x, T.y, 14, 0, Math.PI * 2);
+      cx.fillStyle = DEMO || BOT ? 'rgba(255,255,255,0.18)' : 'rgba(46,197,182,0.22)';
+      cx.fill();
+      cx.strokeStyle = DEMO || BOT ? 'rgba(255,255,255,0.30)' : TEAL;
+      cx.lineWidth = 1.5; cx.stroke();
+    }
+
+    // score / best
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.90)';
+    cx.font = '800 64px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score + '%', W / 2, 96);
+    cx.fillStyle = 'rgba(255,255,255,0.40)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + best + '%', W / 2, 120);
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a;
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 252 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('PEEL SHEET', W / 2, 282);
+      cx.fillStyle = TEAL; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse; cx.fillText('PULL THE TAB SLOWLY', W / 2, 326); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('one slow tear. one clean screen.', W / 2, 354);
+    }
+
+    // game over card
+    if (state.phase === 'over' || state.phase === 'cta') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      if (state.complete) {
+        cx.fillStyle = TEAL; cx.font = '900 38px -apple-system, Helvetica, Arial';
+        cx.fillText('CLEAN SCREEN', W / 2, 294);
+      } else if (state.torn) {
+        cx.fillStyle = GOLD; cx.font = '900 38px -apple-system, Helvetica, Arial';
+        cx.fillText('TORN.', W / 2, 294);
+      } else {
+        cx.fillStyle = 'rgba(255,255,255,0.65)'; cx.font = '900 34px -apple-system, Helvetica, Arial';
+        cx.fillText('PAUSED.', W / 2, 294);
+      }
+      cx.fillStyle = '#fff'; cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + '% peeled', W / 2, 342);
+      cx.fillStyle = GOLD; cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best + '%', W / 2, 374);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — PEEL AGAIN', W / 2, 430);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // demo soft CTA
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('PEEL SHEET', W / 2, 298);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('slow peel. clean screen.', W / 2, 336);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 260);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 398);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore(); // end juice transform
+    requestAnimationFrame(frame);
+  }
+
+  var last = performance.now();
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

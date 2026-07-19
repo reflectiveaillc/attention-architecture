@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Rare Catch — Tilt</title>
+<!--
+  LOOP / attention-architecture — Rare Catch
+  Circuits: 01 RPE, 06 Zeigarnik, 04 loss.
+  Modes:
+    ?demo=1&seed=7        scripted run for clip capture, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'rare-catch';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 18;
+  var SEED = +qs.get('seed') || 42;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function randInt(n) { return Math.floor(rng() * n); }
+  function randRange(a, b) { return a + rng() * (b - a); }
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134';
+  var COLORS = [{ k:'verm', hex:VERM }, { k:'teal', hex:TEAL }, { k:'gold', hex:GOLD }, { k:'ink', hex:'#ffffff' }];
+  var SHAPES = ['circle', 'square', 'triangle', 'diamond'];
+  var TOTAL_RARE = 6;
+  var R = 28, TAP_R = R + 12;
+  var DECOY_PENALTY = 2.0;              // seconds lost for tapping a decoy
+  var SESSION_HUMAN = 90;
+  var SESSION_DEMO  = 14;                // compressed session for clip pacing
+  var SESSION_BOT   = 14;
+  var SESSION = DEMO ? SESSION_DEMO : (BOT ? SESSION_BOT : SESSION_HUMAN);
+  var DEMO_TARGET = 4;
+
+  var state, runStartTs, best = 0;
+  var hitStop = 0, shakeAmt = 0, zoom = 1, dareBeaten = false;
+  var flashes = [];
+  var challengeAt = 0, ctaAt = 0;
+  var botRunsDone = 0;
+
+  try { best = +localStorage.getItem('rc_best') || 0; } catch (_) {}
+
+  function newGame() {
+    var ci = randInt(COLORS.length), si = randInt(SHAPES.length);
+    state = {
+      phase: 'title',
+      items: [], particles: [],
+      target: { ci: ci, si: si },
+      caught: 0, missed: 0, combo: 0,
+      score: 0,
+      sessionT: SESSION,
+      spawnNext: 0.55,
+      rareTimes: generateRareTimes(SESSION),
+      rareSpawned: 0,
+      resultReason: ''
+    };
+    flashes = []; hitStop = 0; shakeAmt = 0; zoom = 1; dareBeaten = false;
+    if (DEMO) {
+      // fixed rare cadence for the scripted arc
+      state.rareTimes = [1.2, 4.2, 6.5, 9.2, 12.0, 14.8];
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setupDemoPlan();
+      setTimeout(startRun, 1200);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function generateRareTimes(total) {
+    var out = [];
+    for (var i = 1; i <= TOTAL_RARE; i++) {
+      var base = total * i / (TOTAL_RARE + 1);
+      var jitter = (rng() - 0.5) * (total / (TOTAL_RARE + 1)) * 0.6;
+      out.push(Math.max(0.8, Math.min(total - 0.8, base + jitter)));
+    }
+    return out.sort(function (a, b) { return a - b; });
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.sessionT = SESSION;
+    state.spawnNext = 0.5;
+    state.items = [];
+    state.particles = [];
+    state.caught = 0; state.missed = 0; state.combo = 0; state.score = 0;
+    state.rareSpawned = 0;
+    if (!DEMO) state.rareTimes = generateRareTimes(SESSION);
+    runStartTs = Date.now();
+    if (DEMO) setupDemoPlan();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function resetRun() {
+    state.phase = 'title';
+    if (window.LOOP) LOOP.emit('restart', {});
+    if (BOT) startRun();
+  }
+
+  // ---- demo autopilot plan ----
+  var demoPlan, demoDecoyPlan, demoRareIdx, demoWait, demoCatchY, demoTargetId, demoDecoyIdx;
+  function setupDemoPlan() {
+    // 6 rares: catch first four; the 3rd is the near-fail/recovery (low catch);
+    // a deliberate decoy tap after recovery, then let the 5th rare slip as time expires.
+    demoPlan = [
+      { wait: 18, catchY: 380 },
+      { wait: 14, catchY: 380 },
+      { wait: 48, catchY: H - 48 },  // near-fail: waits long, catches low
+      { wait: 20, catchY: 380 },
+      { action: 'miss' },
+      { action: 'miss' }
+    ];
+    demoDecoyPlan = [8.8, 12.9];  // seconds to tap a decoy (fake inputs)
+    demoRareIdx = 0; demoWait = 0; demoCatchY = 0; demoTargetId = null; demoDecoyIdx = 0;
+  }
+
+  function spawnItem() {
+    var elapsed = SESSION - state.sessionT;
+    var isRare = state.rareSpawned < TOTAL_RARE && elapsed >= state.rareTimes[state.rareSpawned];
+    var color, shape;
+    if (isRare) {
+      color = state.target.ci; shape = state.target.si; state.rareSpawned++;
+    } else {
+      do { color = randInt(COLORS.length); shape = randInt(SHAPES.length); }
+      while (color === state.target.ci && shape === state.target.si);
+    }
+    var x = randRange(R + 10, W - R - 10);
+    var y = -R - randInt(20);
+    var vy = DEMO || BOT ? randRange(5.2, 7.2) : randRange(4.0, 6.0);
+    var vx = randRange(-0.8, 0.8);
+    var rot = rng() * Math.PI * 2, vr = randRange(-0.04, 0.04);
+    state.items.push({
+      id: ++spawnItem._id || (spawnItem._id = 1),
+      x:x, y:y, vx:vx, vy:vy, r:R,
+      ci:color, si:shape, rare:isRare,
+      rot:rot, vr:vr,
+      caught:false, nearMissed:false
+    });
+  }
+
+  function inputAt(x, y) {
+    if (state.phase !== 'play') return;
+    // find frontmost item under the tap
+    var pick = null;
+    for (var i = state.items.length - 1; i >= 0; i--) {
+      var it = state.items[i];
+      var dx = it.x - x, dy = it.y - y;
+      if (dx * dx + dy * dy <= TAP_R * TAP_R) { pick = it; break; }
+    }
+    if (!pick) return;
+    if (pick.rare) catchItem(pick);
+    else wrongTap(pick);
+  }
+
+  function catchItem(it) {
+    if (it.caught) return;
+    it.caught = true;
+    // remove from stream
+    for (var i = 0; i < state.items.length; i++) {
+      if (state.items[i] === it) { state.items.splice(i, 1); break; }
+    }
+    state.caught++; state.combo++;
+    state.score = state.caught;
+    burst(it.x, it.y, COLORS[it.ci].hex, 10);
+    flash('CAUGHT', TEAL, 42);
+    hitStop = 5; zoom = 1.03; shakeAmt = 2;
+    if (window.J) {
+      J.gold();
+      if (state.combo >= 3) J.perfect(state.combo);
+      else J.hit(state.combo);
+      J.tension(Math.min(state.caught / TOTAL_RARE, 1));
+    }
+    if (window.LOOP) LOOP.emit('rare_caught', { n: state.caught, combo: state.combo });
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+    if (state.caught >= TOTAL_RARE) gameOver('complete');
+  }
+
+  function wrongTap(it) {
+    state.combo = 0;
+    state.sessionT = Math.max(0, state.sessionT - DECOY_PENALTY);
+    shakeAmt = 7;
+    flash('NO', VERM, 38);
+    burst(it.x, it.y, VERM, 8);
+    if (window.J) { J.near(); J.death(0.12); }
+    if (window.LOOP) LOOP.emit('decoy_tapped', { color: COLORS[it.ci].k, shape: SHAPES[it.si] });
+  }
+
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var ang = rng() * Math.PI * 2, sp = randRange(2, 6);
+      state.particles.push({ x:x, y:y, vx:Math.cos(ang)*sp, vy:Math.sin(ang)*sp, life:1, color:color });
+    }
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt:txt, color:color, size:size, t:0 }); }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 2))));
+  }
+
+  function gameOver(reason) {
+    state.phase = 'over';
+    state.resultReason = reason;
+    state.overAt = performance.now();
+    state.score = state.caught;
+    var newBest = state.score > best;
+    if (newBest) { best = state.score; try { localStorage.setItem('rc_best', String(best)); } catch (_) {} }
+    if (window.J) {
+      if (reason === 'complete') J.fanfare();
+      else J.death(Math.min(0.25 + (TOTAL_RARE - state.caught) / 8, 1));
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +((Date.now() - runStartTs) / 1000).toFixed(1), reason: reason });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) window.__botDone = true;
+      else setTimeout(resetRun, 700);
+    }
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 48, y: 10, w: 40, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { inputAt(x, y); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'caught' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(W / 2, H / 2); });
+
+  // ---- autopilots ----
+  function findItemById(id) {
+    for (var i = 0; i < state.items.length; i++) if (state.items[i].id === id) return state.items[i];
+    return null;
+  }
+  function safeDecoyNear(x, y) {
+    for (var i = state.items.length - 1; i >= 0; i--) {
+      var d = state.items[i];
+      if (d.rare || d.y < 180 || d.y > H - 90) continue;
+      var dx = d.x - x, dy = d.y - y;
+      if (dx * dx + dy * dy > 70 * 70) continue;
+      var safe = true;
+      for (var j = 0; j < state.items.length; j++) {
+        var r = state.items[j];
+        if (!r.rare) continue;
+        var rx = r.x - d.x, ry = r.y - d.y;
+        if (rx * rx + ry * ry <= TAP_R * TAP_R) { safe = false; break; }
+      }
+      if (safe) return d;
+    }
+    return null;
+  }
+  function phantomWrongTap() {
+    state.combo = 0;
+    state.sessionT = Math.max(0, state.sessionT - DECOY_PENALTY);
+    shakeAmt = 7; flash('NO', VERM, 38);
+    if (window.J) { J.near(); J.death(0.12); }
+    if (window.LOOP) LOOP.emit('decoy_tapped', { phantom: true });
+  }
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    var elapsed = SESSION - state.sessionT;
+    if (DEMO) {
+      // assign next demo target when a fresh rare spawns
+      if (demoRareIdx < state.rareSpawned && demoTargetId === null) {
+        // find the newest rare
+        for (var i = state.items.length - 1; i >= 0; i--) {
+          var it = state.items[i];
+          if (it.rare && !it.caught && it.id > (demoTargetId || 0)) { demoTargetId = it.id; break; }
+        }
+        var plan = demoPlan[Math.min(demoRareIdx, demoPlan.length - 1)] || { action:'miss' };
+        demoWait = plan.wait || 0;
+        demoCatchY = plan.catchY || 0;
+      }
+      // deliberate decoy taps (fake inputs / mistakes)
+      if (demoDecoyIdx < demoDecoyPlan.length && elapsed >= demoDecoyPlan[demoDecoyIdx]) {
+        var dec = safeDecoyNear(W / 2 + (rng() - 0.5) * 120, H * 0.6);
+        if (dec) inputAt(dec.x, dec.y);
+        else phantomWrongTap();
+        demoDecoyIdx++;
+      }
+      // catch the assigned rare
+      if (demoTargetId !== null) {
+        var t = findItemById(demoTargetId);
+        var p = demoPlan[Math.min(demoRareIdx, demoPlan.length - 1)] || { action:'miss' };
+        if (!t) { demoTargetId = null; demoRareIdx++; }
+        else if (p.action === 'miss') {
+          if (t.y > H + R) { demoTargetId = null; demoRareIdx++; }
+        } else {
+          if (demoWait > 0) demoWait -= dt;
+          if (demoWait <= 0 && t.y >= demoCatchY) {
+            inputAt(t.x, t.y);
+            demoTargetId = null; demoRareIdx++;
+          }
+        }
+      }
+    } else if (BOT) {
+      // imperfect reaction: choose a target in the catch zone, then react after a noisy delay
+      var zoneY = H - 140;
+      var target = null;
+      for (var j = state.items.length - 1; j >= 0; j--) {
+        var b = state.items[j];
+        if (b.rare && b.y > 120 && b.y < zoneY) { target = b; break; }
+      }
+      if (target) {
+        if (botWait === null) botWait = Math.max(2, 10 + gauss() * BOT_ERR);
+        botWait -= dt;
+        if (botWait <= 0 && target.y >= zoneY - 70) {
+          inputAt(target.x, target.y);
+          botWait = null;
+        }
+      } else {
+        // occasional false-positive decoy tap
+        if (botWait === null && rng() < 0.04) {
+          for (var k = state.items.length - 1; k >= 0; k--) {
+            var d = state.items[k];
+            if (!d.rare && d.y > 220 && d.y < zoneY) { inputAt(d.x, d.y); break; }
+          }
+        }
+      }
+    }
+  }
+  var botWait = null;
+
+  // ---- render helpers ----
+  function drawShape(si, x, y, r, color, fill) {
+    cx.save();
+    cx.translate(x, y);
+    cx.strokeStyle = 'rgba(255,255,255,0.55)'; cx.lineWidth = 2;
+    cx.fillStyle = color;
+    if (si === 0) { // circle
+      cx.beginPath(); cx.arc(0, 0, r, 0, Math.PI * 2); cx.fill(); cx.stroke();
+    } else if (si === 1) { // square
+      cx.fillRect(-r, -r, r * 2, r * 2); cx.strokeRect(-r, -r, r * 2, r * 2);
+    } else if (si === 2) { // triangle
+      cx.beginPath();
+      cx.moveTo(0, -r); cx.lineTo(r, r); cx.lineTo(-r, r); cx.closePath();
+      cx.fill(); cx.stroke();
+    } else { // diamond
+      cx.beginPath();
+      cx.moveTo(0, -r); cx.lineTo(r, 0); cx.lineTo(0, r); cx.lineTo(-r, 0); cx.closePath();
+      cx.fill(); cx.stroke();
+    }
+    cx.restore();
+  }
+
+  function drawIcon(ci, si, x, y, r, alpha) {
+    cx.globalAlpha = alpha;
+    drawShape(si, x, y, r, COLORS[ci].hex, true);
+    cx.globalAlpha = 1;
+  }
+
+  var last = performance.now();
+  var dt = 1;
+  function frame(now) {
+    dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') {
+      // spawn
+      state.spawnNext -= dt / 60;
+      if (state.spawnNext <= 0 && state.rareSpawned < TOTAL_RARE) {
+        spawnItem();
+        var next = DEMO || BOT ? randRange(0.34, 0.58) : randRange(0.60, 0.95);
+        // force a spawn just before the next scheduled rare so it appears in the stream
+        var nextRare = state.rareTimes[state.rareSpawned] || SESSION + 1;
+        var gap = nextRare - (SESSION - state.sessionT);
+        if (gap > 0.05 && gap < next) next = gap - 0.05;
+        state.spawnNext = next;
+      }
+      // update items
+      for (var i = state.items.length - 1; i >= 0; i--) {
+        var it = state.items[i];
+        it.x += it.vx * dt; it.y += it.vy * dt; it.rot += it.vr * dt;
+        if (it.x < R) { it.x = R; it.vx *= -1; }
+        if (it.x > W - R) { it.x = W - R; it.vx *= -1; }
+        if (!it.caught && it.rare && it.y > H - 80 && !it.nearMissed) {
+          it.nearMissed = true;
+          if (window.LOOP) LOOP.emit('near_miss', { n: state.caught, remaining: TOTAL_RARE - state.caught });
+        }
+        if (it.y > H + R) {
+          if (it.rare && !it.caught) {
+            state.missed++;
+            if (window.LOOP) LOOP.emit('rare_missed', { n: state.missed });
+          }
+          state.items.splice(i, 1);
+        }
+      }
+      // update particles
+      for (var p = state.particles.length - 1; p >= 0; p--) {
+        var pt = state.particles[p];
+        pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.vy += 0.25 * dt; pt.life -= 0.04 * dt;
+        if (pt.life <= 0) state.particles.splice(p, 1);
+      }
+      // timer
+      state.sessionT -= dt / 60;
+      if (state.sessionT <= 0) { state.sessionT = 0; gameOver('time'); }
+      autopilot();
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // top panel: target + tracker
+    cx.fillStyle = 'rgba(255,255,255,0.06)'; cx.fillRect(0, 0, W, 120);
+    cx.textAlign = 'left';
+    cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '700 12px -apple-system, Helvetica, Arial';
+    cx.fillText('MISSING', 18, 28);
+    drawIcon(state.target.ci, state.target.si, 44, 60, 34, 1);
+    // tracker slots
+    for (var s = 0; s < TOTAL_RARE; s++) {
+      var sx = 96 + s * 48, sy = 56;
+      if (s < state.caught) drawIcon(state.target.ci, state.target.si, sx, sy, 14, 1);
+      else {
+        cx.beginPath(); cx.arc(sx, sy, 14, 0, Math.PI * 2);
+        cx.strokeStyle = 'rgba(255,255,255,0.18)'; cx.lineWidth = 2; cx.stroke();
+      }
+    }
+    // timer bar
+    var ratio = state.sessionT / SESSION;
+    cx.fillStyle = 'rgba(255,255,255,0.10)'; cx.fillRect(96, 78, 270, 6);
+    cx.fillStyle = ratio < 0.2 ? VERM : (ratio < 0.5 ? GOLD : TEAL);
+    cx.fillRect(96, 78, 270 * ratio, 6);
+    cx.textAlign = 'right';
+    cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '700 13px -apple-system, Helvetica, Arial';
+    cx.fillText(Math.ceil(state.sessionT) + 's', W - 18, 28);
+    if (state.combo > 1) {
+      cx.fillStyle = GOLD; cx.font = '900 ' + Math.min(26, 16 + state.combo * 2) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText('×' + state.combo, W - 18, 54);
+    }
+
+    // items
+    for (var ii = 0; ii < state.items.length; ii++) {
+      var item = state.items[ii];
+      cx.save(); cx.translate(item.x, item.y); cx.rotate(item.rot);
+      drawShape(item.si, 0, 0, item.r, COLORS[item.ci].hex, true);
+      cx.restore();
+    }
+
+    // particles
+    for (var pp = 0; pp < state.particles.length; pp++) {
+      var ppt = state.particles[pp];
+      cx.globalAlpha = Math.max(0, ppt.life);
+      cx.fillStyle = ppt.color;
+      cx.fillRect(ppt.x - 3, ppt.y - 3, 6, 6);
+    }
+    cx.globalAlpha = 1;
+
+    // floating text
+    for (var f = flashes.length - 1; f >= 0; f--) {
+      var fl = flashes[f]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 280 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(f, 1);
+    }
+
+    // incoming dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+      cx.textAlign = 'center';
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 150);
+    }
+
+    // title
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('RARE CATCH', W / 2, 280);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO START', W / 2, 332); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.40)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('catch only the missing piece. decoys cost time.', W / 2, 366);
+      cx.fillStyle = 'rgba(255,255,255,0.25)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 404);
+    }
+
+    // challenge card (demo)
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 72px -apple-system, Helvetica, Arial';
+      cx.fillText(String(DEMO_TARGET), W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('catch the missing piece', W / 2, 420);
+      drawIcon(state.target.ci, state.target.si, W / 2, 470, 28, 1);
+    }
+
+    // game over / score card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = state.resultReason === 'complete' ? TEAL : VERM;
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText(state.resultReason === 'complete' ? 'SET COMPLETE' : 'TIME UP', W / 2, 290);
+      cx.fillStyle = '#fff'; cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(state.caught + ' / ' + TOTAL_RARE + ' caught', W / 2, 340);
+      cx.fillStyle = GOLD; cx.font = '900 52px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 400);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 438);
+      cx.fillStyle = 'rgba(255,255,255,0.50)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 462);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 490);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('RARE CATCH', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('he caught ' + (window.__demoScore || DEMO_TARGET) + ' / 6. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || DEMO_TARGET), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -5,14 +5,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>Patch Board — Tilt</title>
 <!--
-  LOOP / attention-architecture — Patch Board
-  Engine: calm. Circuits: 06-zeigarnik, 08-investment, 05-ease.
-  Mechanic: 12 patch outlines on a board; missions drift across as
-            one-tap prompts; each tap earns a patch that fills its slot.
-            Fill all 12 → board complete.
+  LOOP / attention-architecture — Patch Board (CALM engine, contract v2)
+  Circuits: 06-zeigarnik, 08-investment, 05-ease.
+  Conditioned path: merit-badge / achievement-patch boards; the empty slot
+  gesture is already in the thumb from Instagram/TikTok.
   Modes:
-    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → __demoDone
-    ?bot=1&runs=N&seed=5  imperfect bot, N runs → __botDone
+    ?demo=1&seed=7        scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, completes board → window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
 -->
 <style>
   html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
@@ -33,7 +34,7 @@
   var W = 405, H = 720;
   var qs = new URLSearchParams(location.search);
   var DEMO = qs.get('demo') === '1';
-  var BOT  = qs.get('bot')  === '1';
+  var BOT  = qs.get('bot') === '1';
   var BOT_RUNS = +qs.get('runs') || 3;
   var SEED = +qs.get('seed') || 42;
 
@@ -61,263 +62,242 @@
   }
   window.addEventListener('resize', fit); fit();
 
-  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
-  var SOFT_TEAL = 'rgba(46,197,182,0.18)';
+  // CALM palette — vermillion avoided
+  var INK  = '#0b0d12';
+  var TEAL = '#2ec5b6';
+  var GOLD = '#f2b134';
+  var SOFT = '#8aa3a0';
 
-  // Board layout: 3 columns × 4 rows of patches
-  var COLS = 3, ROWS = 4, TOTAL = 12;
-  var SLOT_W = 80, SLOT_H = 80, SLOT_GAP_X = 20, SLOT_GAP_Y = 18;
-  var BOARD_W = COLS * SLOT_W + (COLS - 1) * SLOT_GAP_X;
-  var BOARD_H = ROWS * SLOT_H + (ROWS - 1) * SLOT_GAP_Y;
-  var BOARD_X = (W - BOARD_W) / 2;
-  var BOARD_Y = 190;
-
-  // Patch slot positions
-  var slots = [];
-  for (var r = 0; r < ROWS; r++) {
-    for (var c = 0; c < COLS; c++) {
-      slots.push({
-        x: BOARD_X + c * (SLOT_W + SLOT_GAP_X),
-        y: BOARD_Y + r * (SLOT_H + SLOT_GAP_Y),
-        filled: false,
-        fillAnim: 0,    // 0→1 bloom animation
-        shape: Math.floor(rng() * 4),   // 0=circle 1=hex 2=shield 3=star
-        hue:  Math.floor(rng() * 6)     // colour variant index
-      });
-    }
-  }
-
-  var PATCH_HUES = [168, 196, 210, 144, 52, 30]; // teal family + gold-adjacent
-
-  // Mission labels — calm, completable prompts
-  var MISSION_WORDS = [
-    'REST', 'BREATHE', 'PAUSE', 'SETTLE', 'GROUND',
-    'CENTER', 'SLOW', 'ANCHOR', 'SOFTEN', 'CLEAR',
-    'OPEN', 'HOLD', 'STILL', 'EASE', 'FLOW',
-    'QUIET', 'BLOOM', 'GATHER', 'TRACE', 'BALANCE'
+  var TOTAL = 12;
+  var MISSIONS = [
+    { emoji: '⭐', name: 'Star',    hue: 48  },
+    { emoji: '❤️', name: 'Heart',   hue: 340 },
+    { emoji: '🔥', name: 'Spark',   hue: 28  },
+    { emoji: '🌙', name: 'Night',   hue: 220 },
+    { emoji: '🍃', name: 'Leaf',    hue: 145 },
+    { emoji: '💎', name: 'Gem',     hue: 178 },
+    { emoji: '⚡', name: 'Bolt',    hue: 52  },
+    { emoji: '🎯', name: 'Aim',     hue: 355 },
+    { emoji: '🎨', name: 'Color',   hue: 280 },
+    { emoji: '📍', name: 'Pin',     hue: 195 },
+    { emoji: '✋', name: 'Reach',   hue: 30  },
+    { emoji: '🌊', name: 'Wave',    hue: 188 }
   ];
 
-  // State
-  var state, missions, flashes, runStartTs, hitStop, zoom, shakeAmt;
-  var botRunsDone = 0, ctaAt = 0;
+  // board layout: 4 rows × 3 cols
+  var COLS = 3, ROWS = 4;
+  var BOARD_L = 62, BOARD_R = W - 62;
+  var BOARD_T = 285, BOARD_B = H - 95;
+  var CELL_W = (BOARD_R - BOARD_L) / COLS;
+  var CELL_H = (BOARD_B - BOARD_T) / ROWS;
+  function slotPos(i) {
+    var col = i % COLS, row = Math.floor(i / COLS);
+    return {
+      x: BOARD_L + col * CELL_W + CELL_W / 2,
+      y: BOARD_T + row * CELL_H + CELL_H / 2
+    };
+  }
+
+  // state
+  var phase;            // 'title' | 'play' | 'complete' | 'cta'
+  var patches;          // 12 slots: null or { missionIdx, scale, popT }
+  var sequence;         // order of mission indices to drift
+  var seqPos;           // which mission is currently drifting
+  var completedCount;
+  var card;             // { x, y, missionIdx, speed }
+  var flashes, particles;
+  var hitStop, zoom, shakeAmt;
+  var runStartTs, completeAt, ctaAt;
+  var runsDone, botRunsDone;
+
+  // input rects
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 115, y: 500, w: 230, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function shuffleArr(a) {
+    for (var i = a.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+    }
+  }
+
+  function buildSequence() {
+    var base = [];
+    for (var i = 0; i < TOTAL; i++) base.push(i);
+    if (DEMO || BOT) return base;          // deterministic for autopilots
+    shuffleArr(base);
+    return base;
+  }
+
+  function spawnCard() {
+    if (seqPos >= sequence.length) { card = null; return; }
+    card = {
+      x: W + 60,
+      y: 182,
+      missionIdx: sequence[seqPos],
+      speed: 1.4 + seqPos * 0.06
+    };
+  }
 
   function newGame() {
-    slots.forEach(function (s) { s.filled = false; s.fillAnim = 0; });
-    missions   = [];
-    flashes    = [];
-    hitStop    = 0;
-    zoom       = 1;
-    shakeAmt   = 0;
-    state = {
-      phase:   DEMO ? 'demo_settle' : BOT ? 'play' : 'title',
-      score:   0,
-      patchesFilled: 0,
-      overAt:  0,
-      missionPool: shufflePool()
-    };
-    runStartTs = Date.now();
-    if (!DEMO && !BOT) return;
-    if (BOT) { startPlay(); return; }
-    // DEMO: scripted calm arc
-    // settle phase ~4s — slow missions, 2 fills
-    // deepen phase ~6s — 4 more fills
-    // resolve phase ~4s — remaining 6 fills, board completes
-    // soft invitation ~3.5s
-    demoPhaseAt  = performance.now();
-    demoFillIdx  = 0;
-    demoScript   = buildDemoScript();
-    demoScriptIdx = 0;
-    startPlay();
-  }
+    rng = mulberry32(SEED + (runsDone || 0) * 2654435761 | 0);
+    phase = (DEMO || BOT) ? 'play' : 'title';
+    patches = [];
+    for (var i = 0; i < TOTAL; i++) patches.push(null);
+    sequence = buildSequence();
+    seqPos = 0;
+    completedCount = 0;
+    flashes = []; particles = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    completeAt = 0; ctaAt = 0;
+    spawnCard();
 
-  function shufflePool() {
-    var pool = MISSION_WORDS.slice();
-    for (var i = pool.length - 1; i > 0; i--) {
-      var j = Math.floor(rng() * (i + 1));
-      var tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+    if (DEMO) {
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED, mode: 'demo' });
+      demoStart();
+    } else if (BOT) {
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED, mode: 'bot' });
     }
-    return pool;
   }
 
-  function startPlay() {
-    state.phase = 'play';
+  function startRun() {
+    phase = 'play';
     runStartTs = Date.now();
     if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
-    spawnMissions(2);
   }
 
-  // Build a queue of (slotIndex, timing) for demo
-  var demoPhaseAt = 0, demoFillIdx = 0, demoScript = [], demoScriptIdx = 0;
-  function buildDemoScript() {
-    // Each entry: delay ms from game start before tapping
-    var script = [];
-    // settle: 2 patches at ~2s and ~4s
-    script.push(2000, 3800);
-    // deepen: 4 more patches, ~1.5s apart
-    script.push(5200, 6700, 8000, 9400);
-    // resolve: 6 more patches, ~0.8s apart
-    script.push(10200, 10900, 11500, 12100, 12700, 13200);
-    return script;
-  }
+  function claimMission() {
+    if (phase !== 'play' || completedCount >= TOTAL || !card) return;
+    var mi = card.missionIdx;
+    var m = MISSIONS[mi];
 
-  // Mission objects
-  function spawnMissions(n) {
-    for (var i = 0; i < n; i++) {
-      spawnOneMission();
-    }
-  }
+    // fill next empty slot
+    patches[completedCount] = {
+      missionIdx: mi,
+      scale: 0,
+      popT: 0
+    };
+    completedCount++;
+    seqPos++;
 
-  function spawnOneMission() {
-    if (state.patchesFilled >= TOTAL) return;
-    // pick a word from pool (cycle)
-    var word = state.missionPool[missions.length % state.missionPool.length];
-    // pick a target unfilled slot
-    var unfilled = slots.filter(function (s) { return !s.filled; });
-    if (!unfilled.length) return;
-    var target = unfilled[Math.floor(rng() * unfilled.length)];
+    if (window.J) J.calm(completedCount);
+    hitStop = 3;
+    zoom = 1.025;
+    shakeAmt = 1.5;
+    addFlash(m.name + ' patch', colorFor(m.hue), 30, card.x, card.y - 45);
+    spawnParticles(card.x, card.y, m.hue);
 
-    // missions drift across screen: start outside left or right
-    var fromLeft = rng() < 0.5;
-    var yPos = 120 + rng() * 40; // near top, above the board header
-    missions.push({
-      word:    word,
-      target:  target,
-      x:       fromLeft ? -130 : W + 130,
-      y:       yPos,
-      vx:      fromLeft ? (1.2 + rng() * 0.6) : -(1.2 + rng() * 0.6),
-      active:  true,
-      tapped:  false,
-      tapAnim: 0,
-      glow:    0
-    });
-  }
+    if (window.LOOP) LOOP.emit('patch_claimed', { name: m.name, n: completedCount });
 
-  // Remove missions that scrolled off screen
-  function pruneMissions() {
-    for (var i = missions.length - 1; i >= 0; i--) {
-      var m = missions[i];
-      if (!m.active) { missions.splice(i, 1); continue; }
-      if (m.x < -160 || m.x > W + 160) {
-        missions.splice(i, 1);
-        // If unfilled slots remain, spawn a replacement
-        if (state.patchesFilled < TOTAL) spawnOneMission();
-      }
-    }
-  }
-
-  // Fill the next unfilled slot and return it
-  function fillNextSlot(targetSlot) {
-    if (targetSlot && !targetSlot.filled) {
-      targetSlot.filled = true;
-      targetSlot.fillAnim = 0;
-      state.patchesFilled++;
-      state.score++;
-      return targetSlot;
-    }
-    return null;
-  }
-
-  function tapMission(m) {
-    if (!m.active || m.tapped) return;
-    m.tapped = true;
-    m.active = false;
-    var filled = fillNextSlot(m.target);
-    if (!filled) return;
-    // calm sound
-    if (window.J) J.calm(state.patchesFilled);
-    // soft zoom pulse on every fill
-    zoom = 1.015;
-    // floating reward text
-    flash(m.word, TEAL, 26, m.x, m.y);
-    if (window.LOOP) LOOP.emit('patch_earned', { n: state.patchesFilled, word: m.word });
-    // hit-stop on big milestones
-    if (state.patchesFilled === 6 || state.patchesFilled === 9) {
-      hitStop = 3; shakeAmt = 2.5;
-      flash('HALFWAY ✓', TEAL, 30, W/2, 160);
-    }
-    if (state.patchesFilled >= TOTAL) {
-      // board complete!
-      setTimeout(boardComplete, 300);
+    if (completedCount >= TOTAL) {
+      setTimeout(boardComplete, 450);
     } else {
-      // spawn fresh mission for the tapped spot
-      if (!DEMO && !BOT) setTimeout(spawnOneMission, 400 + rng() * 300);
-    }
-    if (!DEMO && !BOT) {
-      // keep 2 missions active
-      var activeCnt = missions.filter(function (x) { return x.active; }).length;
-      if (activeCnt < 2 && state.patchesFilled < TOTAL) spawnOneMission();
+      spawnCard();
     }
   }
 
   function boardComplete() {
+    phase = 'complete';
+    completeAt = performance.now();
+    shakeAmt = 2;
+    if (window.J) J.calm(TOTAL + 1);
     var dur = (Date.now() - runStartTs) / 1000;
-    state.phase = 'over';
-    state.overAt = performance.now();
-    zoom = 1.04; hitStop = 6; shakeAmt = 1.5;
-    if (window.J) { J.calm(13); }
-    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (window.LOOP) LOOP.emit('game_over', { score: completedCount, dur_s: +dur.toFixed(1) });
+
     if (DEMO) {
-      window.__demoScore = state.score;
+      window.__demoScore = completedCount;
       setTimeout(function () {
-        state.phase = 'cta';
+        phase = 'cta';
         ctaAt = performance.now();
-        setTimeout(function () { window.__demoDone = true; }, 3600);
-      }, 2200);
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2600);
     }
     if (BOT) {
       botRunsDone++;
       if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
-      else setTimeout(function () { resetRun(); }, 800);
+      else setTimeout(function () { resetRun(); }, 1100);
     }
   }
-
-  // Bot and human: game_over is "board complete." But bot must eventually
-  // LOSE — meaning: after BOT_RUNS completions, set __botDone.
-  // If bot can't complete (e.g. TOTAL > missions spawn), force a timeout loss.
-  var BOT_TIMEOUT = 30000; // 30s per run → force game_over if stuck
 
   function resetRun() {
-    slots.forEach(function (s) { s.filled = false; s.fillAnim = 0; });
-    missions = []; flashes = [];
-    state.patchesFilled = 0; state.score = 0;
-    state.missionPool = shufflePool();
+    runsDone = (runsDone || 0) + 1;
+    newGame();
+    phase = 'play';
+    runStartTs = Date.now();
     if (window.LOOP) LOOP.emit('restart', {});
-    startPlay();
   }
 
-  function flash(txt, color, size, fx, fy) {
-    flashes.push({ txt: txt, color: color, size: size, x: fx || W/2, y: fy || 240, t: 0 });
+  function colorFor(hue) {
+    return 'hsl(' + hue + ',70%,62%)';
   }
 
-  // ---- Input ----
-  var MUTE_R  = { x: W - 46, y: 10,  w: 38, h: 38 };
-  var SHARE_R = { x: W/2 - 125, y: 514, w: 250, h: 46 };
-  function inR(r, px, py) { return px >= r.x && px <= r.x+r.w && py >= r.y && py <= r.y+r.h; }
+  function addFlash(txt, color, size, x, y) {
+    flashes.push({ txt: txt, color: color, size: size, x: x || W / 2, y: y || H / 2, t: 0 });
+  }
 
-  function tap(px, py) {
+  function spawnParticles(x, y, hue) {
+    for (var i = 0; i < 14; i++) {
+      var ang = rng() * Math.PI * 2;
+      var spd = 1.2 + rng() * 2.2;
+      particles.push({
+        x: x, y: y,
+        vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - 1.2,
+        life: 1, hue: hue + (rng() - 0.5) * 30
+      });
+    }
+  }
+
+  // ---- demo / bot autopilots ----
+  // Calm demo arc: settle → deepen → resolve → soft invitation.
+  var demoStep = 0, demoTimer = 0;
+  var demoWaits = [120, 100, 90, 80, 75, 70, 65, 60, 55, 50, 45, 40];
+
+  function demoStart() {
+    demoStep = 0;
+    demoTimer = 200;
+  }
+
+  function demoPump(dt) {
+    if (phase !== 'play') return;
+    demoTimer -= dt;
+    if (demoTimer > 0) return;
+    claimMission();
+    demoStep++;
+    demoTimer = demoWaits[Math.min(demoStep, demoWaits.length - 1)] || 45;
+  }
+
+  var botTimer = 0;
+  function botPump(dt) {
+    if (phase !== 'play' || !card) return;
+    botTimer -= dt;
+    if (botTimer > 0) return;
+    // imperfect: tap when card crosses a "comfortable" zone near center
+    if (card.x > W / 2 - 50 && card.x < W / 2 + 60) {
+      claimMission();
+      botTimer = 40 + rng() * 55;
+    }
+  }
+
+  // ---- human input ----
+  function cardHit(ex, ey) {
+    if (!card) return false;
+    return ex >= card.x - 44 && ex <= card.x + 44 && ey >= card.y - 44 && ey <= card.y + 44;
+  }
+
+  function tap(ex, ey) {
     if (DEMO || BOT) return;
-    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
-    if (state.phase === 'title') { startPlay(); return; }
-    if (state.phase === 'play') {
-      // check if any mission pill was tapped
-      for (var i = 0; i < missions.length; i++) {
-        var m = missions[i];
-        if (!m.active || m.tapped) continue;
-        if (px !== undefined) {
-          var hw = 54, hh = 20;
-          if (px >= m.x - hw && px <= m.x + hw && py >= m.y - hh && py <= m.y + hh) {
-            tapMission(m); return;
-          }
-        } else {
-          // spacebar: tap first active mission
-          tapMission(m); return;
-        }
-      }
+    if (ex !== undefined && inR(MUTE_R, ex, ey) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') {
+      if (ex !== undefined && cardHit(ex, ey)) { claimMission(); return; }
       return;
     }
-    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
-      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
-        SHARE.send({ score: state.score, unit: 'patches' }); return;
+    if (phase === 'complete' && performance.now() - completeAt > 350) {
+      if (ex !== undefined && inR(SHARE_R, ex, ey) && window.SHARE) {
+        SHARE.send({ score: completedCount, unit: 'patches' }); return;
       }
       resetRun();
     }
@@ -327,391 +307,292 @@
     var r = cv.getBoundingClientRect();
     tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
   });
-  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
-
-  // ---- Autopilot ----
-  var botRunStart = 0;
-
-  function autopilot(now) {
-    if (state.phase !== 'play') return;
-
-    if (BOT) {
-      // tap any active mission with a small random delay
-      if (!botRunStart) botRunStart = now;
-      // force game_over after timeout (prevents infinite hang)
-      if (now - botRunStart > BOT_TIMEOUT) {
-        var dur = (Date.now() - runStartTs) / 1000;
-        state.phase = 'over'; state.overAt = now;
-        if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
-        botRunsDone++;
-        if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
-        else setTimeout(function () { botRunStart = 0; resetRun(); }, 500);
-        return;
-      }
-      for (var i = 0; i < missions.length; i++) {
-        var m = missions[i];
-        if (m.active && !m.tapped) {
-          // tap when mission is near center of screen (simulate human timing)
-          if (Math.abs(m.x - W/2) < 80 + rng() * 60) {
-            tapMission(m);
-            return;
-          }
-        }
-      }
-      return;
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') {
+      if (!DEMO && !BOT && phase === 'play' && card) claimMission();
+      else tap();
     }
+  });
 
-    if (DEMO) {
-      var elapsed = now - demoPhaseAt;
-      // demo: pre-scripted timings
-      if (demoScriptIdx < demoScript.length) {
-        if (elapsed >= demoScript[demoScriptIdx]) {
-          // find a valid active mission to tap
-          for (var j = 0; j < missions.length; j++) {
-            var dm = missions[j];
-            if (dm.active && !dm.tapped) {
-              tapMission(dm);
-              demoScriptIdx++;
-              break;
-            }
-          }
-        }
-      }
+  // ---- render helpers ----
+  function drawBadge(px, py, r, hue, scale) {
+    cx.save();
+    cx.translate(px, py);
+    cx.scale(scale, scale);
+
+    // scalloped badge edge
+    var n = 16;
+    cx.beginPath();
+    for (var i = 0; i <= n; i++) {
+      var ang = (i / n) * Math.PI * 2;
+      var rr = r + (i % 2 === 0 ? 4 : 0);
+      var x = Math.cos(ang) * rr, y = Math.sin(ang) * rr;
+      if (i === 0) cx.moveTo(x, y); else cx.lineTo(x, y);
     }
+    cx.closePath();
+
+    var g = cx.createRadialGradient(-r * 0.35, -r * 0.35, 2, 0, 0, r + 4);
+    g.addColorStop(0, 'hsl(' + hue + ',55%,58%)');
+    g.addColorStop(0.6, 'hsl(' + hue + ',62%,46%)');
+    g.addColorStop(1, 'hsl(' + hue + ',55%,34%)');
+    cx.fillStyle = g;
+    cx.fill();
+    cx.lineWidth = 2;
+    cx.strokeStyle = 'rgba(255,255,255,0.25)';
+    cx.stroke();
+
+    // inner ring
+    cx.beginPath(); cx.arc(0, 0, r * 0.72, 0, Math.PI * 2);
+    cx.strokeStyle = 'rgba(0,0,0,0.15)'; cx.lineWidth = 1.5; cx.stroke();
+
+    cx.restore();
   }
 
-  // ---- Drawing helpers ----
-  function drawPatchShape(cx, sx, sy, sw, sh, hue, filled, animT) {
-    var alpha = filled ? Math.min(1, animT * 1.5) : 1;
-    var shape = sx; // we use the slot directly
-    // outline
-    cx.save();
-    cx.globalAlpha = filled ? 0 : 0.25;
-    cx.strokeStyle = '#ffffff';
-    cx.lineWidth = 1.5;
-    cx.setLineDash([4, 4]);
+  function drawEmptySlot(px, py, r) {
     cx.beginPath();
-    cx.roundRect
-      ? cx.roundRect(sy - sw/2, sh - sw/2, sw, sw, 10)
-      : cx.rect(sy - sw/2, sh - sw/2, sw, sw);
+    cx.arc(px, py, r, 0, Math.PI * 2);
+    cx.strokeStyle = 'rgba(255,255,255,0.12)';
+    cx.setLineDash([5, 5]);
+    cx.lineWidth = 2;
     cx.stroke();
     cx.setLineDash([]);
-    cx.restore();
+
+    cx.beginPath();
+    cx.arc(px, py, r - 8, 0, Math.PI * 2);
+    cx.strokeStyle = 'rgba(255,255,255,0.06)';
+    cx.lineWidth = 1;
+    cx.stroke();
   }
 
-  function drawSlot(s, now) {
-    var cx2 = cx;
-    var mx = s.x + SLOT_W / 2;
-    var my = s.y + SLOT_H / 2;
-    var R  = SLOT_W / 2 - 4;
+  function drawCard(c) {
+    var m = MISSIONS[c.missionIdx];
+    var x = c.x, y = c.y;
 
-    if (!s.filled) {
-      // empty outline — dashed soft ring
-      cx2.save();
-      cx2.globalAlpha = 0.2;
-      cx2.strokeStyle = '#ffffff';
-      cx2.lineWidth = 1.5;
-      cx2.setLineDash([5, 5]);
-      cx2.beginPath();
-      drawSlotPath(s.shape, mx, my, R);
-      cx2.stroke();
-      cx2.setLineDash([]);
-      cx2.restore();
-      return;
-    }
-
-    // filled — bloom animation
-    s.fillAnim = Math.min(1, s.fillAnim + 0.05);
-    var t = s.fillAnim;
-    var hue = PATCH_HUES[s.hue % PATCH_HUES.length];
-
-    // bloom glow
-    if (t < 0.8) {
-      cx2.save();
-      cx2.globalAlpha = (1 - t / 0.8) * 0.45;
-      var gr = cx2.createRadialGradient(mx, my, 0, mx, my, R * 1.8 * t + 2);
-      gr.addColorStop(0, 'hsl(' + hue + ',70%,60%)');
-      gr.addColorStop(1, 'rgba(0,0,0,0)');
-      cx2.fillStyle = gr;
-      cx2.beginPath(); cx2.arc(mx, my, R * 1.8 * t + 2, 0, Math.PI*2); cx2.fill();
-      cx2.restore();
-    }
-
-    // main patch fill
-    cx2.save();
-    cx2.globalAlpha = Math.min(1, t * 2);
-    var sc = 0.7 + 0.3 * Math.min(1, t * 1.6); // scale in from 70%
-    cx2.translate(mx, my); cx2.scale(sc, sc); cx2.translate(-mx, -my);
-
-    var pg = cx2.createLinearGradient(mx - R, my - R, mx + R, my + R);
-    pg.addColorStop(0, 'hsl(' + hue + ',65%,58%)');
-    pg.addColorStop(1, 'hsl(' + hue + ',70%,38%)');
-    cx2.fillStyle = pg;
-    cx2.beginPath();
-    drawSlotPath(s.shape, mx, my, R);
-    cx2.fill();
-
-    // inner highlight
-    cx2.globalAlpha = Math.min(1, t * 2) * 0.35;
-    cx2.strokeStyle = 'hsl(' + hue + ',80%,80%)';
-    cx2.lineWidth = 2;
-    cx2.beginPath();
-    drawSlotPath(s.shape, mx, my, R * 0.7);
-    cx2.stroke();
-
-    // checkmark when fully bloomed
-    if (t > 0.7) {
-      cx2.globalAlpha = (t - 0.7) / 0.3;
-      cx2.strokeStyle = '#ffffff';
-      cx2.lineWidth = 3;
-      cx2.lineCap = 'round';
-      cx2.lineJoin = 'round';
-      cx2.beginPath();
-      cx2.moveTo(mx - R * 0.28, my);
-      cx2.lineTo(mx - R * 0.05, my + R * 0.28);
-      cx2.lineTo(mx + R * 0.32, my - R * 0.25);
-      cx2.stroke();
-    }
-    cx2.restore();
-  }
-
-  function drawSlotPath(shape, mx, my, R) {
-    if (shape === 0) {
-      // circle
-      cx.arc(mx, my, R, 0, Math.PI * 2);
-    } else if (shape === 1) {
-      // hexagon
-      cx.moveTo(mx + R, my);
-      for (var i = 1; i <= 6; i++) {
-        var a = (i * Math.PI * 2) / 6;
-        cx.lineTo(mx + R * Math.cos(a), my + R * Math.sin(a));
-      }
-      cx.closePath();
-    } else if (shape === 2) {
-      // shield
-      cx.moveTo(mx, my - R);
-      cx.lineTo(mx + R * 0.8, my - R * 0.4);
-      cx.lineTo(mx + R * 0.8, my + R * 0.2);
-      cx.quadraticCurveTo(mx + R * 0.8, my + R * 0.7, mx, my + R);
-      cx.quadraticCurveTo(mx - R * 0.8, my + R * 0.7, mx - R * 0.8, my + R * 0.2);
-      cx.lineTo(mx - R * 0.8, my - R * 0.4);
-      cx.closePath();
-    } else {
-      // star (5-point)
-      var outer = R, inner = R * 0.42;
-      for (var si = 0; si < 10; si++) {
-        var sa = (si * Math.PI) / 5 - Math.PI / 2;
-        var sr = si % 2 === 0 ? outer : inner;
-        if (si === 0) cx.moveTo(mx + sr * Math.cos(sa), my + sr * Math.sin(sa));
-        else          cx.lineTo(mx + sr * Math.cos(sa), my + sr * Math.sin(sa));
-      }
-      cx.closePath();
-    }
-  }
-
-  function drawMission(m) {
-    if (!m.active) return;
-    var hw = 52, hh = 18;
-    // pill background
     cx.save();
-    var pAlpha = 0.92;
-    cx.globalAlpha = pAlpha;
-    cx.fillStyle = 'rgba(46,197,182,0.15)';
-    cx.strokeStyle = TEAL;
+    cx.shadowColor = 'rgba(46,197,182,0.22)';
+    cx.shadowBlur = 18;
+    cx.fillStyle = '#151922';
+    cx.strokeStyle = 'rgba(255,255,255,0.18)';
     cx.lineWidth = 1.5;
     cx.beginPath();
-    if (cx.roundRect) cx.roundRect(m.x - hw, m.y - hh, hw * 2, hh * 2, hh);
-    else cx.rect(m.x - hw, m.y - hh, hw * 2, hh * 2);
+    if (cx.roundRect) cx.roundRect(x - 44, y - 44, 88, 88, 18);
+    else cx.rect(x - 44, y - 44, 88, 88);
     cx.fill(); cx.stroke();
-    cx.fillStyle = TEAL;
-    cx.font = '700 14px -apple-system, Helvetica, Arial';
-    cx.textAlign = 'center';
-    cx.fillText(m.word, m.x, m.y + 5);
     cx.restore();
+
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    cx.font = '30px -apple-system, Helvetica, Arial';
+    cx.fillText(m.emoji, x, y - 6);
+
+    cx.textBaseline = 'alphabetic';
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.font = '700 11px -apple-system, Helvetica, Arial';
+    cx.fillText(m.name.toUpperCase(), x, y + 28);
   }
 
-  // ---- Render loop ----
+  // ---- main loop ----
   var last = performance.now();
-
   function frame(now) {
     var dt = Math.min((now - last) / 16.667, 3); last = now;
 
-    // update missions
-    for (var i = 0; i < missions.length; i++) {
-      missions[i].x += missions[i].vx * dt;
-    }
-    pruneMissions();
-
-    // autopilot
-    if (hitStop > 0) { hitStop -= dt; }
-    else             { autopilot(now); }
-
-    // spawn missions for bot/demo in play phase
-    if ((BOT || DEMO) && state.phase === 'play') {
-      var activeCnt = missions.filter(function (x) { return x.active; }).length;
-      if (activeCnt < 3 && state.patchesFilled < TOTAL) spawnOneMission();
-    }
-
-    // juice transforms
-    cx.save();
-    if (shakeAmt > 0.15 || zoom > 1.001) {
-      var sx = (Math.random() - 0.5) * shakeAmt;
-      var sy = (Math.random() - 0.5) * shakeAmt;
-      cx.translate(W/2 + sx, H/2 + sy);
-      cx.scale(zoom, zoom);
-      cx.translate(-W/2, -H/2);
-    }
+    // decay juice
+    if (hitStop > 0) hitStop -= dt;
     shakeAmt *= Math.pow(0.88, dt);
     zoom += (1 - zoom) * 0.12 * dt;
 
-    // Background
+    // animate patch pop-ins
+    for (var i = 0; i < TOTAL; i++) {
+      var p = patches[i];
+      if (p) {
+        p.popT += dt;
+        p.scale += (1 - p.scale) * 0.14 * dt;
+      }
+    }
+
+    // drift card
+    if (card && phase === 'play' && hitStop <= 0) {
+      card.x -= card.speed * dt;
+      if (card.x < -70) card.x = W + 70;
+    }
+
+    // autopilots
+    if (DEMO && hitStop <= 0) demoPump(dt);
+    if (BOT  && hitStop <= 0) botPump(dt);
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
     cx.fillStyle = INK; cx.fillRect(-10, -10, W + 20, H + 20);
-    // soft radial glow center
-    var bg = cx.createRadialGradient(W/2, H/2, 0, W/2, H/2, 360);
-    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
-    bg.addColorStop(1, 'rgba(0,0,0,0)');
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(0.55, 'rgba(11,13,18,0)');
+    bg.addColorStop(1, 'rgba(242,177,52,0.05)');
     cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
 
-    // BOARD HEADER
-    cx.textAlign = 'center';
-    cx.fillStyle = 'rgba(255,255,255,0.85)';
-    cx.font = '800 26px -apple-system, Helvetica, Arial';
-    cx.fillText('PATCH BOARD', W/2, 54);
-    cx.fillStyle = 'rgba(255,255,255,0.4)';
-    cx.font = '500 12px -apple-system, Helvetica, Arial';
-    cx.fillText(state.patchesFilled + ' / ' + TOTAL + ' earned', W/2, 76);
-
-    // progress bar (thin, below header)
-    var barW = 200, barH = 4, barX = (W - barW) / 2, barY = 90;
-    cx.fillStyle = 'rgba(255,255,255,0.1)';
-    cx.fillRect(barX, barY, barW, barH);
-    cx.fillStyle = TEAL;
-    cx.fillRect(barX, barY, barW * (state.patchesFilled / TOTAL), barH);
-
-    // board background
-    var bp = 14;
-    cx.fillStyle = 'rgba(255,255,255,0.04)';
-    if (cx.roundRect) cx.roundRect(BOARD_X - bp, BOARD_Y - bp, BOARD_W + bp*2, BOARD_H + bp*2, 16);
-    else              cx.rect(BOARD_X - bp, BOARD_Y - bp, BOARD_W + bp*2, BOARD_H + bp*2);
-    cx.fill();
-
-    // SLOTS
-    for (var si2 = 0; si2 < slots.length; si2++) {
-      drawSlot(slots[si2], now);
-    }
-
-    // MISSIONS
-    if (state.phase === 'play') {
-      for (var mi = 0; mi < missions.length; mi++) {
-        drawMission(missions[mi]);
-      }
-      // instruction nudge (first run, no patches yet)
-      if (state.patchesFilled === 0) {
-        cx.textAlign = 'center';
-        cx.fillStyle = 'rgba(255,255,255,0.35)';
-        cx.font = '500 12px -apple-system, Helvetica, Arial';
-        var pulse = 0.5 + 0.5 * Math.sin(now / 500);
-        cx.globalAlpha = pulse;
-        cx.fillText('tap a drifting word to earn its patch', W/2, 660);
-        cx.globalAlpha = 1;
-      }
-    }
-
-    // TITLE SCREEN
-    if (state.phase === 'title') {
-      cx.fillStyle = 'rgba(11,13,18,0.7)'; cx.fillRect(0, 0, W, H);
+    // title
+    if (phase === 'title') {
       cx.textAlign = 'center';
-      cx.fillStyle = '#ffffff';
-      cx.font = '900 40px -apple-system, Helvetica, Arial';
-      cx.fillText('PATCH BOARD', W/2, 300);
+      cx.fillStyle = TEAL;
+      cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('PATCH BOARD', W / 2, 300);
       cx.fillStyle = 'rgba(255,255,255,0.55)';
-      cx.font = '500 16px -apple-system, Helvetica, Arial';
-      cx.fillText('fill all 12 patches', W/2, 336);
-      var tp = 0.6 + 0.4 * Math.sin(now / 340);
-      cx.globalAlpha = tp;
-      cx.fillStyle = TEAL;
-      cx.font = '700 18px -apple-system, Helvetica, Arial';
-      cx.fillText('TAP TO BEGIN', W/2, 390);
+      cx.font = '600 17px -apple-system, Helvetica, Arial';
+      cx.fillText('tap drifting patches · fill the board', W / 2, 340);
+      var pulse = 0.55 + 0.45 * Math.sin(now / 500);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = GOLD;
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, 400);
       cx.globalAlpha = 1;
     }
 
-    // GAME OVER (board complete)
-    if (state.phase === 'over') {
-      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+    // play / complete / cta all show the board
+    if (phase === 'play' || phase === 'complete' || phase === 'cta') {
+      // header progress
       cx.textAlign = 'center';
-      cx.fillStyle = TEAL;
-      cx.font = '900 38px -apple-system, Helvetica, Arial';
-      cx.fillText('BOARD COMPLETE', W/2, 306);
-      cx.fillStyle = '#ffffff';
-      cx.font = '700 20px -apple-system, Helvetica, Arial';
-      cx.fillText('all 12 patches earned', W/2, 346);
-      cx.fillStyle = GOLD;
-      cx.font = '800 22px -apple-system, Helvetica, Arial';
-      var dur2 = ((Date.now() - runStartTs) / 1000).toFixed(1);
-      cx.fillText(dur2 + 's', W/2, 390);
-      if (!DEMO && !BOT) {
-        var p2 = 0.65 + 0.35 * Math.sin(now / 300);
-        cx.globalAlpha = p2;
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('PATCHES', W / 2, 48);
+      cx.fillStyle = '#fff';
+      cx.font = '800 34px -apple-system, Helvetica, Arial';
+      cx.fillText(completedCount + ' / ' + TOTAL, W / 2, 82);
+
+      // mini progress dots
+      for (var d = 0; d < TOTAL; d++) {
+        var dx = W / 2 - (TOTAL - 1) * 7 + d * 14;
+        var dy = 104;
+        cx.beginPath(); cx.arc(dx, dy, 4, 0, Math.PI * 2);
+        cx.fillStyle = patches[d] ? TEAL : 'rgba(255,255,255,0.12)';
+        cx.fill();
+      }
+
+      // board background
+      cx.fillStyle = 'rgba(255,255,255,0.03)';
+      cx.strokeStyle = 'rgba(255,255,255,0.08)';
+      cx.lineWidth = 1;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(BOARD_L - 10, BOARD_T - 10, BOARD_R - BOARD_L + 20, BOARD_B - BOARD_T + 20, 16);
+      else cx.rect(BOARD_L - 10, BOARD_T - 10, BOARD_R - BOARD_L + 20, BOARD_B - BOARD_T + 20);
+      cx.fill(); cx.stroke();
+
+      // slots and patches
+      for (var i = 0; i < TOTAL; i++) {
+        var pos = slotPos(i);
+        var p = patches[i];
+        if (!p) {
+          drawEmptySlot(pos.x, pos.y, 32);
+        } else {
+          var m = MISSIONS[p.missionIdx];
+          drawBadge(pos.x, pos.y, 32, m.hue, p.scale);
+          cx.textAlign = 'center';
+          cx.textBaseline = 'middle';
+          cx.font = '22px -apple-system, Helvetica, Arial';
+          cx.fillText(m.emoji, pos.x, pos.y + 1);
+          cx.textBaseline = 'alphabetic';
+        }
+      }
+
+      // drifting mission card
+      if (phase === 'play' && card) drawCard(card);
+
+      // complete overlay
+      if (phase === 'complete') {
+        cx.fillStyle = 'rgba(11,13,18,0.60)'; cx.fillRect(0, 0, W, H);
+        cx.textAlign = 'center';
         cx.fillStyle = TEAL;
-        cx.font = '700 16px -apple-system, Helvetica, Arial';
-        cx.fillText('TAP — FILL ANOTHER', W/2, 460);
-        cx.globalAlpha = 1;
-        // share pill
-        cx.fillStyle = 'rgba(242,177,52,0.13)';
-        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
-        cx.beginPath();
-        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
-        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
-        cx.fill(); cx.stroke();
+        cx.font = '900 40px -apple-system, Helvetica, Arial';
+        cx.fillText('BOARD FULL', W / 2, 310);
+        cx.fillStyle = 'rgba(255,255,255,0.75)';
+        cx.font = '600 18px -apple-system, Helvetica, Arial';
+        cx.fillText('all ' + TOTAL + ' patches in place', W / 2, 348);
         cx.fillStyle = GOLD;
-        cx.font = '800 15px -apple-system, Helvetica, Arial';
-        cx.fillText('⚡ DARE A FRIEND', W/2, SHARE_R.y + 30);
+        cx.font = '800 22px -apple-system, Helvetica, Arial';
+        cx.fillText(TOTAL + ' patches completed', W / 2, 392);
+
+        if (!DEMO && !BOT) {
+          var p2 = 0.6 + 0.4 * Math.sin(now / 350);
+          cx.globalAlpha = p2;
+          cx.fillStyle = TEAL;
+          cx.font = '700 17px -apple-system, Helvetica, Arial';
+          cx.fillText('TAP TO FILL ANOTHER', W / 2, 450);
+          cx.globalAlpha = 1;
+          // share pill
+          cx.fillStyle = 'rgba(242,177,52,0.14)';
+          cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+          cx.beginPath();
+          if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+          else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+          cx.fill(); cx.stroke();
+          cx.fillStyle = GOLD;
+          cx.font = '800 15px -apple-system, Helvetica, Arial';
+          cx.fillText('⚡ SHARE BOARD', W / 2, SHARE_R.y + 30);
+        }
       }
     }
 
-    // DEMO CTA card
-    if (state.phase === 'cta') {
-      var ct = (now - ctaAt) / 1000, ease = Math.min(1, ct * 2.4);
-      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+    // demo CTA (soft invitation)
+    if (phase === 'cta') {
+      var te = (now - ctaAt) / 1000, ease = Math.min(1, te * 2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
       cx.globalAlpha = ease; cx.textAlign = 'center';
-      cx.fillStyle = '#ffffff';
+      cx.fillStyle = TEAL;
       cx.font = '900 42px -apple-system, Helvetica, Arial';
-      cx.fillText('PATCH BOARD', W/2, 300);
-      cx.fillStyle = 'rgba(255,255,255,0.7)';
-      cx.font = '500 18px -apple-system, Helvetica, Arial';
-      cx.fillText('fill all 12. grow yours.', W/2, 338);
-      var cp = 0.75 + 0.25 * Math.sin(now / 260);
-      cx.fillStyle = TEAL; cx.globalAlpha = ease * cp;
+      cx.fillText('PATCH BOARD', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('the board filled. nothing left empty.', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 300);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL;
       cx.font = '800 26px -apple-system, Helvetica, Arial';
-      cx.fillText('▶ GROW YOURS', W/2, 410);
+      cx.fillText('▶ REACH IT', W / 2, 420);
       cx.globalAlpha = ease;
-      cx.fillStyle = 'rgba(255,255,255,0.5)';
-      cx.font = '500 14px -apple-system, Helvetica, Arial';
-      cx.fillText('link in bio', W/2, 444);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 452);
       cx.globalAlpha = 1;
     }
 
-    // FLASHES (floating reward text)
-    for (var fi = flashes.length - 1; fi >= 0; fi--) {
-      var fl = flashes[fi]; fl.t += dt;
-      var fa = Math.max(0, 1 - fl.t / 38);
-      cx.save();
-      cx.globalAlpha = fa;
-      cx.textAlign = 'center';
+    // floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a; cx.textAlign = 'center';
       cx.fillStyle = fl.color;
-      cx.font = '700 ' + fl.size + 'px -apple-system, Helvetica, Arial';
-      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.8);
-      cx.restore();
-      if (fl.t > 38) flashes.splice(fi, 1);
+      cx.font = '800 ' + (fl.size + fl.t * 0.35) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
     }
 
-    // MUTE toggle (human only)
+    // particles
+    for (var i = particles.length - 1; i >= 0; i--) {
+      var pt = particles[i];
+      pt.vy += 0.08 * dt; pt.x += pt.vx * dt; pt.y += pt.vy * dt;
+      pt.life -= 0.025 * dt;
+      if (pt.life <= 0) { particles.splice(i, 1); continue; }
+      cx.globalAlpha = pt.life;
+      cx.fillStyle = 'hsl(' + pt.hue + ',70%,62%)';
+      cx.beginPath(); cx.arc(pt.x, pt.y, 3.5, 0, Math.PI * 2); cx.fill();
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
     if (!DEMO && !BOT && window.J) {
       cx.textAlign = 'center';
       cx.globalAlpha = 0.5;
       cx.font = '16px -apple-system, Helvetica, Arial';
       cx.fillStyle = '#fff';
-      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w/2, MUTE_R.y + 26);
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
       cx.globalAlpha = 1;
     }
 
@@ -719,6 +600,7 @@
     requestAnimationFrame(frame);
   }
 
+  runsDone = 0; botRunsDone = 0;
   newGame();
   requestAnimationFrame(frame);
 })();

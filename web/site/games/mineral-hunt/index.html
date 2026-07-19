@@ -6,12 +6,13 @@
 <title>Mineral Hunt — Tilt</title>
 <!--
   LOOP / attention-architecture — Mineral Hunt
-  Circuits: 06-zeigarnik (missing specimen), 01-rpe (variable chip reveals), 02-novelty (each mineral).
-  Mechanic: Tap to chip tiles off a stone face; reveal fragments to ID the mineral.
-            Collect all 8 specimens to complete the case.
+  Circuits: 06 Zeigarnik (complete the case), 01 RPE (which mineral next?), 02 novelty (8 shapes).
   Modes:
-    ?demo=1&seed=7        mirror-neuron arc clip, sets window.__demoDone
-    ?bot=1&runs=N&seed=5  imperfect autoplay N runs, sets window.__botDone
+    ?demo=1&seed=7     scripted run for clip capture, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+    ?dare=<n>          incoming challenge from share link
+    ?clip=ID&src=tiktok attribution
+    ?sink=URL          event sink override
 -->
 <style>
   html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
@@ -29,7 +30,6 @@
 <script>
 (function () {
   'use strict';
-
   var W = 405, H = 720;
   var qs = new URLSearchParams(location.search);
   var DEMO = qs.get('demo') === '1';
@@ -37,7 +37,6 @@
   var BOT_RUNS = +qs.get('runs') || 3;
   var SEED = +qs.get('seed') || 42;
 
-  // mulberry32 seeded RNG
   function mulberry32(a) {
     return function () {
       a |= 0; a = a + 0x6D2B79F5 | 0;
@@ -47,6 +46,16 @@
     };
   }
   var rng = mulberry32(SEED);
+  function randInt(n) { return Math.floor(rng() * n); }
+  function seededShuffle(arr, seed) {
+    var r = mulberry32(seed);
+    var a = arr.slice();
+    for (var i = a.length - 1; i > 0; i--) {
+      var j = Math.floor(r() * (i + 1));
+      var t = a[i]; a[i] = a[j]; a[j] = t;
+    }
+    return a;
+  }
 
   var cv = document.getElementById('c'), cx = cv.getContext('2d');
   var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
@@ -59,237 +68,257 @@
   }
   window.addEventListener('resize', fit); fit();
 
-  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var INK = '#0b0d12', VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134';
+  var COLS = 10, ROWS = 13, CELL = 28, GAP = 2;
+  var GX = Math.floor((W - (COLS * (CELL + GAP) - GAP)) / 2);
+  var GY = 188;
+  var BUDGET = 30;
 
-  // ---- Mineral definitions (8 specimens) ----
-  // Each has a name, color palette, shape type, and reveal threshold
   var MINERALS = [
-    { name: 'QUARTZ',    color: '#d4e8f0', glow: '#b0d8f0', shape: 'hex',    chips: 12, rarity: 1 },
-    { name: 'AMETHYST',  color: '#9b6db5', glow: '#c89fe0', shape: 'cluster',chips: 14, rarity: 2 },
-    { name: 'PYRITE',    color: '#c8a83c', glow: '#f2d060', shape: 'cubic',   chips: 10, rarity: 1 },
-    { name: 'MALACHITE', color: '#2ec56c', glow: '#5eff9e', shape: 'band',    chips: 13, rarity: 2 },
-    { name: 'OBSIDIAN',  color: '#2a2a3a', glow: '#5a5a8a', shape: 'sharp',   chips: 11, rarity: 1 },
-    { name: 'GARNET',    color: '#c83c3c', glow: '#ff7070', shape: 'dodec',   chips: 15, rarity: 3 },
-    { name: 'AZURITE',   color: '#2050c0', glow: '#60a0ff', shape: 'tabular', chips: 13, rarity: 2 },
-    { name: 'SELENITE',  color: '#f0ede8', glow: '#fffbe8', shape: 'blade',   chips: 14, rarity: 2 }
+    { name: 'GARNET', hue: 350, shape: 'circle' },
+    { name: 'CITRINE', hue: 44, shape: 'diamond' },
+    { name: 'AMETHYST', hue: 270, shape: 'hexagon' },
+    { name: 'JADE', hue: 158, shape: 'ellipse' },
+    { name: 'SAPPHIRE', hue: 210, shape: 'triangle' },
+    { name: 'RUBY', hue: 345, shape: 'heart' },
+    { name: 'TOPAZ', hue: 38, shape: 'star' },
+    { name: 'OPAL', hue: 178, shape: 'crescent' }
   ];
 
-  // Grid of chips: 5x8 = 40 tiles covering the stone face
-  var COLS = 5, ROWS = 8, TOTAL_TILES = COLS * ROWS;
-  var TILE_W = 66, TILE_H = 54;
-  var GRID_X = (W - COLS * TILE_W) / 2;
-  var GRID_Y = 170;
+  function inShape(shape, u, v) {
+    switch (shape) {
+      case 'circle': return u * u + v * v <= 0.36;
+      case 'diamond': return Math.abs(u) + Math.abs(v) <= 0.92;
+      case 'hexagon': return Math.max(Math.abs(u), Math.abs(u) * 0.5 + Math.abs(v) * 0.866) <= 0.72;
+      case 'ellipse': return (u * u) / (0.48 * 0.48) + (v * v) / (0.82 * 0.82) <= 1;
+      case 'triangle': return v >= -0.62 && v <= 0.78 - Math.abs(u) * 1.1;
+      case 'heart':
+        var d = u * u + (v - 0.05) * (v - 0.05);
+        var notch = u > 0.25 && v < 0.1 && (u - 0.45) * (u - 0.45) + v * v < 0.28;
+        return d <= 0.58 && !notch;
+      case 'star': {
+        var rad = Math.sqrt(u * u + v * v);
+        if (rad < 0.001) return true;
+        var ang = Math.atan2(v, u);
+        var sector = Math.abs(((ang % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI) - Math.PI);
+        var R = 0.26 + 0.36 * (1 - Math.min(sector / (Math.PI / 5), 1));
+        return rad <= R;
+      }
+      case 'crescent': {
+        var d1 = u * u + v * v;
+        var d2 = (u - 0.42) * (u - 0.42) + v * v;
+        return d1 <= 0.62 && d2 >= 0.26;
+      }
+    }
+    return false;
+  }
 
-  // ---- Game state ----
-  var phase, tiles, revealed, mineralIdx, specimenFound, collection,
-      chipCount, flashes, shakeAmt, hitStop, zoom,
-      runStartTs, botRunsDone, dareBeaten, challengeAt, ctaAt, overAt,
-      combo, currentScore, finalScore;
+  var state, flashes, runStartTs, dareBeaten = false;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, combo = 0, challengeAt = 0, ctaAt = 0;
+  var demoPlan = [], demoIdx = 0, demoWait = 0, demoStall = 0;
+  var demoWaits = [5, 8, 6, 11, 7, 5, 10, 6, 8, 7, 5, 12, 6];
+  var botRunsDone = 0, botWait = 0;
+
+  function buildLevel(idx) {
+    var cells = [];
+    var count = 0;
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        var u = (c - (COLS - 1) / 2) / ((COLS - 1) / 2);
+        var v = (r - (ROWS - 1) / 2) / ((ROWS - 1) / 2);
+        var inside = inShape(MINERALS[idx].shape, u, v);
+        cells.push({ c: c, r: r, isMineral: inside, state: 'hidden', chipT: 0 });
+        if (inside) count++;
+      }
+    }
+    var threshold = Math.max(10, Math.ceil(count * 0.5));
+    return { idx: idx, cells: cells, count: count, threshold: threshold, budget: BUDGET, revealed: 0 };
+  }
 
   function newGame() {
-    phase = DEMO ? 'challenge' : (BOT ? 'play' : 'title');
-    specimenFound = false;
-    collection = [];
-    dareBeaten = false;
-    combo = 0;
-    currentScore = 0;
-    finalScore = 0;
-    flashes = [];
-    shakeAmt = 0;
-    hitStop = 0;
-    zoom = 1;
-    botRunsDone = 0;
-
+    state = {
+      phase: 'title',
+      level: null,
+      levelIdx: 0,
+      score: 0,
+      overAt: 0,
+      totalChips: 0
+    };
+    flashes = []; combo = 0; dareBeaten = false;
+    demoPlan = [];
     if (DEMO) {
+      for (var i = 0; i < MINERALS.length; i++) demoPlan.push(makeDemoPlan(i, buildLevel(i)));
+      state.phase = 'challenge';
       challengeAt = performance.now();
-      setTimeout(function () { startStone(); }, 1200);
+      setTimeout(startRun, 1200);
       return;
     }
-    if (BOT) { startStone(); return; }
+    if (BOT) startRun();
   }
 
-  function startStone() {
-    // Pick a random mineral
-    mineralIdx = Math.floor(rng() * MINERALS.length);
-    var mineral = MINERALS[mineralIdx];
-    // Build tile grid — some tiles already "chipped" based on rng
-    tiles = [];
-    for (var i = 0; i < TOTAL_TILES; i++) {
-      tiles.push({
-        chipped: false,
-        crackLevel: 0,    // 0-3 visual crack stages
-        gx: i % COLS,
-        gy: Math.floor(i / COLS)
-      });
+  function makeDemoPlan(levelIdx, level) {
+    var mineral = [], empty = [];
+    for (var i = 0; i < level.cells.length; i++) {
+      if (level.cells[i].isMineral) mineral.push(i);
+      else empty.push(i);
     }
-    revealed = 0;
-    chipCount = mineral.chips;
-    specimenFound = false;
+    mineral = seededShuffle(mineral, SEED + levelIdx * 41);
+    empty = seededShuffle(empty, SEED + levelIdx * 41 + 67);
+    var need = level.threshold;
+    if (levelIdx === 4) {            // near-fail + recovery at ~60%
+      return empty.slice(0, 14).concat(mineral.slice(0, need));
+    } else if (levelIdx === 6) {     // the real fail
+      return empty.slice(0, level.budget);
+    }
+    return mineral.slice(0, need);
+  }
 
-    if (phase !== 'play') phase = 'play';
+  function startRun() {
+    state.levelIdx = 0;
+    state.score = 0;
+    state.totalChips = 0;
+    combo = 0;
+    nextLevel();
+    state.phase = 'play';
     runStartTs = Date.now();
-    if (window.LOOP) LOOP.emit('play_start', { seed: SEED, mineral: MINERALS[mineralIdx].name });
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
   }
 
-  function pctTop(score) {
-    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 5))));
-  }
-
-  function chipTile(idx) {
-    if (idx < 0 || idx >= TOTAL_TILES) return;
-    var t = tiles[idx];
-    if (t.chipped) return;
-    t.crackLevel = Math.min(3, t.crackLevel + 1);
-    if (t.crackLevel >= 3 || rng() < 0.55) {
-      t.chipped = true;
-      revealed++;
-      combo++;
-      var mineral = MINERALS[mineralIdx];
-      var isGold = mineral.rarity === 3;
-      var isPerfect = (revealed === 1 || revealed === chipCount);
-      if (window.J) {
-        if (isPerfect) J.perfect(combo);
-        else if (isGold) J.gold();
-        else J.hit(combo);
-        J.tension(Math.min(revealed / chipCount, 1));
-      }
-      if (isPerfect) { hitStop = 4; zoom = 1.025; }
-      // Flash text
-      if (revealed === 1) flash('FIRST CHIP!', TEAL, 32);
-      else if (revealed >= chipCount - 1) flash('SO CLOSE!', VERM, 36);
-
-      if (window.LOOP) LOOP.emit('chip', { n: revealed, mineral: mineral.name });
-
-      // Check if enough revealed
-      if (revealed >= chipCount) {
-        collectSpecimen();
-      }
-    } else {
-      t.crackLevel++;
-      // near-miss — cracking but not revealing
-      if (rng() < 0.3) {
-        shakeAmt = 2;
-        if (window.J) J.near();
-        flash('SO CLOSE!', GOLD, 28);
-        if (window.LOOP) LOOP.emit('near_miss', { n: revealed });
-      }
+  function nextLevel() {
+    if (state.levelIdx >= MINERALS.length) {
+      gameOver(true);
+      return;
     }
+    state.level = buildLevel(state.levelIdx);
+    demoIdx = 0; demoWait = demoWaits[0];
+    botWait = 0;
   }
 
-  function collectSpecimen() {
-    var mineral = MINERALS[mineralIdx];
-    collection.push(mineralIdx);
-    currentScore = collection.length;
-    specimenFound = true;
-    hitStop = 6;
-    zoom = 1.04;
-    shakeAmt = 4;
-
-    if (window.J) { J.fanfare(); }
-    flash(mineral.name + ' ✓', GOLD, 38);
-
-    if (window.LOOP) LOOP.emit('specimen_found', { mineral: mineral.name, n: currentScore });
-
-    // Dare check
-    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && currentScore > SHARE.dare) {
+  function identify() {
+    var m = MINERALS[state.levelIdx];
+    state.score++;
+    flash(m.name, hsl(m.hue, 70, 60), 42);
+    flash('COLLECTED', GOLD, 26);
+    hitStop = 5; zoom = 1.04; shakeAmt = 0;
+    if (window.J) { J.gold(); J.fanfare(); }
+    if (window.LOOP) LOOP.emit('mineral_identified', { idx: state.levelIdx, name: m.name, score: state.score });
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
       dareBeaten = true;
       flash('DARE BEATEN', TEAL, 40);
       if (window.J) J.fanfare();
-      SHARE.beaten(currentScore);
+      SHARE.beaten(state.score);
+    }
+    state.levelIdx++;
+    nextLevel();
+  }
+
+  function chip(cellIdx, fromAuto) {
+    if (!state.level) return;
+    var cell = state.level.cells[cellIdx];
+    if (!cell || cell.state !== 'hidden') return;
+    cell.state = 'chipped';
+    cell.chipT = 1;
+    state.level.budget--;
+    state.totalChips++;
+    var cxp = GX + cell.c * (CELL + GAP) + CELL / 2;
+    var cyp = GY + cell.r * (CELL + GAP) + CELL / 2;
+
+    if (cell.isMineral) {
+      state.level.revealed++;
+      combo++;
+      if (window.J) J.hit(combo);
+      floating('+' + combo, TEAL, 22, cxp, cyp);
+      if (window.LOOP) LOOP.emit('chip', { mineral_idx: state.levelIdx, mineral: true, combo: combo, remaining: state.level.budget });
+    } else {
+      combo = 0;
+      shakeAmt = 3.5;
+      if (window.J) J.hit(1);
+      floating('empty', 'rgba(255,255,255,0.6)', 14, cxp, cyp);
+      if (window.LOOP) LOOP.emit('chip', { mineral_idx: state.levelIdx, mineral: false, combo: 0, remaining: state.level.budget });
     }
 
-    // Check win (all 8 collected)
-    if (collection.length >= 8) {
-      setTimeout(function () { gameOver(true); }, 800);
-    } else if (DEMO && collection.length >= 3) {
-      // Demo ends after 3 specimens for timing
-      setTimeout(function () { gameOver(false); }, 600);
-    } else if (BOT && collection.length >= 2) {
-      // Bot goes passive after 2, letting the stone run out of moves
-      setTimeout(function () { gameOver(false); }, 400);
-    } else {
-      // Next stone after a beat
-      setTimeout(function () {
-        startStone();
-      }, 900);
+    if (window.J) J.tension(Math.min(1, 1 - state.level.budget / BUDGET));
+
+    if (state.level.revealed >= state.level.threshold) {
+      identify();
+      return;
+    }
+
+    if (state.level.budget <= 0) {
+      gameOver(false);
+      return;
+    }
+
+    if (state.level.budget <= 3 && state.level.revealed < state.level.threshold) {
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { remaining: state.level.budget, needed: state.level.threshold - state.level.revealed });
     }
   }
 
   function gameOver(won) {
-    phase = 'over';
-    overAt = performance.now();
-    finalScore = currentScore;
-    if (DEMO) window.__demoScore = finalScore;
-
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = won ? 0 : 8;
+    if (window.J) { J.tension(0); J.death(won ? 0.1 : Math.min(0.3 + (8 - state.score) / 10, 1)); if (won) setTimeout(function () { J.fanfare(); }, 300); }
+    if (DEMO) window.__demoScore = state.score;
     var dur = (Date.now() - runStartTs) / 1000;
-    shakeAmt = won ? 2 : 7;
-    if (window.J) {
-      if (won) J.fanfare();
-      else J.death(Math.min(0.3 + finalScore / 8, 1));
-    }
-    if (window.LOOP) LOOP.emit('game_over', { score: finalScore, dur_s: +dur.toFixed(1) });
-
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), won: won });
     if (DEMO) {
-      setTimeout(function () {
-        phase = 'cta';
-        ctaAt = performance.now();
-        setTimeout(function () { window.__demoDone = true; }, 3600);
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
       }, 2200);
     }
     if (BOT) {
       botRunsDone++;
-      if (botRunsDone >= BOT_RUNS) {
-        window.__botDone = true;
-      } else {
-        setTimeout(function () {
-          resetRun();
-        }, 600);
-      }
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 700);
     }
   }
 
   function resetRun() {
-    collection = [];
-    currentScore = 0;
+    state.level = null;
+    state.levelIdx = 0;
+    state.score = 0;
+    state.totalChips = 0;
     combo = 0;
-    dareBeaten = false;
     flashes = [];
     if (window.LOOP) LOOP.emit('restart', {});
-    startStone();
-    phase = 'play';
+    startRun();
   }
 
-  function flash(txt, color, size) {
-    flashes.push({ txt: txt, color: color, size: size, t: 0, x: W / 2, y: 140 });
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0, x: W / 2, y: 260 }); }
+  function floating(txt, color, size, x, y) { flashes.push({ txt: txt, color: color, size: size, t: 0, x: x, y: y, float: true }); }
+
+  function hsl(h, s, l) { return 'hsl(' + h + ',' + s + '%,' + l + '%)'; }
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 3.2))));
   }
 
-  // ---- Input ----
+  function cellAt(x, y) {
+    var c = Math.floor((x - GX) / (CELL + GAP));
+    var r = Math.floor((y - GY) / (CELL + GAP));
+    if (c < 0 || c >= COLS || r < 0 || r >= ROWS) return -1;
+    return r * COLS + c;
+  }
+
   var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
-  var SHARE_R = { x: W / 2 - 125, y: 530, w: 250, h: 46 };
+  var SHARE_R = { x: W / 2 - 125, y: 510, w: 250, h: 46 };
   function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
 
-  function tap(px, py) {
+  function tap(x, y) {
     if (DEMO || BOT) return;
-    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
-    if (phase === 'title') { startStone(); phase = 'play'; runStartTs = Date.now();
-      if (window.LOOP) LOOP.emit('play_start', { seed: SEED }); return; }
-    if (phase === 'play') {
-      // Determine which tile was tapped
-      var tx = px - GRID_X, ty = py - GRID_Y;
-      var col = Math.floor(tx / TILE_W), row = Math.floor(ty / TILE_H);
-      if (col >= 0 && col < COLS && row >= 0 && row < ROWS) {
-        chipTile(row * COLS + col);
-      }
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play' && state.level) {
+      var idx = cellAt(x, y);
+      if (idx >= 0) chip(idx, false);
       return;
     }
-    if (phase === 'over' && performance.now() - overAt > 350) {
-      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
-        SHARE.send({ score: finalScore, unit: 'specimens' }); return;
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'specimens' }); return;
       }
-      // Restart
-      collection = []; currentScore = 0; combo = 0; dareBeaten = false; flashes = [];
-      if (window.LOOP) LOOP.emit('restart', {});
-      startStone(); phase = 'play';
+      resetRun();
     }
   }
 
@@ -299,436 +328,280 @@
   });
   window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
 
-  // ---- Demo / Bot autopilots ----
-  // Demo script: tap specific tiles in a sequence that builds tension
-  var demoScript = [
-    { col: 2, row: 3 }, { col: 1, row: 4 }, { col: 3, row: 4 }, { col: 2, row: 5 },
-    { col: 0, row: 3 }, { col: 4, row: 3 }, { col: 2, row: 2 }, { col: 1, row: 2 },
-    { col: 3, row: 2 }, { col: 2, row: 1 }, { col: 1, row: 5 }, { col: 3, row: 5 },
-    { col: 0, row: 4 }, { col: 4, row: 4 }, { col: 2, row: 6 }
-  ];
-  var demoWaits = [38, 28, 45, 32, 52, 29, 41, 36, 48, 30, 55, 27, 43, 31, 38];
-  var demoIdx = 0, demoWait = 40;
-
-  // Bot randomizes taps
-  var botWait = 0, botNextCol = 0, botNextRow = 0;
-
   function autopilot() {
-    if (phase !== 'play') return;
+    if (state.phase !== 'play' || !state.level) return;
     if (DEMO) {
       if (demoWait > 0) { demoWait--; return; }
-      if (demoIdx >= demoScript.length) return;
-      var step = demoScript[demoIdx];
-      var idx = step.row * COLS + step.col;
-      if (idx < TOTAL_TILES && tiles[idx] && !tiles[idx].chipped) {
-        chipTile(idx);
-      } else {
-        // find next unchipped tile
-        for (var i = 0; i < TOTAL_TILES; i++) {
-          if (!tiles[i].chipped) { chipTile(i); break; }
-        }
+      var plan = demoPlan[state.levelIdx];
+      if (!plan || demoIdx >= plan.length) {
+        // plan exhausted without a natural end — choke deliberately so the
+        // demo ALWAYS reaches game_over → __demoDone (never stalls the clip)
+        demoStall++;
+        if (demoStall === 50 && state.phase === 'play') gameOver(false);
+        return;
       }
-      demoWait = demoWaits[demoIdx % demoWaits.length] || 32;
+      demoStall = 0;
+      var idx = plan[demoIdx];
+      chip(idx, true);
       demoIdx++;
+      demoWait = demoWaits[demoIdx % demoWaits.length] || 6;
     } else if (BOT) {
       if (botWait > 0) { botWait--; return; }
-      // Pick a random unchipped tile
-      var unchipped = [];
-      for (var j = 0; j < TOTAL_TILES; j++) {
-        if (tiles && tiles[j] && !tiles[j].chipped) unchipped.push(j);
-      }
-      if (unchipped.length > 0) {
-        var pick = unchipped[Math.floor(rng() * unchipped.length)];
-        chipTile(pick);
-      }
-      botWait = Math.floor(rng() * 20) + 12;
+      var hidden = [];
+      for (var i = 0; i < state.level.cells.length; i++) if (state.level.cells[i].state === 'hidden') hidden.push(i);
+      if (hidden.length === 0) return;
+      var pick = hidden[randInt(hidden.length)];
+      chip(pick, true);
+      botWait = 6 + randInt(8);
     }
   }
 
-  // ---- Drawing helpers ----
-  function drawCrystalShape(mineral, cx2, x, y, size, alpha) {
-    cx2.globalAlpha = alpha;
-    cx2.fillStyle = mineral.color;
-    cx2.strokeStyle = mineral.glow;
-    cx2.lineWidth = 2;
-
-    var s = size;
-    cx2.beginPath();
-    if (mineral.shape === 'hex') {
-      for (var i = 0; i < 6; i++) {
-        var a = Math.PI / 3 * i - Math.PI / 6;
-        i === 0 ? cx2.moveTo(x + s * Math.cos(a), y + s * Math.sin(a))
-                : cx2.lineTo(x + s * Math.cos(a), y + s * Math.sin(a));
-      }
-    } else if (mineral.shape === 'cluster') {
-      // Multiple smaller hexagons
-      for (var c = 0; c < 3; c++) {
-        var ox = (c - 1) * s * 0.6, oy = c % 2 === 0 ? 0 : -s * 0.3;
-        cx2.save(); cx2.translate(ox, oy);
-        cx2.beginPath();
-        for (var ci = 0; ci < 6; ci++) {
-          var ca = Math.PI / 3 * ci;
-          ci === 0 ? cx2.moveTo(x + s * 0.6 * Math.cos(ca), y + s * 0.6 * Math.sin(ca))
-                   : cx2.lineTo(x + s * 0.6 * Math.cos(ca), y + s * 0.6 * Math.sin(ca));
-        }
-        cx2.closePath(); cx2.fill(); cx2.stroke();
-        cx2.restore();
-      }
-      cx2.globalAlpha = 1; return;
-    } else if (mineral.shape === 'cubic') {
-      cx2.rect(x - s * 0.7, y - s * 0.7, s * 1.4, s * 1.4);
-    } else if (mineral.shape === 'band') {
-      cx2.rect(x - s, y - s * 0.45, s * 2, s * 0.9);
-    } else if (mineral.shape === 'sharp') {
-      cx2.moveTo(x, y - s);
-      cx2.lineTo(x + s * 0.6, y + s * 0.3);
-      cx2.lineTo(x, y + s * 0.6);
-      cx2.lineTo(x - s * 0.6, y + s * 0.3);
-    } else if (mineral.shape === 'dodec') {
-      for (var di = 0; di < 8; di++) {
-        var da = Math.PI * 2 / 8 * di;
-        di === 0 ? cx2.moveTo(x + s * Math.cos(da), y + s * Math.sin(da))
-                 : cx2.lineTo(x + s * Math.cos(da), y + s * Math.sin(da));
-      }
-    } else if (mineral.shape === 'tabular') {
-      cx2.rect(x - s * 0.9, y - s * 0.5, s * 1.8, s);
-    } else if (mineral.shape === 'blade') {
-      cx2.moveTo(x, y - s);
-      cx2.lineTo(x + s * 0.25, y);
-      cx2.lineTo(x, y + s);
-      cx2.lineTo(x - s * 0.25, y);
-    } else {
-      cx2.arc(x, y, s, 0, Math.PI * 2);
-    }
-    cx2.closePath();
-    cx2.fill();
-    cx2.stroke();
-    cx2.globalAlpha = 1;
-  }
-
-  function drawStoneGrid() {
-    if (!tiles) return;
-    var mineral = MINERALS[mineralIdx];
-    var revealRatio = revealed / chipCount;
-
-    for (var i = 0; i < TOTAL_TILES; i++) {
-      var t = tiles[i];
-      var tx = GRID_X + t.gx * TILE_W;
-      var ty = GRID_Y + t.gy * TILE_H;
-
-      if (t.chipped) {
-        // Revealed fragment — show mineral color
-        var fragAlpha = 0.7 + 0.3 * revealRatio;
-        cx.globalAlpha = fragAlpha;
-        cx.fillStyle = mineral.color;
-        // Draw fragment shape
-        cx.beginPath();
-        cx.roundRect ? cx.roundRect(tx + 3, ty + 3, TILE_W - 6, TILE_H - 6, 4)
-                     : cx.rect(tx + 3, ty + 3, TILE_W - 6, TILE_H - 6);
-        cx.fill();
-        // Glow on revealed
-        cx.globalAlpha = 0.3 * fragAlpha;
-        cx.fillStyle = mineral.glow;
-        cx.fill();
-        cx.globalAlpha = 1;
-      } else {
-        // Rock tile — darker/lighter based on crack level
-        var rockLight = 25 + t.crackLevel * 6;
-        cx.globalAlpha = 1;
-        cx.fillStyle = 'hsl(220,' + (8 + t.crackLevel * 3) + '%,' + rockLight + '%)';
-        cx.beginPath();
-        cx.roundRect ? cx.roundRect(tx + 1, ty + 1, TILE_W - 2, TILE_H - 2, 3)
-                     : cx.rect(tx + 1, ty + 1, TILE_W - 2, TILE_H - 2);
-        cx.fill();
-
-        // Crack lines
-        if (t.crackLevel > 0) {
-          cx.strokeStyle = 'rgba(255,255,255,' + (0.08 * t.crackLevel) + ')';
-          cx.lineWidth = 1;
-          cx.beginPath();
-          cx.moveTo(tx + TILE_W * 0.3, ty + TILE_H * 0.2);
-          cx.lineTo(tx + TILE_W * 0.6, ty + TILE_H * 0.7);
-          if (t.crackLevel > 1) {
-            cx.moveTo(tx + TILE_W * 0.7, ty + TILE_H * 0.25);
-            cx.lineTo(tx + TILE_W * 0.4, ty + TILE_H * 0.65);
-          }
-          cx.stroke();
-        }
-
-        // Tile border
-        cx.strokeStyle = 'rgba(255,255,255,0.06)';
-        cx.lineWidth = 1;
-        cx.beginPath();
-        cx.roundRect ? cx.roundRect(tx + 1, ty + 1, TILE_W - 2, TILE_H - 2, 3)
-                     : cx.rect(tx + 1, ty + 1, TILE_W - 2, TILE_H - 2);
-        cx.stroke();
-      }
-    }
-  }
-
-  function drawCollectionCase() {
-    // Bottom strip: display case showing 8 specimen slots
-    var caseY = GRID_Y + ROWS * TILE_H + 20;
-    var slotW = 40, slotH = 38, slotSpacing = 6;
-    var totalW = 8 * (slotW + slotSpacing) - slotSpacing;
-    var caseX = (W - totalW) / 2;
-
-    cx.fillStyle = 'rgba(255,255,255,0.04)';
-    cx.strokeStyle = 'rgba(255,255,255,0.12)';
-    cx.lineWidth = 1;
+  function roundRect(x, y, w, h, r) {
+    if (cx.roundRect) { cx.roundRect(x, y, w, h, r); return; }
+    var rr = Math.min(r, w / 2, h / 2);
     cx.beginPath();
-    cx.roundRect ? cx.roundRect(caseX - 8, caseY - 6, totalW + 16, slotH + 18, 8)
-                 : cx.rect(caseX - 8, caseY - 6, totalW + 16, slotH + 18);
-    cx.fill(); cx.stroke();
-
-    for (var i = 0; i < 8; i++) {
-      var sx = caseX + i * (slotW + slotSpacing);
-      var sy = caseY;
-      var filled = collection.indexOf(i) >= 0;
-
-      cx.globalAlpha = filled ? 1 : 0.25;
-      cx.fillStyle = filled ? MINERALS[i].color : 'rgba(255,255,255,0.08)';
-      cx.strokeStyle = filled ? MINERALS[i].glow : 'rgba(255,255,255,0.15)';
-      cx.lineWidth = 1;
-      cx.beginPath();
-      cx.roundRect ? cx.roundRect(sx, sy, slotW, slotH, 4) : cx.rect(sx, sy, slotW, slotH);
-      cx.fill(); cx.stroke();
-
-      if (filled) {
-        // Mini mineral name
-        cx.globalAlpha = 1;
-        cx.fillStyle = INK;
-        cx.font = '500 7px -apple-system, Helvetica, Arial';
-        cx.textAlign = 'center';
-        cx.fillText(MINERALS[i].name.slice(0, 3), sx + slotW / 2, sy + slotH - 6);
-      }
-      cx.globalAlpha = 1;
-    }
-
-    // Label
-    cx.fillStyle = 'rgba(255,255,255,0.3)';
-    cx.font = '600 10px Menlo, monospace';
-    cx.textAlign = 'center';
-    cx.fillText('SPECIMEN CASE — ' + collection.length + '/8', W / 2, caseY + slotH + 14);
+    cx.moveTo(x + rr, y);
+    cx.arcTo(x + w, y, x + w, y + h, rr);
+    cx.arcTo(x + w, y + h, x, y + h, rr);
+    cx.arcTo(x, y + h, x, y, rr);
+    cx.arcTo(x, y, x + w, y, rr);
+    cx.closePath();
   }
 
-  function drawRevealBar() {
-    if (!tiles) return;
-    var barX = GRID_X, barY = GRID_Y - 18, barW = COLS * TILE_W, barH = 6;
-    var ratio = Math.min(revealed / chipCount, 1);
-
-    cx.fillStyle = 'rgba(255,255,255,0.08)';
-    cx.beginPath();
-    cx.roundRect ? cx.roundRect(barX, barY, barW, barH, 3) : cx.rect(barX, barY, barW, barH);
-    cx.fill();
-
-    if (ratio > 0) {
-      var g = cx.createLinearGradient(barX, 0, barX + barW * ratio, 0);
-      g.addColorStop(0, TEAL); g.addColorStop(1, GOLD);
-      cx.fillStyle = g;
-      cx.beginPath();
-      cx.roundRect ? cx.roundRect(barX, barY, barW * ratio, barH, 3) : cx.rect(barX, barY, barW * ratio, barH);
-      cx.fill();
-    }
-  }
-
-  function drawMineralHint() {
-    if (!tiles) return;
-    var mineral = MINERALS[mineralIdx];
-    var ratio = revealed / chipCount;
-    if (ratio < 0.2) return; // No hint until 20% revealed
-
-    var hintAlpha = Math.max(0, (ratio - 0.2) / 0.5);
-    cx.globalAlpha = hintAlpha * 0.85;
+  function drawDisplayCase() {
     cx.textAlign = 'center';
-    cx.fillStyle = mineral.glow;
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
     cx.font = '700 11px Menlo, monospace';
+    cx.fillText('DISPLAY CASE', W / 2, 34);
+    var slotR = 18, startX = (W - (MINERALS.length * (slotR * 2 + 10) - 10)) / 2 + slotR;
+    var y = 62;
+    for (var i = 0; i < MINERALS.length; i++) {
+      var x = startX + i * (slotR * 2 + 10);
+      cx.beginPath();
+      cx.arc(x, y, slotR, 0, Math.PI * 2);
+      cx.fillStyle = i < state.score ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.04)';
+      cx.fill();
+      cx.strokeStyle = (state.phase === 'play' && state.levelIdx === i) ? TEAL : 'rgba(255,255,255,0.2)';
+      cx.lineWidth = state.levelIdx === i ? 2 : 1;
+      cx.stroke();
+      if (i < state.score) {
+        cx.beginPath();
+        cx.arc(x, y, 9, 0, Math.PI * 2);
+        cx.fillStyle = hsl(MINERALS[i].hue, 72, 58);
+        cx.fill();
+        cx.shadowBlur = 0;
+      } else {
+        cx.fillStyle = 'rgba(255,255,255,0.12)';
+        cx.font = '600 10px Menlo, monospace';
+        cx.fillText('?', x, y + 3);
+      }
+    }
+  }
 
-    var label = ratio < 0.5 ? '???' : ratio < 0.8 ? mineral.name.slice(0, 4) + '...' : mineral.name + '?';
-    cx.fillText(label, W / 2, GRID_Y - 30);
+  function rockFill(x, y) {
+    var g = cx.createLinearGradient(x, y, x + CELL, y + CELL);
+    g.addColorStop(0, '#2a2d35');
+    g.addColorStop(1, '#1a1d24');
+    return g;
+  }
+
+  function drawGrid() {
+    if (!state.level) return;
+    var lvl = state.level;
+    for (var i = 0; i < lvl.cells.length; i++) {
+      var cell = lvl.cells[i];
+      var x = GX + cell.c * (CELL + GAP);
+      var y = GY + cell.r * (CELL + GAP);
+      if (cell.state === 'hidden') {
+        var t = 1 - cell.chipT * 0.2;
+        cx.save();
+        cx.translate(x + CELL / 2, y + CELL / 2);
+        cx.scale(t, t);
+        cx.translate(-(x + CELL / 2), -(y + CELL / 2));
+        cx.fillStyle = rockFill(x, y);
+        cx.fillRect(x + 1, y + 1, CELL - 2, CELL - 2);
+        cx.strokeStyle = 'rgba(255,255,255,0.08)';
+        cx.lineWidth = 1;
+        cx.strokeRect(x + 1.5, y + 1.5, CELL - 3, CELL - 3);
+        cx.restore();
+      } else {
+        var sc = 1 - cell.chipT * 0.45;
+        cx.save();
+        cx.translate(x + CELL / 2, y + CELL / 2);
+        cx.scale(sc, sc);
+        cx.translate(-(x + CELL / 2), -(y + CELL / 2));
+        cx.globalAlpha = 1 - cell.chipT * 0.7;
+        if (cell.isMineral) {
+          var glow = cx.createRadialGradient(x + CELL / 2, y + CELL / 2, 2, x + CELL / 2, y + CELL / 2, CELL);
+          glow.addColorStop(0, hsl(MINERALS[lvl.idx].hue, 80, 70));
+          glow.addColorStop(1, hsl(MINERALS[lvl.idx].hue, 70, 45));
+          cx.fillStyle = glow;
+        } else {
+          cx.fillStyle = '#11141a';
+        }
+        cx.fillRect(x + 2, y + 2, CELL - 4, CELL - 4);
+        cx.restore();
+        cx.globalAlpha = 1;
+        if (cell.chipT > 0) cell.chipT -= 0.04;
+        if (cell.chipT < 0) cell.chipT = 0;
+      }
+    }
+  }
+
+  function drawHUD() {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.9)';
+    cx.font = '800 52px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score, W / 2, 128);
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('of 8 specimens', W / 2, 148);
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 170);
+    }
+
+    if (state.level && state.phase === 'play') {
+      var barW = 180, barH = 8, bx = (W - barW) / 2, by = 630;
+      cx.fillStyle = 'rgba(255,255,255,0.12)';
+      cx.fillRect(bx, by, barW, barH);
+      var pct = Math.max(0, state.level.budget / BUDGET);
+      cx.fillStyle = pct < 0.2 ? VERM : pct < 0.5 ? GOLD : TEAL;
+      cx.fillRect(bx, by, barW * pct, barH);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '700 11px Menlo, monospace';
+      cx.fillText(state.level.budget + ' CHIPS LEFT', W / 2, by + 22);
+    }
+
+    if (combo > 1 && state.phase === 'play') {
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('×' + combo, W / 2, 600);
+    }
+  }
+
+  function drawTitle() {
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+    cx.fillText('MINERAL HUNT', W / 2, 300);
+    cx.fillStyle = TEAL; cx.font = '700 17px -apple-system, Helvetica, Arial';
+    var pulse = 0.6 + 0.4 * Math.sin(performance.now() / 300);
+    cx.globalAlpha = pulse; cx.fillText('CHIP THE ROCK. REVEAL THE CRYSTAL.', W / 2, 345); cx.globalAlpha = 1;
+    cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('collect all 8 specimens', W / 2, 372);
+  }
+
+  function drawChallenge() {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+    cx.fillText('SCORE TO BEAT', W / 2, 300);
+    cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+    cx.fillText('6', W / 2, 400);
+    cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText("today's top haul", W / 2, 430);
+  }
+
+  function drawOver() {
+    cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    var won = state.score >= MINERALS.length;
+    cx.fillStyle = won ? TEAL : VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+    cx.fillText(won ? 'COLLECTION COMPLETE' : 'CRUMBLED.', W / 2, 300);
+    cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score + ' specimen' + (state.score === 1 ? '' : 's'), W / 2, 345);
+    var pt = pctTop(state.score);
+    cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+    cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+    cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 416);
+    if (!DEMO && !BOT) {
+      var p2 = 0.6 + 0.4 * Math.sin(performance.now() / 280);
+      cx.globalAlpha = p2; cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — ONE MORE TRY', W / 2, 462);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(242,177,52,0.14)';
+      cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+      cx.beginPath();
+      roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+      cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+    }
+  }
+
+  function drawCTA() {
+    var t = (performance.now() - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease; cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+    cx.fillText('MINERAL HUNT', W / 2, 300);
+    cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+    cx.fillText('they found ' + (window.__demoScore || 6) + '. your move.', W / 2, 340);
+    var p3 = 0.7 + 0.3 * Math.sin(performance.now() / 240);
+    cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+    cx.font = '900 30px -apple-system, Helvetica, Arial';
+    cx.fillText('BEAT ' + (window.__demoScore || 6), W / 2, 410);
+    cx.globalAlpha = ease;
+    cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 442);
     cx.globalAlpha = 1;
   }
 
-  // ---- Render loop ----
-  var last = performance.now(), ctaLocal = 0;
-
+  var last = performance.now();
   function frame(now) {
     var dt = Math.min((now - last) / 16.667, 3); last = now;
 
-    // Decay hit-stop — call autopilot only when not frozen
-    if (hitStop > 0) {
-      hitStop -= dt;
-    } else {
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play' && state.level) {
       autopilot();
     }
 
-    // Juice transforms
     cx.save();
     if (shakeAmt > 0.2 || zoom > 1.001) {
-      var sx = (Math.random() - 0.5) * shakeAmt;
-      var sy2 = (Math.random() - 0.5) * shakeAmt;
-      cx.translate(W / 2 + sx, H / 2 + sy2);
-      cx.scale(zoom, zoom);
-      cx.translate(-W / 2, -H / 2);
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
     }
-    shakeAmt *= Math.pow(0.84, dt);
-    zoom += (1 - zoom) * 0.12 * dt;
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
 
-    // Background
     cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
     var bg = cx.createLinearGradient(0, 0, 0, H);
     bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(232,80,46,0.06)');
     cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
 
-    // ----- TITLE -----
-    if (phase === 'title') {
-      cx.textAlign = 'center';
-      cx.fillStyle = '#fff';
-      cx.font = '900 44px -apple-system, Helvetica, Arial';
-      cx.fillText('MINERAL HUNT', W / 2, 240);
-      cx.fillStyle = 'rgba(255,255,255,0.45)';
-      cx.font = '600 15px -apple-system, Helvetica, Arial';
-      cx.fillText('chip the rock. find the crystal.', W / 2, 280);
-      cx.fillStyle = TEAL; cx.font = '700 14px -apple-system, Helvetica, Arial';
-      cx.fillText('collect all 8 specimens', W / 2, 308);
-      // Pulse CTA
-      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
-      cx.globalAlpha = pulse;
-      cx.fillStyle = VERM; cx.font = '700 19px -apple-system, Helvetica, Arial';
-      cx.fillText('TAP TO CHIP', W / 2, 380);
-      cx.globalAlpha = 1;
+    var vignette = cx.createRadialGradient(W / 2, GY + ROWS * (CELL + GAP) / 2, 20, W / 2, GY + ROWS * (CELL + GAP) / 2, 220);
+    vignette.addColorStop(0, 'rgba(255,255,255,0.04)');
+    vignette.addColorStop(1, 'rgba(255,255,255,0)');
+    cx.fillStyle = vignette;
+    cx.fillRect(GX - 10, GY - 10, COLS * (CELL + GAP) + 20, ROWS * (CELL + GAP) + 20);
+
+    drawDisplayCase();
+
+    if (state.phase === 'title') drawTitle();
+    else if (state.phase === 'challenge') drawChallenge();
+    else {
+      drawGrid();
+      if (state.phase === 'play' || state.phase === 'over') drawHUD();
     }
 
-    // ----- CHALLENGE CARD -----
-    if (phase === 'challenge') {
-      cx.textAlign = 'center';
-      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 15px Menlo, monospace';
-      cx.fillText('SPECIMENS TO BEAT', W / 2, 290);
-      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
-      cx.fillText('5', W / 2, 400);
-      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
-      cx.fillText("today's top hunt", W / 2, 432);
-    }
-
-    // ----- PLAY -----
-    if (phase === 'play') {
-      // Mineral hint (top)
-      drawMineralHint();
-
-      // Current mineral name (top label)
-      if (tiles) {
-        var mineral = MINERALS[mineralIdx];
-        cx.textAlign = 'center';
-        cx.fillStyle = 'rgba(255,255,255,0.35)';
-        cx.font = '600 11px Menlo, monospace';
-        cx.fillText('CHIPPING: ' + (revealed >= chipCount * 0.5 ? mineral.name + '?' : '???'), W / 2, 155);
-      }
-
-      // Reveal progress bar
-      drawRevealBar();
-
-      // Stone grid
-      drawStoneGrid();
-
-      // Collection case
-      drawCollectionCase();
-
-      // Score (top)
-      cx.textAlign = 'center';
-      cx.fillStyle = 'rgba(255,255,255,0.9)';
-      cx.font = '800 52px -apple-system, Helvetica, Arial';
-      cx.fillText(collection.length, W / 2, 100);
-      cx.fillStyle = 'rgba(255,255,255,0.35)';
-      cx.font = '600 11px -apple-system, Helvetica, Arial';
-      cx.fillText('SPECIMENS', W / 2, 120);
-
-      // Dare banner
-      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
-        cx.fillStyle = dareBeaten ? TEAL : GOLD;
-        cx.font = '700 13px -apple-system, Helvetica, Arial';
-        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' · ' + SHARE.by : ''), W / 2, 138);
-      }
-    }
-
-    // ----- GAME OVER -----
-    if (phase === 'over') {
-      // Still draw the grid underneath
-      drawRevealBar();
-      drawStoneGrid();
-      drawCollectionCase();
-
-      cx.fillStyle = 'rgba(11,13,18,0.65)'; cx.fillRect(0, 0, W, H);
-      cx.textAlign = 'center';
-
-      var won2 = finalScore >= 8;
-      cx.fillStyle = won2 ? GOLD : VERM;
-      cx.font = '900 36px -apple-system, Helvetica, Arial';
-      cx.fillText(won2 ? 'COLLECTION COMPLETE!' : 'THE ROCK WINS.', W / 2, 280);
-
-      cx.fillStyle = '#fff';
-      cx.font = '800 26px -apple-system, Helvetica, Arial';
-      cx.fillText(finalScore + ' specimens', W / 2, 322);
-
-      var pt = pctTop(finalScore);
-      cx.fillStyle = GOLD;
-      cx.font = '900 22px -apple-system, Helvetica, Arial';
-      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 366);
-      cx.fillStyle = 'rgba(255,255,255,0.5)';
-      cx.font = '600 13px -apple-system, Helvetica, Arial';
-      cx.fillText('better than ' + (100 - pt) + '% of hunters', W / 2, 390);
-
-      if (!DEMO && !BOT) {
-        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
-        cx.globalAlpha = p2;
-        cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
-        cx.fillText('TAP — HUNT AGAIN', W / 2, 440);
-        cx.globalAlpha = 1;
-
-        // Share pill
-        cx.fillStyle = 'rgba(242,177,52,0.14)';
-        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
-        cx.beginPath();
-        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23)
-                     : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
-        cx.fill(); cx.stroke();
-        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
-        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
-      }
-    }
-
-    // ----- DEMO CTA -----
-    if (phase === 'cta') {
-      if (!ctaLocal) ctaLocal = now;
-      var ct = (now - ctaLocal) / 1000, ease = Math.min(1, ct * 2.2);
-      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
-      cx.globalAlpha = ease; cx.textAlign = 'center';
-      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
-      cx.fillText('MINERAL HUNT', W / 2, 290);
-      cx.fillStyle = 'rgba(255,255,255,0.72)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
-      cx.fillText('found ' + (window.__demoScore || 3) + ' specimens. find more.', W / 2, 328);
-      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
-      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
-      cx.font = '900 28px -apple-system, Helvetica, Arial';
-      cx.fillText('▶ BEAT ' + (window.__demoScore || 3), W / 2, 396);
-      cx.globalAlpha = ease;
-      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
-      cx.fillText('link in bio', W / 2, 428);
-      cx.globalAlpha = 1;
-    }
-
-    // ----- FLASHES -----
     for (var k = flashes.length - 1; k >= 0; k--) {
       var fl = flashes[k]; fl.t += dt;
-      var fa = Math.max(0, 1 - fl.t / 36);
-      cx.globalAlpha = fa; cx.textAlign = 'center';
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a; cx.textAlign = 'center';
       cx.fillStyle = fl.color;
-      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
-      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.8);
+      cx.font = '900 ' + (fl.size + fl.t * 0.35) + 'px -apple-system, Helvetica, Arial';
+      var fy = fl.float ? fl.y - fl.t * 1.2 : fl.y - fl.t * 0.7;
+      cx.fillText(fl.txt, fl.x, fy);
       cx.globalAlpha = 1;
-      if (fl.t > 36) flashes.splice(k, 1);
+      if (fl.t > 45) flashes.splice(k, 1);
     }
 
-    // ----- MUTE TOGGLE (human only) -----
+    if (state.phase === 'over') drawOver();
+    if (state.phase === 'cta') drawCTA();
+
     if (!DEMO && !BOT && window.J) {
       cx.textAlign = 'center';
       cx.globalAlpha = 0.5;

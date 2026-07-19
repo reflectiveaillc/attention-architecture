@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Map Pin — Tilt</title>
+<!--
+  LOOP / attention-architecture — Map Pin
+  Circuits: 06 Zeigarnik, 05 ease, 08 investment.
+  Modes:
+    ?demo=1&seed=7        calm clip arc, sets window.__demoDone
+    ?bot=1&runs=3&seed=7  imperfect autoplay, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'map-pin';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+  function pick(arr) { return arr[Math.floor(rng() * arr.length)]; }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134', CREAM = '#f7f4ea';
+  var MAP_Y = 165, MAP_H = 310, MAP_R = { x: 35, y: 130, w: W - 70, h: 350 };
+
+  // 12 destinations placed on the stylized world map
+  var DESTS = [
+    { id: 'reykjavik', name: 'Reykjavík', x: 168, y: 138, color: '#7dd3c0' },
+    { id: 'paris',     name: 'Paris',     x: 192, y: 176, color: '#f2b134' },
+    { id: 'cairo',     name: 'Cairo',     x: 226, y: 226, color: '#e8a87c' },
+    { id: 'tokyo',     name: 'Tokyo',     x: 340, y: 188, color: '#ff7e79' },
+    { id: 'mumbai',    name: 'Mumbai',    x: 286, y: 224, color: '#b8e1dd' },
+    { id: 'bangkok',   name: 'Bangkok',   x: 322, y: 242, color: '#9ddbad' },
+    { id: 'capetown',  name: 'Cape Town', x: 212, y: 340, color: '#c5a3e8' },
+    { id: 'nairobi',   name: 'Nairobi',   x: 236, y: 272, color: '#f4d06f' },
+    { id: 'nyc',       name: 'New York',  x: 116, y: 180, color: '#8fd3f4' },
+    { id: 'lima',      name: 'Lima',      x: 112, y: 300, color: '#f39c6b' },
+    { id: 'rio',       name: 'Rio',       x: 148, y: 332, color: '#6fe8c5' },
+    { id: 'sydney',    name: 'Sydney',    x: 358, y: 362, color: '#d6a4a4' }
+  ];
+
+  var state, cards, pinned, startTs, overAt, ctaAt = 0;
+  var hitStop = 0, zoom = 1, calmStep = 0, floats = [], rings = [];
+  var demoOrder, demoIdx = 0, demoWait = 0, demoStage = 'idle'; // idle | selecting | pinning
+  var botRunsDone = 0, botTarget = null, botTimer = 0, botStage = 'idle';
+
+  function newGame() {
+    state = { phase: 'title', score: 0, selected: null, pinPulse: 0 };
+    cards = []; pinned = []; floats = []; rings = [];
+    demoIdx = 0; demoWait = 70; demoStage = 'idle';
+    botRunsDone = 0; botTarget = null; botTimer = 0; botStage = 'idle';
+    // deterministic demo order, varied by seed
+    demoOrder = DESTS.map(function (d) { return d.id; });
+    for (var i = demoOrder.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var t = demoOrder[i]; demoOrder[i] = demoOrder[j]; demoOrder[j] = t;
+    }
+    if (DEMO || BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.score = 0;
+    pinned = [];
+    state.selected = null;
+    cards = [];
+    floats = []; rings = [];
+    startTs = Date.now();
+    spawnCards();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function spawnCards() {
+    var ids = DESTS.map(function (d) { return d.id; }).filter(function (id) { return pinned.indexOf(id) === -1; });
+    // shuffle remaining
+    for (var i = ids.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var t = ids[i]; ids[i] = ids[j]; ids[j] = t;
+    }
+    var startY = H + 30;
+    ids.forEach(function (id, idx) {
+      cards.push({
+        id: id,
+        x: 30 + (idx % 2) * (W - 170) + rng() * 20,
+        y: startY + idx * 18,
+        vy: -0.35 - rng() * 0.25,
+        w: 130,
+        h: 42,
+        driftOffset: rng() * Math.PI * 2
+      });
+    });
+  }
+
+  function findDest(id) { for (var i = 0; i < DESTS.length; i++) if (DESTS[i].id === id) return DESTS[i]; return null; }
+  function findCard(id) { for (var i = 0; i < cards.length; i++) if (cards[i].id === id) return cards[i]; return null; }
+
+  function selectCard(id) {
+    if (state.selected === id) return;
+    state.selected = id;
+    if (window.J) J.calm(calmStep++);
+  }
+
+  function pinDest(id) {
+    if (pinned.indexOf(id) !== -1) return;
+    pinned.push(id);
+    state.score = pinned.length;
+    state.selected = null;
+    // remove card
+    for (var i = cards.length - 1; i >= 0; i--) if (cards[i].id === id) cards.splice(i, 1);
+    // juice
+    hitStop = 4; zoom = 1.025; state.pinPulse = 1;
+    rings.push({ id: id, t: 0 });
+    var d = findDest(id);
+    floats.push({ txt: d.name, color: d.color, size: 17, x: d.x, y: d.y - 14, t: 0 });
+    floats.push({ txt: '+1', color: '#fff', size: 22, x: d.x, y: d.y - 36, t: 2 });
+    if (window.J) J.calm(calmStep++);
+    if (window.LOOP) LOOP.emit('pin_placed', { name: id, n: state.score });
+    if (state.score >= DESTS.length) {
+      setTimeout(gameOver, 220);
+    } else if (cards.length === 0) {
+      spawnCards();
+    }
+  }
+
+  function wrongTap() {
+    // gentle nudge, no penalty
+    if (window.J) J.calm(calmStep++);
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - startTs) / 1000;
+    if (window.J) J.calm(calmStep++);
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 1400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { if (window.LOOP) LOOP.emit('restart', {}); startRun(); }, 700);
+    }
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function inCircle(cx_, cy_, r, x, y) { var dx = x - cx_, dy = y - cy_; return dx * dx + dy * dy <= r * r; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over' && performance.now() - overAt > 350) { if (window.LOOP) LOOP.emit('restart', {}); startRun(); return; }
+    if (state.phase !== 'play') return;
+
+    // tap a card?
+    for (var i = cards.length - 1; i >= 0; i--) {
+      var c = cards[i];
+      if (inR({ x: c.x, y: c.y, w: c.w, h: c.h }, x, y)) { selectCard(c.id); return; }
+    }
+    // tap a circle?
+    for (var j = 0; j < DESTS.length; j++) {
+      var d = DESTS[j];
+      if (inCircle(d.x, d.y, 18, x, y)) {
+        if (state.selected === d.id) { pinDest(d.id); }
+        else if (state.selected) { wrongTap(); }
+        return;
+      }
+    }
+    // tap background deselects
+    state.selected = null;
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilots ----
+  var demoWaits = [34, 28, 40, 32, 38, 26, 44, 30, 36, 28, 42, 24, 30, 22, 46, 28, 38, 32, 26, 40, 34, 48, 30, 36];
+  function nextDemoWait() {
+    var v = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 30;
+    demoIdx++;
+    return v;
+  }
+
+  function updateAutopilot() {
+    if (state.phase !== 'play') return;
+    if (DEMO) {
+      if (demoWait > 0) { demoWait--; return; }
+      var wantId = demoOrder[pinned.length];
+      if (!wantId) return;
+      var card = findCard(wantId);
+      if (!card) { spawnCards(); return; }
+      if (demoStage === 'idle' || demoStage === 'selecting') {
+        selectCard(wantId);
+        demoStage = 'pinning';
+        demoWait = nextDemoWait();
+      } else {
+        pinDest(wantId);
+        demoStage = 'selecting';
+        demoWait = nextDemoWait();
+      }
+    } else if (BOT) {
+      if (botTimer > 0) { botTimer--; return; }
+      var remaining = DESTS.map(function (d) { return d.id; }).filter(function (id) { return pinned.indexOf(id) === -1; });
+      if (remaining.length === 0) return;
+      if (botStage === 'idle') {
+        botTarget = pick(remaining);
+        botStage = 'selecting';
+        botTimer = 18 + Math.floor(Math.abs(gauss()) * 14);
+      } else if (botStage === 'selecting') {
+        selectCard(botTarget);
+        botStage = 'pinning';
+        botTimer = 16 + Math.floor(Math.abs(gauss()) * 12);
+      } else {
+        // small chance of a wrong tap before correction
+        if (rng() < 0.08) {
+          wrongTap();
+          state.selected = botTarget;
+          botTimer = 10;
+          return;
+        }
+        pinDest(botTarget);
+        botStage = 'idle';
+        botTimer = 14 + Math.floor(Math.abs(gauss()) * 10);
+      }
+    }
+  }
+
+  // ---- render helpers ----
+  function drawMap() {
+    cx.save();
+    cx.translate(0, MAP_Y);
+    cx.strokeStyle = 'rgba(247,244,234,0.10)';
+    cx.lineWidth = 1.6;
+    cx.beginPath();
+    // simplified world map: loose continent ellipses
+    ellipsePath(95, 55, 62, 58, 0.15);   // N. America
+    ellipsePath(118, 170, 38, 74, -0.05); // S. America
+    ellipsePath(245, 55, 92, 44, 0.04);   // Europe/Asia
+    ellipsePath(230, 150, 42, 68, 0);     // Africa
+    ellipsePath(325, 208, 34, 22, 0);     // Australia
+    cx.stroke();
+    // faint latitude lines
+    cx.strokeStyle = 'rgba(247,244,234,0.04)';
+    cx.lineWidth = 1;
+    for (var k = 1; k < 5; k++) {
+      cx.beginPath(); cx.moveTo(20, k * 60); cx.lineTo(W - 20, k * 60); cx.stroke();
+    }
+    cx.restore();
+  }
+  function ellipsePath(x, y, rx, ry, rot) {
+    // approximate ellipse with bezier
+    var c = Math.cos(rot), s = Math.sin(rot);
+    function tx(px, py) { return x + px * c - py * s; }
+    function ty(px, py) { return y + px * s + py * c; }
+    var k = 0.5522848;
+    cx.moveTo(tx(rx, 0), ty(rx, 0));
+    cx.bezierCurveTo(tx(rx, k * ry), ty(rx, k * ry), tx(k * rx, ry), ty(k * rx, ry), tx(0, ry), ty(0, ry));
+    cx.bezierCurveTo(tx(-k * rx, ry), ty(-k * rx, ry), tx(-rx, k * ry), ty(-rx, k * ry), tx(-rx, 0), ty(-rx, 0));
+    cx.bezierCurveTo(tx(-rx, -k * ry), ty(-rx, -k * ry), tx(-k * rx, -ry), ty(-k * rx, -ry), tx(0, -ry), ty(0, -ry));
+    cx.bezierCurveTo(tx(k * rx, -ry), ty(k * rx, -ry), tx(rx, -k * ry), ty(rx, -k * ry), tx(rx, 0), ty(rx, 0));
+    cx.closePath();
+  }
+
+  function drawPin(d, active) {
+    var isPinned = pinned.indexOf(d.id) !== -1;
+    var isSelected = state.selected === d.id;
+    var pulse = isPinned ? 0 : (isSelected ? 0.4 + 0.4 * Math.sin(performance.now() / 200) : 0);
+    var r = 8 + pulse * 3;
+
+    // outer ring
+    cx.beginPath(); cx.arc(d.x, d.y, r + 4, 0, Math.PI * 2);
+    cx.strokeStyle = isPinned ? d.color : 'rgba(247,244,234,0.25)';
+    cx.lineWidth = 2;
+    cx.stroke();
+
+    // fill when pinned
+    if (isPinned) {
+      cx.beginPath(); cx.arc(d.x, d.y, r, 0, Math.PI * 2);
+      cx.fillStyle = d.color; cx.globalAlpha = 0.85; cx.fill(); cx.globalAlpha = 1;
+      // pin head
+      cx.beginPath(); cx.arc(d.x, d.y - 3, 3.5, 0, Math.PI * 2);
+      cx.fillStyle = '#fff'; cx.fill();
+    }
+  }
+
+  function drawCards(now) {
+    for (var i = 0; i < cards.length; i++) {
+      var c = cards[i];
+      var d = findDest(c.id);
+      var isSelected = state.selected === c.id;
+      var sway = Math.sin(now / 700 + c.driftOffset) * 2;
+      var x = c.x + sway;
+      cx.save();
+      cx.globalAlpha = isSelected ? 1 : 0.92;
+      // card bg
+      cx.fillStyle = isSelected ? 'rgba(46,197,182,0.18)' : 'rgba(255,255,255,0.06)';
+      cx.strokeStyle = isSelected ? TEAL : 'rgba(255,255,255,0.15)';
+      cx.lineWidth = isSelected ? 2 : 1;
+      if (cx.roundRect) {
+        cx.beginPath(); cx.roundRect(x, c.y, c.w, c.h, 12); cx.fill(); cx.stroke();
+      } else {
+        cx.fillRect(x, c.y, c.w, c.h); cx.strokeRect(x + 0.5, c.y + 0.5, c.w - 1, c.h - 1);
+      }
+      // dot
+      cx.beginPath(); cx.arc(x + 16, c.y + c.h / 2, 5, 0, Math.PI * 2);
+      cx.fillStyle = d.color; cx.fill();
+      // label
+      cx.fillStyle = CREAM; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'left'; cx.textBaseline = 'middle';
+      cx.fillText(d.name, x + 30, c.y + c.h / 2 + 1);
+      cx.restore();
+    }
+  }
+
+  function drawFloats(dt) {
+    for (var i = floats.length - 1; i >= 0; i--) {
+      var f = floats[i];
+      f.t += dt;
+      var a = Math.max(0, 1 - f.t / 55);
+      cx.save();
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = f.color;
+      cx.font = '800 ' + (f.size + f.t * 0.15) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(f.txt, f.x, f.y - f.t * 0.55);
+      cx.restore();
+      if (f.t > 55) floats.splice(i, 1);
+    }
+  }
+
+  function drawRings(dt) {
+    for (var i = rings.length - 1; i >= 0; i--) {
+      var ri = rings[i]; ri.t += dt;
+      var a = Math.max(0, 1 - ri.t / 45);
+      var r = 12 + ri.t * 1.2;
+      var d = findDest(ri.id);
+      cx.save();
+      cx.globalAlpha = a * 0.55;
+      cx.strokeStyle = d.color; cx.lineWidth = 2;
+      cx.beginPath(); cx.arc(d.x, d.y, r, 0, Math.PI * 2); cx.stroke();
+      cx.restore();
+      if (ri.t > 45) rings.splice(i, 1);
+    }
+  }
+
+  function titleScreen(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = CREAM; cx.font = '900 48px -apple-system, Helvetica, Arial';
+    cx.fillText('MAP PIN', W / 2, 88);
+    cx.fillStyle = TEAL; cx.font = '700 17px -apple-system, Helvetica, Arial';
+    var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+    cx.globalAlpha = pulse; cx.fillText('TAP TO START', W / 2, 620); cx.globalAlpha = 1;
+    cx.fillStyle = 'rgba(247,244,234,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('pin all twelve places', W / 2, 648);
+  }
+
+  function playUI() {
+    cx.textAlign = 'center';
+    cx.fillStyle = CREAM; cx.font = '800 52px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score + '/' + DESTS.length, W / 2, 78);
+    cx.fillStyle = 'rgba(247,244,234,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('places pinned', W / 2, 106);
+    // helper line
+    if (state.selected) {
+      var d = findDest(state.selected);
+      cx.strokeStyle = 'rgba(46,197,182,0.25)'; cx.setLineDash([4, 4]); cx.lineWidth = 1;
+      cx.beginPath(); cx.moveTo(W / 2, 620); cx.lineTo(d.x, d.y); cx.stroke(); cx.setLineDash([]);
+      cx.fillStyle = TEAL; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('tap ' + d.name + ' on the map', W / 2, 602);
+    } else {
+      cx.fillStyle = 'rgba(247,244,234,0.35)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('tap a card, then its place', W / 2, 602);
+    }
+  }
+
+  function overScreen(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.45)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL; cx.font = '900 42px -apple-system, Helvetica, Arial';
+    cx.fillText('MAP COMPLETE', W / 2, 306);
+    cx.fillStyle = CREAM; cx.font = '800 26px -apple-system, Helvetica, Arial';
+    cx.fillText('12 places pinned', W / 2, 352);
+    cx.fillStyle = GOLD; cx.font = '700 20px -apple-system, Helvetica, Arial';
+    cx.fillText('the journey is closed', W / 2, 386);
+    if (!DEMO && !BOT) {
+      var p = 0.6 + 0.4 * Math.sin(now / 280);
+      cx.globalAlpha = p; cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — PIN IT AGAIN', W / 2, 450);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function ctaScreen(now) {
+    var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease; cx.textAlign = 'center';
+    cx.fillStyle = CREAM; cx.font = '900 46px -apple-system, Helvetica, Arial';
+    cx.fillText('MAP PIN', W / 2, 292);
+    cx.fillStyle = 'rgba(247,244,234,0.75)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+    cx.fillText('pin the places you haven’t been', W / 2, 334);
+    var p = 0.7 + 0.3 * Math.sin(now / 260);
+    cx.globalAlpha = ease * p; cx.fillStyle = TEAL;
+    cx.font = '900 28px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ REACH IT', W / 2, 398);
+    cx.globalAlpha = ease;
+    cx.fillStyle = 'rgba(46,197,182,0.85)'; cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 432);
+    cx.globalAlpha = 1;
+  }
+
+  function drawMute() {
+    if ((DEMO || BOT) || !window.J) return;
+    cx.textAlign = 'center';
+    cx.globalAlpha = 0.5;
+    cx.font = '16px -apple-system, Helvetica, Arial';
+    cx.fillStyle = '#fff';
+    cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // hit-stop decay
+    if (hitStop > 0) hitStop -= dt;
+    else {
+      // drift cards upward
+      for (var i = 0; i < cards.length; i++) {
+        var c = cards[i];
+        c.y += c.vy * dt;
+        if (c.y < 550) { c.y = 550; c.vy = Math.abs(c.vy) * 0.3; }
+      }
+      updateAutopilot();
+    }
+
+    // juice transform
+    cx.save();
+    if (zoom > 1.001) {
+      cx.translate(W / 2, H / 2); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    zoom += (1 - zoom) * 0.12 * dt;
+    if (state.pinPulse > 0.001) state.pinPulse *= Math.pow(0.9, dt);
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(242,177,52,0.04)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // map frame
+    cx.strokeStyle = 'rgba(247,244,234,0.08)'; cx.lineWidth = 1;
+    if (cx.roundRect) { cx.beginPath(); cx.roundRect(MAP_R.x, MAP_R.y, MAP_R.w, MAP_R.h, 18); cx.stroke(); }
+    else { cx.strokeRect(MAP_R.x, MAP_R.y, MAP_R.w, MAP_R.h); }
+
+    drawMap();
+
+    // destination pins
+    for (var j = 0; j < DESTS.length; j++) drawPin(DESTS[j]);
+
+    drawRings(dt);
+    drawCards(now);
+    drawFloats(dt);
+
+    // UI layers
+    if (state.phase === 'title') titleScreen(now);
+    if (state.phase === 'play') playUI();
+    if (state.phase === 'over') overScreen(now);
+    if (state.phase === 'cta') ctaScreen(now);
+
+    drawMute();
+
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -242,3 +242,4 @@ full close); adaptive per-user resting baseline. Games consume via `FC.tap(sig)`
   Registry entry carries `locked: true` + `locked_note`. Its EASIER face-steered
   sibling is **infinite-fall-face** (head-lean steering, wider gaps 190→110, slower
   scroll 2.2, gentler ramps) — tune THAT one for face playability, never the parent.
+- 12:15 LESSON (shell): `'\n'.join(list)` sin newline final + `while read` = la última línea se salta silenciosamente (ink-drop no se construyó). Escribir siempre trailing newline o usar `printf '%s\n'`.

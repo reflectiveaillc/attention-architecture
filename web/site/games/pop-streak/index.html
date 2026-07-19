@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Pop Streak — Tilt</title>
+<!--
+  LOOP / attention-architecture — Pop Streak (viral game)
+  Circuits: 01 RPE (speed reward), 06 Zeigarnik (one more round),
+            03 social (dare a friend to beat your streak).
+  Modes:
+    ?demo=1&seed=7        scripted run for clip capture, sets window.__demoDone
+    ?bot=1&runs=3&seed=7  imperfect autoplay, sets window.__botDone
+    ?dare=<score>         incoming dare from a share
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'pop-streak';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var BOT_ERR  = +qs.get('err') || 14;
+  var SEED = +qs.get('seed') || 42;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134';
+  var DEMO_TARGET = 54;
+  var COLS = 5, BASE_ROWS = 4, BUBBLE_R = 28, HIT_R = 38, GAP = 66;
+  var GRID_TOP = 168, GRID_W = COLS * GAP, GRID_LEFT = (W - GRID_W) / 2 + GAP / 2;
+
+  var state, runStartTs, best = 0, combo = 0;
+  var hitStop = 0, shakeAmt = 0, zoom = 1, dareBeaten = false, challengeAt = 0;
+  var flashes = [];
+  try { best = +localStorage.getItem('ps_best') || 0; } catch (_) {}
+
+  function bubbleX(c) { return GRID_LEFT + c * GAP; }
+  function bubbleY(r) { return GRID_TOP + r * GAP; }
+
+  function buildBoard(rows) {
+    var b = [];
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < COLS; c++) { b.push({ r: r, c: c, popped: false }); }
+    }
+    return b;
+  }
+
+  function newGame() {
+    state = {
+      phase: 'title',
+      board: buildBoard(BASE_ROWS),
+      round: 1,
+      score: 0,
+      overAt: 0,
+      rows: BASE_ROWS
+    };
+    combo = 0; dareBeaten = false;
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function popBubble(idx) {
+    var b = state.board[idx];
+    if (!b || b.popped) return false;
+    b.popped = true;
+    state.score++;
+    combo++;
+    if (window.J) {
+      if (combo % 10 === 0) J.perfect(combo);
+      else if (combo % 25 === 0) J.gold();
+      else J.hit(combo);
+      J.tension(Math.min(state.score / 120, 1));
+    }
+    hitStop = 2;
+    zoom = 1.02;
+    flash('+' + combo, combo >= 10 ? GOLD : TEAL, 34 + Math.min(combo, 18));
+    if (window.LOOP) LOOP.emit('pop', { n: state.score, combo: combo, round: state.round });
+    checkRound();
+    return true;
+  }
+
+  function checkRound() {
+    if (state.board.every(function (b) { return b.popped; })) {
+      combo = 0;
+      hitStop = 5;
+      zoom = 1.04;
+      flash('ROUND ' + state.round + ' CLEAR', GOLD, 42);
+      if (window.J) { J.gold(); J.fanfare(); }
+      if (window.LOOP) LOOP.emit('round_clear', { round: state.round, score: state.score });
+      state.round++;
+      state.rows = BASE_ROWS + state.round - 1;
+      state.board = buildBoard(state.rows);
+    }
+  }
+
+  function failGame(reason) {
+    if (state.phase !== 'play') return;
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 10;
+    combo = 0;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (window.J) { J.death(Math.min(0.25 + state.score / 100, 1)); if (newBest) setTimeout(function () { J.fanfare(); }, 400); }
+    if (DEMO) window.__demoScore = state.score;
+    if (newBest) { best = state.score; try { localStorage.setItem('ps_best', String(best)); } catch (_) {} }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), reason: reason });
+    if (DEMO) setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+      setTimeout(function () { window.__demoDone = true; }, 3600); }, 2800);
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 700);
+    }
+  }
+
+  function resetRun() {
+    state.board = buildBoard(BASE_ROWS);
+    state.round = 1; state.score = 0; state.rows = BASE_ROWS; combo = 0; dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 546, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'popped' }); return;
+      }
+      resetRun(); return;
+    }
+    if (state.phase !== 'play') return;
+
+    // find nearest unpopped bubble
+    var tx = x === undefined ? W / 2 : x;
+    var ty = y === undefined ? H / 2 : y;
+    var nearest = null, bestD = Infinity;
+    for (var i = 0; i < state.board.length; i++) {
+      var b = state.board[i];
+      var dx = tx - bubbleX(b.c), dy = ty - bubbleY(b.r);
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d < HIT_R && d < bestD) { bestD = d; nearest = i; }
+    }
+    var hitUnpopped = nearest !== null && !state.board[nearest].popped;
+    if (hitUnpopped) {
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score + 1 > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(state.score + 1);
+      }
+      popBubble(nearest);
+    } else {
+      // tapped empty / already popped = fail
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { n: state.score, reason: 'wrong_bubble' });
+      failGame('wrong_bubble');
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilots ----
+  // Demo script: frame delays + a final 'fail'. The actual bubble each step hits is
+  // chosen deterministically from the remaining unpopped bubbles so the clip looks
+  // like a human speed-run across growing rounds.
+  var demoWaits = [18, 12, 10, 22, 8, 14, 11, 9, 24, 7, 15, 12, 9, 20, 10, 13, 8, 26, 6, 14,
+                   16, 11, 8, 19, 9, 12, 7, 23, 10, 14, 6, 17, 9, 21, 8, 13, 6, 18, 9,
+                   20, 10, 8, 16, 7, 14, 11, 25, 6, 19, 10, 15, 7, 22, 'fail'];
+  var demoIdx = 0, demoWait = 30, demoNearDone = false;
+  var botRunsDone = 0, botTarget = null;
+
+  function pickNextDemoTarget() {
+    var seq = demoWaits;
+    if (demoIdx >= seq.length) return 'fail';
+    var want = seq[demoIdx];
+    if (want === 'fail') return 'fail';
+    var unpopped = [];
+    for (var i = 0; i < state.board.length; i++) if (!state.board[i].popped) unpopped.push(i);
+    if (!unpopped.length) return null; // round cleared, will rebuild synchronously
+    return unpopped[want % unpopped.length];
+  }
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    if (demoWait > 0) { demoWait--; return; }
+
+    if (DEMO) {
+      if (!demoNearDone && demoIdx / demoWaits.length > 0.58 && demoIdx / demoWaits.length < 0.68) {
+        // near-fail: hover over an already-popped bubble, then recover
+        var popped = [];
+        for (var i = 0; i < state.board.length; i++) if (state.board[i].popped) popped.push(i);
+        if (popped.length && rng() > 0.5) {
+          var bait = popped[Math.floor(rng() * popped.length)];
+          var bx = bubbleX(state.board[bait].c), by = bubbleY(state.board[bait].r);
+          if (window.J) J.near();
+          if (window.LOOP) LOOP.emit('near_miss', { n: state.score, reason: 'demo_recovery' });
+          flash('SO CLOSE', VERM, 38);
+          shakeAmt = 4;
+          demoWait = 55; // hesitation: viewer thinks it's over
+          demoNearDone = true;
+          return;
+        }
+      }
+      var target = pickNextDemoTarget();
+      if (target === 'fail') {
+        // deliberate miss: tap a popped bubble
+        var popped2 = [];
+        for (var i = 0; i < state.board.length; i++) if (state.board[i].popped) popped2.push(i);
+        if (popped2.length) {
+          var bait2 = popped2[Math.floor(rng() * popped2.length)];
+          failGame('demo_miss');
+          demoIdx++;
+        } else {
+          failGame('demo_timeout');
+        }
+        return;
+      }
+      if (target !== null && !state.board[target].popped) {
+        popBubble(target);
+        demoIdx++;
+        demoWait = typeof demoWaits[demoIdx] === 'number' ? demoWaits[demoIdx] : 28;
+      } else {
+        demoIdx++;
+      }
+    } else if (BOT) {
+      if (botTarget === null || state.board[botTarget] === undefined || state.board[botTarget].popped) {
+        var unpopped = [];
+        for (var i = 0; i < state.board.length; i++) if (!state.board[i].popped) unpopped.push(i);
+        if (!unpopped.length) return; // round clear will happen naturally
+        botTarget = unpopped[Math.floor(rng() * unpopped.length)];
+      }
+      var tb = state.board[botTarget];
+      var tx = bubbleX(tb.c) + gauss() * BOT_ERR;
+      var ty = bubbleY(tb.r) + gauss() * BOT_ERR;
+      // apply tap logic: nearest within HIT_R
+      var nearest = null, bestD = Infinity;
+      for (var i = 0; i < state.board.length; i++) {
+        var b = state.board[i];
+        var dx = tx - bubbleX(b.c), dy = ty - bubbleY(b.r);
+        var d = Math.sqrt(dx * dx + dy * dy);
+        if (d < HIT_R && d < bestD) { bestD = d; nearest = i; }
+      }
+      var hitUnpopped = nearest !== null && !state.board[nearest].popped;
+      if (hitUnpopped) { popBubble(nearest); botTarget = null; }
+      else { failGame('bot_miss'); }
+    }
+  }
+
+  // ---- render ----
+  function drawBubble(b, now) {
+    var x = bubbleX(b.c), y = bubbleY(b.r);
+    var r = BUBBLE_R;
+    if (b.popped) {
+      // popped crater
+      cx.beginPath(); cx.arc(x, y, r, 0, Math.PI * 2);
+      var g = cx.createRadialGradient(x - 6, y - 6, 2, x, y, r);
+      g.addColorStop(0, '#1a2630');
+      g.addColorStop(1, '#0f151c');
+      cx.fillStyle = g; cx.fill();
+      cx.strokeStyle = 'rgba(46,197,182,0.22)'; cx.lineWidth = 2;
+      cx.stroke();
+      // tiny pop ring
+      cx.beginPath(); cx.arc(x, y, r * 0.55, 0, Math.PI * 2);
+      cx.strokeStyle = 'rgba(232,80,46,0.18)'; cx.lineWidth = 1.5;
+      cx.stroke();
+    } else {
+      // unpopped dome
+      var pulse = 0.97 + 0.03 * Math.sin(now / 220 + b.r * 0.4 + b.c * 0.7);
+      cx.beginPath(); cx.arc(x, y, r * pulse, 0, Math.PI * 2);
+      var g2 = cx.createRadialGradient(x - 8, y - 10, 4, x, y, r);
+      g2.addColorStop(0, '#45e6d6');
+      g2.addColorStop(0.5, '#2ec5b6');
+      g2.addColorStop(1, '#1e8f84');
+      cx.fillStyle = g2; cx.fill();
+      // highlight
+      cx.beginPath(); cx.arc(x - 7, y - 8, r * 0.22, 0, Math.PI * 2);
+      cx.fillStyle = 'rgba(255,255,255,0.28)'; cx.fill();
+      cx.strokeStyle = 'rgba(255,255,255,0.18)'; cx.lineWidth = 1;
+      cx.stroke();
+    }
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 55))));
+  }
+
+  var ctaAt = 0, last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') { autopilot(); }
+
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt); zoom += (1 - zoom) * 0.12 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)'); bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // title / header
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 38px -apple-system, Helvetica, Arial';
+    cx.fillText('POP STREAK', W / 2, 62);
+    cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('pop every bubble. don’t repeat.', W / 2, 86);
+
+    // score strip
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.fillStyle = '#fff'; cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 140);
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('ROUND ' + state.round + ' · BEST ' + best, W / 2, 160);
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 186);
+      }
+    }
+
+    // grid
+    for (var i = 0; i < state.board.length; i++) drawBubble(state.board[i], now);
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 42);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 260 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(k, 1);
+    }
+
+    // title overlay CTA
+    if (state.phase === 'title') {
+      cx.fillStyle = 'rgba(11,13,18,0.72)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO START', W / 2, 620); cx.globalAlpha = 1;
+    }
+
+    // challenge card (demo)
+    if (state.phase === 'challenge') {
+      cx.fillStyle = 'rgba(11,13,18,0.72)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('' + (window.__demoScore || DEMO_TARGET), W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top streak", W / 2, 430);
+    }
+
+    // game over
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('POPPED OUT.', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' popped', W / 2, 350);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD; cx.font = '900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 424);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 472);
+        cx.globalAlpha = 1;
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23); else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('POP STREAK', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('she popped ' + (window.__demoScore || DEMO_TARGET) + '. your move.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || DEMO_TARGET), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

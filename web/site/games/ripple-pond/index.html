@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Ripple Pond — Tilt</title>
+<!--
+  LOOP / attention-architecture — Ripple Pond
+  Engine: calm. Circuits: 05-ease, 01-rpe, 07-timing.
+  Conditioned path: water-ripple ASMR — tap a still pond, watch rings expand,
+  hear soft harmonic plops when they meet. Twelve drops, then the water stills.
+  Modes:
+    ?demo=1&seed=7        scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs → window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'ripple-pond';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo clips and bot runs are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game state ----
+  var MAX_TAPS = 12;
+  var STILL_TIMEOUT = 4200;   // ms before forcing game_over during stilling
+  var RIPPLE_LIFE = 2.6;      // seconds a ripple lives
+  var state = { phase: 'title', score: 0, taps: 0, overAt: 0, stillStart: 0 };
+  var ripples = [], flashes = [], ripId = 0, collided = {};
+  var runStartTs = 0, lastTapAt = 0, calmTone = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  var best = 0;
+  try { best = +localStorage.getItem('rp_best') || 0; } catch (_) {}
+
+  var inviteT = 0, waveT = 0, ctaAt = 0;
+
+  // ---- demo script: hesitation frames + tap positions (0..1) ----
+  var demoIdx = 0, demoWait = 55;
+  var demoWaits = [55, 45, 60, 80, 50, 68, 55, 75, 50, 62, 48, 40];
+  var demoPositions = [
+    [0.50, 0.52], [0.44, 0.48], [0.56, 0.55],
+    [0.38, 0.50], [0.62, 0.50], [0.50, 0.44],
+    [0.47, 0.58], [0.53, 0.42], [0.35, 0.55],
+    [0.65, 0.45], [0.50, 0.60], [0.42, 0.44]
+  ];
+
+  // ---- bot state ----
+  var botRunsDone = 0, botTapsDone = 0, botTapTimer = 0;
+  var botTargetX = 0, botTargetY = 0;
+
+  function flash(txt, color, size, x, y) {
+    flashes.push({ txt: txt, color: color, size: size, x: x, y: y, t: 0 });
+  }
+
+  function addRipple(x, y) {
+    var maxR = 110 + rng() * 70;
+    ripples.push({ id: ripId++, x: x, y: y, r: 0, maxR: maxR, born: 0, life: RIPPLE_LIFE });
+    state.taps++;
+    lastTapAt = performance.now();
+    if (window.J) J.calm(calmTone++);              // soft plop
+    // gentle reward pulse every fourth drop
+    if (state.taps % 4 === 0) {
+      hitStop = 2;
+      shakeAmt = 1.5;
+      zoom = 1.012;
+      flash('soft', TEAL, 18);
+    }
+    if (window.LOOP) LOOP.emit('ripple_drop', { n: state.taps, x: Math.round(x), y: Math.round(y) });
+
+    if (state.taps >= MAX_TAPS) {
+      state.phase = 'stilling';
+      state.stillStart = performance.now();
+    }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.score = 0; state.taps = 0; state.overAt = 0; state.stillStart = 0;
+    ripples = []; flashes = []; collided = {}; ripId = 0; calmTone = 0;
+    dareBeaten = false;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (newBest) {
+      best = state.score;
+      try { localStorage.setItem('rp_best', String(best)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 1400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else { setTimeout(function () { resetRun(); }, 900); }
+    }
+  }
+
+  function resetRun() {
+    state.score = 0; state.taps = 0;
+    ripples = []; flashes = []; collided = {}; ripId = 0; calmTone = 0;
+    dareBeaten = false;
+    if (BOT) { botTapsDone = 0; botTapTimer = 26 + Math.floor(rng() * 52); botTargetX = 0; botTargetY = 0; }
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function checkDare() {
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      SHARE.beaten(state.score);
+    }
+  }
+
+  // ---- input (coordinate-passing, like stack-rush) ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function tap(x, y) {
+    if (DEMO || BOT) return;                     // scripted modes ignore human taps
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play' && state.taps < MAX_TAPS) {
+      var rx = x !== undefined ? x : W / 2;
+      var ry = y !== undefined ? y : H / 2;
+      addRipple(rx, ry);
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'rings' }); return;
+      }
+      resetRun();
+    }
+    if (state.phase === 'cta') { resetRun(); }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilots (human ignores them; they ignore human input) ----
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    if (DEMO) {
+      if (demoWait > 0) { demoWait -= 1; return; }
+      if (demoIdx >= demoPositions.length) return; // let the pond still
+      var pos = demoPositions[demoIdx];
+      addRipple(pos[0] * W, pos[1] * H);
+      demoIdx++;
+      demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 40;
+    } else if (BOT) {
+      if (botTapsDone >= MAX_TAPS) return;
+      if (botTapTimer > 0) { botTapTimer -= 1; return; }
+      if (botTargetX === 0 && botTargetY === 0) {
+        botTargetX = 0.18 + rng() * 0.64;
+        botTargetY = 0.28 + rng() * 0.48;
+      }
+      addRipple(botTargetX * W, botTargetY * H);
+      botTapsDone++;
+      botTargetX = 0; botTargetY = 0;
+      botTapTimer = 26 + Math.floor(rng() * 52);   // ~0.4–1.3s at 60fps
+    }
+  }
+
+  // ---- simulation ----
+  function onCollision(a, b, mx, my) {
+    state.score++;
+    if (window.J) J.calm(calmTone++);            // harmonic tone
+    // calm juice: brief freeze + tiny shake, bigger pulse every fifth ring meeting
+    if (state.score % 5 === 0) {
+      hitStop = 3;
+      shakeAmt = 2.2;
+      zoom = 1.02;
+      flash('♪', GOLD, 24, mx, my);
+    } else {
+      hitStop = 1.5;
+      shakeAmt = 1.2;
+      zoom = Math.max(zoom, 1.006);
+      flash('+1', TEAL, 15, mx, my);
+    }
+    if (window.LOOP) LOOP.emit('harmony', { n: state.score, pair: a.id + '-' + b.id });
+  }
+
+  function updateSim(dt) {
+    var sdt = dt * 0.0166667;                    // convert frame units → seconds
+    waveT += sdt * 0.8;
+    inviteT += sdt;
+
+    // advance ripples
+    for (var i = ripples.length - 1; i >= 0; i--) {
+      var rp = ripples[i];
+      rp.born += sdt;
+      rp.r = (rp.born / rp.life) * rp.maxR;
+      if (rp.born >= rp.life) { ripples.splice(i, 1); continue; }
+    }
+
+    // detect first meeting of any two expanding rings
+    for (var i = 0; i < ripples.length; i++) {
+      for (var j = i + 1; j < ripples.length; j++) {
+        var a = ripples[i], b = ripples[j];
+        var dx = a.x - b.x, dy = a.y - b.y;
+        var d = Math.hypot(dx, dy);
+        if (d <= a.r + b.r && d >= Math.abs(a.r - b.r)) {
+          var key = a.id < b.id ? a.id + ',' + b.id : b.id + ',' + a.id;
+          if (!collided[key]) {
+            collided[key] = true;
+            onCollision(a, b, (a.x + b.x) / 2, (a.y + b.y) / 2);
+          }
+        }
+      }
+    }
+
+    checkDare();
+
+    // still the pond after the twelfth drop
+    if (state.phase === 'stilling') {
+      var since = performance.now() - state.stillStart;
+      if ((since > 1800 && ripples.length === 0) || since > STILL_TIMEOUT) { gameOver(); }
+    }
+  }
+
+  // ---- rendering ----
+  function drawBackground(now) {
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(0.5, 'rgba(46,197,182,0.02)');
+    bg.addColorStop(1, 'rgba(11,13,18,0.0)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+  }
+
+  function drawStillingDim() {
+    if (state.phase === 'stilling') {
+      var since = performance.now() - state.stillStart;
+      var dim = Math.min(0.55, since / STILL_TIMEOUT);
+      cx.fillStyle = 'rgba(11,13,18,' + dim + ')';
+      cx.fillRect(0, 0, W, H);
+    }
+  }
+
+  function drawWater(now) {
+    cx.save();
+    cx.globalAlpha = 0.07;
+    for (var i = 0; i < 18; i++) {
+      var yBase = 180 + i * 32;
+      cx.beginPath();
+      cx.moveTo(0, yBase);
+      for (var x = 0; x <= W; x += 8) {
+        var wave = Math.sin((x / W) * Math.PI * 4 + waveT + i * 0.4) * 2.5;
+        cx.lineTo(x, yBase + wave);
+      }
+      cx.strokeStyle = TEAL;
+      cx.lineWidth = 0.8;
+      cx.stroke();
+    }
+    cx.restore();
+  }
+
+  function drawRipples() {
+    for (var i = 0; i < ripples.length; i++) {
+      var rp = ripples[i];
+      var age = rp.born / rp.life;
+      for (var ring = 0; ring < 3; ring++) {
+        var ringAge = Math.max(0, age - ring * 0.12);
+        var ringR = ringAge * rp.maxR;
+        var alpha = Math.max(0, (1 - ringAge) * 0.5 * (1 - ring * 0.22));
+        if (ringR <= 0) continue;
+        cx.beginPath();
+        cx.arc(rp.x, rp.y, ringR, 0, Math.PI * 2);
+        cx.strokeStyle = TEAL;
+        cx.lineWidth = 1.6 - ring * 0.35;
+        cx.globalAlpha = alpha;
+        cx.stroke();
+        cx.globalAlpha = 1;
+      }
+      // center splash dot
+      if (rp.born < 0.18) {
+        var splashA = (1 - rp.born / 0.18) * 0.65;
+        cx.beginPath();
+        cx.arc(rp.x, rp.y, 5 * (1 - rp.born / 0.18), 0, Math.PI * 2);
+        cx.fillStyle = TEAL;
+        cx.globalAlpha = splashA;
+        cx.fill();
+        cx.globalAlpha = 1;
+      }
+    }
+  }
+
+  function drawFlashes(dt) {
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      var x = fl.x === undefined ? W / 2 : fl.x;
+      var y = fl.y === undefined ? H / 2 - 80 : fl.y - fl.t * 0.55;
+      cx.fillText(fl.txt, x, y);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+  }
+
+  function drawInvite(now) {
+    var pulse = 0.35 + 0.25 * Math.sin(inviteT * 2.2);
+    cx.beginPath();
+    cx.arc(W / 2, H / 2, 48 + 10 * Math.sin(inviteT * 1.8), 0, Math.PI * 2);
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 1.5;
+    cx.globalAlpha = pulse;
+    cx.stroke();
+    cx.globalAlpha = 1;
+  }
+
+  function drawHUD(now) {
+    cx.textAlign = 'center';
+
+    // score / taps
+    if (state.phase !== 'title') {
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '800 56px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px Menlo, monospace';
+      cx.fillText('BEST ' + best, W / 2, 120);
+      cx.fillStyle = 'rgba(46,197,182,0.7)';
+      cx.font = '600 12px Menlo, monospace';
+      cx.fillText(state.taps + ' / ' + MAX_TAPS + ' drops', W / 2, 142);
+
+      // incoming dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 170);
+      }
+    }
+
+    // title
+    if (state.phase === 'title') {
+      drawInvite(now);
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('RIPPLE POND', W / 2, H / 2 - 70);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO DROP', W / 2, H / 2 - 25);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('twelve drops. let the rings meet.', W / 2, H / 2 + 5);
+    }
+
+    // game over card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.fillStyle = TEAL;
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' RINGS', W / 2, 300);
+      cx.fillStyle = '#fff';
+      cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText(state.taps + ' drops', W / 2, 345);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 390);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE POND', W / 2, 456);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        if (cx.roundRect) {
+          cx.beginPath(); cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        } else {
+          cx.beginPath(); cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        }
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        var shareLabel = (window.SHARE && SHARE.dare !== null && dareBeaten) ? '⚡ DARE THEM BACK' : '⚡ SHARE A FRIEND';
+        cx.fillText(shareLabel, W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // demo CTA card (calm invitation, not a dare)
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.fillStyle = '#fff';
+      cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('RIPPLE POND', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('let the rings meet', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // hit-stop: decay every frame, then run autopilot only when clear
+    if (hitStop > 0) { hitStop -= dt; }
+    else if (state.phase === 'play') { autopilot(); }
+
+    var frozen = hitStop > 0;
+    if (!frozen) updateSim(dt);
+
+    // decaying juice transforms
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // ---- draw ----
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    drawBackground(now);
+    drawWater(now);
+    drawRipples();
+    drawStillingDim();
+    drawFlashes(dt);
+    drawHUD(now);
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- init ----
+  if (DEMO) {
+    startRun();
+  } else if (BOT) {
+    botTapTimer = 25 + Math.floor(rng() * 25);
+    startRun();
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

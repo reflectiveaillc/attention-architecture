@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Wax Melt — Tilt</title>
+<!--
+  LOOP / attention-architecture — Wax Melt (calm engine)
+  Circuits: 05-ease, 07-timing, 08-investment.
+  Modes (query params):
+    ?demo=1&seed=7        scripted calm arc for clip capture, sets window.__demoDone
+    ?bot=1&runs=3&seed=5  imperfect autoplay for traffic simulation, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'wax-melt';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;                       // internal 9:16 space
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // deterministic RNG (mulberry32) so demo clips and bot runs are reproducible
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var INK = '#0b0d12', TEAL = '#2ec5b6', GOLD = '#f2b134', CREAM = '#f5e6c8';
+  var HUMAN_DUR = 90, DEMO_DUR = 10, BOT_DUR = 10; // seconds
+  var SEGMENTS = 16, PILLAR_W = 170, PILLAR_H = 440, PILLAR_TOP = 110;
+
+  var state, pillar, drips, pool, glow, runStartTs;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, lastCalmStep = -1;
+  var botRunsDone = 0, ctaAt = 0;
+  var flashes = [];
+  var dragging = false, dragStartX = 0, dragStartGuide = 0;
+  var nextBotTarget = null;
+
+  function newGame() {
+    state = { phase: 'title', score: 0, startTime: 0, duration: HUMAN_DUR, overAt: 0 };
+    pillar = {
+      segments: [],
+      guideX: 0,               // front face position on the cylinder (-w/2..w/2)
+      targetGuideX: 0,
+      heatY: 0                 // 0 = top, 1 = bottom
+    };
+    for (var i = 0; i < SEGMENTS; i++) {
+      pillar.segments.push({ melt: 0, dripped: false, catchable: true });
+    }
+    drips = [];
+    pool = 0;
+    glow = 0;
+    hitStop = 0; zoom = 1; shakeAmt = 0; lastCalmStep = -1;
+    flashes = [];
+    if (DEMO) {
+      state.duration = DEMO_DUR;
+      setTimeout(function () { startRun(); }, 1500); // 1.5s settle before ignite
+    } else if (BOT) {
+      state.duration = BOT_DUR;
+      startRun();
+    }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    state.startTime = performance.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500); }, 1000);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 700);
+    }
+  }
+
+  function resetRun() {
+    state = { phase: 'play', score: 0, startTime: 0, duration: BOT ? BOT_DUR : HUMAN_DUR, overAt: 0 };
+    pillar.guideX = 0; pillar.targetGuideX = 0; pillar.heatY = 0;
+    for (var i = 0; i < SEGMENTS; i++) { pillar.segments[i].melt = 0; pillar.segments[i].dripped = false; }
+    drips = []; pool = 0; glow = 0; hitStop = 0; zoom = 1; shakeAmt = 0; nextBotTarget = null;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 110, y: 520, w: 220, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'glow' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale;
+    if (DEMO || BOT || state.phase !== 'play') { tap(x, y); return; }
+    dragging = true;
+    dragStartX = x;
+    dragStartGuide = pillar.guideX;
+  });
+  window.addEventListener('pointermove', function (e) {
+    if (!dragging || DEMO || BOT || state.phase !== 'play') return;
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale;
+    var dx = x - dragStartX;
+    pillar.targetGuideX = Math.max(-PILLAR_W / 2, Math.min(PILLAR_W / 2, dragStartGuide + dx * 1.1));
+  });
+  window.addEventListener('pointerup', function () { dragging = false; });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- physics ----
+  function spawnDrip(segIndex) {
+    // angle mapped to horizontal position on the visible cylinder face
+    var angleX = (rng() - 0.5) * PILLAR_W;
+    var dist = Math.abs(angleX - pillar.guideX);
+    var caught = dist < 34;
+    var perfect = dist < 12;
+    drips.push({
+      segIndex: segIndex,
+      x: W / 2 + angleX,
+      y: PILLAR_TOP + segIndex * (PILLAR_H / SEGMENTS) + (PILLAR_H / SEGMENTS) / 2,
+      vy: 0.8 + rng() * 0.7,
+      angleX: angleX,
+      caught: caught,
+      perfect: perfect,
+      landed: false,
+      t: 0
+    });
+  }
+
+  function scoreDrip(d) {
+    var points = d.perfect ? 100 : 50;
+    state.score += points;
+    pool = Math.min(1, pool + 0.04);
+    flash(d.perfect ? '+100' : '+50', d.perfect ? GOLD : TEAL, d.perfect ? 32 : 24);
+    if (d.perfect) { hitStop = 3; zoom = 1.015; }
+    else { hitStop = 1.5; zoom = 1.006; }
+    shakeAmt = d.perfect ? 3 : 1.5;
+    if (window.LOOP) LOOP.emit('drip_caught', { points: points, perfect: d.perfect });
+  }
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+    // find the lowest drip that hasn't landed yet
+    var target = null, bestY = -Infinity;
+    for (var i = 0; i < drips.length; i++) {
+      var d = drips[i];
+      if (!d.landed && d.y > bestY) { bestY = d.y; target = d; }
+    }
+    if (target) {
+      var err = DEMO ? (rng() - 0.5) * 10 : gauss() * 14;
+      pillar.targetGuideX = Math.max(-PILLAR_W / 2, Math.min(PILLAR_W / 2, target.angleX + err));
+    } else {
+      pillar.targetGuideX *= 0.95;
+    }
+  }
+
+  function gauss() {
+    var u = 1 - rng(), v = rng();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+
+  function update(now, dt) {
+    // decaying hit-stop: never gate the sim without decaying it
+    if (hitStop > 0) hitStop -= dt;
+
+    if (state.phase === 'play') {
+      var elapsed = (now - state.startTime) / 1000;
+      var progress = Math.min(1, elapsed / state.duration);
+      pillar.heatY = progress;
+
+      // melt segments from top down; spawn drips as they finish melting
+      for (var i = 0; i < SEGMENTS; i++) {
+        var seg = pillar.segments[i];
+        var segTop = i / SEGMENTS;
+        var segBot = (i + 1) / SEGMENTS;
+        if (progress >= segTop && seg.melt < 1) {
+          var rate = 0.012 * dt * (1 + (progress - segTop) * 3);
+          seg.melt = Math.min(1, seg.melt + rate);
+          if (seg.melt >= 1 && !seg.dripped) {
+            seg.dripped = true;
+            spawnDrip(i);
+          }
+        }
+      }
+
+      // rotate toward target (human drag or autopilot)
+      pillar.guideX += (pillar.targetGuideX - pillar.guideX) * 0.14 * dt;
+
+      // update drips
+      for (var k = drips.length - 1; k >= 0; k--) {
+        var d = drips[k];
+        d.t += dt;
+        if (!d.landed) {
+          // check catch as it passes the pillar bottom
+          if (d.y >= PILLAR_TOP + PILLAR_H - 10) {
+            d.landed = true;
+            d.caught = Math.abs(d.angleX - pillar.guideX) < 34;
+            d.perfect = Math.abs(d.angleX - pillar.guideX) < 12;
+            if (d.caught) scoreDrip(d);
+            else {
+              if (window.LOOP) LOOP.emit('drip_missed', { angle: +d.angleX.toFixed(2) });
+            }
+          } else {
+            d.y += d.vy * dt;
+            d.vy += 0.04 * dt;
+          }
+        } else {
+          // fallen droplet continues to pool or off-screen
+          d.y += (d.caught ? 2.2 : 3.5) * dt;
+          if (d.y > H + 30) drips.splice(k, 1);
+        }
+      }
+
+      // calm sound cadence tied to melt progress (no percussion)
+      var step = Math.floor(progress * 6);
+      if (window.J && step !== lastCalmStep && progress < 1) {
+        J.calm(step);
+        lastCalmStep = step;
+      }
+
+      // glow builds toward the end
+      glow = Math.max(glow, Math.pow(progress, 2) * 0.45);
+
+      // completion: full melt
+      if (progress >= 1) gameOver();
+    }
+
+    if (state.phase === 'over') {
+      glow = Math.min(1, glow + 0.02 * dt);
+    }
+
+    // decay juice
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+  }
+
+  // ---- render ----
+  function drawPillar() {
+    var cx2 = W / 2, top = PILLAR_TOP, w = PILLAR_W, h = PILLAR_H;
+    var segH = h / SEGMENTS;
+
+    // soft ambient glow behind the candle
+    var amb = cx.createRadialGradient(cx2, top + h / 2, 10, cx2, top + h / 2, w);
+    amb.addColorStop(0, 'rgba(46,197,182,0.10)');
+    amb.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = amb;
+    cx.fillRect(cx2 - w, top - 20, w * 2, h + 40);
+
+    // cylinder body (cream with warm gradient from heat)
+    for (var i = 0; i < SEGMENTS; i++) {
+      var y = top + i * segH;
+      var melt = pillar.segments[i].melt;
+      var bodyGrad = cx.createLinearGradient(cx2 - w / 2, y, cx2 + w / 2, y);
+      bodyGrad.addColorStop(0, '#1e222b');
+      bodyGrad.addColorStop(0.25, '#d6c6a6');
+      bodyGrad.addColorStop(0.5, '#fff8ec');
+      bodyGrad.addColorStop(0.75, '#d6c6a6');
+      bodyGrad.addColorStop(1, '#1e222b');
+      cx.fillStyle = bodyGrad;
+      cx.beginPath();
+      if (i === 0) {
+        cx.roundRect(cx2 - w / 2, y, w, segH, [w / 2, w / 2, 0, 0]);
+      } else if (i === SEGMENTS - 1) {
+        cx.roundRect(cx2 - w / 2, y, w, segH, [0, 0, w / 2, w / 2]);
+      } else {
+        cx.rect(cx2 - w / 2, y, w, segH);
+      }
+      cx.fill();
+
+      // warm melt overlay
+      if (melt > 0.01) {
+        var warm = cx.createLinearGradient(0, y, 0, y + segH);
+        warm.addColorStop(0, 'rgba(242,177,52,' + (melt * 0.28) + ')');
+        warm.addColorStop(1, 'rgba(232,80,46,' + (melt * 0.12) + ')');
+        cx.fillStyle = warm;
+        cx.fillRect(cx2 - w / 2 + 2, y, w - 4, segH);
+      }
+
+      // segment seam
+      cx.strokeStyle = 'rgba(11,13,18,' + (0.18 + melt * 0.2) + ')';
+      cx.lineWidth = 1;
+      cx.beginPath(); cx.moveTo(cx2 - w / 2, y); cx.lineTo(cx2 + w / 2, y); cx.stroke();
+    }
+
+    // front-face guide stripe (teal glow where the drip is being guided)
+    var norm = ((pillar.guideX / (PILLAR_W / 2)) + 1) / 2; // 0..1
+    var gx = cx2 - w / 2 + norm * w;
+    var stripe = cx.createLinearGradient(gx - 24, top, gx + 24, top);
+    stripe.addColorStop(0, 'rgba(46,197,182,0)');
+    stripe.addColorStop(0.5, 'rgba(46,197,182,0.22)');
+    stripe.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = stripe;
+    cx.fillRect(cx2 - w / 2, top, w, h);
+
+    // top guide indicator
+    cx.fillStyle = 'rgba(46,197,182,0.55)';
+    cx.beginPath();
+    cx.arc(gx, top - 8, 4, 0, Math.PI * 2);
+    cx.fill();
+
+    // flame when ignited
+    if (state.phase === 'play' || state.phase === 'over') {
+      var flicker = 1 + Math.sin(now / 80) * 0.08 + (rng() - 0.5) * 0.1;
+      var fy = top - 24;
+      var fGrad = cx.createRadialGradient(cx2, fy, 2, cx2, fy, 34 * flicker);
+      fGrad.addColorStop(0, 'rgba(255,232,180,0.9)');
+      fGrad.addColorStop(0.4, 'rgba(242,177,52,0.55)');
+      fGrad.addColorStop(1, 'rgba(232,80,46,0)');
+      cx.fillStyle = fGrad;
+      cx.beginPath(); cx.arc(cx2, fy, 34 * flicker, 0, Math.PI * 2); cx.fill();
+      // flame core
+      cx.fillStyle = 'rgba(255,250,220,0.85)';
+      cx.beginPath();
+      cx.ellipse(cx2, fy, 6 * flicker, 14 * flicker, 0, 0, Math.PI * 2);
+      cx.fill();
+    }
+  }
+
+  function drawDrips() {
+    for (var i = 0; i < drips.length; i++) {
+      var d = drips[i];
+      var alpha = d.landed && !d.caught ? 0.45 : 0.9;
+      var color = d.caught ? TEAL : CREAM;
+      cx.globalAlpha = alpha;
+      cx.fillStyle = color;
+      cx.beginPath();
+      var r = d.caught ? 5.5 : 5;
+      cx.arc(d.x, d.y, r, 0, Math.PI * 2);
+      cx.fill();
+      // little tail
+      cx.beginPath();
+      cx.moveTo(d.x, d.y - r);
+      cx.quadraticCurveTo(d.x - r * 0.6, d.y + r * 0.8, d.x, d.y + r * 1.6);
+      cx.quadraticCurveTo(d.x + r * 0.6, d.y + r * 0.8, d.x, d.y - r);
+      cx.fill();
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawPool() {
+    var py = H - 70;
+    var pw = 80 + pool * 180;
+    var poolGrad = cx.createRadialGradient(W / 2, py, 4, W / 2, py, pw / 2);
+    poolGrad.addColorStop(0, 'rgba(46,197,182,' + (0.25 + pool * 0.35) + ')');
+    poolGrad.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = poolGrad;
+    cx.beginPath();
+    cx.ellipse(W / 2, py, pw / 2, 16, 0, 0, Math.PI * 2);
+    cx.fill();
+  }
+
+  function drawGlowOverlay() {
+    if (glow <= 0.01) return;
+    var g = cx.createRadialGradient(W / 2, H - 90, 20, W / 2, H - 90, 360);
+    g.addColorStop(0, 'rgba(46,197,182,' + (glow * 0.55) + ')');
+    g.addColorStop(0.5, 'rgba(242,177,52,' + (glow * 0.18) + ')');
+    g.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = g;
+    cx.fillRect(0, 0, W, H);
+  }
+
+  var now = performance.now(), last = now;
+  function frame(t) {
+    now = t;
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    update(now, dt);
+
+    // juice transforms (save/restore)
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(242,177,52,0.05)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    drawPillar();
+    drawPool();
+    drawDrips();
+    drawGlowOverlay();
+
+    // score / progress
+    if (state.phase === 'play' || state.phase === 'over') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 56px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 76);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('GLOW', W / 2, 98);
+      // progress bar
+      var prog = Math.min(1, ((now - state.startTime) / 1000) / state.duration);
+      cx.fillStyle = 'rgba(255,255,255,0.12)';
+      cx.fillRect(W / 2 - 80, 108, 160, 4);
+      cx.fillStyle = TEAL;
+      cx.fillRect(W / 2 - 80, 108, 160 * prog, 4);
+    }
+
+    // floating rewards
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.35) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 250 - fl.t * 0.9);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // title / settle
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('WAX MELT', W / 2, 280);
+      cx.fillStyle = TEAL; cx.font = '700 17px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse; cx.fillText('TAP TO IGNITE', W / 2, 326); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('rotate the pillar. guide the drip.', W / 2, 356);
+    }
+
+    // completion card
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,' + (0.45 + glow * 0.35) + ')'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('MELTED.', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' glow', W / 2, 344);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      var pct = Math.round((state.score / 1600) * 100);
+      cx.fillText('smoothness ' + Math.min(100, pct) + '%', W / 2, 374);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 300);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — LIGHT ANOTHER', W / 2, 430);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23) : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ SHARE YOUR GLOW', W / 2, SHARE_R.y + 29);
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.75 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('WAX MELT', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('slow melt. soft glow. yours to guide.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 260);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 404);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.6)'; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 438);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

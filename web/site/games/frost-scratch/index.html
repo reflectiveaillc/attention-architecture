@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Frost Scratch — Tilt</title>
+<!--
+  LOOP / attention-architecture — Frost Scratch (CALM engine, contract v2)
+  Circuits: 05-ease, 06-zeigarnik, 01-rpe.
+  Conditioned path: frost-window / fogged-glass scratching ASMR — the viewer's
+  thumb already knows this drag-to-reveal gesture from Instagram/TikTok.
+  Modes (query params):
+    ?demo=1&seed=7        scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'frost-scratch';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+  function gauss() { var u = 1 - rng(), v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // CALM palette — vermillion avoided
+  var INK  = '#0b0d12';
+  var TEAL = '#2ec5b6';
+  var GOLD = '#f2b134';
+  var ICE  = '#d4f0ff';
+  var MIST = '#a8dce8';
+
+  // ---- frost field ----
+  var COLS = 45, ROWS = 80;              // ~9x9 px cells, one flake each
+  var totalFlakes = COLS * ROWS;
+  var flakes = [];
+  var clearedCount = 0;
+  var score = 0;                         // 0..100 percent
+  var flakeT = 0;
+
+  // ---- state ----
+  var phase;                             // 'title' | 'play' | 'complete' | 'cta'
+  var runStartTs = 0, completeAt = 0, ctaAt = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var flashes = [];
+  var lastMilestone = 0;
+  var calmAccum = 0, nextCalmAt = 0;
+  var strokeDist = 0, strokeSpeed = 0, strokeCleared = 0;
+  var dragging = false, lastX = 0, lastY = 0;
+  var botRunsDone = 0, runsDone = 0;
+
+  // demo autopilot state
+  var demoX = W / 2, demoY = 110, demoDir = 1, demoT = 0, demoPause = 0, demoLastSec = 0;
+  var demoWaits = [0, 40, 0, 0, 55, 0, 0, 35, 0, 0, 0, 45, 0, 0, 0]; // hesitation beats
+
+  // bot autopilot state
+  var botX = W / 2, botY = H / 2, botTarget = null, botTimer = 0;
+
+  // rects
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- init ----
+  function newGame() {
+    rng = mulberry32(SEED + (runsDone || 0) * 2654435761 | 0);
+    initFlakes();
+    phase = DEMO ? 'play' : 'title';
+    runStartTs = Date.now();
+    completeAt = 0; ctaAt = 0;
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    flashes = [];
+    lastMilestone = 0;
+    calmAccum = 0; nextCalmAt = 0;
+    strokeDist = 0; strokeSpeed = 0; strokeCleared = 0;
+    dragging = false; lastX = demoX; lastY = demoY;
+    flakeT = 0;
+    demoX = W / 2; demoY = 110; demoDir = 1; demoT = 0; demoPause = demoWaits[0] || 0; demoLastSec = 0;
+    botX = W / 2; botY = H / 2; botTarget = null; botTimer = 0;
+
+    if (DEMO) {
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED, mode: 'demo' });
+    } else if (BOT) {
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED, mode: 'bot' });
+    }
+  }
+
+  function initFlakes() {
+    flakes = [];
+    var cellW = W / COLS, cellH = H / ROWS;
+    for (var row = 0; row < ROWS; row++) {
+      for (var col = 0; col < COLS; col++) {
+        var fx = col * cellW + rng() * cellW;
+        var fy = row * cellH + rng() * cellH;
+        flakes.push({
+          x: fx, y: fy,
+          size: 2.2 + rng() * 3.2,
+          phase: rng() * Math.PI * 2,
+          frost: 1,
+          tint: rng() < 0.7 ? ICE : MIST
+        });
+      }
+    }
+    clearedCount = 0;
+    score = 0;
+  }
+
+  // ---- core scratch action ----
+  function scratch(x, y) {
+    if (phase !== 'play') return;
+    var dx = x - lastX, dy = y - lastY;
+    var dist = Math.hypot(dx, dy);
+    var dt = 1; // frame unit; speed is px per reference frame
+    var speed = dist / Math.max(0.2, dt);
+    var radius = 26 + Math.min(55, speed * 0.9);
+
+    var clearedNow = 0;
+    for (var i = 0; i < flakes.length; i++) {
+      var f = flakes[i];
+      if (f.frost <= 0) continue;
+      if (Math.hypot(f.x - x, f.y - y) < radius) {
+        f.frost = 0;
+        clearedNow++;
+      }
+    }
+
+    if (clearedNow > 0) {
+      clearedCount += clearedNow;
+      score = Math.min(100, Math.floor(100 * clearedCount / totalFlakes));
+      strokeCleared += clearedNow;
+      strokeDist += dist;
+      strokeSpeed = 0.8 * strokeSpeed + 0.2 * speed;
+
+      // calm audio: pitch rises with speed; throttle so it stays musical
+      calmAccum += clearedNow;
+      if (calmAccum >= nextCalmAt) {
+        var step = Math.min(12, 1 + Math.floor(speed / 2.5));
+        if (window.J) J.calm(step);
+        nextCalmAt = calmAccum + 6 + Math.floor(speed / 3);
+      }
+
+      // visual juice on satisfying swipes
+      if (clearedNow >= 10) zoom = 1.012;
+      if (clearedNow >= 18) { zoom = 1.018; shakeAmt = Math.max(shakeAmt, 1.2); }
+
+      // milestone flashes
+      var m = Math.floor(score / 25) * 25;
+      if (m > lastMilestone && m < 100) {
+        lastMilestone = m;
+        flash(m + '%', TEAL, 38);
+        zoom = 1.025;
+      }
+    }
+
+    lastX = x; lastY = y;
+
+    if (score >= 98) completeSession();
+  }
+
+  function startDrag(x, y) {
+    if (phase !== 'play') return;
+    dragging = true;
+    lastX = x; lastY = y;
+    strokeDist = 0; strokeSpeed = 0; strokeCleared = 0;
+  }
+
+  function endDrag() {
+    if (!dragging) return;
+    dragging = false;
+    if (strokeCleared > 0 && window.LOOP) {
+      LOOP.emit('scratch_stroke', {
+        cleared: strokeCleared,
+        dist: Math.round(strokeDist),
+        speed: +strokeSpeed.toFixed(1),
+        score: score
+      });
+    }
+    strokeDist = 0; strokeSpeed = 0; strokeCleared = 0;
+  }
+
+  function completeSession() {
+    if (phase === 'complete' || phase === 'cta') return;
+    phase = 'complete';
+    completeAt = performance.now();
+    score = 100;
+    hitStop = 5;
+    zoom = 1.06;
+    shakeAmt = 4;
+    flash('CLEAR', TEAL, 54);
+    if (window.J) J.calm(12);
+    var dur = (Date.now() - runStartTs) / 1000;
+    window.__demoScore = 100;
+    if (window.LOOP) LOOP.emit('game_over', { score: 100, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 1200);
+    }
+  }
+
+  function resetRun() {
+    runsDone = (runsDone || 0) + 1;
+    initFlakes();
+    phase = 'play';
+    runStartTs = Date.now();
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    flashes = [];
+    lastMilestone = 0;
+    calmAccum = 0; nextCalmAt = 0;
+    strokeDist = 0; strokeSpeed = 0; strokeCleared = 0;
+    dragging = false; lastX = demoX; lastY = demoY;
+    flakeT = 0;
+    demoX = W / 2; demoY = 110; demoDir = 1; demoT = 0; demoPause = demoWaits[0] || 0; demoLastSec = 0;
+    botX = W / 2; botY = H / 2; botTarget = null; botTimer = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'complete') { resetRun(); return; }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale;
+    tap(x, y);
+    if (phase === 'play') startDrag(x, y);
+  });
+  window.addEventListener('pointermove', function (e) {
+    if (DEMO || BOT) return;
+    if (!dragging) return;
+    var r = cv.getBoundingClientRect();
+    scratch((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointerup', function () { if (!(DEMO || BOT)) endDrag(); });
+  window.addEventListener('pointercancel', function () { if (!(DEMO || BOT)) endDrag(); });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- autopilots ----
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+    if (DEMO) {
+      if (demoPause > 0) { demoPause -= dt; return; }
+      demoT += dt * 0.016667; // seconds
+      // calm window-wiping arc: horizontal sweeps that descend the canvas
+      var sweepSpeed = 6.0 + demoT * 0.35; // starts gentle, accelerates slightly
+      var dy = 46; // vertical advance per pass
+      demoX += demoDir * sweepSpeed * dt;
+      if (demoX > W - 28) {
+        demoX = W - 28; demoDir = -1; demoY += dy; demoPause = 15;
+      } else if (demoX < 28) {
+        demoX = 28; demoDir = 1; demoY += dy; demoPause = 15;
+      }
+      if (demoY > H - 40) { demoY = 110; demoX = W / 2; demoDir = 1; }
+      scratch(demoX, demoY + (rng() - 0.5) * 6);
+      // longer hesitation beats for human feel
+      var sec = Math.floor(demoT);
+      if (sec !== demoLastSec && sec > 0 && sec < demoWaits.length && demoWaits[sec]) {
+        demoPause = demoWaits[sec];
+        demoLastSec = sec;
+      }
+    } else if (BOT) {
+      if (botTimer-- <= 0) {
+        var pool = [];
+        for (var i = 0; i < flakes.length; i++) { if (flakes[i].frost > 0) pool.push(flakes[i]); }
+        if (pool.length === 0) { completeSession(); return; }
+        var f = pool[Math.floor(rng() * pool.length)];
+        botTarget = { x: f.x + gauss() * 35, y: f.y + gauss() * 35 };
+        botTimer = 18 + rng() * 24;
+      }
+      if (!botTarget) return;
+      var dx = botTarget.x - botX, dy = botTarget.y - botY;
+      var dist = Math.hypot(dx, dy);
+      var speed = 5.0 + rng() * 3.5;
+      if (dist > 0) {
+        botX += dx / dist * Math.min(dist, speed * dt);
+        botY += dy / dist * Math.min(dist, speed * dt);
+      }
+      scratch(botX, botY);
+    }
+  }
+
+  // ---- render ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    if (hitStop > 0) { hitStop -= dt; }
+    else {
+      flakeT += dt;
+      if (DEMO || BOT) autopilot(dt);
+    }
+
+    // decay juice
+    shakeAmt *= Math.pow(0.88, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // update flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background ink
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // soft under-glow, grows as frost clears
+    var glowR = 70 + (score / 100) * 260;
+    var glowA = 0.10 + (score / 100) * 0.22;
+    var g = cx.createRadialGradient(W / 2, H / 2, 8, W / 2, H / 2, glowR);
+    g.addColorStop(0, 'rgba(46,197,182,' + glowA + ')');
+    g.addColorStop(0.55, 'rgba(46,197,182,' + (glowA * 0.45) + ')');
+    g.addColorStop(1, 'rgba(46,197,182,0)');
+    cx.fillStyle = g; cx.fillRect(0, 0, W, H);
+
+    // extra center warmth when nearly clear
+    if (score > 80) {
+      var warmA = (score - 80) / 20 * 0.18;
+      var wg = cx.createRadialGradient(W / 2, H / 2, 20, W / 2, H / 2, 160);
+      wg.addColorStop(0, 'rgba(242,177,52,' + warmA + ')');
+      wg.addColorStop(1, 'rgba(242,177,52,0)');
+      cx.fillStyle = wg; cx.fillRect(0, 0, W, H);
+    }
+
+    // frost flakes
+    for (var i = 0; i < flakes.length; i++) {
+      var f = flakes[i];
+      if (f.frost <= 0.02) continue;
+      var fy = f.y + Math.sin(flakeT * 0.012 + f.phase) * 1.4;
+      cx.globalAlpha = f.frost * 0.78;
+      cx.fillStyle = f.tint;
+      cx.beginPath();
+      cx.arc(f.x, fy, f.size * (0.85 + 0.15 * f.frost), 0, Math.PI * 2);
+      cx.fill();
+    }
+    cx.globalAlpha = 1;
+
+    // title
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = ICE;
+      cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('FROST SCRATCH', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '600 17px -apple-system, Helvetica, Arial';
+      cx.fillText('drag to scratch the frost away', W / 2, 332);
+      var pulse = 0.55 + 0.45 * Math.sin(now / 500);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, 390);
+      cx.globalAlpha = 1;
+    }
+
+    // score (play / complete)
+    if (phase === 'play' || phase === 'complete') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(score + '%', W / 2, 96);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('FROST CLEARED', W / 2, 120);
+    }
+
+    // floating flashes
+    for (var k2 = flashes.length - 1; k2 >= 0; k2--) {
+      var fl2 = flashes[k2];
+      var a = Math.max(0, 1 - fl2.t / 45);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl2.color;
+      cx.font = '900 ' + (fl2.size + fl2.t * 0.5) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl2.txt, W / 2, 260 - fl2.t * 0.7);
+      cx.globalAlpha = 1;
+    }
+
+    // complete card
+    if (phase === 'complete') {
+      cx.fillStyle = 'rgba(11,13,18,0.58)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('FROST CLEARED', W / 2, 300);
+      cx.fillStyle = '#fff';
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText('100%', W / 2, 350);
+      cx.fillStyle = GOLD;
+      cx.font = '600 17px -apple-system, Helvetica, Arial';
+      cx.fillText('the glow beneath is soft', W / 2, 384);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 350);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 18px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP TO SCRATCH AGAIN', W / 2, 450);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // demo CTA card
+    if (phase === 'cta') {
+      cx.fillStyle = 'rgba(11,13,18,0.75)'; cx.fillRect(0, 0, W, H);
+      var te = (now - ctaAt) / 1000, ease = Math.min(1, te * 2.2);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = ICE;
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('FROST SCRATCH', W / 2, 298);
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('the frost melted away.', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 300);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL;
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 412);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 450);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
