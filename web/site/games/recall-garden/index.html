@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Recall Garden — Tilt</title>
+<!--
+  LOOP / attention-architecture — Recall Garden
+  Circuits: 06-zeigarnik, 05-ease, 08-investment.
+  Engine: calm.
+  Modes:
+    ?demo=1&seed=7    scripted calm arc ~16s → soft CTA card → __demoDone
+    ?bot=1&runs=N     imperfect autopilot, N runs → __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'recall-garden';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL  = '#2ec5b6';
+  var GOLD  = '#f2b134';
+  var INK   = '#0b0d12';
+  var MIST  = 'rgba(255,255,255,0.12)';
+
+  // ─── mote definitions ───────────────────────────────────────────────────────
+  // Each mote has a shape (circle/square/diamond/triangle), a color, and a
+  // small icon-label (for variety). Rendered purely on canvas, no images.
+  var MOTE_SHAPES = ['circle', 'square', 'diamond', 'triangle'];
+  var MOTE_COLORS = [TEAL, GOLD, '#a78bfa', '#f472b6', '#34d399', '#fb923c'];
+  var MOTE_LABELS = ['✿', '◉', '△', '⬡', '✦', '◈', '⌘', '✺'];
+
+  function buildMotePool(n) {
+    var pool = [];
+    for (var i = 0; i < n; i++) {
+      pool.push({
+        shape: MOTE_SHAPES[Math.floor(rng() * MOTE_SHAPES.length)],
+        color: MOTE_COLORS[Math.floor(rng() * MOTE_COLORS.length)],
+        label: MOTE_LABELS[Math.floor(rng() * MOTE_LABELS.length)]
+      });
+    }
+    return pool;
+  }
+
+  // ─── game state ─────────────────────────────────────────────────────────────
+  var PHASES = {
+    TITLE: 'title', SHOW: 'show', RECALL: 'recall',
+    BLOOM: 'bloom', OVER: 'over', CTA: 'cta'
+  };
+
+  var state, flashes, hitStop, zoom, shakeAmt;
+  var runStartTs, botRunsDone = 0;
+  var ctaAt = 0, phaseAt = 0;
+
+  // garden tiles that bloom
+  var gardenTiles = [];
+  // floating petals for ambient calm
+  var petals = [];
+
+  function makePetal() {
+    return {
+      x: rng() * W,
+      y: -10 - rng() * 40,
+      vy: 0.3 + rng() * 0.4,
+      vx: (rng() - 0.5) * 0.3,
+      r:  rng() * Math.PI * 2,
+      vr: (rng() - 0.5) * 0.015,
+      size: 4 + rng() * 5,
+      color: MOTE_COLORS[Math.floor(rng() * MOTE_COLORS.length)],
+      alpha: 0.2 + rng() * 0.3
+    };
+  }
+
+  function newGame() {
+    var seqLen = 5; // number of motes to memorise
+    state = {
+      phase: PHASES.TITLE,
+      motes: buildMotePool(seqLen),   // the sequence to memorise
+      showIdx: 0,                     // which mote is being shown
+      showTimer: 0,                   // frames to hold current mote
+      showHold: 68,                   // frames per mote (calm pace)
+      showGap:  22,                   // gap frames between motes
+      inGap: false,
+      recallOrder: [],                // which indices have been tapped (recall phase)
+      tapped: [],                     // booleans per mote index
+      score: 0,
+      round: 0
+    };
+    for (var i = 0; i < state.motes.length; i++) state.tapped.push(false);
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0;
+    phaseAt = performance.now();
+    if (DEMO) {
+      // skip title, go directly to show
+      setTimeout(function () { startRun(); }, 800);
+      return;
+    }
+    if (BOT) {
+      startRun();
+    }
+  }
+
+  function startRun() {
+    state.phase = PHASES.SHOW;
+    state.showIdx = 0;
+    state.showTimer = state.showHold;
+    state.inGap = false;
+    runStartTs = Date.now();
+    phaseAt = performance.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED, round: state.round });
+  }
+
+  function enterRecall() {
+    state.phase = PHASES.RECALL;
+    phaseAt = performance.now();
+    // build grid positions for the motes (3-column, shuffled)
+    shufflePositions();
+    flash('NOW TAP THEM', TEAL, 22);
+  }
+
+  // grid cell positions for recall tapping
+  var recallPositions = [];
+  var MOTE_R = 42; // radius/half-size of each mote in recall grid
+
+  function shufflePositions() {
+    var n = state.motes.length;
+    var cols = 3;
+    var rows = Math.ceil(n / cols);
+    var cellW = W / cols;
+    var cellH = 180;
+    var startY = 260;
+    var indices = [];
+    for (var i = 0; i < n; i++) indices.push(i);
+    // shuffle
+    for (var j = indices.length - 1; j > 0; j--) {
+      var k = Math.floor(rng() * (j + 1));
+      var tmp = indices[j]; indices[j] = indices[k]; indices[k] = tmp;
+    }
+    recallPositions = [];
+    for (var m = 0; m < n; m++) {
+      var col = m % cols, row = Math.floor(m / cols);
+      recallPositions.push({
+        idx: indices[m],
+        x: cellW * col + cellW / 2,
+        y: startY + row * cellH + cellH / 2
+      });
+    }
+  }
+
+  function tapMote(moteIdx) {
+    if (state.tapped[moteIdx]) return;
+    state.tapped[moteIdx] = true;
+    state.recallOrder.push(moteIdx);
+    if (window.J) J.calm(state.recallOrder.length);
+    hitStop = 3; zoom = 1.018;
+    flash('✿', state.motes[moteIdx].color, 36);
+    if (window.LOOP) LOOP.emit('mote_recalled', { idx: moteIdx, n: state.recallOrder.length });
+    // check if all tapped
+    var allDone = state.tapped.every(function (v) { return v; });
+    if (allDone) {
+      setTimeout(function () { enterBloom(); }, 350);
+    }
+  }
+
+  function enterBloom() {
+    state.phase = PHASES.BLOOM;
+    phaseAt = performance.now();
+    state.score = state.motes.length * 10 + state.round * 5;
+    if (window.J) J.calm(state.motes.length + 2);
+    zoom = 1.03; shakeAmt = 1.5;
+    // add a garden tile
+    gardenTiles.push({
+      x: 60 + (gardenTiles.length % 5) * 60,
+      y: 620,
+      bloom: 0,
+      color: state.motes[Math.floor(rng() * state.motes.length)].color
+    });
+    flash('GARDEN BLOOMS', TEAL, 28);
+    setTimeout(function () { doGameOver(); }, 2200);
+  }
+
+  function doGameOver() {
+    state.phase = PHASES.OVER;
+    phaseAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () { state.phase = PHASES.CTA; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2200);
+      return;
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRound(); }, 700);
+      }
+      return;
+    }
+  }
+
+  function resetRound() {
+    state.round++;
+    // next round has one more mote (up to 7)
+    var nextLen = Math.min(7, state.motes.length + 1);
+    state.motes = buildMotePool(nextLen);
+    state.tapped = [];
+    for (var i = 0; i < nextLen; i++) state.tapped.push(false);
+    state.recallOrder = [];
+    recallPositions = [];
+    flashes = [];
+    botRecallScheduled = false;
+    demoTapScheduled = false;
+    if (window.LOOP) LOOP.emit('restart', { round: state.round });
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ─── input ──────────────────────────────────────────────────────────────────
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 480, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function inCircle(cx2, cy2, rad, x, y) { var dx = x - cx2, dy = y - cy2; return dx*dx + dy*dy <= rad*rad; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === PHASES.TITLE) { startRun(); return; }
+    if (state.phase === PHASES.RECALL) {
+      for (var i = 0; i < recallPositions.length; i++) {
+        var rp = recallPositions[i];
+        if (!state.tapped[rp.idx] && inCircle(rp.x, rp.y, MOTE_R + 8, x, y)) {
+          tapMote(rp.idx);
+          return;
+        }
+      }
+    }
+    if (state.phase === PHASES.OVER && performance.now() - phaseAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'remembered' }); return;
+      }
+      resetRound();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ─── autopilots ─────────────────────────────────────────────────────────────
+  // Demo: watch the show phase pass, then tap motes one by one with hesitation
+  var demoTapScheduled = false;
+  var demoTapQueue = [];
+
+  function scheduleDemoRecall() {
+    if (demoTapScheduled) return;
+    demoTapScheduled = true;
+    // Build a queue of mote taps with calm delays
+    var n = recallPositions.length;
+    var delay = 900;
+    for (var i = 0; i < n; i++) {
+      (function (ii, d) {
+        setTimeout(function () {
+          if (state.phase === PHASES.RECALL) {
+            tapMote(recallPositions[ii].idx);
+          }
+        }, d);
+      })(i, delay);
+      delay += 700 + Math.floor(rng() * 400); // varied hesitation
+    }
+  }
+
+  // Bot: same but all runs must complete
+  var botRecallScheduled = false;
+
+  function scheduleBotRecall() {
+    if (botRecallScheduled) return;
+    botRecallScheduled = true;
+    var n = recallPositions.length;
+    var delay = 400;
+    for (var i = 0; i < n; i++) {
+      (function (ii, d) {
+        setTimeout(function () {
+          if (state.phase === PHASES.RECALL) {
+            tapMote(recallPositions[ii].idx);
+          }
+        }, d);
+      })(i, delay);
+      delay += 300 + Math.floor(rng() * 200);
+    }
+  }
+
+  function autopilot() {
+    if (DEMO && state.phase === PHASES.RECALL && !demoTapScheduled) {
+      scheduleDemoRecall();
+    }
+    if (BOT && state.phase === PHASES.RECALL && !botRecallScheduled) {
+      scheduleBotRecall();
+    }
+  }
+
+  // ─── mote drawing ────────────────────────────────────────────────────────────
+  function drawMote(mx, my, mote, radius, alpha) {
+    cx.save();
+    cx.globalAlpha = alpha !== undefined ? alpha : 1;
+    cx.fillStyle = mote.color;
+    cx.strokeStyle = 'rgba(255,255,255,0.25)';
+    cx.lineWidth = 2;
+    var r = Math.max(0, radius || 40);
+    if (mote.shape === 'circle') {
+      cx.beginPath();
+      cx.arc(mx, my, r, 0, Math.PI * 2);
+      cx.fill();
+      cx.stroke();
+    } else if (mote.shape === 'square') {
+      cx.beginPath();
+      cx.roundRect ? cx.roundRect(mx - r, my - r, r * 2, r * 2, r * 0.22)
+                   : cx.rect(mx - r, my - r, r * 2, r * 2);
+      cx.fill();
+      cx.stroke();
+    } else if (mote.shape === 'diamond') {
+      cx.beginPath();
+      cx.moveTo(mx, my - r * 1.1);
+      cx.lineTo(mx + r, my);
+      cx.lineTo(mx, my + r * 1.1);
+      cx.lineTo(mx - r, my);
+      cx.closePath();
+      cx.fill();
+      cx.stroke();
+    } else { // triangle
+      cx.beginPath();
+      cx.moveTo(mx, my - r * 1.05);
+      cx.lineTo(mx + r * 0.95, my + r * 0.65);
+      cx.lineTo(mx - r * 0.95, my + r * 0.65);
+      cx.closePath();
+      cx.fill();
+      cx.stroke();
+    }
+    // icon label inside
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    cx.font = Math.floor(r * 0.7) + 'px -apple-system, Helvetica, Arial';
+    cx.fillText(mote.label, mx, my + 1);
+    cx.textBaseline = 'alphabetic';
+    cx.restore();
+  }
+
+  function drawTappedMark(mx, my, color) {
+    cx.save();
+    cx.globalAlpha = 0.45;
+    cx.strokeStyle = color;
+    cx.lineWidth = 3;
+    cx.beginPath();
+    cx.arc(mx, my, MOTE_R + 6, 0, Math.PI * 2);
+    cx.stroke();
+    cx.globalAlpha = 0.22;
+    cx.fillStyle = color;
+    cx.beginPath();
+    cx.arc(mx, my, MOTE_R + 6, 0, Math.PI * 2);
+    cx.fill();
+    cx.restore();
+  }
+
+  // ─── garden tile drawing ─────────────────────────────────────────────────────
+  function drawGardenTile(tile, now) {
+    var b = Math.max(0, Math.min(1, (now - phaseAt) / 800));
+    tile.bloom = b;
+    cx.save();
+    cx.globalAlpha = 0.7 * b;
+    cx.fillStyle = tile.color;
+    cx.beginPath();
+    // simple flower: center + petals
+    var cx2 = tile.x, cy2 = tile.y;
+    for (var p = 0; p < 6; p++) {
+      var ang = (p / 6) * Math.PI * 2;
+      var px = cx2 + Math.cos(ang) * 10 * b;
+      var py = cy2 + Math.sin(ang) * 10 * b;
+      cx.beginPath();
+      cx.arc(px, py, 6 * b, 0, Math.PI * 2);
+      cx.fill();
+    }
+    cx.globalAlpha = b;
+    cx.beginPath();
+    cx.arc(cx2, cy2, 7 * b, 0, Math.PI * 2);
+    cx.fill();
+    cx.restore();
+  }
+
+  // ─── render ──────────────────────────────────────────────────────────────────
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // spawn ambient petals
+    if (petals.length < 18 && rng() < 0.03) petals.push(makePetal());
+
+    // update petals
+    for (var pi = petals.length - 1; pi >= 0; pi--) {
+      var p = petals[pi];
+      p.y += p.vy * dt; p.x += p.vx * dt; p.r += p.vr * dt;
+      if (p.y > H + 20) petals.splice(pi, 1);
+    }
+
+    // autopilot tick
+    if (DEMO || BOT) autopilot();
+
+    // hit-stop: decay every frame, then run autopilot
+    if (hitStop > 0) hitStop -= dt;
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ambient petals
+    for (var pi2 = 0; pi2 < petals.length; pi2++) {
+      var pt = petals[pi2];
+      cx.save();
+      cx.globalAlpha = pt.alpha;
+      cx.fillStyle = pt.color;
+      cx.translate(pt.x, pt.y);
+      cx.rotate(pt.r);
+      cx.beginPath();
+      cx.ellipse(0, 0, pt.size, pt.size * 0.5, 0, 0, Math.PI * 2);
+      cx.fill();
+      cx.restore();
+    }
+
+    // garden tiles (bottom strip)
+    for (var gi = 0; gi < gardenTiles.length; gi++) {
+      drawGardenTile(gardenTiles[gi], now);
+    }
+
+    // ── TITLE ──
+    if (state.phase === PHASES.TITLE) {
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '300 18px -apple-system, Helvetica, Arial';
+      cx.fillText('A MEMORY GARDEN', W / 2, 220);
+      cx.fillStyle = '#fff';
+      cx.font = '700 48px -apple-system, Helvetica, Arial';
+      cx.fillText('RECALL', W / 2, 280);
+      cx.fillStyle = TEAL;
+      cx.font = '700 48px -apple-system, Helvetica, Arial';
+      cx.fillText('GARDEN', W / 2, 336);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '400 15px -apple-system, Helvetica, Arial';
+      cx.fillText('watch • remember • tap', W / 2, 388);
+      var pulse = 0.55 + 0.45 * Math.sin(now / 700);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, 450);
+      cx.globalAlpha = 1;
+    }
+
+    // ── SHOW phase ──
+    if (state.phase === PHASES.SHOW) {
+      var elapsed = now - phaseAt;
+      state.showTimer -= dt;
+
+      if (!state.inGap) {
+        if (state.showTimer <= 0) {
+          state.showTimer = state.showGap;
+          state.inGap = true;
+        }
+      } else {
+        // in gap
+        if (state.showTimer <= 0) {
+          state.showIdx++;
+          if (state.showIdx >= state.motes.length) {
+            enterRecall();
+          } else {
+            state.showTimer = state.showHold;
+            state.inGap = false;
+          }
+        }
+      }
+
+      // draw current mote centred (or fade if in gap)
+      var showAlpha = state.inGap
+        ? Math.max(0, state.showTimer / state.showGap)
+        : Math.min(1, 1 - (state.showTimer - state.showHold + 12) / 12);
+
+      if (!state.inGap && state.showIdx < state.motes.length) {
+        var sm = state.motes[state.showIdx];
+        // subtle float
+        var floatY = Math.sin(now / 900) * 5;
+        drawMote(W / 2, 340 + floatY, sm, 58, showAlpha);
+      }
+
+      // show progress dots
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '400 13px -apple-system, Helvetica, Arial';
+      cx.fillText('watch and remember', W / 2, 160);
+      var dotSpacing = 22, dotY = 195;
+      var totalW = (state.motes.length - 1) * dotSpacing;
+      for (var di = 0; di < state.motes.length; di++) {
+        var dotX = W / 2 - totalW / 2 + di * dotSpacing;
+        cx.beginPath();
+        cx.arc(dotX, dotY, 5, 0, Math.PI * 2);
+        cx.fillStyle = di < state.showIdx ? TEAL : (di === state.showIdx && !state.inGap ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.18)');
+        cx.fill();
+      }
+
+      // index label
+      if (!state.inGap && state.showIdx < state.motes.length) {
+        cx.textAlign = 'center';
+        cx.fillStyle = 'rgba(255,255,255,0.22)';
+        cx.font = '400 12px Menlo, monospace';
+        cx.fillText((state.showIdx + 1) + ' / ' + state.motes.length, W / 2, 520);
+      }
+    }
+
+    // ── RECALL phase ──
+    if (state.phase === PHASES.RECALL) {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '400 14px -apple-system, Helvetica, Arial';
+      cx.fillText('tap each one you saw', W / 2, 195);
+
+      // count tapped
+      var tappedCount = 0;
+      for (var ti = 0; ti < state.tapped.length; ti++) if (state.tapped[ti]) tappedCount++;
+      var remaining = state.motes.length - tappedCount;
+
+      cx.fillStyle = TEAL;
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText(remaining + ' remaining', W / 2, 225);
+
+      // draw each mote in recall grid
+      for (var ri = 0; ri < recallPositions.length; ri++) {
+        var rpos = recallPositions[ri];
+        var mote  = state.motes[rpos.idx];
+        var tapped = state.tapped[rpos.idx];
+        if (tapped) {
+          drawTappedMark(rpos.x, rpos.y, mote.color);
+          drawMote(rpos.x, rpos.y, mote, MOTE_R, 0.22);
+        } else {
+          drawMote(rpos.x, rpos.y, mote, MOTE_R, 1);
+        }
+      }
+    }
+
+    // ── BLOOM phase ──
+    if (state.phase === PHASES.BLOOM) {
+      var bt = Math.min(1, (now - phaseAt) / 1200);
+      cx.globalAlpha = bt;
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '300 22px -apple-system, Helvetica, Arial';
+      cx.fillText('garden grows', W / 2, 300);
+      cx.globalAlpha = Math.min(1, bt * 1.4);
+      cx.fillStyle = '#fff';
+      cx.font = '700 52px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 380);
+      cx.globalAlpha = bt * 0.7;
+      cx.fillStyle = GOLD;
+      cx.font = '400 16px -apple-system, Helvetica, Arial';
+      cx.fillText('remembered', W / 2, 415);
+      cx.globalAlpha = 1;
+    }
+
+    // ── OVER phase ──
+    if (state.phase === PHASES.OVER) {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '300 20px -apple-system, Helvetica, Arial';
+      cx.fillText('GARDEN GREW', W / 2, 258);
+      cx.fillStyle = '#fff';
+      cx.font = '800 68px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score, W / 2, 345);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '400 15px -apple-system, Helvetica, Arial';
+      cx.fillText(state.motes.length + ' motes held', W / 2, 378);
+      cx.fillStyle = GOLD;
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('round ' + (state.round + 1), W / 2, 412);
+
+      if (!DEMO && !BOT) {
+        var pulse2 = 0.6 + 0.4 * Math.sin(now / 700);
+        cx.globalAlpha = pulse2;
+        cx.fillStyle = TEAL;
+        cx.font = '600 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP TO PLANT AGAIN', W / 2, 454);
+        cx.globalAlpha = 1;
+        // share zone
+        cx.fillStyle = 'rgba(46,197,182,0.12)';
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        cx.beginPath();
+        cx.roundRect ? cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23)
+                     : cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = TEAL;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ SHARE YOUR GARDEN', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ── CTA card (demo only) ──
+    if (state.phase === PHASES.CTA) {
+      var ct = (now - ctaAt) / 1000, ease = Math.min(1, ct * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '300 18px -apple-system, Helvetica, Arial';
+      cx.fillText('RECALL GARDEN', W / 2, 268);
+      cx.fillStyle = '#fff';
+      cx.font = '700 36px -apple-system, Helvetica, Arial';
+      cx.fillText('grow yours', W / 2, 320);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '400 16px -apple-system, Helvetica, Arial';
+      cx.fillText('watch · remember · bloom', W / 2, 358);
+      var p3 = 0.72 + 0.28 * Math.sin(now / 600);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL;
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ GROW YOURS', W / 2, 422);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '400 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 458);
+      cx.globalAlpha = 1;
+    }
+
+    // floating reward flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 230 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

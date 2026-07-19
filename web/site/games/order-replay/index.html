@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Order Replay — Tilt</title>
+<!--
+  LOOP / attention-architecture — Order Replay
+  Mechanic: items flash in canonical order for 4s, then scramble;
+            drag them back into the original sequence from memory.
+            Miss-order distance = total errors (lower is better).
+  Circuits: 01-rpe, 06-zeigarnik, 08-investment.
+  Modes:
+    ?demo=1&seed=7    mirror-neuron video clip, sets window.__demoDone
+    ?bot=1&runs=N     imperfect autoplay, sets window.__botDone
+    ?dare=N           incoming dare banner + SHARE flow
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'order-replay';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = Math.max(1, +qs.get('runs') || 3);
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- item pool (self-contained, no network) ----
+  var POOL = [
+    'MOON', 'FIRE', 'BOLT', 'WAVE', 'BLOOM',
+    'AIM',  'GEM',  'LAUNCH', 'LEAF', 'FROST',
+    'MASK', 'WIN',  'SPIN',  'SPARK', 'TENT',
+    'ROCK', 'PETAL','PEAK',  'BRUSH', 'RISE',
+    'ECHO', 'DRIFT','FLARE', 'PULSE', 'GLOW'
+  ];
+
+  // card layout
+  var CARD_W = 340, CARD_H = 62, CARD_GAP = 10;
+  var LIST_TOP = 200;
+
+  function cardY(idx) { return LIST_TOP + idx * (CARD_H + CARD_GAP); }
+
+  // game state
+  var phase;      // title|challenge|memorize|arrange|result|over|cta
+  var items;      // canonical order (array of strings)
+  var playerOrder;// current player arrangement
+  var roundNum, totalErrors, runStartTs;
+  var dragging, dragOffY, pointerY;
+  var flashes, hitStop, zoom, shakeAmt;
+  var challengeAt, overAt, ctaAt, dareBeaten;
+  var botRunsDone;
+  var memorizeTimer;  // ms remaining in memorize phase
+  var autoScheduled;  // flag: autopilot submission already scheduled
+
+  var best;
+  try { best = +localStorage.getItem('or_best'); if (!best || best < 0) best = 999; } catch(_) { best = 999; }
+
+  // ---- helpers ----
+  function shuffle(arr) {
+    var a = arr.slice();
+    for (var i = a.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+    }
+    return a;
+  }
+
+  function pickItems(n) {
+    var pool = POOL.slice();
+    var out = [];
+    for (var i = 0; i < n; i++) {
+      var idx = Math.floor(rng() * pool.length);
+      out.push(pool.splice(idx, 1)[0]);
+    }
+    return out;
+  }
+
+  function calcErrors() {
+    if (!playerOrder || !items) return 0;
+    var e = 0;
+    for (var i = 0; i < playerOrder.length; i++) {
+      var correct = items.indexOf(playerOrder[i]);
+      e += Math.abs(i - correct);
+    }
+    return e;
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * (1 - Math.exp(-score / 8)))));
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- game flow ----
+  function newGame() {
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0;
+    dareBeaten = false; botRunsDone = 0; totalErrors = 0; roundNum = 0;
+    dragging = null; pointerY = 0; dragOffY = 0; autoScheduled = false;
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRound, 1250);
+      return;
+    }
+    if (BOT) {
+      startRound();
+      return;
+    }
+    phase = 'title';
+  }
+
+  function startRound() {
+    roundNum++;
+    var n = Math.min(4 + roundNum, 7); // 5, 6, 7 items across rounds
+    items = pickItems(n);
+    // scramble so it differs from canonical
+    do { playerOrder = shuffle(items); } while (sameOrder(playerOrder, items) && items.length > 1);
+    phase = 'memorize';
+    memorizeTimer = 4000;
+    autoScheduled = false;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED, round: roundNum });
+  }
+
+  function sameOrder(a, b) {
+    for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  function beginArrange() {
+    phase = 'arrange';
+    autoScheduled = false;
+    dragging = null;
+    if (window.J) J.tension(Math.min((roundNum - 1) / 3, 1));
+    // schedule autopilot for bot/demo
+    if (BOT || DEMO) scheduleAutoSubmit();
+  }
+
+  function scheduleAutoSubmit() {
+    if (autoScheduled) return;
+    autoScheduled = true;
+    // demo: apply scripted errors per round
+    // bot: random swaps
+    var delay = 600 + rng() * 600;
+    setTimeout(function () {
+      if (phase !== 'arrange') return; // phase changed, abort
+      if (DEMO) applyDemoErrors();
+      else applyBotErrors();
+      submitOrder();
+    }, delay);
+  }
+
+  function applyDemoErrors() {
+    // round 1: near-perfect (1 swap → 2 errors)
+    // round 2: near-fail (2 swaps → 4 errors), then next round will be spectacle
+    // round 3: big fail (3+ swaps → spectacle)
+    var n = playerOrder.length;
+    var swaps = roundNum === 1 ? 1 : (roundNum === 2 ? 2 : 3);
+    swaps = Math.min(swaps, Math.floor(n / 2));
+    for (var s = 0; s < swaps; s++) {
+      var ai = (s * 2) % n;
+      var bi = (s * 2 + 1) % n;
+      var tmp = playerOrder[ai]; playerOrder[ai] = playerOrder[bi]; playerOrder[bi] = tmp;
+    }
+    // for round 2 near-fail: partially recover (undo one swap)
+    if (roundNum === 2 && swaps >= 2) {
+      var tmp2 = playerOrder[0]; playerOrder[0] = playerOrder[1]; playerOrder[1] = tmp2;
+    }
+  }
+
+  function applyBotErrors() {
+    // imperfect bot: 0-2 random swaps per round
+    var swaps = Math.floor(rng() * 3);
+    for (var s = 0; s < swaps; s++) {
+      var ai = Math.floor(rng() * playerOrder.length);
+      var bi = Math.floor(rng() * playerOrder.length);
+      var tmp = playerOrder[ai]; playerOrder[ai] = playerOrder[bi]; playerOrder[bi] = tmp;
+    }
+  }
+
+  function submitOrder() {
+    if (phase !== 'arrange') return;
+    var errs = calcErrors();
+    totalErrors += errs;
+    var perfect = errs === 0;
+
+    if (window.J) {
+      if (perfect) { J.perfect(roundNum); hitStop = 4; zoom = 1.03; }
+      else if (errs <= 2) { J.near(); shakeAmt = 3; }
+      else { J.hit(Math.max(1, roundNum)); }
+    }
+
+    if (perfect) {
+      flash('PERFECT ORDER!', TEAL, 36);
+    } else if (errs <= 2) {
+      flash('SO CLOSE!', GOLD, 34);
+      if (window.LOOP) LOOP.emit('near_miss', { errs: errs, round: roundNum });
+    } else if (errs >= 6) {
+      flash('SCRAMBLED!', VERM, 34);
+    }
+
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && totalErrors < SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 38);
+      if (window.J) J.fanfare();
+      SHARE.beaten(totalErrors);
+    }
+
+    if (window.LOOP) LOOP.emit('round_done', { round: roundNum, errs: errs, perfect: perfect });
+
+    phase = 'result';
+    overAt = performance.now();
+
+    var ROUNDS = 3;
+    if (roundNum >= ROUNDS) {
+      setTimeout(endGame, 1600);
+    } else {
+      setTimeout(function () { startRound(); }, 1500);
+    }
+  }
+
+  function endGame() {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = totalErrors < best;
+
+    if (window.J) {
+      J.death(Math.min(0.3 + totalErrors / 20, 1));
+      if (newBest) setTimeout(function () { if (window.J) J.fanfare(); }, 450);
+    }
+
+    if (DEMO) window.__demoScore = totalErrors;
+    if (newBest && totalErrors < 999) {
+      best = totalErrors;
+      try { localStorage.setItem('or_best', String(best)); } catch(_) {}
+    }
+
+    if (window.LOOP) LOOP.emit('game_over', { score: totalErrors, dur_s: +(dur).toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2200);
+    }
+
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 700);
+      }
+    }
+  }
+
+  function resetRun() {
+    totalErrors = 0; roundNum = 0; flashes = [];
+    autoScheduled = false; dragging = null;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRound();
+  }
+
+  // ---- input (human only) ----
+  var MUTE_R  = { x: W - 46, y: 10,  w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 498, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function onDown(x, y) {
+    if (DEMO || BOT) return;
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRound(); return; }
+    if (phase === 'arrange' && playerOrder) {
+      for (var i = 0; i < playerOrder.length; i++) {
+        var cy = cardY(i);
+        if (y >= cy && y <= cy + CARD_H && x >= (W - CARD_W) / 2 && x <= (W + CARD_W) / 2) {
+          dragging = { idx: i };
+          dragOffY = y - cy;
+          pointerY = y;
+          return;
+        }
+      }
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: totalErrors, unit: 'errors' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  function onMove(x, y) {
+    if (DEMO || BOT) return;
+    pointerY = y;
+    if (phase === 'arrange' && dragging !== null && playerOrder) {
+      var newIdx = Math.round((y - dragOffY - LIST_TOP + CARD_H / 2) / (CARD_H + CARD_GAP));
+      newIdx = Math.max(0, Math.min(playerOrder.length - 1, newIdx));
+      if (newIdx !== dragging.idx) {
+        var item = playerOrder[dragging.idx];
+        playerOrder.splice(dragging.idx, 1);
+        playerOrder.splice(newIdx, 0, item);
+        dragging.idx = newIdx;
+      }
+    }
+  }
+
+  function onUp() {
+    if (DEMO || BOT) return;
+    if (phase === 'arrange' && dragging !== null) {
+      dragging = null;
+      submitOrder();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    onDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointermove', function (e) {
+    if (!(e.buttons & 1)) return;
+    var r = cv.getBoundingClientRect();
+    onMove((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('pointerup', function () { onUp(); });
+
+  // ---- render helpers ----
+  function drawCard(label, x, y, w, h, fillColor, borderColor) {
+    cx.fillStyle = fillColor || 'rgba(255,255,255,0.07)';
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(x, y, w, h, 14);
+    else cx.rect(x, y, w, h);
+    cx.fill();
+    cx.strokeStyle = borderColor || 'rgba(255,255,255,0.12)';
+    cx.lineWidth = 1.2;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(x, y, w, h, 14);
+    else cx.rect(x, y, w, h);
+    cx.stroke();
+    cx.fillStyle = '#fff';
+    cx.font = '700 19px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'center';
+    cx.fillText(label, x + w / 2, y + h / 2 + 7);
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // memorize countdown → trigger arrange
+    if (phase === 'memorize') {
+      memorizeTimer -= dt * 16.667;
+      if (memorizeTimer <= 0) { memorizeTimer = 0; beginArrange(); }
+    }
+
+    // juice: hit-stop decay (never gate anything on it)
+    if (hitStop > 0) hitStop -= dt;
+
+    // draw with juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ===== TITLE =====
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('ORDER REPLAY', W / 2, 252);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('memorize the sequence.', W / 2, 296);
+      cx.fillText('put it back. exactly.', W / 2, 318);
+      var pulse = 0.65 + 0.35 * Math.sin(now / 320);
+      cx.globalAlpha = pulse; cx.fillStyle = VERM;
+      cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO PLAY', W / 2, 384);
+      cx.globalAlpha = 1;
+    }
+
+    // ===== CHALLENGE CARD (demo beat 1) =====
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 286);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('3', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('errors total. can you beat it?', W / 2, 424);
+    }
+
+    // ===== MEMORIZE =====
+    if (phase === 'memorize' && items) {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '700 12px Menlo, monospace';
+      cx.fillText('ROUND ' + roundNum + ' OF 3  —  MEMORIZE THE ORDER', W / 2, 136);
+
+      // timer bar
+      var frac = Math.max(0, memorizeTimer / 4000);
+      cx.fillStyle = 'rgba(255,255,255,0.09)';
+      cx.fillRect((W - CARD_W) / 2, 150, CARD_W, 6);
+      cx.fillStyle = frac > 0.3 ? TEAL : VERM;
+      cx.fillRect((W - CARD_W) / 2, 150, CARD_W * frac, 6);
+
+      for (var i = 0; i < items.length; i++) {
+        var cy = cardY(i);
+        // sequence number on left
+        cx.fillStyle = GOLD;
+        cx.font = '900 13px Menlo, monospace';
+        cx.textAlign = 'right';
+        cx.fillText((i + 1) + '.', (W - CARD_W) / 2 - 10, cy + CARD_H / 2 + 5);
+        drawCard(items[i], (W - CARD_W) / 2, cy, CARD_W, CARD_H);
+      }
+    }
+
+    // ===== ARRANGE =====
+    if (phase === 'arrange' && playerOrder) {
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '800 13px Menlo, monospace';
+      cx.fillText('PUT THEM BACK IN ORDER', W / 2, 136);
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('drag to rearrange  —  release to confirm', W / 2, 157);
+
+      for (var pi = 0; pi < playerOrder.length; pi++) {
+        var isDrag = dragging && dragging.idx === pi;
+        var pcy = isDrag ? pointerY - dragOffY : cardY(pi);
+        var fillC = isDrag ? 'rgba(46,197,182,0.22)' : 'rgba(255,255,255,0.07)';
+        var borderC = isDrag ? TEAL : 'rgba(255,255,255,0.12)';
+        drawCard(playerOrder[pi], (W - CARD_W) / 2, pcy, CARD_W, CARD_H, fillC, borderC);
+        // slot number on right
+        cx.fillStyle = 'rgba(255,255,255,0.22)';
+        cx.font = '700 11px Menlo, monospace';
+        cx.textAlign = 'left';
+        cx.fillText('#' + (pi + 1), (W + CARD_W) / 2 + 10, pcy + CARD_H / 2 + 5);
+        cx.textAlign = 'center';
+      }
+    }
+
+    // ===== RESULT =====
+    if (phase === 'result' && playerOrder && items) {
+      var errs = calcErrors();
+      cx.textAlign = 'center';
+      cx.fillStyle = errs === 0 ? TEAL : (errs <= 2 ? GOLD : VERM);
+      cx.font = '800 20px -apple-system, Helvetica, Arial';
+      cx.fillText(
+        errs === 0 ? 'PERFECT ORDER!' : errs + ' error' + (errs === 1 ? '' : 's') + ' this round',
+        W / 2, 136
+      );
+
+      for (var ri = 0; ri < items.length; ri++) {
+        var rcy = cardY(ri);
+        var isCorrect = playerOrder[ri] === items[ri];
+        var rFill = isCorrect ? 'rgba(46,197,182,0.15)' : 'rgba(232,80,46,0.15)';
+        var rBorder = isCorrect ? TEAL : VERM;
+        drawCard(playerOrder[ri], (W - CARD_W) / 2, rcy, CARD_W, CARD_H, rFill, rBorder);
+        if (!isCorrect) {
+          cx.fillStyle = VERM;
+          cx.font = '600 11px Menlo, monospace';
+          cx.textAlign = 'left';
+          cx.fillText('→ #' + (items.indexOf(playerOrder[ri]) + 1), (W + CARD_W) / 2 + 8, rcy + CARD_H / 2 + 5);
+          cx.textAlign = 'center';
+        }
+      }
+
+      if (roundNum < 3) {
+        cx.fillStyle = 'rgba(255,255,255,0.35)';
+        cx.font = '600 13px -apple-system, Helvetica, Arial';
+        cx.fillText('next round…', W / 2, H - 60);
+      }
+    }
+
+    // ===== GAME OVER =====
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = totalErrors <= 3 ? TEAL : VERM;
+      cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText(totalErrors === 0 ? 'FLAWLESS' : totalErrors + ' ERRORS', W / 2, 280);
+      cx.fillStyle = '#fff';
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('across 3 rounds', W / 2, 316);
+      var pt = pctTop(totalErrors);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 362);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('best: ' + (best >= 999 ? '—' : best + ' errors'), W / 2, 390);
+
+      if (!DEMO && !BOT) {
+        // dare banner
+        if (window.SHARE && SHARE.dare !== null) {
+          cx.fillStyle = dareBeaten ? TEAL : GOLD;
+          cx.font = '800 14px -apple-system, Helvetica, Arial';
+          cx.fillText(
+            dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + ' errors' + (SHARE.by ? ' — ' + SHARE.by : ''),
+            W / 2, 416
+          );
+        }
+        var p2 = 0.65 + 0.35 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — TRY AGAIN', W / 2, 454);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.13)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W / 2, SHARE_R.y + 30
+        );
+      }
+    }
+
+    // ===== CTA (demo beat 6) =====
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 43px -apple-system, Helvetica, Arial';
+      cx.fillText('ORDER REPLAY', W / 2, 286);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('they got ' + (window.__demoScore || 5) + ' errors.', W / 2, 330);
+      cx.fillText('your turn.', W / 2, 355);
+      var p3 = 0.72 + 0.28 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 5), W / 2, 414);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 448);
+      cx.globalAlpha = 1;
+    }
+
+    // ===== dare banner during arrange =====
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'arrange') {
+      cx.textAlign = 'center';
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 13px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + ' errors', W / 2, H - 26);
+    }
+
+    // ===== floating flash text =====
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 185 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // ===== running error tally =====
+    if (phase === 'memorize' || phase === 'arrange' || phase === 'result') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.18)';
+      cx.font = '600 11px Menlo, monospace';
+      cx.fillText('TOTAL ERRORS: ' + totalErrors, W / 2, H - 14);
+    }
+
+    // ===== mute toggle (human only) =====
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.48;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

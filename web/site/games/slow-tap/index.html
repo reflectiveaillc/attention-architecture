@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Slow Tap — Tilt</title>
+<!--
+  LOOP / attention-architecture — Slow Tap
+  Engine: calm. Circuits: 07-timing, 05-ease, 01-rpe.
+  The beat starts fast; each perfectly-timed tap lengthens the next interval.
+  Win = hold 40 BPM for 3 consecutive beats.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone=true
+    ?bot=1&runs=N&seed=M  imperfect autopilot, N runs → window.__botDone=true
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'slow-tap';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var SOFT_BLUE = '#5b9cf6', SOFT_LAVENDER = '#a78bfa';
+
+  // ---- game parameters ----
+  var BPM_START = 140;   // starting beats per minute
+  var BPM_TARGET = 40;   // win tempo
+  var BPM_LOSE   = 180;  // if tempo rises above this → lose
+  // Each perfect tap reduces BPM by this much (interval lengthens = calm)
+  var BPM_STEP_PERFECT = 6;
+  // Each imperfect (early/late) tap increases BPM slightly
+  var BPM_STEP_BAD     = 4;
+  // Win = BPM <= 40 for 3 consecutive beats
+  var WIN_HOLD = 3;
+
+  // timing window: fraction of interval that counts as "on time"
+  var WINDOW_PERFECT = 0.13;  // ±13% of interval = perfect (green)
+  var WINDOW_OK      = 0.25;  // ±25% = ok (not penalized heavily)
+
+  var state, flashes, hitStop, zoom, shakeAmt, runStartTs;
+  var botRunsDone = 0;
+  var ctaAt = 0, overAt = 0;
+
+  // region rects
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function newGame() {
+    state = {
+      phase: 'title',    // title | play | over | win | cta
+      bpm: BPM_START,
+      beatInterval: 60000 / BPM_START,  // ms
+      nextBeatAt: 0,     // performance.now() timestamp
+      lastBeatAt: 0,
+      totalBeats: 0,
+      score: 0,          // total perfect taps
+      winHoldCount: 0,   // consecutive beats at target BPM
+      tapPending: false, // has the player tapped since last beat marker?
+      lastTapTime: 0,
+      tapQuality: null,  // 'perfect' | 'ok' | 'miss' | 'early'
+      winAt: 0,
+      calmnessLevel: 0,  // 0-1 visual calm progress
+    };
+    flashes = [];
+    hitStop = 0;
+    zoom = 1;
+    shakeAmt = 0;
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    state.bpm = BPM_START;
+    state.beatInterval = 60000 / BPM_START;
+    state.nextBeatAt = performance.now() + state.beatInterval;
+    state.lastBeatAt = performance.now();
+    state.totalBeats = 0;
+    state.score = 0;
+    state.winHoldCount = 0;
+    state.tapPending = false;
+    state.tapQuality = null;
+    state.calmnessLevel = 0;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED, bpm_start: BPM_START });
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 36, t: 0, y: H / 2 - 60 });
+  }
+
+  // Called when the beat marker fires (start of next expected tap window)
+  function onBeat(now) {
+    state.lastBeatAt = now;
+    state.totalBeats++;
+
+    // Check previous tap quality
+    if (state.tapPending) {
+      // player tapped in time
+      var tapAge = state.lastTapTime - state.lastBeatAt; // how early/late relative to beat
+      // tapAge is measured from when beat started; ideal tap is at start of next beat
+      // "on beat" means tapping near the moment of nextBeatAt - i.e. near the start of this interval
+      // We measure from lastBeatAt: ideal is exactly beatInterval ms after lastBeat
+      var tapOffset = state.lastTapTime - state.lastBeatAt;
+      var norm = (tapOffset / state.beatInterval) - 1.0; // 0 = perfect, -1 = very early, >0 = late
+      var absNorm = Math.abs(norm);
+
+      if (absNorm <= WINDOW_PERFECT) {
+        // Perfect tap — slow down the beat
+        state.bpm = Math.max(BPM_TARGET, state.bpm - BPM_STEP_PERFECT);
+        state.score++;
+        state.tapQuality = 'perfect';
+        hitStop = 3;
+        zoom = 1.025;
+        if (window.J) J.calm(state.score);
+        flash('SLOWER', TEAL, 38);
+        if (window.LOOP) LOOP.emit('tap_perfect', { bpm: state.bpm, score: state.score });
+        if (state.bpm <= BPM_TARGET) {
+          state.winHoldCount++;
+          if (state.winHoldCount >= WIN_HOLD) {
+            win();
+            return;
+          }
+        } else {
+          state.winHoldCount = 0;
+        }
+      } else if (absNorm <= WINDOW_OK) {
+        // OK tap — neutral, very slight slow
+        state.bpm = Math.max(BPM_TARGET, state.bpm - 1);
+        state.tapQuality = 'ok';
+        if (window.J) J.calm(Math.max(1, state.score - 1));
+        state.winHoldCount = 0;
+        if (window.LOOP) LOOP.emit('tap_ok', { bpm: state.bpm });
+      } else {
+        // Off beat tap (too early or too late) — tempo rises
+        state.bpm = Math.min(BPM_LOSE, state.bpm + BPM_STEP_BAD);
+        state.tapQuality = 'miss';
+        shakeAmt = 3;
+        state.winHoldCount = 0;
+        flash('OFF BEAT', SOFT_LAVENDER, 32);
+        if (window.LOOP) LOOP.emit('near_miss', { bpm: state.bpm });
+      }
+      state.tapPending = false;
+    } else {
+      // Missed beat entirely — tempo rises
+      state.bpm = Math.min(BPM_LOSE, state.bpm + BPM_STEP_BAD);
+      state.tapQuality = 'miss';
+      shakeAmt = 3;
+      state.winHoldCount = 0;
+      flash('MISSED', SOFT_LAVENDER, 28);
+      if (window.LOOP) LOOP.emit('near_miss', { bpm: state.bpm });
+    }
+
+    // Check lose condition
+    if (state.bpm >= BPM_LOSE) {
+      gameOver();
+      return;
+    }
+
+    // Schedule next beat
+    state.beatInterval = 60000 / state.bpm;
+    state.nextBeatAt = now + state.beatInterval;
+    state.calmnessLevel = Math.max(0, Math.min(1, (BPM_START - state.bpm) / (BPM_START - BPM_TARGET)));
+  }
+
+  function onTap() {
+    if (state.phase !== 'play') return;
+    state.tapPending = true;
+    state.lastTapTime = performance.now();
+  }
+
+  function win() {
+    state.phase = 'win';
+    state.winAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.calm(99); // final resolution bell
+    flash('SLOWED IT DOWN', TEAL, 38);
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), win: true });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(resetRun, 900);
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 7;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.calm(0);
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1), win: false });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () { state.phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(resetRun, 900);
+    }
+  }
+
+  function resetRun() {
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- input ----
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') { onTap(); return; }
+    if ((state.phase === 'over' || state.phase === 'win') && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'perfect taps' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- Demo / Bot autopilot ----
+  // Demo arc: settle (6 taps gradually perfect) → deepen (4 perfect, BPM drops) → resolve (reach near 40) → soft end
+  // We simulate this by feeding timed taps near the beat with slight offsets
+  var demoTapIdx = 0;
+  // Offsets (fraction of interval) from perfect: 0 = perfect, neg = early, pos = late
+  // Negative means tapping before the beat fires = "too early" for the window calc
+  var demoOffsets = [0.22, 0.18, 0.09, 0.06, 0.04, 0.02, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01];
+  var demoScheduled = false;
+
+  function scheduleDemo(now) {
+    if (demoScheduled || state.phase !== 'play') return;
+    demoScheduled = true;
+    var off = demoOffsets[Math.min(demoTapIdx, demoOffsets.length - 1)];
+    // we want to tap at lastBeatAt + beatInterval * (1 + off) — but slightly before nextBeatAt
+    var tapAt = state.lastBeatAt + state.beatInterval * (1.0 - off * 0.5 + off);
+    var delay = Math.max(10, tapAt - now);
+    setTimeout(function () {
+      demoScheduled = false;
+      if (state.phase !== 'play') return;
+      state.tapPending = true;
+      state.lastTapTime = performance.now();
+      demoTapIdx++;
+    }, delay);
+  }
+
+  // Bot autopilot: imperfect taps with noise
+  var botScheduled = false;
+  var BOT_PLAY_COUNT = 0;   // how many taps bot has done this run
+  var BOT_MAX_TAPS = 18;    // bot stops tapping after this many → BPM rises → game_over
+
+  function scheduleBot(now) {
+    if (botScheduled || state.phase !== 'play') return;
+    // After BOT_MAX_TAPS, bot goes passive — BPM will rise and trigger gameOver
+    if (BOT_PLAY_COUNT >= BOT_MAX_TAPS) return;
+    botScheduled = true;
+    var noise = (rng() - 0.5) * 0.3; // ±15% of interval
+    var tapAt = state.lastBeatAt + state.beatInterval * (1.0 + noise);
+    var delay = Math.max(10, tapAt - now);
+    setTimeout(function () {
+      botScheduled = false;
+      if (state.phase !== 'play') return;
+      state.tapPending = true;
+      state.lastTapTime = performance.now();
+      BOT_PLAY_COUNT++;
+    }, delay);
+  }
+
+  function autopilot(now) {
+    if (state.phase !== 'play') return;
+    if (DEMO) scheduleDemo(now);
+    if (BOT) scheduleBot(now);
+  }
+
+  // ---- render helpers ----
+  // Ring / pulse visual: concentric circles that breathe with the beat
+  function drawPulse(now, cx) {
+    var phase = state.phase;
+    if (phase !== 'play' && phase !== 'win') return;
+
+    var cx_ = W / 2, cy_ = H / 2 + 30;
+    var bpm = state.bpm;
+    var interval = state.beatInterval;
+
+    // How far into current beat interval are we?
+    var elapsed = now - state.lastBeatAt;
+    var beatFrac = Math.min(1, elapsed / interval); // 0→1 within interval
+
+    // Calm level: 0 (fast/tense) → 1 (slow/serene)
+    var calm = state.calmnessLevel;
+
+    // Base circle radius pulses with beat
+    var baseR = 60 + calm * 60;
+    var pulse = Math.sin(beatFrac * Math.PI) * (8 - calm * 4);
+    var r = baseR + pulse;
+
+    // Color shifts from SOFT_BLUE to TEAL as we slow
+    var alpha = 0.18 + calm * 0.22;
+
+    // Outer glow rings (3)
+    for (var i = 3; i >= 1; i--) {
+      var ringR = r * (1 + i * 0.28);
+      var ringA = alpha * (1 - i * 0.27) * (1 - beatFrac * 0.4);
+      cx.beginPath();
+      cx.arc(cx_, cy_, ringR, 0, Math.PI * 2);
+      cx.strokeStyle = 'rgba(46,197,182,' + ringA.toFixed(3) + ')';
+      cx.lineWidth = 1.5 - i * 0.3;
+      cx.stroke();
+    }
+
+    // Main ring
+    cx.beginPath();
+    cx.arc(cx_, cy_, r, 0, Math.PI * 2);
+    cx.strokeStyle = TEAL;
+    cx.globalAlpha = 0.55 + calm * 0.35;
+    cx.lineWidth = 2 + calm * 1.5;
+    cx.stroke();
+    cx.globalAlpha = 1;
+
+    // Inner dot brightens at beat moment
+    var dotA = Math.max(0, 1 - beatFrac * 2) * 0.9;
+    cx.beginPath();
+    cx.arc(cx_, cy_, 6 + calm * 4, 0, Math.PI * 2);
+    cx.fillStyle = TEAL;
+    cx.globalAlpha = dotA + 0.15;
+    cx.fill();
+    cx.globalAlpha = 1;
+
+    // BPM progress arc (shows how close to 40 BPM we are)
+    var progress = calm;
+    if (progress > 0.01) {
+      cx.beginPath();
+      cx.arc(cx_, cy_, r + 18, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
+      cx.strokeStyle = GOLD;
+      cx.globalAlpha = 0.7;
+      cx.lineWidth = 3;
+      cx.stroke();
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawBPM(now) {
+    if (state.phase !== 'play' && state.phase !== 'over' && state.phase !== 'win') return;
+    var bpm = Math.round(state.bpm);
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.font = '800 72px -apple-system, Helvetica, Arial';
+    cx.fillText(bpm, W / 2, 130);
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('BPM', W / 2, 152);
+    cx.fillStyle = 'rgba(46,197,182,0.6)';
+    cx.font = '600 12px Menlo, monospace';
+    cx.fillText('TARGET: 40 BPM', W / 2, 172);
+
+    // score (perfect taps)
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '700 14px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score + ' PERFECT', W / 2, 195);
+
+    // win hold indicator
+    if (state.winHoldCount > 0) {
+      for (var i = 0; i < WIN_HOLD; i++) {
+        cx.beginPath();
+        cx.arc(W / 2 - (WIN_HOLD - 1) * 10 + i * 20, 212, 5, 0, Math.PI * 2);
+        cx.fillStyle = i < state.winHoldCount ? TEAL : 'rgba(255,255,255,0.2)';
+        cx.fill();
+      }
+    }
+  }
+
+  // tap quality flash ring burst
+  function drawTapFeedback(now) {
+    if (!state.tapQuality) return;
+    // quality fades quickly — driven by flashes array
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // beat clock
+    if (state.phase === 'play' && now >= state.nextBeatAt) {
+      onBeat(now);
+    }
+
+    // autopilots
+    autopilot(now);
+
+    // juice decay
+    if (hitStop > 0) hitStop -= dt;
+    else {
+      zoom  += (1 - zoom)    * 0.12 * dt;
+      shakeAmt *= Math.pow(0.85, dt);
+    }
+
+    // draw
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+
+    // background — calm level shifts background hue
+    var calm = state.calmnessLevel;
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,' + (0.04 + calm * 0.08) + ')');
+    bg.addColorStop(1, 'rgba(91,156,246,' + (0.03 + calm * 0.06) + ')');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // title phase
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('SLOW TAP', W / 2, 290);
+      cx.fillStyle = 'rgba(46,197,182,0.9)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 400);
+      cx.globalAlpha = pulse; cx.fillText('TAP IN TIME', W / 2, 338); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('each perfect tap slows the beat', W / 2, 368);
+      cx.fillText('reach 40 BPM to win', W / 2, 390);
+    }
+
+    // play phase visuals
+    if (state.phase === 'play') {
+      drawPulse(now, cx);
+      drawBPM(now);
+
+      // beat window indicator bar at bottom
+      if (state.nextBeatAt > 0) {
+        var interval = state.beatInterval;
+        var elapsed = now - state.lastBeatAt;
+        var frac = Math.min(1, elapsed / interval);
+        var barW = 260, barX = W / 2 - barW / 2, barY = H - 160;
+        cx.fillStyle = 'rgba(255,255,255,0.07)';
+        cx.fillRect(barX, barY, barW, 8);
+        // perfect window markers
+        var winW = WINDOW_PERFECT * barW;
+        cx.fillStyle = 'rgba(46,197,182,0.3)';
+        cx.fillRect(barX + barW * (1 - WINDOW_PERFECT) - winW / 2, barY, winW * 2, 8);
+        // progress cursor
+        cx.fillStyle = frac < 0.7 ? TEAL : frac < 0.9 ? GOLD : SOFT_LAVENDER;
+        cx.fillRect(barX + frac * barW - 2, barY - 3, 4, 14);
+        // label
+        cx.textAlign = 'center';
+        cx.fillStyle = 'rgba(255,255,255,0.25)';
+        cx.font = '500 11px Menlo, monospace';
+        cx.fillText('TAP HERE', W / 2, barY + 28);
+      }
+
+      // calm progress strip on side
+      var stripH = 200, stripX = 24, stripY = H / 2 - stripH / 2;
+      cx.fillStyle = 'rgba(255,255,255,0.06)';
+      cx.fillRect(stripX, stripY, 4, stripH);
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = 0.7;
+      cx.fillRect(stripX, stripY + stripH * (1 - calm), 4, stripH * calm);
+      cx.globalAlpha = 1;
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '500 10px Menlo, monospace';
+      cx.fillText('CALM', stripX + 2, stripY - 8);
+    }
+
+    // over phase
+    if (state.phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = SOFT_LAVENDER; cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('LOST THE BEAT', W / 2, 300);
+      cx.fillStyle = '#fff'; cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' perfect taps', W / 2, 345);
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('reached ' + Math.round(state.bpm) + ' BPM before losing', W / 2, 380);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 300);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — TRY AGAIN', W / 2, 430); cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // win phase
+    if (state.phase === 'win') {
+      cx.fillStyle = 'rgba(11,13,18,0.45)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('SLOWED IT DOWN', W / 2, 295);
+      cx.fillStyle = '#fff'; cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' perfect taps', W / 2, 340);
+      cx.fillStyle = GOLD; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('reached 40 BPM', W / 2, 372);
+      if (!DEMO && !BOT) {
+        var pw = 0.65 + 0.35 * Math.sin(now / 320);
+        cx.globalAlpha = pw; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP TO PLAY AGAIN', W / 2, 425); cx.globalAlpha = 1;
+        cx.fillStyle = 'rgba(242,177,52,0.12)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+      // Subtle continuing pulse in win
+      drawPulse(now, cx);
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('SLOW TAP', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('can you slow it to 40?', W / 2, 338);
+      var p3 = 0.72 + 0.28 * Math.sin(now / 280);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 405);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 36);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, fl.y - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+
+  // Demo auto-start
+  if (DEMO) {
+    setTimeout(startRun, 400);
+  }
+})();
+</script>
+</body>
+</html>

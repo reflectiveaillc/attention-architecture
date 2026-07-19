@@ -3,6 +3,13 @@
 > Started 2026-07-17 ~14:10. Goal: drain `engine/state/design-backlog.json` (100
 > designs) into live, validated, clipped games. Read this after any autocompact.
 
+## 🏁 DRAINED 2026-07-19 ~15:20 — registry 383 games, 0 unbuilt backlog designs.
+Round 6 (final): 27/27 built (1.5M tokens) + integrated; recall-garden needed a
+one-line orchestrator fix (negative arc radius — clamp bloom factor to [0,1]).
+Full arc: 360-design backlog → 6 Claude build rounds + tilt-fix recovery, ~100%
+first-pass rate from sonnet self-validation. The factory is done; next lever is
+DISTRIBUTION (go-live gated on Manuel: Vercel + clip posting).
+
 ## 📌 SESSION 2026-07-19 (state as of ~13:30)
 - ⛔ **drop-dodge LOCKED** — Manuel play-tested: "very engaging and addicting".
   Difficulty frozen (registry `locked:true` + header comment + docs/locked-games.md).

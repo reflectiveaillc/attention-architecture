@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Echo Fade — Tilt</title>
+<!--
+  LOOP / attention-architecture — Echo Fade
+  Mechanic: watch a sequence of glowing nodes appear one-by-one, then tap them
+            back in order after they fade. Each correct recall plays a soft chime.
+  Engine: calm. Circuits: 06-zeigarnik, 05-ease, 07-timing.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA, window.__demoDone
+    ?bot=1&runs=N    imperfect autopilot, window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'echo-fade';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var SOFT_BLUE = '#4fc3f7', SOFT_LAVENDER = '#b39ddb', SOFT_MINT = '#80cbc4';
+
+  // ---- node grid layout: 3×4 grid of tap nodes ----
+  var COLS = 3, ROWS = 4;
+  var CELL_W = 110, CELL_H = 110;
+  var GRID_X = (W - COLS * CELL_W) / 2 + CELL_W / 2;
+  var GRID_Y = 200;
+  var NODE_R = 34;
+  var nodes = [];
+  for (var r = 0; r < ROWS; r++) {
+    for (var c = 0; c < COLS; c++) {
+      nodes.push({
+        x: GRID_X + c * CELL_W,
+        y: GRID_Y + r * CELL_H
+      });
+    }
+  }
+  var NODE_COUNT = nodes.length; // 12
+
+  // ---- game state ----
+  var phase;       // 'title' | 'show' | 'recall' | 'success' | 'over' | 'cta'
+  var sequence;    // array of node indices for this round
+  var showIdx;     // which element of sequence is currently being shown
+  var showTimer;   // frames until next show step
+  var recallIdx;   // how many the player has recalled correctly
+  var score;       // rounds completed
+  var runStartTs;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var flashes = [];
+  var nodeGlow = [];   // per-node glow alpha
+  var nodeRipple = []; // per-node ripple: {t, maxR}
+  var phaseTimer = 0;  // general timer for phase transitions
+  var ctaAt = 0;
+  var last = performance.now();
+
+  // bot state
+  var botRunsDone = 0;
+  var botPending = [];       // queued taps for bot
+  var botTapTimer = 0;
+  var botPassiveRounds = 0;  // after K rounds bot plays wrong to hit game_over
+
+  // demo state
+  var demoStep = 0;
+  var demoTimer = 0;
+
+  // ---- init node arrays ----
+  for (var i = 0; i < NODE_COUNT; i++) {
+    nodeGlow.push(0);
+    nodeRipple.push(null);
+  }
+
+  // ---- colors for sequence elements ----
+  var SEQ_COLORS = [SOFT_MINT, SOFT_BLUE, SOFT_LAVENDER, TEAL, GOLD];
+
+  function seqColor(idx) {
+    return SEQ_COLORS[idx % SEQ_COLORS.length];
+  }
+
+  // ---- sequence generation ----
+  // sequence length grows with score: 3 → 4 → 5 → ...
+  function seqLen() { return Math.min(3 + score, 8); }
+
+  function buildSequence() {
+    var len = seqLen();
+    var seq = [];
+    var last2 = -1;
+    for (var i = 0; i < len; i++) {
+      var pick;
+      do { pick = Math.floor(rng() * NODE_COUNT); } while (pick === last2);
+      seq.push(pick);
+      last2 = pick;
+    }
+    return seq;
+  }
+
+  // ---- SHOW_INTERVAL: frames each element is highlighted ----
+  // Calm game — slow reveal: 60 frames show, 20 frames gap = 80 total
+  var SHOW_ON = 60, SHOW_OFF = 20;
+
+  // ---- state machine ----
+  function newGame() {
+    phase = 'title';
+    score = 0;
+    sequence = [];
+    showIdx = -1;
+    recallIdx = 0;
+    flashes = [];
+    for (var i = 0; i < NODE_COUNT; i++) { nodeGlow[i] = 0; nodeRipple[i] = null; }
+    botRunsDone = 0;
+    botPending = [];
+    botTapTimer = 0;
+    botPassiveRounds = 0;
+    demoStep = 0;
+    demoTimer = 0;
+
+    if (BOT) {
+      startRound();
+    } else if (DEMO) {
+      startRound();
+    }
+  }
+
+  function startRound() {
+    recallIdx = 0;
+    sequence = buildSequence();
+    showIdx = -1;
+    showTimer = 40; // initial pause before first element
+    phase = 'show';
+    if (window.LOOP && score === 0) LOOP.emit('play_start', { seed: SEED });
+    runStartTs = runStartTs || Date.now();
+  }
+
+  function flashMsg(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 36, t: 0 });
+  }
+
+  function glowNode(idx, amount) {
+    nodeGlow[idx] = Math.max(nodeGlow[idx], amount);
+  }
+
+  function rippleNode(idx) {
+    nodeRipple[idx] = { t: 0 };
+  }
+
+  function advanceShow() {
+    showIdx++;
+    if (showIdx >= sequence.length) {
+      // all shown — move to recall after a pause
+      phase = 'recall';
+      recallIdx = 0;
+      // fade all glows out
+      for (var i = 0; i < NODE_COUNT; i++) nodeGlow[i] = 0;
+      flashMsg('your turn', TEAL, 28);
+      return;
+    }
+    var ni = sequence[showIdx];
+    glowNode(ni, 1.0);
+    rippleNode(ni);
+    if (window.J) J.calm(showIdx);
+    showTimer = SHOW_ON + SHOW_OFF;
+  }
+
+  function correctTap(nodeIdx) {
+    glowNode(nodeIdx, 1.0);
+    rippleNode(nodeIdx);
+    if (window.J) J.calm(recallIdx);
+    flashMsg('+1', seqColor(recallIdx), 30);
+    recallIdx++;
+    if (recallIdx >= sequence.length) {
+      // full sequence recalled!
+      score++;
+      hitStop = 5;
+      zoom = 1.025;
+      if (window.J) J.calm(score);
+      flashMsg('remembered', TEAL, 38);
+      if (window.LOOP) LOOP.emit('recall_complete', { score: score, length: sequence.length });
+      phase = 'success';
+      phaseTimer = 70; // wait then start next round
+    }
+  }
+
+  function wrongTap(nodeIdx) {
+    glowNode(nodeIdx, 0.5);
+    shakeAmt = 4;
+    flashMsg('faded', SOFT_LAVENDER, 34);
+    if (window.LOOP) LOOP.emit('near_miss', { score: score });
+    gameOver();
+  }
+
+  function gameOver() {
+    phase = 'over';
+    phaseTimer = 0;
+    var dur = (Date.now() - (runStartTs || Date.now())) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+      phaseTimer = 130; // wait on over screen, then CTA
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        phaseTimer = 30;
+      }
+    }
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function hitNode(px, py) {
+    // returns index of node tapped, or -1
+    for (var i = 0; i < NODE_COUNT; i++) {
+      var n = nodes[i];
+      var dx = px - n.x, dy = py - n.y;
+      if (dx * dx + dy * dy <= (NODE_R + 12) * (NODE_R + 12)) return i;
+    }
+    return -1;
+  }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return; // autopilots ignore human
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { runStartTs = Date.now(); startRound(); return; }
+    if (phase === 'recall') {
+      var ni = (px !== undefined) ? hitNode(px, py) : -1;
+      if (ni < 0) return;
+      if (ni === sequence[recallIdx]) correctTap(ni);
+      else wrongTap(ni);
+      return;
+    }
+    if (phase === 'over' && phaseTimer <= 0) {
+      restartRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') tap();
+  });
+
+  function restartRun() {
+    score = 0;
+    runStartTs = Date.now();
+    for (var i = 0; i < NODE_COUNT; i++) { nodeGlow[i] = 0; nodeRipple[i] = null; }
+    flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRound();
+  }
+
+  // ---- bot autopilot ----
+  // Bot plays K=4 rounds correctly, then starts making wrong taps to reach game_over.
+  var BOT_PASS_ROUNDS = 4;
+
+  function botAutopilot(dt) {
+    if (phase === 'show') return; // wait for recall phase
+
+    if (phase === 'recall') {
+      if (botTapTimer > 0) { botTapTimer -= dt; return; }
+
+      if (botPassiveRounds >= BOT_PASS_ROUNDS) {
+        // play wrong to trigger game_over
+        var wrongIdx;
+        do { wrongIdx = Math.floor(rng() * NODE_COUNT); } while (wrongIdx === sequence[recallIdx]);
+        wrongTap(wrongIdx);
+        botTapTimer = 25;
+        return;
+      }
+
+      // correct tap
+      var correct = sequence[recallIdx];
+      correctTap(correct);
+      botTapTimer = 22 + Math.floor(rng() * 18);
+      return;
+    }
+
+    if (phase === 'success') {
+      // handled by phaseTimer — just count rounds
+      return;
+    }
+
+    if (phase === 'over') {
+      // phaseTimer handles restart via frame loop
+      return;
+    }
+
+    if (phase === 'title') {
+      // start immediately
+      runStartTs = Date.now();
+      startRound();
+    }
+  }
+
+  // ---- demo autopilot ----
+  // Calm arc: settle (rounds 0-2 smooth) → deepen (longer seq, round 3) → resolve → invitation
+  // Demo script: ~16 seconds total
+  // demoStep 0-2: play correctly, gentle timing
+  // demoStep 3: longer sequence, one intentional wrong at end → game_over → CTA
+
+  var DEMO_ROUND_TAPS_DONE = 0;
+  var DEMO_WRONG_AT = -1; // which recallIdx to go wrong at, or -1=never
+
+  function demoAutopilot(dt) {
+    if (phase === 'show') return;
+
+    if (phase === 'recall') {
+      if (botTapTimer > 0) { botTapTimer -= dt; return; }
+
+      var shouldGoWrong = (DEMO_WRONG_AT >= 0 && recallIdx === DEMO_WRONG_AT);
+
+      if (shouldGoWrong) {
+        var wrongI;
+        do { wrongI = Math.floor(rng() * NODE_COUNT); } while (wrongI === sequence[recallIdx]);
+        wrongTap(wrongI);
+        botTapTimer = 30;
+        return;
+      }
+
+      correctTap(sequence[recallIdx]);
+      // slight hesitation on last element of sequence (very human)
+      var isLast = (recallIdx >= sequence.length - 1);
+      botTapTimer = isLast ? 50 + Math.floor(rng() * 20) : 28 + Math.floor(rng() * 22);
+      return;
+    }
+
+    if (phase === 'success') {
+      demoStep++;
+      if (demoStep >= 3) {
+        // next round: go wrong near the end
+        DEMO_WRONG_AT = Math.max(2, seqLen() - 1);
+      }
+      return;
+    }
+
+    if (phase === 'over') {
+      // CTA fires via phaseTimer in frame loop
+      return;
+    }
+  }
+
+  // ---- render helpers ----
+  function drawNode(idx, dt) {
+    var n = nodes[idx];
+    var glow = nodeGlow[idx];
+    var rp = nodeRipple[idx];
+
+    // ripple ring
+    if (rp !== null) {
+      rp.t += dt;
+      var rp_a = Math.max(0, 1 - rp.t / 30);
+      var rp_r = NODE_R + rp.t * 1.8;
+      cx.save();
+      cx.globalAlpha = rp_a * 0.5;
+      cx.strokeStyle = TEAL;
+      cx.lineWidth = 2;
+      cx.beginPath();
+      cx.arc(n.x, n.y, rp_r, 0, Math.PI * 2);
+      cx.stroke();
+      cx.restore();
+      if (rp.t > 30) nodeRipple[idx] = null;
+    }
+
+    // node body
+    cx.save();
+    // soft glow shadow
+    if (glow > 0.05) {
+      cx.shadowColor = TEAL;
+      cx.shadowBlur = 18 * glow;
+    }
+    // fill
+    var alpha = 0.18 + glow * 0.72;
+    cx.globalAlpha = alpha;
+    cx.fillStyle = glow > 0.3 ? TEAL : 'rgba(46,197,182,0.6)';
+    cx.beginPath();
+    cx.arc(n.x, n.y, NODE_R, 0, Math.PI * 2);
+    cx.fill();
+    // rim
+    cx.globalAlpha = 0.25 + glow * 0.55;
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 2;
+    cx.shadowBlur = 0;
+    cx.stroke();
+    cx.restore();
+
+    // decay glow
+    nodeGlow[idx] = Math.max(0, nodeGlow[idx] - 0.018 * dt);
+  }
+
+  function drawSequenceHint(now) {
+    // during recall: show small dots below indicating progress
+    if (phase !== 'recall' && phase !== 'success') return;
+    var total = sequence.length;
+    var dotSpacing = 22;
+    var startX = W / 2 - ((total - 1) * dotSpacing) / 2;
+    var dotY = GRID_Y + ROWS * CELL_H + 22;
+    for (var i = 0; i < total; i++) {
+      var done = i < recallIdx;
+      cx.save();
+      cx.globalAlpha = done ? 0.85 : 0.25;
+      cx.fillStyle = done ? TEAL : 'rgba(255,255,255,0.4)';
+      cx.beginPath();
+      cx.arc(startX + i * dotSpacing, dotY, 5, 0, Math.PI * 2);
+      cx.fill();
+      cx.restore();
+    }
+  }
+
+  function drawShowBeat(now) {
+    // during show phase: pulse the current active node index label
+    if (phase !== 'show' || showIdx < 0 || showIdx >= sequence.length) return;
+    var elapsed = (SHOW_ON + SHOW_OFF) - showTimer;
+    var t = Math.min(1, elapsed / SHOW_ON);
+    var pulse = Math.sin(t * Math.PI);
+    cx.save();
+    cx.globalAlpha = 0.5 * pulse;
+    cx.fillStyle = TEAL;
+    cx.textAlign = 'center';
+    cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText((showIdx + 1) + ' / ' + sequence.length, W / 2, GRID_Y - 28);
+    cx.restore();
+  }
+
+  function drawFlashes(dt) {
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.save();
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + fl.size + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 155 - fl.t * 0.4);
+      cx.restore();
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+  }
+
+  // ---- main frame loop ----
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3);
+    last = now;
+
+    // --- phase update ---
+    if (phase === 'show') {
+      if (hitStop > 0) { hitStop -= dt; }
+      else {
+        showTimer -= dt;
+        if (showTimer <= 0) {
+          // dim current node
+          if (showIdx >= 0 && showIdx < sequence.length) {
+            nodeGlow[sequence[showIdx]] = 0.08;
+          }
+          advanceShow();
+        }
+      }
+    }
+
+    if (phase === 'success') {
+      phaseTimer -= dt;
+      if (phaseTimer <= 0) {
+        botPassiveRounds++;
+        startRound();
+      }
+    }
+
+    if (phase === 'over') {
+      phaseTimer -= dt;
+      if (DEMO && phaseTimer <= 0 && phase === 'over') {
+        phase = 'cta';
+        ctaAt = now;
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }
+      if (BOT && phaseTimer <= 0 && !window.__botDone) {
+        // restart for next bot run
+        for (var bi = 0; bi < NODE_COUNT; bi++) { nodeGlow[bi] = 0; nodeRipple[bi] = null; }
+        flashes = [];
+        botPassiveRounds = 0;
+        score = 0;
+        runStartTs = Date.now();
+        if (window.LOOP) LOOP.emit('restart', {});
+        startRound();
+      }
+    }
+
+    // autopilots
+    if (hitStop <= 0) {
+      if (DEMO) demoAutopilot(dt);
+      else if (BOT) botAutopilot(dt);
+    } else {
+      hitStop -= dt;
+    }
+
+    // --- juice transforms ---
+    cx.save();
+    if (shakeAmt > 0.1 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.1 * dt;
+
+    // --- background ---
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    // subtle radial glow center
+    var bg = cx.createRadialGradient(W / 2, H / 2, 80, W / 2, H / 2, 380);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    // --- title ---
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '700 42px -apple-system, Helvetica, Arial';
+      cx.fillText('ECHO FADE', W / 2, 200);
+      cx.fillStyle = 'rgba(46,197,182,0.8)';
+      cx.font = '500 17px -apple-system, Helvetica, Arial';
+      var pulse = 0.55 + 0.45 * Math.sin(now / 700);
+      cx.globalAlpha = pulse;
+      cx.fillText('remember the pattern', W / 2, 244);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.3)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to begin', W / 2, 280);
+      // draw dim nodes as preview
+      for (var i = 0; i < NODE_COUNT; i++) drawNode(i, dt);
+    }
+
+    // --- show / recall / success ---
+    if (phase === 'show' || phase === 'recall' || phase === 'success') {
+      // score
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('round ' + (score + 1), W / 2, 56);
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '800 52px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 120);
+
+      // phase label
+      cx.fillStyle = phase === 'recall' ? 'rgba(46,197,182,0.85)' : 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px Menlo, monospace';
+      cx.fillText(phase === 'show' ? 'watch' : phase === 'recall' ? 'recall' : '✓', W / 2, 152);
+
+      drawShowBeat(now);
+      for (var i = 0; i < NODE_COUNT; i++) drawNode(i, dt);
+      drawSequenceHint(now);
+      drawFlashes(dt);
+    }
+
+    // --- game over ---
+    if (phase === 'over') {
+      // dim bg overlay
+      cx.fillStyle = 'rgba(11,13,18,0.6)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+
+      cx.fillStyle = 'rgba(179,157,219,0.9)'; // lavender — calm, not alarming
+      cx.font = '700 36px -apple-system, Helvetica, Arial';
+      cx.fillText('faded', W / 2, 300);
+
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '800 54px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 370);
+
+      cx.fillStyle = 'rgba(46,197,182,0.7)';
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText(score === 1 ? '1 echo held' : score + ' echoes held', W / 2, 402);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.55 + 0.45 * Math.sin(now / 600);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '600 17px -apple-system, Helvetica, Arial';
+        cx.fillText('tap to try again', W / 2, 470);
+        cx.globalAlpha = 1;
+      }
+      drawFlashes(dt);
+    }
+
+    // --- demo CTA ---
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '700 42px -apple-system, Helvetica, Arial';
+      cx.fillText('ECHO FADE', W / 2, 290);
+
+      cx.fillStyle = 'rgba(255,255,255,0.65)';
+      cx.font = '500 18px -apple-system, Helvetica, Arial';
+      cx.fillText('how many can you hold?', W / 2, 332);
+
+      var p3 = 0.65 + 0.35 * Math.sin(now / 500);
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = ease * p3;
+      cx.font = '700 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 396);
+
+      cx.globalAlpha = ease * 0.7;
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // --- mute toggle (human only) ---
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

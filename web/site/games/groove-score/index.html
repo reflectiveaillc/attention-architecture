@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Groove Score — Tilt</title>
+<!--
+  LOOP / attention-architecture — Groove Score
+  Circuits: 01-rpe (variable reward per tap alignment), 03-social (shareable score),
+            07-timing (rhythm feel assessment).
+  Modes:
+    ?demo=1&seed=7   mirror-neuron arc: challenge → human-feeling groove → near-fail → fail → score → CTA
+    ?bot=1&runs=N    imperfect autoplay, fires game_over, sets __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'groove-score';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  var GROOVE_DURATION = 30;  // seconds of groove
+  var MACRO_BPM = 120;
+  var MACRO_BEAT_S = 60 / MACRO_BPM;           // 0.5s per beat
+  var SUB_DIV = 4;                               // 4 sub-beats per beat
+  var SUB_BEAT_S = MACRO_BEAT_S / SUB_DIV;      // 0.125s per sub-beat
+
+  // scoring constants
+  var PERFECT_WIN = SUB_BEAT_S * 0.15;   // within 15% of sub-beat = perfect
+  var GOOD_WIN    = SUB_BEAT_S * 0.35;   // within 35% = good
+  var NEAR_WIN    = SUB_BEAT_S * 0.55;   // within 55% = near
+
+  // ---- state ----
+  var phase, grooveTime, taps, score, combo, bestScore;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false;
+  var flashes = [], rings = [];
+  var runStartTs, overAt, ctaAt, challengeAt;
+  var botRunsDone = 0;
+  try { bestScore = +localStorage.getItem('gs_best') || 0; } catch (_) { bestScore = 0; }
+
+  // pulse ring pool
+  function addRing(x, y, color, size) {
+    rings.push({ x: x, y: y, r: size || 10, maxR: size ? size * 4 : 60, color: color, alpha: 1 });
+  }
+
+  function flash(txt, color, sz) {
+    flashes.push({ txt: txt, color: color, size: sz || 40, t: 0 });
+  }
+
+  // ---- groove beat ----
+  // Returns how many SUB-beats have elapsed in the groove
+  function grovePhaseAt(t) {
+    return t / SUB_BEAT_S;
+  }
+  // Distance in seconds to the nearest sub-beat
+  function distToNearestSubBeat(t) {
+    var phase = (t % SUB_BEAT_S);
+    return Math.min(phase, SUB_BEAT_S - phase);
+  }
+  // Which sub-beat boundary we're closest to (for floating position marker)
+  function nearestSubBeatTime(t) {
+    return Math.round(t / SUB_BEAT_S) * SUB_BEAT_S;
+  }
+
+  // ---- scoring a tap ----
+  function scoreTap(t) {
+    var d = distToNearestSubBeat(t);
+    var isMacroBeat = false;
+    var macroPhase = (t % MACRO_BEAT_S);
+    var toMacro = Math.min(macroPhase, MACRO_BEAT_S - macroPhase);
+    if (toMacro < SUB_BEAT_S * 0.25) isMacroBeat = true;
+
+    var pts, quality;
+    if (d <= PERFECT_WIN) {
+      pts = isMacroBeat ? 10 : 7;
+      quality = 'perfect';
+    } else if (d <= GOOD_WIN) {
+      pts = isMacroBeat ? 6 : 4;
+      quality = 'good';
+    } else if (d <= NEAR_WIN) {
+      pts = isMacroBeat ? 3 : 2;
+      quality = 'near';
+    } else {
+      pts = 0;
+      quality = 'off';
+    }
+    return { pts: pts, quality: quality, isMacroBeat: isMacroBeat, dist: d };
+  }
+
+  // ---- pct rank ----
+  function pctTop(s) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 120))));
+  }
+
+  // ---- MUTE / SHARE rects ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 130, y: 490, w: 260, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- new game ----
+  function newGame() {
+    phase = 'title';
+    grooveTime = 0;
+    taps = [];
+    score = 0;
+    combo = 0;
+    dareBeaten = false;
+    flashes = [];
+    rings = [];
+    hitStop = 0;
+    zoom = 1;
+    shakeAmt = 0;
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startPlay, 1250);
+      return;
+    }
+    if (BOT) { startPlay(); return; }
+  }
+
+  function startPlay() {
+    phase = 'play';
+    grooveTime = 0;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function endGame() {
+    if (phase === 'over' || phase === 'cta') return;
+    phase = 'over';
+    overAt = performance.now();
+    var newBest = score > bestScore;
+    if (newBest) { bestScore = score; try { localStorage.setItem('gs_best', String(bestScore)); } catch(_) {} }
+    shakeAmt = 8;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) {
+      J.death(Math.min(0.3 + score / 300, 1));
+      if (newBest) setTimeout(function() { J.fanfare(); }, 500);
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function() {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function() { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function() { restartBot(); }, 900);
+      }
+    }
+  }
+
+  function restartBot() {
+    phase = 'play';
+    grooveTime = 0;
+    score = 0;
+    combo = 0;
+    taps = [];
+    flashes = [];
+    rings = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function restartHuman() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    newGame();
+    if (!DEMO && !BOT) startPlay();
+  }
+
+  // ---- human tap ----
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startPlay(); return; }
+    if (phase === 'play') {
+      doTap();
+      return;
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'score' }); return;
+      }
+      restartHuman();
+    }
+  }
+
+  function doTap() {
+    var t = grooveTime;
+    var result = scoreTap(t);
+    var pts = result.pts;
+    var quality = result.quality;
+    taps.push({ t: t, quality: quality, pts: pts });
+
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score + pts > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(score + pts);
+    }
+
+    score += pts;
+    if (pts > 0) combo++;
+    else combo = 0;
+
+    // visual feedback
+    var cx2 = W / 2, cy2 = H * 0.6;
+    if (quality === 'perfect') {
+      hitStop = 4;
+      zoom = 1.025;
+      addRing(cx2, cy2, GOLD, 20);
+      flash(result.isMacroBeat ? 'PERFECT ×BEAT' : 'PERFECT', GOLD, 42);
+      if (window.J) { J.perfect(combo); J.tension(Math.min(score / 200, 1)); }
+      if (window.LOOP) LOOP.emit('perfect_tap', { score: score, combo: combo, macro: result.isMacroBeat });
+    } else if (quality === 'good') {
+      addRing(cx2, cy2, TEAL, 14);
+      flash('+' + pts, TEAL, 34);
+      if (window.J) { J.hit(combo); J.tension(Math.min(score / 200, 1)); }
+    } else if (quality === 'near') {
+      addRing(cx2, cy2, VERM, 10);
+      flash('SO CLOSE', VERM, 30);
+      shakeAmt = 3;
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { t: +t.toFixed(3), dist: +result.dist.toFixed(4) });
+    } else {
+      addRing(cx2, cy2, 'rgba(255,255,255,0.3)', 8);
+      if (combo > 0) flash('LOST COMBO', VERM, 28);
+      if (window.J && combo > 3) J.near();
+      combo = 0;
+    }
+  }
+
+  // ---- input listeners ----
+  window.addEventListener('pointerdown', function(e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function(e) { if (e.code === 'Space') tap(); });
+
+  // ---- DEMO autopilot ----
+  // human-feeling script: varied timing, near-fail at ~60%, then silent until groove ends (→ game_over)
+  var demoTaps = null, demoTapIdx = 0, demoNextTap = 0, demoPhase = 'normal', demoPassive = false;
+
+  function buildDemoScript() {
+    // First ~18s: taps with human variance; near-fail moment at ~18s; then passive → time runs out
+    var taps2 = [];
+    var seed2 = mulberry32(SEED + 77);
+    // Normal section: tap beats + occasional sub-beats (0 → 18s)
+    var t = 0.2;
+    while (t < 18) {
+      // mostly macro beats, occasionally sub-beats
+      var isSubOnly = seed2() < 0.3;
+      var div = isSubOnly ? SUB_BEAT_S : MACRO_BEAT_S;
+      var nextBeat = Math.round(t / div) * div;
+      if (nextBeat <= t) nextBeat += div;
+      // human hesitation: +/- jitter
+      var jitter = (seed2() - 0.5) * 0.06; // up to ~60ms off
+      taps2.push(nextBeat + jitter);
+      t = nextBeat + jitter + (seed2() > 0.7 ? div * 2 : div); // sometimes skip a beat
+    }
+    // near-fail zone: one very off tap then a recovery perfect
+    taps2.push(18.12);  // off tap
+    taps2.push(18.52);  // recovery on macro beat
+    taps2.push(19.0);
+    taps2.push(19.5);
+    // Then go passive — groove time will hit GROOVE_DURATION and endGame fires
+    return taps2.sort(function(a, b) { return a - b; });
+  }
+
+  function demoPumpTaps(now_t) {
+    if (demoPassive) return;
+    if (demoTaps === null) demoTaps = buildDemoScript();
+    while (demoTapIdx < demoTaps.length && grooveTime >= demoTaps[demoTapIdx]) {
+      // fire this tap
+      var t = grooveTime;
+      var result = scoreTap(t);
+      score += result.pts;
+      if (result.pts > 0) combo++; else combo = 0;
+      taps.push({ t: t, quality: result.quality, pts: result.pts });
+      // visual feedback
+      var cx2 = W / 2, cy2 = H * 0.6;
+      if (result.quality === 'perfect') {
+        hitStop = 3; zoom = 1.02;
+        addRing(cx2, cy2, GOLD, 18);
+        flash('PERFECT', GOLD, 40);
+        if (window.J) J.perfect(combo);
+      } else if (result.quality === 'good') {
+        addRing(cx2, cy2, TEAL, 12);
+        flash('+' + result.pts, TEAL, 32);
+        if (window.J) J.hit(combo);
+      } else if (result.quality === 'near') {
+        addRing(cx2, cy2, VERM, 8);
+        flash('SO CLOSE', VERM, 28);
+        if (window.J) J.near();
+      } else {
+        addRing(cx2, cy2, 'rgba(255,255,255,0.25)', 6);
+      }
+      demoTapIdx++;
+    }
+    if (demoTapIdx >= demoTaps.length && grooveTime > 19.5) {
+      demoPassive = true;  // wait for groove to expire naturally
+    }
+  }
+
+  // ---- BOT autopilot ----
+  var botLastTap = -1, botSeed2;
+  function botPump() {
+    if (!botSeed2) botSeed2 = mulberry32(SEED + 13);
+    // tap every macro beat with some error
+    var nextBeat = Math.round(grooveTime / MACRO_BEAT_S) * MACRO_BEAT_S;
+    if (nextBeat > botLastTap + MACRO_BEAT_S * 0.5 && grooveTime >= nextBeat - 0.02) {
+      var jitter = (botSeed2() - 0.5) * 0.1;
+      var t2 = grooveTime + jitter;
+      var result = scoreTap(t2);
+      score += result.pts;
+      if (result.pts > 0) combo++; else combo = 0;
+      taps.push({ t: t2, quality: result.quality, pts: result.pts });
+      var cx2 = W / 2, cy2 = H * 0.6;
+      addRing(cx2, cy2, result.quality === 'perfect' ? GOLD : TEAL, 10);
+      if (result.quality === 'perfect' && window.J) J.hit(combo);
+      botLastTap = nextBeat;
+    }
+  }
+
+  // ---- render helpers ----
+  function beatProgress() {
+    // 0..1 within the current macro beat
+    return (grooveTime % MACRO_BEAT_S) / MACRO_BEAT_S;
+  }
+  function subBeatProgress() {
+    return (grooveTime % SUB_BEAT_S) / SUB_BEAT_S;
+  }
+
+  // Visualizer: circular beat display
+  var BEAT_CENTER_X = W / 2, BEAT_CENTER_Y = H * 0.53;
+  var BEAT_R_OUTER = 110, BEAT_R_INNER = 72;
+
+  function drawBeatRing(now) {
+    if (phase !== 'play') return;
+    // outer ring pulses on each macro beat
+    var bp = beatProgress();
+    var pulse = bp < 0.08 ? (1 - bp / 0.08) * 0.3 : 0;
+    var outerAlpha = 0.18 + pulse;
+
+    cx.save();
+    // outer arc (groove progress over 30s)
+    var groovePct = Math.min(1, grooveTime / GROOVE_DURATION);
+    cx.beginPath();
+    cx.arc(BEAT_CENTER_X, BEAT_CENTER_Y, BEAT_R_OUTER + 18, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * groovePct);
+    cx.strokeStyle = GOLD;
+    cx.lineWidth = 4;
+    cx.globalAlpha = 0.55;
+    cx.stroke();
+    cx.globalAlpha = 1;
+
+    // sub-beat tick marks (4 per beat shown around inner ring)
+    for (var sb = 0; sb < SUB_DIV * 4; sb++) {
+      var angle = -Math.PI / 2 + (sb / (SUB_DIV * 4)) * Math.PI * 2;
+      var isMainBeat = sb % SUB_DIV === 0;
+      var tickLen = isMainBeat ? 14 : 7;
+      var tickAlpha = isMainBeat ? 0.55 : 0.22;
+      cx.globalAlpha = tickAlpha;
+      cx.beginPath();
+      cx.moveTo(BEAT_CENTER_X + Math.cos(angle) * (BEAT_R_INNER - 4),
+                BEAT_CENTER_Y + Math.sin(angle) * (BEAT_R_INNER - 4));
+      cx.lineTo(BEAT_CENTER_X + Math.cos(angle) * (BEAT_R_INNER - 4 + tickLen),
+                BEAT_CENTER_Y + Math.sin(angle) * (BEAT_R_INNER - 4 + tickLen));
+      cx.strokeStyle = isMainBeat ? GOLD : 'rgba(255,255,255,0.6)';
+      cx.lineWidth = isMainBeat ? 2.5 : 1.5;
+      cx.stroke();
+      cx.globalAlpha = 1;
+    }
+
+    // pulsing inner circle (beat drum)
+    var subP = subBeatProgress();
+    var subPulse = subP < 0.12 ? (1 - subP / 0.12) * 0.25 : 0;
+    cx.beginPath();
+    cx.arc(BEAT_CENTER_X, BEAT_CENTER_Y, BEAT_R_INNER + subPulse * 10, 0, Math.PI * 2);
+    cx.fillStyle = 'rgba(46,197,182,0.06)';
+    cx.globalAlpha = 0.9;
+    cx.fill();
+    cx.strokeStyle = TEAL;
+    cx.lineWidth = 1.5;
+    cx.globalAlpha = 0.3 + outerAlpha;
+    cx.stroke();
+    cx.globalAlpha = 1;
+
+    // sweeping needle (where the beat is RIGHT NOW)
+    var needleAngle = -Math.PI / 2 + beatProgress() * Math.PI * 2;
+    cx.save();
+    cx.translate(BEAT_CENTER_X, BEAT_CENTER_Y);
+    cx.rotate(needleAngle);
+    cx.beginPath();
+    cx.moveTo(0, 0);
+    cx.lineTo(0, -(BEAT_R_INNER - 8));
+    cx.strokeStyle = VERM;
+    cx.lineWidth = 2.5;
+    cx.globalAlpha = 0.85;
+    cx.stroke();
+    // arrowhead
+    cx.beginPath();
+    cx.moveTo(0, -(BEAT_R_INNER - 8));
+    cx.lineTo(-5, -(BEAT_R_INNER - 20));
+    cx.lineTo(5, -(BEAT_R_INNER - 20));
+    cx.closePath();
+    cx.fillStyle = VERM;
+    cx.fill();
+    cx.globalAlpha = 1;
+    cx.restore();
+
+    // beat flash at center
+    var bFlash = bp < 0.06 ? (1 - bp / 0.06) : 0;
+    if (bFlash > 0) {
+      cx.beginPath();
+      cx.arc(BEAT_CENTER_X, BEAT_CENTER_Y, 20 + bFlash * 18, 0, Math.PI * 2);
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = bFlash * 0.35;
+      cx.fill();
+      cx.globalAlpha = 1;
+    }
+    cx.restore();
+  }
+
+  function drawRings(dt) {
+    for (var i = rings.length - 1; i >= 0; i--) {
+      var rg = rings[i];
+      rg.r += dt * 3.5;
+      rg.alpha -= dt * 0.045;
+      if (rg.alpha <= 0 || rg.r > rg.maxR) { rings.splice(i, 1); continue; }
+      cx.beginPath();
+      cx.arc(rg.x, rg.y, rg.r, 0, Math.PI * 2);
+      cx.strokeStyle = rg.color;
+      cx.lineWidth = 2;
+      cx.globalAlpha = rg.alpha;
+      cx.stroke();
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawFlashes(dt) {
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 260 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+  }
+
+  // score display: large number, feel meter
+  function drawHUD(now) {
+    if (phase !== 'play' && phase !== 'over') return;
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.94)';
+    cx.font = '800 68px -apple-system, Helvetica, Arial';
+    cx.fillText(score, W / 2, 96);
+
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + bestScore, W / 2, 115);
+
+    // combo bar
+    if (combo > 1) {
+      var comboW = Math.min(W - 80, combo * 16);
+      var comboH = 6 + Math.floor(combo / 5);
+      cx.fillStyle = GOLD;
+      cx.globalAlpha = 0.7;
+      cx.fillRect(W / 2 - comboW / 2, 126, comboW, comboH);
+      cx.globalAlpha = 1;
+      cx.fillStyle = GOLD;
+      cx.font = '700 12px Menlo, monospace';
+      cx.fillText('×' + combo + ' COMBO', W / 2, 148);
+    }
+
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — by ' + SHARE.by : ''), W / 2, 162);
+    }
+
+    // countdown (bottom)
+    var remaining = Math.max(0, GROOVE_DURATION - grooveTime);
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '700 14px Menlo, monospace';
+    cx.fillText(remaining.toFixed(1) + 's', W / 2, H - 48);
+  }
+
+  // ---- title screen ----
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '900 46px -apple-system, Helvetica, Arial';
+    cx.fillText('GROOVE SCORE', W / 2, 268);
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.font = '600 15px -apple-system, Helvetica, Arial';
+    cx.fillText('30 seconds. tap to the groove.', W / 2, 304);
+    cx.fillText('the AI scores your rhythm feel.', W / 2, 324);
+    var pulse = 0.55 + 0.45 * Math.sin(now / 320);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = VERM;
+    cx.font = '800 18px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO START', W / 2, 380);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- challenge card ----
+  function drawChallenge() {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '800 15px Menlo, monospace';
+    cx.fillText('SCORE TO BEAT', W / 2, 298);
+    cx.fillStyle = GOLD;
+    cx.font = '900 100px -apple-system, Helvetica, Arial';
+    cx.fillText('84', W / 2, 408);
+    cx.fillStyle = 'rgba(255,255,255,0.3)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText("today's top groove", W / 2, 438);
+  }
+
+  // ---- over screen ----
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = VERM;
+    cx.font = '900 38px -apple-system, Helvetica, Arial';
+    cx.fillText('GROOVE OVER.', W / 2, 298);
+    cx.fillStyle = '#fff';
+    cx.font = '800 28px -apple-system, Helvetica, Arial';
+    cx.fillText(score + ' pts', W / 2, 340);
+    var pt = pctTop(score);
+    cx.fillStyle = GOLD;
+    cx.font = '900 22px -apple-system, Helvetica, Arial';
+    cx.fillText('TOP ' + pt + '% TODAY', W / 2, 378);
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('felt by ' + (100 - pt) + '% of players', W / 2, 400);
+    if (!DEMO && !BOT) {
+      var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+      cx.globalAlpha = p2;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — FEEL IT AGAIN', W / 2, 450);
+      cx.globalAlpha = 1;
+      // share pill
+      cx.fillStyle = 'rgba(242,177,52,0.14)';
+      cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+      else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = GOLD;
+      cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+    }
+  }
+
+  // ---- CTA card ----
+  function drawCTA(now) {
+    var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '900 44px -apple-system, Helvetica, Arial';
+    cx.fillText('GROOVE SCORE', W / 2, 296);
+    cx.fillStyle = 'rgba(255,255,255,0.7)';
+    cx.font = '700 19px -apple-system, Helvetica, Arial';
+    cx.fillText('scored ' + (window.__demoScore || 84) + ' pts. your rhythm?', W / 2, 338);
+    var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+    cx.fillStyle = VERM;
+    cx.globalAlpha = ease * p3;
+    cx.font = '900 30px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ BEAT ' + (window.__demoScore || 84), W / 2, 408);
+    cx.globalAlpha = ease;
+    cx.fillStyle = TEAL;
+    cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 440);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- mute toggle ----
+  function drawMute() {
+    if (DEMO || BOT || !window.J) return;
+    cx.textAlign = 'center';
+    cx.globalAlpha = 0.5;
+    cx.font = '16px -apple-system, Helvetica, Arial';
+    cx.fillStyle = '#fff';
+    cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // advance groove time
+    if (phase === 'play') {
+      if (hitStop > 0) {
+        hitStop -= dt;
+      } else {
+        grooveTime += dt * 16.667 / 1000;
+        if (DEMO) demoPumpTaps(now);
+        if (BOT) botPump();
+        if (grooveTime >= GROOVE_DURATION) endGame();
+      }
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.83, dt);
+    zoom += (1 - zoom) * 0.13 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // beat ring (play only)
+    drawBeatRing(now);
+
+    // floating rings
+    drawRings(dt);
+
+    // HUD
+    drawHUD(now);
+
+    // flash texts
+    drawFlashes(dt);
+
+    // screens
+    if (phase === 'title')     drawTitle(now);
+    if (phase === 'challenge') drawChallenge();
+    if (phase === 'over')      drawOver(now);
+    if (phase === 'cta')       drawCTA(now);
+
+    drawMute();
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

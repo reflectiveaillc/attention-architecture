@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Face Recall — Tilt</title>
+<!--
+  LOOP / attention-architecture — Face Recall
+  Circuits: 01-rpe (recognition dopamine), 03-social (ego bait, dare link), 02-novelty (lineup shuffle)
+  Conditioned path: 'do you remember them?' recognition memory — the thumb already knows this move.
+  Mechanic: Three faces flash 2s; lineup of six appears; tap the three you saw.
+  Modes:
+    ?demo=1&seed=7     mirror-neuron arc → __demoDone
+    ?bot=1&runs=N&seed=M  imperfect autopilot → __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'face-recall';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- Face generation (canvas-drawn, no external resources) ----
+  // Each face is parameterized: skin tone, hair color, feature set
+  // 18 distinct face templates to give enough variety across rounds
+  var FACE_TEMPLATES = (function () {
+    var templates = [];
+    var skins  = ['#f5c8a8','#e8a87c','#d4835a','#c26b3a','#8b4513','#4a2c0a'];
+    var hairs  = ['#1a0a00','#3b1f08','#7a4a1e','#c8831a','#e8c547','#888888','#222222','#b22222'];
+    var feats  = [
+      // [eyeOffset, eyeSize, noseH, mouthW, brow, ear]
+      [0, 7, 0, 36, 2, 6],
+      [3, 8, 3, 32, 3, 7],
+      [-2, 6, -2, 40, 1, 5],
+      [4, 9, 2, 34, 4, 8],
+      [-3, 7, 4, 38, 2, 6],
+      [2, 8, -3, 30, 3, 7],
+      [0, 10, 1, 42, 1, 5],
+      [-4, 6, 3, 36, 4, 8],
+      [3, 7, -1, 38, 2, 6],
+      [1, 9, 2, 32, 3, 7],
+      [-2, 8, 0, 40, 1, 5],
+      [4, 7, -2, 36, 4, 8],
+    ];
+    var glassesSet = [false, false, false, true, false, false];
+    var beardSet   = [false, false, true, false, false, false];
+    // Generate 18 templates seeded deterministically
+    var r2 = mulberry32(999);
+    for (var i = 0; i < 18; i++) {
+      templates.push({
+        skin:    skins[Math.floor(r2() * skins.length)],
+        hair:    hairs[Math.floor(r2() * hairs.length)],
+        feat:    feats[i % feats.length],
+        glasses: glassesSet[i % glassesSet.length],
+        beard:   beardSet[i % beardSet.length],
+        id: i
+      });
+    }
+    return templates;
+  }());
+
+  function drawFace(tpl, cx, x, y, sz, selected, revealed, wrong) {
+    // sz = radius of head
+    var f = tpl.feat;
+    cx.save();
+    cx.translate(x, y);
+
+    // selection ring
+    if (selected) {
+      cx.beginPath();
+      cx.arc(0, 0, sz + 6, 0, Math.PI * 2);
+      cx.strokeStyle = wrong ? VERM : TEAL;
+      cx.lineWidth = 3.5;
+      cx.stroke();
+    }
+    if (revealed && !selected) {
+      // correct answer not picked (only shown post-round)
+      cx.beginPath();
+      cx.arc(0, 0, sz + 6, 0, Math.PI * 2);
+      cx.strokeStyle = 'rgba(242,177,52,0.6)';
+      cx.lineWidth = 2;
+      cx.stroke();
+    }
+
+    // head
+    cx.beginPath();
+    cx.ellipse(0, 0, sz * 0.82, sz, 0, 0, Math.PI * 2);
+    cx.fillStyle = tpl.skin;
+    cx.fill();
+
+    // ears
+    var eSz = f[5];
+    cx.beginPath();
+    cx.ellipse(-sz * 0.82 + 2, sz * 0.1, eSz * 0.55, eSz * 0.85, 0, 0, Math.PI * 2);
+    cx.fillStyle = tpl.skin; cx.fill();
+    cx.beginPath();
+    cx.ellipse(sz * 0.82 - 2, sz * 0.1, eSz * 0.55, eSz * 0.85, 0, 0, Math.PI * 2);
+    cx.fillStyle = tpl.skin; cx.fill();
+
+    // hair
+    cx.beginPath();
+    cx.ellipse(0, -sz * 0.55, sz * 0.82, sz * 0.58, 0, Math.PI, Math.PI * 2);
+    cx.fillStyle = tpl.hair;
+    cx.fill();
+
+    // eyes
+    var eyeX = sz * 0.3 + f[0] * 0.5;
+    var eyeY = -sz * 0.05;
+    var eyeR = f[1] * sz / 52;
+    for (var side = -1; side <= 1; side += 2) {
+      cx.beginPath();
+      cx.ellipse(side * eyeX, eyeY, eyeR, eyeR * 1.2, 0, 0, Math.PI * 2);
+      cx.fillStyle = '#fff'; cx.fill();
+      cx.beginPath();
+      cx.arc(side * eyeX, eyeY, eyeR * 0.55, 0, Math.PI * 2);
+      cx.fillStyle = '#222'; cx.fill();
+    }
+
+    // eyebrows
+    var bW = eyeR * 2.2 + f[4] * 0.3;
+    var bY = eyeY - eyeR * 1.8;
+    for (var s2 = -1; s2 <= 1; s2 += 2) {
+      cx.beginPath();
+      cx.moveTo(s2 * (eyeX - bW / 2), bY + f[4] * 0.4);
+      cx.lineTo(s2 * (eyeX + bW / 2), bY);
+      cx.strokeStyle = tpl.hair;
+      cx.lineWidth = sz * 0.06;
+      cx.lineCap = 'round';
+      cx.stroke();
+    }
+
+    // nose
+    var nY = sz * 0.18 + f[2] * 0.5;
+    cx.beginPath();
+    cx.moveTo(0, eyeY + eyeR * 1.5);
+    cx.lineTo(-sz * 0.1, nY);
+    cx.lineTo(sz * 0.1, nY);
+    cx.strokeStyle = 'rgba(0,0,0,0.18)';
+    cx.lineWidth = sz * 0.035;
+    cx.lineJoin = 'round';
+    cx.stroke();
+
+    // mouth
+    var mY = sz * 0.45;
+    var mW = f[3] * sz / 120;
+    cx.beginPath();
+    cx.moveTo(-mW, mY);
+    cx.quadraticCurveTo(0, mY + sz * 0.12, mW, mY);
+    cx.strokeStyle = 'rgba(0,0,0,0.28)';
+    cx.lineWidth = sz * 0.04;
+    cx.lineCap = 'round';
+    cx.stroke();
+
+    // beard
+    if (tpl.beard) {
+      cx.beginPath();
+      cx.ellipse(0, sz * 0.58, mW * 1.1, sz * 0.22, 0, 0, Math.PI);
+      cx.fillStyle = tpl.hair;
+      cx.globalAlpha = 0.5;
+      cx.fill();
+      cx.globalAlpha = 1;
+    }
+
+    // glasses
+    if (tpl.glasses) {
+      for (var g = -1; g <= 1; g += 2) {
+        cx.beginPath();
+        cx.arc(g * eyeX, eyeY, eyeR * 1.35, 0, Math.PI * 2);
+        cx.strokeStyle = '#444';
+        cx.lineWidth = sz * 0.04;
+        cx.stroke();
+      }
+      cx.beginPath();
+      cx.moveTo(-eyeX + eyeR * 1.35, eyeY);
+      cx.lineTo(eyeX - eyeR * 1.35, eyeY);
+      cx.stroke();
+    }
+
+    cx.restore();
+  }
+
+  // ---- Game state ----
+  var LINEUP_SIZE = 6;
+  var FLASH_DUR = 2000;   // ms faces shown
+  var ROUNDS = 4;
+
+  var state, flashes, hitStop, zoom, shakeAmt, dareBeaten;
+  var botRunsDone = 0;
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / ROUNDS))));
+  }
+
+  function newGame() {
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0; dareBeaten = false;
+    state = {
+      phase: 'title',    // title|challenge|flash|lineup|result|over|cta
+      round: 0,
+      score: 0,
+      targets: [],      // indices into facePool for this round (3 faces)
+      lineup: [],       // 6 face indices (3 targets + 3 foils shuffled)
+      picked: [],       // player taps so far
+      flashStart: 0,
+      resultTimer: 0,
+      overAt: 0,
+      ctaAt: 0,
+    };
+    if (DEMO) {
+      state.phase = 'challenge';
+      state.challengeAt = performance.now();
+      setTimeout(function () { startRound(); }, 1300);
+    } else if (BOT) {
+      startRound();
+    }
+  }
+
+  function shuffleArray(arr) {
+    for (var i = arr.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+    }
+    return arr;
+  }
+
+  function pickTargets() {
+    var all = FACE_TEMPLATES.map(function (t, i) { return i; });
+    shuffleArray(all);
+    return all.slice(0, 3);
+  }
+
+  function pickFoils(targets) {
+    var all = FACE_TEMPLATES.map(function (t, i) { return i; });
+    var foils = all.filter(function (i) { return targets.indexOf(i) === -1; });
+    shuffleArray(foils);
+    return foils.slice(0, 3);
+  }
+
+  function startRound() {
+    state.targets = pickTargets();
+    var foils = pickFoils(state.targets);
+    state.lineup = shuffleArray(state.targets.concat(foils));
+    state.picked = [];
+    state.phase = 'flash';
+    state.flashStart = performance.now();
+    if (state.round === 0 && window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function endFlash() {
+    state.phase = 'lineup';
+  }
+
+  function tapFace(idx) {
+    if (state.phase !== 'lineup') return;
+    var pos = state.picked.indexOf(idx);
+    if (pos !== -1) {
+      // deselect
+      state.picked.splice(pos, 1);
+      return;
+    }
+    if (state.picked.length >= 3) return;
+    state.picked.push(idx);
+    if (window.J) J.hit(state.picked.length);
+    if (state.picked.length === 3) {
+      submitAnswer();
+    }
+  }
+
+  function submitAnswer() {
+    // count correct
+    var correct = 0;
+    for (var i = 0; i < state.picked.length; i++) {
+      if (state.targets.indexOf(state.lineup[state.picked[i]]) !== -1) correct++;
+    }
+    var perfect = correct === 3;
+    var near = correct === 2;
+    state.score += correct;
+    state.phase = 'result';
+    state.resultTimer = performance.now();
+    if (window.J) {
+      if (perfect) { J.perfect(state.round + 1); hitStop = 60; zoom = 1.035; }
+      else if (near) { J.near(); shakeAmt = 3; }
+      else { J.death(0.4); shakeAmt = 6; }
+      J.tension(Math.min((state.round + 1) / ROUNDS, 1));
+    }
+    if (window.LOOP) LOOP.emit('round_result', { round: state.round, correct: correct, score: state.score });
+    if (near) {
+      flash('SO CLOSE!', VERM, 38);
+      if (window.LOOP) LOOP.emit('near_miss', { round: state.round, correct: correct });
+    } else if (perfect) {
+      flash('PERFECT!', TEAL, 42);
+    } else if (correct === 1) {
+      flash('1 of 3', 'rgba(255,255,255,0.5)', 30);
+    } else {
+      flash('NONE', VERM, 36);
+    }
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+    setTimeout(function () {
+      state.round++;
+      if (state.round >= ROUNDS) {
+        endGame();
+      } else {
+        startRound();
+      }
+    }, perfect ? 1400 : 1600);
+  }
+
+  function endGame() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    shakeAmt = 8;
+    var dur = (performance.now() - (state._startTs || performance.now())) / 1000;
+    var newBest = false;
+    try { var pb = +localStorage.getItem('fr_best') || 0; newBest = state.score > pb; if (newBest) localStorage.setItem('fr_best', String(state.score)); } catch (_) {}
+    if (window.J) { J.death(0.5); if (newBest) setTimeout(function () { J.fanfare(); }, 500); }
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +Math.max(1, dur).toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetBot(); }, 600);
+      }
+    }
+  }
+
+  function resetBot() {
+    rng = mulberry32(SEED + botRunsDone * 37);
+    flashes = []; hitStop = 0; zoom = 1; shakeAmt = 0;
+    state = {
+      phase: 'flash',
+      round: 0, score: 0,
+      targets: [], lineup: [], picked: [],
+      flashStart: 0, resultTimer: 0, overAt: 0, ctaAt: 0
+    };
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRound();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- face grid layouts ----
+  // Flash phase: 3 faces in a row, centered
+  // Lineup phase: 3x2 grid
+  var FLASH_COLS = 3, FLASH_ROW = 1;
+  var GRID_COLS = 3, GRID_ROWS = 2;
+  var FACE_SZ_FLASH = 58;
+  var FACE_SZ_GRID  = 48;
+
+  function flashPositions() {
+    var positions = [];
+    var spacing = W / 4;
+    var y = H / 2 - 20;
+    for (var i = 0; i < 3; i++) {
+      positions.push({ x: spacing * (i + 1), y: y });
+    }
+    return positions;
+  }
+
+  function gridPositions() {
+    var positions = [];
+    var padX = 68, padY = 290;
+    var colW = (W - padX * 2) / (GRID_COLS - 1);
+    var rowH = 148;
+    for (var row = 0; row < GRID_ROWS; row++) {
+      for (var col = 0; col < GRID_COLS; col++) {
+        positions.push({ x: padX + col * colW, y: padY + row * rowH });
+      }
+    }
+    return positions;
+  }
+
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 530, w: 250, h: 46 };
+
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- input ----
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') {
+      state.phase = 'flash';
+      startRound();
+      state._startTs = performance.now();
+      return;
+    }
+    if (state.phase === 'flash') {
+      // skip flash early
+      endFlash();
+      return;
+    }
+    if (state.phase === 'lineup') {
+      var gp = gridPositions();
+      for (var i = 0; i < gp.length; i++) {
+        var p = gp[i];
+        var dx = x - p.x, dy = y - p.y;
+        if (Math.sqrt(dx * dx + dy * dy) < FACE_SZ_GRID + 12) {
+          tapFace(i);
+          return;
+        }
+      }
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 400) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'correct' }); return;
+      }
+      // restart
+      rng = mulberry32(SEED + Math.floor(rng() * 1000));
+      newGame();
+      state.phase = 'flash';
+      startRound();
+      state._startTs = performance.now();
+      if (window.LOOP) LOOP.emit('restart', {});
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- bot autopilot ----
+  var botPendingTap = false, botTapTimer = 0;
+
+  function botAct(dt) {
+    if (!BOT || state.phase === 'over' || state.phase === 'title') return;
+    if (state.phase === 'flash') {
+      // let flash expire naturally (or bot skips after random wait)
+      return;
+    }
+    if (state.phase === 'lineup' && state.picked.length < 3) {
+      botTapTimer -= dt;
+      if (botTapTimer <= 0) {
+        // bot picks imperfectly: sometimes chooses wrong face
+        var choices = [];
+        for (var i = 0; i < 6; i++) {
+          if (state.picked.indexOf(i) === -1) choices.push(i);
+        }
+        if (choices.length === 0) return;
+        shuffleArray(choices);
+        // 70% chance picks a correct face, 30% picks random
+        var targetIndices = state.targets.map(function (t) {
+          return state.lineup.indexOf(t);
+        }).filter(function (i) { return i !== -1 && state.picked.indexOf(i) === -1; });
+        var pick;
+        if (targetIndices.length > 0 && rng() < 0.70) {
+          pick = targetIndices[Math.floor(rng() * targetIndices.length)];
+        } else {
+          pick = choices[0];
+        }
+        tapFace(pick);
+        botTapTimer = 25 + rng() * 30;
+      }
+    }
+  }
+
+  // ---- render ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // flash phase timer
+    if (state.phase === 'flash') {
+      if (now - state.flashStart >= FLASH_DUR) {
+        endFlash();
+      }
+    }
+
+    // bot
+    if (BOT) botAct(dt);
+
+    // demo autopilot
+    if (DEMO) demoAct(now, dt);
+
+    // juice decay
+    if (hitStop > 0) hitStop -= dt;
+    zoom += (1 - zoom) * 0.12 * dt;
+    shakeAmt *= Math.pow(0.85, dt);
+
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.002) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ------- phase rendering -------
+
+    if (state.phase === 'challenge') {
+      drawChallenge(now);
+    } else if (state.phase === 'title') {
+      drawTitle(now);
+    } else if (state.phase === 'flash' || state.phase === 'result') {
+      drawFlashPhase(now);
+    } else if (state.phase === 'lineup') {
+      drawLineupPhase(now);
+    } else if (state.phase === 'over') {
+      drawOver(now);
+    } else if (state.phase === 'cta') {
+      drawCta(now);
+    }
+
+    // HUD score (during flash + lineup + result)
+    if (state.phase === 'flash' || state.phase === 'lineup' || state.phase === 'result') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 14px -apple-system, Helvetica, Arial';
+      cx.fillText('ROUND ' + (state.round + 1) + ' / ' + ROUNDS + '   ·   ' + state.score + ' correct', W / 2, 34);
+      // dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '700 13px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 54);
+      }
+    }
+
+    // floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 42);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 200 - fl.t * 0.55);
+      cx.globalAlpha = 1;
+      if (fl.t > 44) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '900 44px -apple-system, Helvetica, Arial';
+    cx.fillText('FACE RECALL', W / 2, 260);
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.font = '500 15px -apple-system, Helvetica, Arial';
+    cx.fillText('three faces flash — remember them', W / 2, 300);
+    cx.fillText('tap the three in the lineup', W / 2, 322);
+    var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = VERM;
+    cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO START', W / 2, 380);
+    cx.globalAlpha = 1;
+    // show 3 face previews
+    var fp = flashPositions();
+    for (var i = 0; i < 3; i++) {
+      drawFace(FACE_TEMPLATES[i], cx, fp[i].x, fp[i].y + 50, FACE_SZ_FLASH, false, false, false);
+    }
+  }
+
+  function drawChallenge(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '800 16px Menlo, monospace';
+    cx.fillText('SCORE TO BEAT', W / 2, 300);
+    cx.fillStyle = GOLD;
+    cx.font = '900 96px -apple-system, Helvetica, Arial';
+    cx.fillText('11', W / 2, 405);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText("out of 12 correct", W / 2, 435);
+  }
+
+  function drawFlashPhase(now) {
+    // countdown bar
+    var elapsed = now - state.flashStart;
+    var pct = Math.max(0, 1 - elapsed / FLASH_DUR);
+    cx.fillStyle = 'rgba(255,255,255,0.12)';
+    cx.fillRect(40, 68, W - 80, 6);
+    cx.fillStyle = pct > 0.33 ? TEAL : VERM;
+    cx.fillRect(40, 68, (W - 80) * pct, 6);
+
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('REMEMBER THESE', W / 2, 96);
+
+    var fp = flashPositions();
+    for (var i = 0; i < 3; i++) {
+      drawFace(FACE_TEMPLATES[state.targets[i]], cx, fp[i].x, fp[i].y, FACE_SZ_FLASH, false, false, false);
+    }
+
+    // result overlay (after submitting)
+    if (state.phase === 'result') {
+      cx.fillStyle = 'rgba(11,13,18,0.38)';
+      cx.fillRect(0, 0, W, H);
+    }
+  }
+
+  function drawLineupPhase(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.85)';
+    cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP THE THREE YOU SAW', W / 2, 96);
+    cx.fillStyle = 'rgba(255,255,255,0.38)';
+    cx.font = '500 12px -apple-system, Helvetica, Arial';
+    cx.fillText(state.picked.length + ' / 3 selected', W / 2, 116);
+
+    var gp = gridPositions();
+    for (var i = 0; i < state.lineup.length; i++) {
+      var selected = state.picked.indexOf(i) !== -1;
+      drawFace(FACE_TEMPLATES[state.lineup[i]], cx, gp[i].x, gp[i].y, FACE_SZ_GRID, selected, false, false);
+    }
+  }
+
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.6)';
+    cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+
+    // show final lineup with correct answers revealed
+    var gp = gridPositions();
+    for (var i = 0; i < state.lineup.length; i++) {
+      var isTarget = state.targets.indexOf(state.lineup[i]) !== -1;
+      var wasPicked = state.picked.indexOf(i) !== -1;
+      var wrong = wasPicked && !isTarget;
+      drawFace(FACE_TEMPLATES[state.lineup[i]], cx, gp[i].x, gp[i].y, FACE_SZ_GRID, wasPicked, isTarget && !wasPicked, wrong);
+    }
+
+    cx.fillStyle = VERM;
+    cx.font = '900 36px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score + ' / 12', W / 2, 130);
+    var pt = pctTop(state.score);
+    cx.fillStyle = GOLD;
+    cx.font = '800 18px -apple-system, Helvetica, Arial';
+    cx.fillText('TOP ' + pt + '% TODAY', W / 2, 158);
+
+    if (!DEMO && !BOT) {
+      var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+      cx.globalAlpha = p2;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — PLAY AGAIN', W / 2, 192);
+      cx.globalAlpha = 1;
+      // share pill
+      cx.fillStyle = 'rgba(242,177,52,0.14)';
+      cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+      else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = GOLD;
+      cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+    }
+  }
+
+  function drawCta(now) {
+    var t = (now - state.ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '900 44px -apple-system, Helvetica, Arial';
+    cx.fillText('FACE RECALL', W / 2, 300);
+    cx.fillStyle = 'rgba(255,255,255,0.7)';
+    cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('I got ' + (window.__demoScore || 11) + '/12. think you can?', W / 2, 342);
+    var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+    cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+    cx.font = '900 28px -apple-system, Helvetica, Arial';
+    cx.fillText('BEAT ' + (window.__demoScore || 11), W / 2, 406);
+    cx.globalAlpha = ease;
+    cx.fillStyle = TEAL;
+    cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 440);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- demo autopilot ----
+  // Beats: challenge(done via timeout) → flash(watch) → lineup(pick 3 with human timing)
+  // Mirror-neuron arc: round 1 perfect, round 2 perfect, round 3 near-miss (2/3), round 4 fail (1/3)
+  var demoPhase = 0; // which sub-beat we're in
+  var demoWait  = 0;
+  var demoPicks = [];  // for current lineup
+  var demoLineupIdx = 0;
+
+  // per-round scripts: array of lineup slot indices to pick (may be wrong)
+  // We'll pick them based on state after flash. Schedule set when lineup begins.
+  var demoRoundScripts = [
+    { correct: 3, hesitation: [48, 55, 40] },  // round 0: all right, slow
+    { correct: 3, hesitation: [38, 44, 50] },  // round 1: all right
+    { correct: 2, hesitation: [52, 40, 60] },  // round 2: near-miss (2/3) — tension
+    { correct: 1, hesitation: [44, 60, 55] },  // round 3: fail (1/3) — the real death
+  ];
+  var demoRoundIdx = 0;
+  var demoPickPlan = null;
+  var demoPickCursor = 0;
+  var demoPickWait = 0;
+
+  function buildPickPlan(roundScript) {
+    // build ordered list of 3 lineup indices to tap
+    var plan = [];
+    var targetSlots = state.targets.map(function (t) { return state.lineup.indexOf(t); });
+    var foilSlots = [];
+    for (var i = 0; i < 6; i++) { if (targetSlots.indexOf(i) === -1) foilSlots.push(i); }
+    shuffleArray(foilSlots);
+    var correct = roundScript.correct;
+    // pick correct targets
+    for (var j = 0; j < correct; j++) plan.push(targetSlots[j]);
+    // fill rest with foils
+    for (var f = 0; plan.length < 3; f++) plan.push(foilSlots[f]);
+    // shuffle pick order
+    shuffleArray(plan);
+    return plan;
+  }
+
+  function demoAct(now, dt) {
+    if (!DEMO) return;
+    if (state.phase === 'flash') {
+      // just wait for flash to expire — human-feeling
+      demoPickPlan = null;
+      demoPickCursor = 0;
+    }
+    if (state.phase === 'lineup' && state.picked.length < 3) {
+      if (!demoPickPlan) {
+        var script = demoRoundScripts[Math.min(demoRoundIdx, demoRoundScripts.length - 1)];
+        demoPickPlan = buildPickPlan(script);
+        demoPickWait = script.hesitation[0] || 45;
+        demoPickCursor = 0;
+      }
+      demoPickWait -= dt;
+      if (demoPickWait <= 0 && demoPickCursor < demoPickPlan.length) {
+        tapFace(demoPickPlan[demoPickCursor]);
+        demoPickCursor++;
+        var script2 = demoRoundScripts[Math.min(demoRoundIdx, demoRoundScripts.length - 1)];
+        demoPickWait = script2.hesitation[demoPickCursor] || 42;
+      }
+    }
+    if (state.phase === 'result') {
+      demoPickPlan = null;
+      demoRoundIdx++;
+    }
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+}());
+</script>
+</body>
+</html>

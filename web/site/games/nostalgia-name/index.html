@@ -1,0 +1,1004 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Nostalgia Name — Tilt</title>
+<!--
+  LOOP / attention-architecture — Nostalgia Name
+  Circuits: 01-rpe (score scales with how early you tap), 03-social (ego bait recall flex),
+            02-novelty (blur-reveal of cultural icons)
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron arc → sets window.__demoDone
+    ?bot=1&runs=N    imperfect autoplay → sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'nostalgia-name';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  /* ── mulberry32 seeded RNG ── */
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  /* ── canvas setup ── */
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  /* ── palette ── */
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  /* ── cultural icons database ── (no external resources; all drawn via canvas) ──
+     Each entry has:
+       name     – correct answer
+       alts     – 2 wrong options
+       draw(cx) – function that renders the icon in a ~160×160 box centred at (0,0)
+  */
+  var ICONS = [
+    {
+      name: 'Tamagotchi',
+      alts: ['Furby', 'Digimon'],
+      draw: function(c) {
+        /* egg body */
+        c.fillStyle = '#f5c518';
+        c.beginPath(); c.ellipse(0, 8, 52, 62, 0, 0, Math.PI * 2); c.fill();
+        c.strokeStyle = '#b8860b'; c.lineWidth = 3; c.stroke();
+        /* screen */
+        c.fillStyle = '#2a1a0e';
+        c.beginPath(); c.roundRect ? c.roundRect(-22, -10, 44, 34, 6) : c.rect(-22, -10, 44, 34);
+        c.fill();
+        /* screen glow */
+        c.fillStyle = '#4dff88';
+        c.beginPath(); c.ellipse(0, 7, 12, 8, 0, 0, Math.PI * 2); c.fill();
+        /* buttons */
+        var bx = [-28, 0, 28];
+        for (var i = 0; i < 3; i++) {
+          c.fillStyle = i===1 ? VERM : '#ddd';
+          c.beginPath(); c.arc(bx[i], 40, 7, 0, Math.PI * 2); c.fill();
+          c.strokeStyle = '#888'; c.lineWidth = 1.5; c.stroke();
+        }
+        /* keychain hole */
+        c.strokeStyle = '#b8860b'; c.lineWidth = 3;
+        c.beginPath(); c.arc(0, -54, 7, 0, Math.PI * 2); c.stroke();
+      }
+    },
+    {
+      name: 'Floppy Disk',
+      alts: ['Zip Drive', 'CD-ROM'],
+      draw: function(c) {
+        /* body */
+        c.fillStyle = '#1a1a2e';
+        c.fillRect(-55, -60, 110, 120);
+        c.strokeStyle = '#555'; c.lineWidth = 3; c.strokeRect(-55, -60, 110, 120);
+        /* metal slider */
+        c.fillStyle = '#aaa';
+        c.fillRect(-30, -60, 60, 22);
+        c.fillStyle = '#666';
+        c.fillRect(-8, -60, 16, 22);
+        /* label */
+        c.fillStyle = '#fff9e6';
+        c.fillRect(-42, -25, 84, 65);
+        /* label lines */
+        c.strokeStyle = '#ccc'; c.lineWidth = 1.5;
+        for (var i = 0; i < 4; i++) {
+          var ly = -12 + i * 14;
+          c.beginPath(); c.moveTo(-34, ly); c.lineTo(34, ly); c.stroke();
+        }
+        /* write protect notch */
+        c.fillStyle = '#333';
+        c.fillRect(40, 40, 12, 15);
+      }
+    },
+    {
+      name: 'AIM',
+      alts: ['MSN', 'ICQ'],
+      draw: function(c) {
+        /* circle bg */
+        c.fillStyle = '#ffff00';
+        c.beginPath(); c.arc(0, 0, 65, 0, Math.PI * 2); c.fill();
+        c.strokeStyle = '#cccc00'; c.lineWidth = 3; c.stroke();
+        /* running man body */
+        c.fillStyle = '#ff6600';
+        /* torso */
+        c.beginPath(); c.ellipse(0, -10, 18, 24, 0, 0, Math.PI * 2); c.fill();
+        /* head */
+        c.fillStyle = '#ffcc99';
+        c.beginPath(); c.arc(0, -42, 14, 0, Math.PI * 2); c.fill();
+        /* legs */
+        c.strokeStyle = '#ff6600'; c.lineWidth = 8; c.lineCap = 'round';
+        c.beginPath(); c.moveTo(-4, 14); c.lineTo(-18, 44); c.stroke();
+        c.beginPath(); c.moveTo(4, 14); c.lineTo(22, 38); c.stroke();
+        /* arms */
+        c.lineWidth = 7;
+        c.beginPath(); c.moveTo(-8, -4); c.lineTo(-28, 12); c.stroke();
+        c.beginPath(); c.moveTo(8, -4); c.lineTo(26, -18); c.stroke();
+      }
+    },
+    {
+      name: 'Razor Scooter',
+      alts: ['Heelys', 'Pogo Stick'],
+      draw: function(c) {
+        /* deck */
+        c.fillStyle = '#cc0000';
+        c.fillRect(-60, -6, 120, 12);
+        c.strokeStyle = '#880000'; c.lineWidth = 2; c.strokeRect(-60, -6, 120, 12);
+        /* handlebar stem */
+        c.strokeStyle = '#888'; c.lineWidth = 8; c.lineCap = 'round';
+        c.beginPath(); c.moveTo(-10, -6); c.lineTo(-20, -65); c.stroke();
+        /* handlebar */
+        c.lineWidth = 7;
+        c.beginPath(); c.moveTo(-46, -65); c.lineTo(6, -65); c.stroke();
+        /* grips */
+        c.fillStyle = '#222';
+        c.fillRect(-50, -72, 10, 16);
+        c.fillRect(2, -72, 10, 16);
+        /* wheels */
+        c.fillStyle = '#333';
+        c.beginPath(); c.arc(-44, 8, 18, 0, Math.PI * 2); c.fill();
+        c.beginPath(); c.arc(44, 8, 18, 0, Math.PI * 2); c.fill();
+        c.strokeStyle = '#666'; c.lineWidth = 4;
+        c.beginPath(); c.arc(-44, 8, 18, 0, Math.PI * 2); c.stroke();
+        c.beginPath(); c.arc(44, 8, 18, 0, Math.PI * 2); c.stroke();
+        /* hub caps */
+        c.fillStyle = '#ccc';
+        c.beginPath(); c.arc(-44, 8, 6, 0, Math.PI * 2); c.fill();
+        c.beginPath(); c.arc(44, 8, 6, 0, Math.PI * 2); c.fill();
+      }
+    },
+    {
+      name: 'iPod Mini',
+      alts: ['Zune', 'Discman'],
+      draw: function(c) {
+        /* body */
+        c.fillStyle = '#4db8ff';
+        c.beginPath();
+        if (c.roundRect) c.roundRect(-38, -68, 76, 136, 18);
+        else c.rect(-38, -68, 76, 136);
+        c.fill();
+        c.strokeStyle = '#2288cc'; c.lineWidth = 3; c.stroke();
+        /* screen */
+        c.fillStyle = '#d0e8f0';
+        c.fillRect(-28, -56, 56, 44);
+        /* screen content lines */
+        c.fillStyle = '#2255aa';
+        c.font = 'bold 9px -apple-system, Helvetica, Arial';
+        c.textAlign = 'center';
+        c.fillText('Now Playing', 0, -40);
+        c.fillStyle = '#444';
+        c.font = '8px -apple-system, Helvetica, Arial';
+        c.fillText('Mr. Brightside', 0, -28);
+        c.fillText('The Killers', 0, -18);
+        /* click wheel */
+        c.fillStyle = '#a0d0f0';
+        c.beginPath(); c.arc(0, 40, 30, 0, Math.PI * 2); c.fill();
+        c.strokeStyle = '#2288cc'; c.lineWidth = 2; c.stroke();
+        /* center button */
+        c.fillStyle = '#fff';
+        c.beginPath(); c.arc(0, 40, 11, 0, Math.PI * 2); c.fill();
+        /* wheel menu text */
+        c.fillStyle = '#1155aa';
+        c.font = 'bold 7px -apple-system, Helvetica, Arial';
+        c.textAlign = 'center';
+        c.fillText('MENU', 0, 18);
+      }
+    },
+    {
+      name: 'Skip-It',
+      alts: ['Hacky Sack', 'Pogo Ball'],
+      draw: function(c) {
+        /* rope/string */
+        c.strokeStyle = '#ff44aa'; c.lineWidth = 4; c.lineCap = 'round';
+        c.beginPath();
+        c.moveTo(-10, -55);
+        c.bezierCurveTo(-30, 10, 30, 20, 20, 60);
+        c.stroke();
+        /* ankle ring (top) */
+        c.fillStyle = '#ff44aa';
+        c.beginPath(); c.ellipse(-10, -58, 18, 10, 0, 0, Math.PI * 2); c.fill();
+        c.strokeStyle = '#cc2288'; c.lineWidth = 2; c.stroke();
+        /* counter ball */
+        c.fillStyle = '#ffcc00';
+        c.beginPath(); c.arc(22, 64, 22, 0, Math.PI * 2); c.fill();
+        c.strokeStyle = '#cc9900'; c.lineWidth = 3; c.stroke();
+        /* ball star detail */
+        c.fillStyle = '#ff4400';
+        c.beginPath(); c.arc(22, 64, 8, 0, Math.PI * 2); c.fill();
+        /* counter window */
+        c.fillStyle = '#222';
+        c.fillRect(-5, -70, 30, 16);
+        c.fillStyle = '#00ff88';
+        c.font = 'bold 10px Menlo, monospace';
+        c.textAlign = 'center';
+        c.fillText('047', 10, -58);
+      }
+    },
+    {
+      name: 'Game Boy',
+      alts: ['Game Gear', 'Lynx'],
+      draw: function(c) {
+        /* body */
+        c.fillStyle = '#b8b8b0';
+        c.beginPath();
+        if (c.roundRect) c.roundRect(-44, -70, 88, 140, 12);
+        else c.rect(-44, -70, 88, 140);
+        c.fill();
+        c.strokeStyle = '#888'; c.lineWidth = 2; c.stroke();
+        /* screen area */
+        c.fillStyle = '#333';
+        c.fillRect(-34, -58, 68, 54);
+        /* screen */
+        c.fillStyle = '#8bac0f';
+        c.fillRect(-26, -52, 52, 42);
+        /* screen content - small figure */
+        c.fillStyle = '#0f380f';
+        c.fillRect(-8, -36, 16, 20);
+        c.fillRect(-4, -46, 8, 10);
+        /* d-pad */
+        c.fillStyle = '#222';
+        c.fillRect(-28, 14, 11, 30); /* vertical */
+        c.fillRect(-38, 24, 30, 11); /* horizontal */
+        /* a/b buttons */
+        c.fillStyle = '#7a0042';
+        c.beginPath(); c.arc(24, 22, 9, 0, Math.PI * 2); c.fill();
+        c.beginPath(); c.arc(10, 32, 9, 0, Math.PI * 2); c.fill();
+        /* A B labels */
+        c.fillStyle = '#fff';
+        c.font = 'bold 7px -apple-system, Helvetica, Arial';
+        c.textAlign = 'center';
+        c.fillText('A', 24, 25);
+        c.fillText('B', 10, 35);
+        /* select/start */
+        c.fillStyle = '#555';
+        c.fillRect(-22, 48, 18, 7);
+        c.fillRect(4, 48, 18, 7);
+        c.fillStyle = '#bbb';
+        c.font = '5px -apple-system, Helvetica, Arial';
+        c.textAlign = 'center';
+        c.fillText('SELECT', -13, 60);
+        c.fillText('START', 13, 60);
+      }
+    },
+    {
+      name: 'Pogs',
+      alts: ['Marbles', 'Tops'],
+      draw: function(c) {
+        /* slammer */
+        c.fillStyle = '#888';
+        c.beginPath(); c.arc(-28, -40, 22, 0, Math.PI * 2); c.fill();
+        c.strokeStyle = '#555'; c.lineWidth = 2; c.stroke();
+        c.fillStyle = '#cc0000';
+        c.beginPath(); c.arc(-28, -40, 14, 0, Math.PI * 2); c.fill();
+        /* skull on slammer */
+        c.fillStyle = '#fff';
+        c.font = '16px -apple-system, Helvetica, Arial';
+        c.textAlign = 'center';
+        c.fillText('☠', -28, -35);
+        /* stack of pogs */
+        var pColors = ['#ffcc00','#ff4400','#0044ff','#00cc44','#ff00aa'];
+        for (var i = 0; i < 5; i++) {
+          c.fillStyle = pColors[i];
+          c.beginPath(); c.ellipse(14, 10 + i * 8, 36, 12, 0, 0, Math.PI * 2); c.fill();
+          c.strokeStyle = 'rgba(0,0,0,0.3)'; c.lineWidth = 1; c.stroke();
+        }
+        /* top pog detail */
+        c.fillStyle = '#0044ff';
+        c.beginPath(); c.ellipse(14, 10, 36, 12, 0, 0, Math.PI * 2); c.fill();
+        c.fillStyle = '#fff';
+        c.font = 'bold 9px -apple-system, Helvetica, Arial';
+        c.textAlign = 'center';
+        c.fillText('POG', 14, 14);
+      }
+    },
+    {
+      name: 'Blockbuster',
+      alts: ['Hollywood Video', 'Movie Gallery'],
+      draw: function(c) {
+        /* store sign shape */
+        c.fillStyle = '#1a1a1a';
+        c.fillRect(-66, -30, 132, 70);
+        /* yellow top stripe */
+        c.fillStyle = '#ffe600';
+        c.fillRect(-66, -50, 132, 22);
+        /* blue bottom stripe */
+        c.fillStyle = '#0033cc';
+        c.fillRect(-66, 40, 132, 20);
+        /* "BLOCKBUSTER" text block */
+        c.fillStyle = '#ffe600';
+        c.font = 'bold 16px -apple-system, Helvetica, Arial';
+        c.textAlign = 'center';
+        c.fillText('BLOCK', 0, -4);
+        c.fillText('BUSTER', 0, 18);
+        /* B logo */
+        c.fillStyle = '#ffe600';
+        c.beginPath(); c.arc(-46, -38, 12, 0, Math.PI * 2); c.fill();
+        c.fillStyle = '#1a1a1a';
+        c.font = 'bold 14px -apple-system, Helvetica, Arial';
+        c.fillText('B', -46, -34);
+        /* VHS tape under sign */
+        c.fillStyle = '#333';
+        c.fillRect(-34, 48, 68, 30);
+        c.fillStyle = '#000';
+        c.fillRect(-28, 52, 56, 20);
+        /* tape reels */
+        c.fillStyle = '#666';
+        c.beginPath(); c.arc(-10, 62, 8, 0, Math.PI * 2); c.fill();
+        c.beginPath(); c.arc(10, 62, 8, 0, Math.PI * 2); c.fill();
+      }
+    },
+    {
+      name: 'Lite-Brite',
+      alts: ['Etch A Sketch', 'Spirograph'],
+      draw: function(c) {
+        /* box */
+        c.fillStyle = '#222';
+        c.fillRect(-58, -58, 116, 116);
+        c.strokeStyle = '#444'; c.lineWidth = 3; c.strokeRect(-58, -58, 116, 116);
+        /* peg grid */
+        var pegColors = ['#ff0000','#ff6600','#ffff00','#00ff00','#00ffff','#0088ff','#ff00ff','#ffffff'];
+        var grid = [
+          [0,1,0,1,0,1,0],
+          [1,0,2,0,3,0,1],
+          [0,2,0,4,0,2,0],
+          [1,0,5,0,6,0,1],
+          [0,3,0,7,0,3,0],
+          [1,0,4,0,5,0,1],
+          [0,1,0,2,0,1,0]
+        ];
+        for (var row = 0; row < 7; row++) {
+          for (var col = 0; col < 7; col++) {
+            var ci = grid[row][col];
+            if (ci > 0) {
+              c.fillStyle = pegColors[ci - 1];
+              c.shadowColor = pegColors[ci - 1];
+              c.shadowBlur = 8;
+              c.beginPath(); c.arc(-42 + col * 14, -42 + row * 14, 5, 0, Math.PI * 2); c.fill();
+            }
+          }
+        }
+        c.shadowBlur = 0;
+      }
+    }
+  ];
+
+  /* ── game data / stages ── */
+  /* blur: 0 = clear, 1 = max blur. Points: more blur = more points. */
+  var STAGES = [
+    { blur: 0.95, pts: 500, label: '500 pts' },
+    { blur: 0.80, pts: 350, label: '350 pts' },
+    { blur: 0.60, pts: 200, label: '200 pts' },
+    { blur: 0.35, pts: 100, label: '100 pts' },
+    { blur: 0.10, pts:  50, label:  '50 pts' },
+  ];
+  var ICONS_PER_ROUND = 8;   /* rounds per game */
+  var REVEAL_SPEED = 0.006;  /* blur decreases this much per frame tick */
+
+  /* ── state ── */
+  var phase, score, roundIdx, iconIdx, stageIdx, blurAmt;
+  var choices, correctChoice, answered, answerCorrect;
+  var roundTs, runStartTs;
+  var flashes = [], shakeAmt = 0, zoom = 1, hitStop = 0;
+  var dareBeaten = false, ctaAt = 0, overAt = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('nn_best') || 0; } catch (_) {}
+
+  /* ── icon order (seeded shuffle) ── */
+  var iconOrder = [];
+  function buildOrder() {
+    iconOrder = [];
+    for (var i = 0; i < ICONS.length; i++) iconOrder.push(i);
+    /* Fisher-Yates */
+    for (var j = iconOrder.length - 1; j > 0; j--) {
+      var k = Math.floor(rng() * (j + 1));
+      var tmp = iconOrder[j]; iconOrder[j] = iconOrder[k]; iconOrder[k] = tmp;
+    }
+  }
+
+  /* ── choice buttons layout ── */
+  var BTN_Y = 540, BTN_H = 56, BTN_W = 340;
+  var BTN_GAP = 10;
+  var BTNS = [
+    { x: W/2 - BTN_W/2, y: BTN_Y,                       w: BTN_W, h: BTN_H },
+    { x: W/2 - BTN_W/2, y: BTN_Y + BTN_H + BTN_GAP,     w: BTN_W, h: BTN_H },
+    { x: W/2 - BTN_W/2, y: BTN_Y + (BTN_H + BTN_GAP)*2, w: BTN_W, h: BTN_H },
+  ];
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W/2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  /* ── pct rank ── */
+  function pctTop(s) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 800)))); }
+
+  /* ── new game ── */
+  function newGame() {
+    rng = mulberry32(SEED);
+    buildOrder();
+    score = 0; roundIdx = 0; dareBeaten = false; flashes = [];
+    shakeAmt = 0; zoom = 1; hitStop = 0;
+    if (DEMO) {
+      phase = 'challenge';
+      setTimeout(function () { startRound(); }, 1250);
+      return;
+    }
+    if (BOT) {
+      phase = 'play';
+      startRound();
+      return;
+    }
+    phase = 'title';
+  }
+
+  function startRound() {
+    phase = 'play';
+    if (roundIdx === 0) {
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+    iconIdx = iconOrder[roundIdx % iconOrder.length];
+    stageIdx = 0;
+    blurAmt = STAGES[0].blur;
+    answered = false;
+    answerCorrect = false;
+    /* build 3 choices: correct + 2 wrong (seeded) */
+    var icon = ICONS[iconIdx];
+    var wrongPool = [];
+    for (var i = 0; i < ICONS.length; i++) {
+      if (i !== iconIdx) wrongPool.push(ICONS[i].name);
+    }
+    /* also use icon's own alts first */
+    var alts = icon.alts.slice();
+    /* shuffle alts */
+    for (var j = alts.length - 1; j > 0; j--) {
+      var ki = Math.floor(rng() * (j + 1));
+      var t2 = alts[j]; alts[j] = alts[ki]; alts[ki] = t2;
+    }
+    var w1 = alts[0] || wrongPool[0];
+    var w2 = alts[1] || wrongPool[1];
+    choices = [icon.name, w1, w2];
+    /* seeded shuffle choices */
+    for (var m = choices.length - 1; m > 0; m--) {
+      var ni = Math.floor(rng() * (m + 1));
+      var tc = choices[m]; choices[m] = choices[ni]; choices[ni] = tc;
+    }
+    correctChoice = choices.indexOf(icon.name);
+    roundTs = performance.now();
+    if (window.J) J.tension(roundIdx / ICONS_PER_ROUND);
+  }
+
+  function doAnswer(choiceIdx) {
+    if (answered || phase !== 'play') return;
+    answered = true;
+    var correct = (choiceIdx === correctChoice);
+    answerCorrect = correct;
+    var pts = correct ? STAGES[Math.min(stageIdx, STAGES.length - 1)].pts : 0;
+
+    if (correct) {
+      score += pts;
+      var label = '+' + pts;
+      if (stageIdx === 0) {
+        flash(label + ' PERFECT', TEAL, 38);
+        if (window.J) { J.perfect(stageIdx + 1); J.gold(); }
+        hitStop = 6; zoom = 1.04;
+      } else if (stageIdx <= 1) {
+        flash(label + ' EARLY!', GOLD, 34);
+        if (window.J) J.hit(stageIdx + 1);
+        hitStop = 3; zoom = 1.02;
+      } else {
+        flash(label, TEAL, 30);
+        if (window.J) J.hit(1);
+      }
+      if (window.LOOP) LOOP.emit('answer_correct', { pts: pts, stage: stageIdx, round: roundIdx });
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN!', TEAL, 40);
+        if (window.J) J.fanfare();
+        SHARE.beaten(score);
+      }
+    } else {
+      flash('WRONG!', VERM, 36);
+      shakeAmt = 6;
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('answer_wrong', { round: roundIdx, stage: stageIdx });
+    }
+
+    roundIdx++;
+    if (roundIdx >= ICONS_PER_ROUND) {
+      setTimeout(function () { gameOver(); }, 900);
+    } else {
+      setTimeout(function () { startRound(); }, 900);
+    }
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) {
+      J.death(0.4);
+      if (score > best) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    shakeAmt = 7;
+    if (score > best) {
+      best = score;
+      try { localStorage.setItem('nn_best', String(best)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+  }
+
+  function resetRun() {
+    flashes = []; shakeAmt = 0; zoom = 1; hitStop = 0; roundIdx = 0; score = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRound();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  /* ── input ── */
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { runStartTs = Date.now(); startRound(); return; }
+    if (phase === 'play' && !answered) {
+      for (var i = 0; i < BTNS.length; i++) {
+        if (x !== undefined && inR(BTNS[i], x, y)) { doAnswer(i); return; }
+      }
+      return;
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'pts' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Digit1') tap(BTNS[0].x + 1, BTNS[0].y + 1);
+    if (e.code === 'Digit2') tap(BTNS[1].x + 1, BTNS[1].y + 1);
+    if (e.code === 'Digit3') tap(BTNS[2].x + 1, BTNS[2].y + 1);
+    if (e.code === 'Space') tap();
+  });
+
+  /* ── demo / bot autopilots ── */
+  /* demo script: which choice + at which blur stage to tap */
+  var demoScript = [
+    { stage: 1, correct: true  },   /* early correct – high score */
+    { stage: 0, correct: true  },   /* PERFECT – very early */
+    { stage: 2, correct: true  },   /* medium early */
+    { stage: 3, correct: false },   /* WRONG – near-fail tension */
+    { stage: 1, correct: true  },   /* recovery */
+    { stage: 2, correct: true  },   /* holding on */
+    { stage: 4, correct: false },   /* another wrong – real fail */
+    { stage: 4, correct: true  },   /* last round scrapes by */
+  ];
+  var demoStep = 0;
+  /* hesitation waits (frames) before answering */
+  var demoWaits = [52, 18, 38, 60, 28, 44, 55, 70];
+
+  var botRunsDone = 0;
+
+  function autopilot() {
+    if (phase !== 'play' || answered) return;
+    if (DEMO) {
+      var step = demoScript[Math.min(demoStep, demoScript.length - 1)];
+      /* wait until blur has revealed enough to match the target stage */
+      if (stageIdx < step.stage) return;
+      /* also add hesitation based on demoWaits (approximate frame count via blur decay) */
+      var wait = demoWaits[Math.min(demoStep, demoWaits.length - 1)];
+      /* translate frame wait to blur delta (REVEAL_SPEED * 60fps ≈ 0.36/s) */
+      var blurThreshold = Math.max(0.01, STAGES[Math.min(step.stage, STAGES.length-1)].blur - wait * REVEAL_SPEED);
+      if (blurAmt > blurThreshold) return;
+      /* pick answer */
+      var choice;
+      if (step.correct) {
+        choice = correctChoice;
+      } else {
+        /* pick a wrong answer */
+        choice = (correctChoice + 1 + Math.floor(rng() * 2)) % 3;
+      }
+      demoStep++;
+      doAnswer(choice);
+    } else if (BOT) {
+      /* bot: randomly chooses correct ~70% of time, but waits to a random blur stage */
+      var targetStage = Math.min(Math.floor(rng() * 5), 4);
+      if (stageIdx < targetStage) return;
+      var correct = rng() < 0.65;
+      var botChoice = correct ? correctChoice : ((correctChoice + 1) % 3);
+      doAnswer(botChoice);
+    }
+  }
+
+  /* ── blur renderer ── */
+  /* Renders the icon to an offscreen canvas, applies a pixelation/blur trick */
+  var offCv = document.createElement('canvas');
+  offCv.width = 180; offCv.height = 180;
+  var offCx = offCv.getContext('2d');
+
+  function renderIcon(iconI, blur) {
+    /* draw at low res for pixelation effect */
+    var px = Math.max(2, Math.round(blur * 36));  /* pixel size for pixelation */
+    var small = Math.max(6, Math.round(180 / px));
+    /* render icon full size to temp */
+    offCx.clearRect(0, 0, 180, 180);
+    offCx.save();
+    offCx.translate(90, 90);
+    ICONS[iconI].draw(offCx);
+    offCx.restore();
+
+    if (blur > 0.05) {
+      /* pixelate: draw small, scale back up */
+      var tmp = document.createElement('canvas');
+      tmp.width = small; tmp.height = small;
+      var tc = tmp.getContext('2d');
+      tc.imageSmoothingEnabled = false;
+      tc.drawImage(offCv, 0, 0, small, small);
+
+      cx.imageSmoothingEnabled = false;
+      cx.drawImage(tmp, W/2 - 90, 240 - 90, 180, 180);
+      cx.imageSmoothingEnabled = true;
+    } else {
+      cx.drawImage(offCv, W/2 - 90, 240 - 90);
+    }
+  }
+
+  /* ── draw buttons ── */
+  function drawButtons(highlight, wrongHighlight) {
+    for (var i = 0; i < BTNS.length; i++) {
+      var b = BTNS[i];
+      var isCorrect = (i === correctChoice);
+      var bg, border, textCol;
+      if (answered) {
+        if (isCorrect) { bg = 'rgba(46,197,182,0.25)'; border = TEAL; textCol = TEAL; }
+        else if (i === wrongHighlight) { bg = 'rgba(232,80,46,0.25)'; border = VERM; textCol = VERM; }
+        else { bg = 'rgba(255,255,255,0.04)'; border = 'rgba(255,255,255,0.15)'; textCol = 'rgba(255,255,255,0.3)'; }
+      } else if (highlight === i) {
+        bg = 'rgba(242,177,52,0.2)'; border = GOLD; textCol = GOLD;
+      } else {
+        bg = 'rgba(255,255,255,0.06)'; border = 'rgba(255,255,255,0.25)'; textCol = '#fff';
+      }
+      cx.fillStyle = bg;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(b.x, b.y, b.w, b.h, 12);
+      else cx.rect(b.x, b.y, b.w, b.h);
+      cx.fill();
+      cx.strokeStyle = border; cx.lineWidth = 1.5;
+      cx.stroke();
+      cx.fillStyle = textCol;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText(choices[i], b.x + b.w / 2, b.y + b.h / 2 + 7);
+    }
+  }
+
+  /* ── main loop ── */
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    /* update blur */
+    if (phase === 'play' && !answered) {
+      blurAmt = Math.max(0, blurAmt - REVEAL_SPEED * dt);
+      /* advance stage based on blur */
+      for (var s = STAGES.length - 1; s >= 0; s--) {
+        if (blurAmt <= STAGES[s].blur) { stageIdx = s; break; }
+      }
+      /* if fully revealed and unanswered, auto-miss */
+      if (blurAmt <= 0 && !answered) {
+        doAnswer(-1); /* wrong – no match */
+      }
+      /* run autopilot (if needed) */
+      if (hitStop > 0) { hitStop -= dt; } else { autopilot(); }
+    } else {
+      if (hitStop > 0) hitStop -= dt;
+    }
+
+    /* juice: shake + zoom decay */
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W/2 + sx, H/2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W/2, -H/2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    /* bg */
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    /* ── TITLE phase ── */
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('NOSTALGIA', W/2, 280);
+      cx.fillStyle = GOLD; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('NAME', W/2, 328);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('name it before it reveals', W/2, 366);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.fillStyle = VERM; cx.globalAlpha = pulse;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W/2, 420);
+      cx.globalAlpha = 1;
+    }
+
+    /* ── CHALLENGE card (demo beat 1) ── */
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 15px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W/2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('2400', W/2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's high score", W/2, 432);
+    }
+
+    /* ── PLAY phase ── */
+    if (phase === 'play') {
+      /* score top */
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 56px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W/2, 86);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('ROUND ' + (roundIdx + 1) + ' / ' + ICONS_PER_ROUND, W/2, 108);
+
+      /* dare banner */
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '700 13px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare, W/2, 130);
+      }
+
+      /* points available indicator */
+      var curStage = STAGES[Math.min(stageIdx, STAGES.length - 1)];
+      cx.fillStyle = stageIdx <= 1 ? GOLD : (stageIdx <= 2 ? TEAL : 'rgba(255,255,255,0.4)');
+      cx.font = '700 14px -apple-system, Helvetica, Arial';
+      cx.fillText(curStage.label + ' available', W/2, 155);
+
+      /* blur reveal bar */
+      var barW = 260, barH = 6;
+      var barX = W/2 - barW/2, barY = 170;
+      cx.fillStyle = 'rgba(255,255,255,0.1)';
+      cx.fillRect(barX, barY, barW, barH);
+      cx.fillStyle = stageIdx <= 1 ? GOLD : TEAL;
+      cx.fillRect(barX, barY, barW * blurAmt, barH);
+
+      /* icon area */
+      var iconX = W/2, iconY = 285;
+      /* background card */
+      cx.fillStyle = 'rgba(255,255,255,0.07)';
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(iconX - 100, iconY - 100, 200, 200, 16);
+      else cx.rect(iconX - 100, iconY - 100, 200, 200);
+      cx.fill();
+
+      renderIcon(iconIdx, blurAmt);
+
+      /* choices */
+      drawButtons(-1, answered && !answerCorrect ? choices.indexOf(choices.find(function(_, i){ return i !== correctChoice && answered; })) : -1);
+    }
+
+    /* ── OVER phase ── */
+    if (phase === 'over') {
+      /* draw last icon fading */
+      cx.globalAlpha = 0.3;
+      renderIcon(iconIdx, 0);
+      cx.globalAlpha = 1;
+
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('GAME OVER', W/2, 280);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' pts', W/2, 328);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W/2, 370);
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W/2, 394);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — PLAY AGAIN', W/2, 444);
+        cx.globalAlpha = 1;
+        /* share pill */
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          (window.SHARE && SHARE.dare !== null && dareBeaten) ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W/2, SHARE_R.y + 30
+        );
+      }
+    }
+
+    /* ── CTA card (demo beat 6) ── */
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('NOSTALGIA', W/2, 286);
+      cx.fillStyle = GOLD; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('NAME', W/2, 334);
+      cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('can you beat ' + (window.__demoScore || 2400) + '?', W/2, 374);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 2400), W/2, 424);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W/2, 454);
+      cx.globalAlpha = 1;
+    }
+
+    /* ── floating flashes ── */
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W/2, 210 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 44) flashes.splice(k, 1);
+    }
+
+    /* ── mute toggle (human only) ── */
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  /* ── bot runner ── */
+  function runBot() {
+    if (botRunsDone >= BOT_RUNS) { window.__botDone = true; return; }
+    /* reset RNG and state for each run */
+    rng = mulberry32(SEED + botRunsDone * 13);
+    buildOrder();
+    score = 0; roundIdx = 0; flashes = [];
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED + botRunsDone * 13 });
+    doNextBotRound();
+  }
+
+  function doNextBotRound() {
+    if (roundIdx >= ICONS_PER_ROUND) {
+      /* game over for this bot run */
+      var dur = (Date.now() - runStartTs) / 1000;
+      if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        if (window.LOOP) LOOP.emit('restart', {});
+        setTimeout(runBot, 200);
+      }
+      return;
+    }
+    iconIdx = iconOrder[roundIdx % iconOrder.length];
+    stageIdx = 0;
+    blurAmt = STAGES[0].blur;
+    answered = false;
+    answerCorrect = false;
+    var icon = ICONS[iconIdx];
+    var alts = icon.alts.slice();
+    choices = [icon.name, alts[0] || 'Unknown', alts[1] || 'Other'];
+    /* shuffle */
+    for (var m = choices.length - 1; m > 0; m--) {
+      var ni = Math.floor(rng() * (m + 1));
+      var tc = choices[m]; choices[m] = choices[ni]; choices[ni] = tc;
+    }
+    correctChoice = choices.indexOf(icon.name);
+    roundTs = performance.now();
+
+    /* bot picks answer after a random blur stage */
+    var targetStage = Math.min(Math.floor(rng() * 5), 4);
+    var correct = rng() < 0.65;
+    var botChoice = correct ? correctChoice : ((correctChoice + 1) % 3);
+    /* simulate time passing for blur to reach targetStage */
+    var targetBlur = STAGES[targetStage].blur;
+    var framesNeeded = Math.ceil((STAGES[0].blur - targetBlur) / REVEAL_SPEED);
+    var delay = Math.max(80, framesNeeded * 16);
+    setTimeout(function () {
+      /* update state to simulate reveal */
+      blurAmt = targetBlur;
+      stageIdx = targetStage;
+      /* actually answer */
+      answered = true;
+      answerCorrect = (botChoice === correctChoice);
+      var pts = answerCorrect ? STAGES[Math.min(stageIdx, STAGES.length - 1)].pts : 0;
+      score += pts;
+      roundIdx++;
+      if (window.LOOP) LOOP.emit(answerCorrect ? 'answer_correct' : 'answer_wrong', { pts: pts, round: roundIdx });
+      setTimeout(doNextBotRound, 100);
+    }, delay);
+  }
+
+  /* ── start ── */
+  if (BOT) {
+    newGame();
+    /* run bot entirely via its own loop, not autopilot() in frame() */
+    runBot();
+  } else {
+    newGame();
+  }
+  requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>

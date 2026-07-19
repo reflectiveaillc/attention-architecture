@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Breath Beat — Tilt</title>
+<!--
+  LOOP / attention-architecture — Breath Beat
+  Engine: calm. Circuits: 05-ease, 07-timing, 01-rpe.
+  Mechanic: pulse sets the inhale; hold during beat, release on rest.
+  10 matched breath cycles → completion. 3 misses → drift out.
+  Modes:
+    ?demo=1&seed=7      calm arc → completion → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed  imperfect autopilot, last run deliberately misses → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'breath-beat';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO     = qs.get('demo') === '1';
+  var BOT      = qs.get('bot')  === '1';
+  var BOT_RUNS = Math.max(1, +qs.get('runs') || 3);
+  var SEED     = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr; cv.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- breath cycle timing (ms) ----
+  // Human play: 1 cycle ≈ 5.2s. Demo/bot: 5x faster so 10 cycles = ~10.4s.
+  var SPEED    = (DEMO || BOT) ? 5.0 : 1.0;
+  var INHALE   = 1800 / SPEED;   // pulse expands
+  var HOLD_DUR = 600  / SPEED;   // peak plateau
+  var EXHALE   = 2000 / SPEED;   // pulse contracts
+  var REST     = 800  / SPEED;   // gap between cycles
+  var CYCLE    = INHALE + HOLD_DUR + EXHALE + REST;  // one full breath
+
+  var TOTAL_CYCLES = 10;  // matched cycles needed to win
+  var MAX_MISSES   = 3;   // misses before drift-out (game_over)
+
+  // judgment windows (fraction of phase)
+  var HOLD_WIN = 0.55;   // player must start holding within first 55% of inhale
+  var REL_WIN  = 0.55;   // player must release within first 55% of exhale
+
+  // ---- state ----
+  var phase;        // 'title'|'play'|'complete'|'over'|'cta'
+  var score, misses;
+  var cycleStart;   // performance.now() when current cycle began
+  var runStart;     // performance.now() when run began
+  var holding;      // boolean: is player currently pressing?
+  var warmth;       // 0→1, grows with each matched cycle
+  var shakeAmt, zoom, hitStop;
+  var flashes;
+  var endAt;        // performance.now() when phase became complete/over/cta
+  var ctaStart;
+  var botRunsDone;
+  // per-cycle tracking
+  var didHold, didRelease, failedRelease;
+
+  // ambient particles
+  var particles = [];
+  (function () {
+    for (var i = 0; i < 18; i++) {
+      particles.push({ x: rng() * W, y: rng() * H, r: 0.8 + rng() * 2,
+        vx: (rng()-0.5)*0.18, vy: (rng()-0.5)*0.14, ph: rng()*Math.PI*2 });
+    }
+  })();
+
+  function resetState() {
+    phase = 'title'; score = 0; misses = 0; holding = false; warmth = 0;
+    shakeAmt = 0; zoom = 1; hitStop = 0; flashes = []; botRunsDone = 0;
+    endAt = 0; ctaStart = 0;
+  }
+
+  function startRun() {
+    score = 0; misses = 0; holding = false; warmth = 0;
+    shakeAmt = 0; zoom = 1; hitStop = 0; flashes = [];
+    didHold = false; didRelease = false; failedRelease = false;
+    runStart = performance.now();
+    cycleStart = runStart;
+    phase = 'play';
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function flash(txt, col, sz) {
+    flashes.push({ txt: txt, col: col, sz: sz || 34, age: 0 });
+  }
+
+  function onCycleEnd(cycleT) {
+    // cycleT: ms elapsed in this cycle (should equal ~CYCLE at boundary)
+    // Judgment: must have started holding early in inhale, and released early in exhale
+    var matched = didHold && didRelease && !failedRelease;
+
+    if (matched) {
+      score++;
+      warmth = Math.min(1, score / TOTAL_CYCLES);
+      zoom = 1.025; hitStop = (DEMO || BOT) ? 1 : 3;
+      if (window.J) J.calm(score);
+      flash(score === TOTAL_CYCLES ? 'COMPLETE' : 'MATCHED', TEAL, score === TOTAL_CYCLES ? 44 : 34);
+      if (window.LOOP) LOOP.emit('breath_matched', { n: score });
+      if (score >= TOTAL_CYCLES) {
+        // win — end after brief pause
+        var winDelay = (DEMO || BOT) ? 300 : 700;
+        setTimeout(doComplete, winDelay);
+        return; // don't advance cycle
+      }
+    } else {
+      misses++;
+      shakeAmt = 2;
+      if (window.J) J.calm(0);
+      flash('BREATHE', 'rgba(255,255,255,0.55)', 30);
+      if (window.LOOP) LOOP.emit('near_miss', { n: score, misses: misses });
+      if (misses >= MAX_MISSES) {
+        setTimeout(doOver, (DEMO || BOT) ? 200 : 400);
+        return;
+      }
+    }
+
+    // advance to next cycle
+    cycleStart = performance.now();
+    didHold = false; didRelease = false; failedRelease = false;
+  }
+
+  function doComplete() {
+    if (phase !== 'play') return;
+    phase = 'complete'; endAt = performance.now();
+    window.__demoScore = score;
+    var dur = (performance.now() - runStart) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta'; ctaStart = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 1000);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(startRun, 400);
+    }
+  }
+
+  function doOver() {
+    if (phase !== 'play') return;
+    phase = 'over'; endAt = performance.now();
+    shakeAmt = 3;
+    var dur = (performance.now() - runStart) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(startRun, 400);
+    }
+  }
+
+  // ---- cycle phase from elapsed ms ----
+  function cyclePhase(elapsed) {
+    if (elapsed < INHALE)              return 'inhale';
+    if (elapsed < INHALE + HOLD_DUR)   return 'hold';
+    if (elapsed < INHALE + HOLD_DUR + EXHALE) return 'exhale';
+    return 'rest';
+  }
+
+  // orb pulse value 0→1→0 through inhale→hold→exhale→rest
+  function orbPulse(elapsed) {
+    if (elapsed < INHALE)              return elapsed / INHALE;
+    if (elapsed < INHALE + HOLD_DUR)   return 1.0;
+    var et = elapsed - INHALE - HOLD_DUR;
+    if (et < EXHALE)                   return 1.0 - et / EXHALE;
+    return 0.0;
+  }
+
+  // ---- autopilot (demo + bot) ----
+  // Demo: correct on every cycle (full 10). Uses small per-cycle timing jitter.
+  // Bot: correct for all-but-last run; last run deliberately never holds → 3 misses → over.
+  var demoHoldOffset  = [120,  80, 150,  60, 100,  90, 130,  70, 110,  85]; // ms into inhale to press
+  var demoRelOffset   = [ 90, 140,  60, 120,  80, 100, 150,  70,  95, 110]; // ms into exhale to release
+  var autoCycleIdx    = 0;
+
+  function autopilot(elapsed) {
+    if (phase !== 'play') return;
+    var cp = cyclePhase(elapsed);
+    var ci = autoCycleIdx % 10;
+
+    // bot last run: never hold → force misses
+    var botFail = BOT && botRunsDone >= BOT_RUNS - 1;
+
+    if (botFail) {
+      holding = false;
+      return;
+    }
+
+    var holdDelay = (DEMO ? demoHoldOffset[ci] : (50 + rng() * 120)) / SPEED;
+    var relDelay  = (DEMO ? demoRelOffset[ci]  : (60 + rng() * 100)) / SPEED;
+
+    if (cp === 'inhale') {
+      var ti = elapsed;
+      if (!holding && ti >= holdDelay) holding = true;
+    } else if (cp === 'hold') {
+      holding = true;
+    } else if (cp === 'exhale') {
+      var te = elapsed - INHALE - HOLD_DUR;
+      if (holding && te >= relDelay) holding = false;
+    } else { // rest
+      holding = false;
+    }
+  }
+
+  // ---- update judgment flags per frame ----
+  function updateJudgment(elapsed) {
+    var cp = cyclePhase(elapsed);
+    // Track hold: did they press during inhale (within window)?
+    if ((cp === 'inhale' || cp === 'hold') && holding) {
+      var inhFrac = Math.min(elapsed, INHALE) / INHALE;
+      if (inhFrac <= HOLD_WIN) didHold = true;
+      // even if late, mark it (just won't count as "within window" unless didHold already set)
+      if (!didHold && inhFrac > HOLD_WIN) didHold = false; // too late to count
+    }
+    // Also count holding at any point in inhale if we haven't started late
+    if (cp === 'inhale' && holding && !didHold) {
+      didHold = true; // simplify: any hold during inhale counts
+    }
+    if (cp === 'hold' && holding) {
+      didHold = true;
+    }
+    // Track release: did they let go early in exhale?
+    if (cp === 'exhale') {
+      var exEl = elapsed - INHALE - HOLD_DUR;
+      var exFrac = exEl / EXHALE;
+      if (!holding && !didRelease && exFrac <= REL_WIN) didRelease = true;
+      // If they hold too deep into exhale, penalize
+      if (holding && exFrac > 0.75) failedRelease = true;
+    }
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h; }
+
+  function onDown(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play')  { holding = true; return; }
+    if ((phase === 'over' || phase === 'complete') &&
+         performance.now() - endAt > 350) {
+      autoCycleIdx = 0;
+      startRun();
+    }
+  }
+  function onUp() { if (!DEMO && !BOT && phase === 'play') holding = false; }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    onDown((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  cv.addEventListener('pointerup', onUp);
+  cv.addEventListener('pointercancel', onUp);
+  window.addEventListener('keydown', function (e) { if (e.code==='Space'&&!e.repeat) onDown(); });
+  window.addEventListener('keyup',   function (e) { if (e.code==='Space') onUp(); });
+
+  // ---- main loop ----
+  var lastNow = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - lastNow) / 16.667, 3); lastNow = now;
+
+    // juice decay — always happens every frame
+    if (hitStop > 0) hitStop -= dt;
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    if (phase === 'play') {
+      var elapsed = now - cycleStart;
+
+      // run autopilot (sets holding)
+      if (DEMO || BOT) autopilot(elapsed);
+
+      // update judgment flags from holding state + elapsed
+      if (hitStop <= 0) {
+        updateJudgment(elapsed);
+        // cycle boundary
+        if (elapsed >= CYCLE) {
+          autoCycleIdx++;
+          onCycleEnd(elapsed);
+          // cycleStart may have been reset in onCycleEnd; if phase changed, that's fine
+        }
+      }
+    }
+
+    // ---- draw ----
+    ctx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (rng()-0.5)*shakeAmt*2, sy = (rng()-0.5)*shakeAmt*2;
+      ctx.translate(W/2+sx, H/2+sy); ctx.scale(zoom, zoom); ctx.translate(-W/2, -H/2);
+    }
+
+    // background
+    ctx.fillStyle = INK; ctx.fillRect(-20,-20,W+40,H+40);
+    var bgA = warmth * 0.08;
+    ctx.fillStyle = 'rgba(46,197,182,'+bgA+')'; ctx.fillRect(0,0,W,H);
+
+    // ambient particles
+    for (var i = 0; i < particles.length; i++) {
+      var p = particles[i];
+      p.x += p.vx; p.y += p.vy;
+      if (p.x < 0) p.x = W; if (p.x > W) p.x = 0;
+      if (p.y < 0) p.y = H; if (p.y > H) p.y = 0;
+      var pa = (0.07 + warmth*0.1) * (0.3 + 0.25*Math.sin(now/2200+p.ph));
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+      ctx.fillStyle = 'rgba(46,197,182,'+pa+')'; ctx.fill();
+    }
+
+    if (phase === 'title')    drawTitle(now);
+    if (phase === 'play')     drawPlay(now);
+    if (phase === 'complete') drawComplete(now);
+    if (phase === 'over')     drawOver(now);
+    if (phase === 'cta')      drawCta(now);
+
+    // flashes
+    for (var k = flashes.length-1; k >= 0; k--) {
+      var fl = flashes[k]; fl.age += dt;
+      var fa = Math.max(0, 1 - fl.age/38);
+      ctx.globalAlpha = fa; ctx.textAlign = 'center';
+      ctx.fillStyle = fl.col;
+      ctx.font = '700 '+(fl.sz + fl.age*0.3)+'px -apple-system,Helvetica,Arial';
+      ctx.fillText(fl.txt, W/2, 268 - fl.age*0.45);
+      ctx.globalAlpha = 1;
+      if (fl.age > 44) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      ctx.textAlign = 'center'; ctx.globalAlpha = 0.45;
+      ctx.font = '16px -apple-system,Helvetica,Arial'; ctx.fillStyle = '#fff';
+      ctx.fillText(J.muted ? '🔇':'🔊', MUTE_R.x+MUTE_R.w/2, MUTE_R.y+26);
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- orb drawing ----
+  function drawOrb(cx2, cy, pulseVal, isHolding, wm) {
+    var BASE_R = 90, PEAK_R = 150;
+    var orbR = BASE_R + (PEAK_R - BASE_R) * pulseVal;
+
+    // glow rings
+    var gl = isHolding ? 5 : 3;
+    for (var g = gl; g >= 1; g--) {
+      var gr = orbR + g * (isHolding ? 16 : 10);
+      var ga = (0.04 + wm*0.05) * (1 - g/(gl+1));
+      ctx.beginPath(); ctx.arc(cx2, cy, gr, 0, Math.PI*2);
+      ctx.fillStyle = 'rgba(46,197,182,'+ga+')'; ctx.fill();
+    }
+
+    // main orb
+    var grad = ctx.createRadialGradient(cx2-orbR*0.22, cy-orbR*0.22, orbR*0.05, cx2, cy, orbR);
+    grad.addColorStop(0, isHolding ? 'rgba(46,197,182,0.88)' : 'rgba(46,197,182,0.55)');
+    grad.addColorStop(1, isHolding ? 'rgba(20,138,130,0.92)' : 'rgba(18,90,88,0.72)');
+    ctx.beginPath(); ctx.arc(cx2, cy, orbR, 0, Math.PI*2);
+    ctx.fillStyle = grad; ctx.fill();
+
+    // highlight
+    ctx.beginPath(); ctx.arc(cx2-orbR*0.26, cy-orbR*0.26, orbR*0.18, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,255,255,'+(0.10+pulseVal*0.08)+')'; ctx.fill();
+
+    // warm gold overlay
+    if (wm > 0.1) {
+      ctx.beginPath(); ctx.arc(cx2, cy, orbR, 0, Math.PI*2);
+      ctx.fillStyle = 'rgba(242,177,52,'+(wm*0.16)+')'; ctx.fill();
+    }
+  }
+
+  function drawTitle(now) {
+    var pulse = 0.35 + 0.35*Math.sin(now/2100);
+    drawOrb(W/2, H/2-30, pulse, false, 0);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.font = '800 38px -apple-system,Helvetica,Arial';
+    ctx.fillText('BREATH BEAT', W/2, 130);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = '500 15px -apple-system,Helvetica,Arial';
+    ctx.fillText('hold with the pulse · release with the rest', W/2, 158);
+    var a = 0.55 + 0.45*Math.sin(now/620);
+    ctx.globalAlpha = a; ctx.fillStyle = TEAL;
+    ctx.font = '700 17px -apple-system,Helvetica,Arial';
+    ctx.fillText('TAP TO BEGIN', W/2, 645); ctx.globalAlpha = 1;
+  }
+
+  function drawPlay(now) {
+    if (phase !== 'play') return;
+    var elapsed = now - cycleStart;
+    var cp  = cyclePhase(elapsed);
+    var pv  = orbPulse(elapsed);
+    var cx2 = W/2, cy = H/2 - 30;
+
+    drawOrb(cx2, cy, pv, holding, warmth);
+
+    // cycle progress ring
+    var orbR   = 90 + (150-90)*pv;
+    var ringR  = orbR + 26;
+    var cycleFrac = Math.min(1, elapsed / CYCLE);
+    ctx.beginPath();
+    ctx.arc(cx2, cy, ringR, -Math.PI/2, -Math.PI/2 + Math.PI*2*cycleFrac);
+    ctx.strokeStyle = (cp==='inhale'||cp==='hold') ? 'rgba(46,197,182,0.6)' : 'rgba(242,177,52,0.3)';
+    ctx.lineWidth = 2.5; ctx.lineCap = 'round'; ctx.stroke();
+
+    // cue label
+    var label = (cp==='inhale'||cp==='hold') ? 'HOLD' : 'RELEASE';
+    var labelCol = (cp==='inhale'||cp==='hold') ? TEAL : 'rgba(255,255,255,0.6)';
+    ctx.textAlign = 'center'; ctx.globalAlpha = 0.7;
+    ctx.fillStyle = labelCol;
+    ctx.font = '700 14px -apple-system,Helvetica,Arial';
+    ctx.fillText(label, cx2, cy + orbR + 20); ctx.globalAlpha = 1;
+
+    // score dots
+    var dotR = 5.5, dotSp = 22, total = TOTAL_CYCLES;
+    var startX = W/2 - ((total-1)*dotSp)/2;
+    for (var i = 0; i < total; i++) {
+      var filled = i < score;
+      var dx = startX + i*dotSp;
+      ctx.beginPath(); ctx.arc(dx, 84, dotR, 0, Math.PI*2);
+      if (filled) {
+        ctx.fillStyle = TEAL; ctx.globalAlpha = 0.9; ctx.fill(); ctx.globalAlpha = 1;
+      } else {
+        ctx.strokeStyle = 'rgba(46,197,182,0.28)'; ctx.lineWidth = 1.5; ctx.stroke();
+      }
+    }
+
+    // miss pips (top-right corner)
+    for (var m = 0; m < MAX_MISSES; m++) {
+      var bx = W - 28 - m*13, by = 94;
+      ctx.fillStyle = m < misses ? 'rgba(255,90,70,0.5)' : 'rgba(255,255,255,0.1)';
+      ctx.fillRect(bx, by, 8, 8);
+    }
+  }
+
+  function drawComplete(now) {
+    ctx.fillStyle = 'rgba(11,13,18,0.48)'; ctx.fillRect(0,0,W,H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = TEAL;
+    ctx.font = '800 44px -apple-system,Helvetica,Arial';
+    ctx.fillText('BALANCED', W/2, 300);
+    ctx.fillStyle = 'rgba(255,255,255,0.78)';
+    ctx.font = '600 18px -apple-system,Helvetica,Arial';
+    ctx.fillText('10 breath cycles matched', W/2, 338);
+    var a = 0.6+0.4*Math.sin(now/520);
+    ctx.globalAlpha = a; ctx.fillStyle = GOLD;
+    ctx.font = '700 15px -apple-system,Helvetica,Arial';
+    ctx.fillText('TAP TO BREATHE AGAIN', W/2, 490); ctx.globalAlpha = 1;
+  }
+
+  function drawOver(now) {
+    ctx.fillStyle = 'rgba(11,13,18,0.50)'; ctx.fillRect(0,0,W,H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(255,255,255,0.68)';
+    ctx.font = '800 36px -apple-system,Helvetica,Arial';
+    ctx.fillText('DRIFTED', W/2, 300);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = '600 16px -apple-system,Helvetica,Arial';
+    ctx.fillText(score+' of '+TOTAL_CYCLES+' cycles matched', W/2, 334);
+    ctx.fillStyle = TEAL;
+    ctx.font = '500 13px -apple-system,Helvetica,Arial';
+    ctx.fillText('hold with the pulse · release with the rest', W/2, 365);
+    var a = 0.55+0.45*Math.sin(now/580);
+    ctx.globalAlpha = a; ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.font = '700 15px -apple-system,Helvetica,Arial';
+    ctx.fillText('TAP TO TRY AGAIN', W/2, 430); ctx.globalAlpha = 1;
+  }
+
+  function drawCta(now) {
+    var t = (now - ctaStart)/1000;
+    var ease = Math.min(1, t*2.2);
+    ctx.fillStyle = 'rgba(11,13,18,'+(0.78*ease)+')'; ctx.fillRect(0,0,W,H);
+    ctx.globalAlpha = ease;
+
+    // soft background glow
+    var glow = ctx.createRadialGradient(W/2, H/2-40, 10, W/2, H/2-40, 180);
+    glow.addColorStop(0,'rgba(46,197,182,0.16)'); glow.addColorStop(1,'rgba(46,197,182,0)');
+    ctx.fillStyle = glow; ctx.fillRect(0,0,W,H);
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.font = '900 44px -apple-system,Helvetica,Arial';
+    ctx.fillText('BREATH BEAT', W/2, 300);
+    ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx.font = '500 18px -apple-system,Helvetica,Arial';
+    ctx.fillText('find your rhythm', W/2, 336);
+
+    var p = 0.75+0.25*Math.sin(now/500);
+    ctx.globalAlpha = ease*p; ctx.fillStyle = TEAL;
+    ctx.font = '800 26px -apple-system,Helvetica,Arial';
+    ctx.fillText('▶ REACH IT', W/2, 412);
+
+    ctx.globalAlpha = ease*0.65; ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.font = '600 14px -apple-system,Helvetica,Arial';
+    ctx.fillText('link in bio', W/2, 446);
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- kick off ----
+  resetState();
+  if (DEMO || BOT) startRun();
+  lastNow = performance.now();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

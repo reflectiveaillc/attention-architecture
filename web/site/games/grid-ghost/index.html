@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Grid Ghost — Tilt</title>
+<!--
+  LOOP / attention-architecture — Grid Ghost
+  Mechanic: Grid of symbols lights up briefly, then goes dark; tap the cells
+            that were lit, in any order. Wrong tap ends the round.
+  Engine: viral. Circuits: 01-rpe, 06-zeigarnik, 04-loss.
+  Modes:
+    ?demo=1&seed=7   mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N    imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'grid-ghost';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // grid layout: 4x4 grid, centered
+  var COLS = 4, ROWS = 4, CELL = 74, GAP = 8;
+  var GRID_W = COLS * CELL + (COLS - 1) * GAP;
+  var GRID_H = ROWS * CELL + (ROWS - 1) * GAP;
+  var GRID_X = (W - GRID_W) / 2;
+  var GRID_Y = H / 2 - GRID_H / 2 + 20;
+
+  // symbols for cells
+  var SYMBOLS = ['◆','●','▲','■','★','✦','◉','⬟'];
+
+  // juice state
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var flashes = [];
+  var dareBeaten = false;
+  var best = 0;
+  try { best = +localStorage.getItem('gg_best') || 0; } catch(_) {}
+
+  // game state
+  var state, runStartTs, botRunsDone = 0, ctaAt = 0;
+
+  // per-cell symbols (assigned once and kept stable)
+  var cellSymbols = [];
+  function assignSymbols() {
+    cellSymbols = [];
+    for (var i = 0; i < COLS * ROWS; i++) {
+      cellSymbols.push(SYMBOLS[Math.floor(rng() * SYMBOLS.length)]);
+    }
+  }
+
+  function newGame() {
+    assignSymbols();
+    dareBeaten = false;
+    state = {
+      phase: 'title',   // title | challenge | show | recall | over | cta
+      level: 1,
+      score: 0,
+      litCells: [],     // indices of cells that were lit
+      tapped: [],       // indices tapped so far this recall
+      showTimer: 0,     // countdown while pattern is visible (frames)
+      overAt: 0,
+      missCell: -1      // cell that caused failure (for flash)
+    };
+    flashes = [];
+    if (DEMO) {
+      state.phase = 'challenge';
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { startRun(); return; }
+    // human: title screen
+  }
+
+  function startRun() {
+    state.phase = 'show';
+    state.score = 0;
+    state.level = 1;
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    beginLevel();
+  }
+
+  function patternSize(level) {
+    // level 1: 2 cells, grows to max 10
+    return Math.min(2 + level, 10);
+  }
+
+  function showDuration(level) {
+    // ms to display the pattern: starts at 1800ms, reduces to 900ms
+    return Math.max(900, 1800 - level * 80);
+  }
+
+  function beginLevel() {
+    // pick random lit cells
+    var n = patternSize(state.level);
+    var pool = [];
+    for (var i = 0; i < COLS * ROWS; i++) pool.push(i);
+    // fisher-yates shuffle
+    for (var j = pool.length - 1; j > 0; j--) {
+      var k = Math.floor(rng() * (j + 1));
+      var tmp = pool[j]; pool[j] = pool[k]; pool[k] = tmp;
+    }
+    state.litCells = pool.slice(0, n);
+    state.tapped = [];
+    state.missCell = -1;
+    state.phase = 'show';
+    state.showTimer = showDuration(state.level);
+    if (window.J) J.tension(Math.min(state.level / 10, 1));
+  }
+
+  function endShow() {
+    state.phase = 'recall';
+    state.showTimer = 0;
+  }
+
+  function tapCell(idx) {
+    if (state.phase !== 'recall') return;
+    if (state.tapped.indexOf(idx) >= 0) return; // already tapped
+
+    if (state.litCells.indexOf(idx) >= 0) {
+      // correct
+      state.tapped.push(idx);
+      var combo = state.tapped.length;
+      if (window.J) J.hit(combo);
+      shakeAmt = 1.5;
+      flash('+' + combo, TEAL, 30);
+      if (window.LOOP) LOOP.emit('cell_correct', { level: state.level, n: combo });
+
+      if (state.tapped.length === state.litCells.length) {
+        // level complete!
+        state.score += state.litCells.length;
+        var perfect = (state.litCells.length >= 4);
+        if (perfect) {
+          hitStop = 5; zoom = 1.025;
+          if (window.J) J.perfect(state.level);
+          flash('PERFECT!', GOLD, 38);
+        } else {
+          if (window.J) J.gold();
+          flash('LEVEL ' + state.level + ' CLEAR', TEAL, 34);
+        }
+        if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+          dareBeaten = true;
+          flash('DARE BEATEN', TEAL, 40);
+          if (window.J) J.fanfare();
+          SHARE.beaten(state.score);
+        }
+        if (window.LOOP) LOOP.emit('level_complete', { level: state.level, score: state.score, cells: state.litCells.length });
+        state.level++;
+        setTimeout(function () { beginLevel(); }, 700);
+      }
+    } else {
+      // wrong tap — game over
+      state.missCell = idx;
+      shakeAmt = 9;
+      if (window.J) J.death(Math.min(0.3 + state.score / 30, 1));
+      if (window.LOOP) LOOP.emit('near_miss', { score: state.score });
+      gameOver();
+    }
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (newBest) {
+      best = state.score;
+      try { localStorage.setItem('gg_best', String(best)); } catch(_) {}
+      if (window.J) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (DEMO) window.__demoScore = state.score;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2500);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    assignSymbols();
+    state.score = 0; state.level = 1; state.tapped = []; state.litCells = []; state.missCell = -1;
+    flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 14))));
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 500, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function cellAt(px, py) {
+    for (var row = 0; row < ROWS; row++) {
+      for (var col = 0; col < COLS; col++) {
+        var cx_ = GRID_X + col * (CELL + GAP);
+        var cy_ = GRID_Y + row * (CELL + GAP);
+        if (px >= cx_ && px <= cx_ + CELL && py >= cy_ && py <= cy_ + CELL) {
+          return row * COLS + col;
+        }
+      }
+    }
+    return -1;
+  }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'recall') {
+      var idx = cellAt(px, py);
+      if (idx >= 0) tapCell(idx);
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'cells' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- bot/demo autopilot ----
+  // demo script: pre-planned tap sequences per level
+  // level1=2cells correct, level2=3cells correct, level3=4 cells then near-miss (wrong tap first),
+  // recovery on level4, then fail on level5
+  var demoPhase = 0;
+  // For demo: we track which level autopilot is on, and apply varied hesitation
+  var autoDelay = 0;
+  var demoNearFail = false; // trigger the near-fail arc
+  var demoPendingFail = false;
+  var botPassRate = 0.78; // bot correct rate per level
+
+  function autopilot() {
+    if (state.phase !== 'recall') return;
+    if (autoDelay > 0) { autoDelay--; return; }
+
+    if (DEMO) {
+      demoAutopilot();
+    } else if (BOT) {
+      botAutopilot();
+    }
+  }
+
+  // demo arc: levels 1-2 perfect, level 3 near-fail (wrong tap then immediate correct of remaining),
+  // level 4 recovery, level 5 intentional miss
+  function demoAutopilot() {
+    var lv = state.level - 1; // 0-indexed
+    var remaining = state.litCells.filter(function (c) { return state.tapped.indexOf(c) < 0; });
+
+    if (remaining.length === 0) return;
+
+    if (lv === 2 && !demoNearFail && state.tapped.length === 0) {
+      // near-fail: tap a wrong cell first
+      demoNearFail = true;
+      // find a cell NOT in litCells
+      var wrong = -1;
+      for (var i = 0; i < COLS * ROWS; i++) {
+        if (state.litCells.indexOf(i) < 0) { wrong = i; break; }
+      }
+      if (wrong >= 0) {
+        autoDelay = 45; // pause before mis-tap (tension)
+        setTimeout(function () {
+          // This will trigger game over — that's the near-fail
+          tapCell(wrong);
+        }, 0);
+        return;
+      }
+    }
+
+    if (lv >= 4 && state.tapped.length === state.litCells.length - 1) {
+      // final level, second-to-last tap: pause dramatically, then WRONG tap
+      autoDelay = 60;
+      var wrongCell = -1;
+      for (var ii = 0; ii < COLS * ROWS; ii++) {
+        if (state.litCells.indexOf(ii) < 0 && state.tapped.indexOf(ii) < 0) {
+          wrongCell = ii; break;
+        }
+      }
+      if (wrongCell >= 0) {
+        setTimeout(function () { tapCell(wrongCell); }, 0);
+        return;
+      }
+    }
+
+    // tap next correct cell with hesitation
+    var nextCell = remaining[0];
+    // hesitation: 20-55 frames
+    var wait = 20 + Math.floor(rng() * 35);
+    autoDelay = wait;
+    setTimeout(function () { tapCell(nextCell); }, 0);
+  }
+
+  function botAutopilot() {
+    var remaining = state.litCells.filter(function (c) { return state.tapped.indexOf(c) < 0; });
+    if (remaining.length === 0) return;
+
+    // imperfect: sometimes tap wrong cell
+    var doWrong = rng() < (1 - botPassRate) && remaining.length <= 2;
+    var wait = 15 + Math.floor(rng() * 30);
+    autoDelay = wait;
+
+    if (doWrong) {
+      // pick a wrong cell
+      var wrong = -1;
+      for (var i = 0; i < COLS * ROWS; i++) {
+        if (state.litCells.indexOf(i) < 0) { wrong = i; break; }
+      }
+      if (wrong >= 0) {
+        setTimeout(function () { tapCell(wrong); }, 0);
+        return;
+      }
+    }
+
+    var nextCell = remaining[Math.floor(rng() * remaining.length)];
+    setTimeout(function () { tapCell(nextCell); }, 0);
+  }
+
+  // ---- render ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // show timer countdown
+    if (state.phase === 'show') {
+      state.showTimer -= dt * 16.667;
+      if (state.showTimer <= 0) endShow();
+    }
+
+    // autopilot tick
+    if ((DEMO || BOT) && state.phase === 'recall') {
+      if (hitStop > 0) {
+        hitStop -= dt;
+      } else {
+        autopilot();
+      }
+    }
+
+    // juice decay
+    if (hitStop > 0) hitStop -= dt; else { /* nothing extra needed */ }
+    shakeAmt *= Math.pow(0.84, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- title screen ----
+    if (state.phase === 'title') {
+      drawTitle(now);
+    }
+
+    // ---- challenge card (demo beat 1) ----
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('27', W / 2, 405);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top memory run", W / 2, 435);
+    }
+
+    // ---- show phase: grid lit up ----
+    if (state.phase === 'show' || state.phase === 'recall') {
+      drawHUD();
+      drawGrid(now);
+    }
+
+    // ---- game over ----
+    if (state.phase === 'over') {
+      drawHUD();
+      drawGrid(now); // shows the reveal
+      drawOver(now);
+    }
+
+    // ---- CTA (demo) ----
+    if (state.phase === 'cta') {
+      drawGrid(now);
+      drawCTA(now);
+    }
+
+    // ---- floating flash texts ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 230 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '900 44px -apple-system, Helvetica, Arial';
+    cx.fillText('GRID GHOST', W / 2, 260);
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.font = '500 15px -apple-system, Helvetica, Arial';
+    cx.fillText('remember the pattern', W / 2, 295);
+    cx.fillText("tap what lit up", W / 2, 315);
+
+    // draw a tiny example grid
+    var miniCell = 40, miniGap = 5, miniCols = 4;
+    var mx = W/2 - (miniCols * miniCell + (miniCols-1)*miniGap)/2;
+    var my = 360;
+    for (var r = 0; r < 3; r++) {
+      for (var col = 0; col < miniCols; col++) {
+        var isLit = (r === 0 && col === 1) || (r === 1 && col === 3) || (r === 2 && col === 0);
+        var cellX = mx + col * (miniCell + miniGap);
+        var cellY = my + r * (miniCell + miniGap);
+        cx.fillStyle = isLit ? TEAL : 'rgba(255,255,255,0.07)';
+        cx.globalAlpha = isLit ? 0.8 : 1;
+        roundRect(cx, cellX, cellY, miniCell, miniCell, 8);
+        cx.fill();
+        cx.globalAlpha = 1;
+      }
+    }
+
+    var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+    cx.globalAlpha = pulse;
+    cx.fillStyle = VERM;
+    cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO PLAY', W / 2, 530);
+    cx.globalAlpha = 1;
+  }
+
+  function drawHUD() {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.92)';
+    cx.font = '800 56px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score, W / 2, 86);
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + best, W / 2, 110);
+
+    // level indicator
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '700 13px Menlo, monospace';
+    cx.fillText('LEVEL ' + state.level + '  ·  ' + state.litCells.length + ' CELLS', W / 2, 136);
+
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase !== 'over') {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 158);
+    }
+  }
+
+  function drawGrid(now) {
+    for (var row = 0; row < ROWS; row++) {
+      for (var col = 0; col < COLS; col++) {
+        var idx = row * COLS + col;
+        var cx_ = GRID_X + col * (CELL + GAP);
+        var cy_ = GRID_Y + row * (CELL + GAP);
+
+        var isLit = state.litCells.indexOf(idx) >= 0;
+        var isTapped = state.tapped.indexOf(idx) >= 0;
+        var isMiss = idx === state.missCell;
+        var isRevealed = (state.phase === 'over') && isLit && !isTapped; // show what they missed
+
+        // cell background
+        var alpha = 1;
+        if (state.phase === 'show') {
+          if (isLit) {
+            cx.fillStyle = TEAL;
+            // pulsing glow on lit cells
+            var pulse = 0.85 + 0.15 * Math.sin(now / 200 + idx);
+            cx.globalAlpha = pulse;
+          } else {
+            cx.fillStyle = 'rgba(255,255,255,0.07)';
+            cx.globalAlpha = 1;
+          }
+        } else if (state.phase === 'recall') {
+          if (isTapped) {
+            cx.fillStyle = TEAL;
+            cx.globalAlpha = 0.9;
+          } else if (isMiss) {
+            cx.fillStyle = VERM;
+            cx.globalAlpha = 1;
+          } else {
+            cx.fillStyle = 'rgba(255,255,255,0.07)';
+            cx.globalAlpha = 1;
+          }
+        } else if (state.phase === 'over' || state.phase === 'cta') {
+          if (isTapped) {
+            cx.fillStyle = TEAL;
+            cx.globalAlpha = 0.7;
+          } else if (isMiss) {
+            cx.fillStyle = VERM;
+            cx.globalAlpha = 0.9;
+          } else if (isRevealed) {
+            cx.fillStyle = GOLD;
+            cx.globalAlpha = 0.55;
+          } else {
+            cx.fillStyle = 'rgba(255,255,255,0.05)';
+            cx.globalAlpha = 1;
+          }
+        } else {
+          cx.fillStyle = 'rgba(255,255,255,0.07)';
+          cx.globalAlpha = 1;
+        }
+
+        roundRect(cx, cx_, cy_, CELL, CELL, 12);
+        cx.fill();
+        cx.globalAlpha = 1;
+
+        // cell border
+        cx.strokeStyle = (isLit && state.phase === 'show') ? 'rgba(46,197,182,0.6)' : 'rgba(255,255,255,0.08)';
+        cx.lineWidth = 1.5;
+        roundRect(cx, cx_, cy_, CELL, CELL, 12);
+        cx.stroke();
+
+        // symbol inside cell (show phase: dim; recall phase: just border)
+        var sym = cellSymbols[idx] || '◆';
+        if (state.phase === 'show') {
+          cx.textAlign = 'center';
+          cx.fillStyle = isLit ? 'rgba(11,13,18,0.7)' : 'rgba(255,255,255,0.12)';
+          cx.font = '700 26px -apple-system, Helvetica, Arial';
+          cx.globalAlpha = 1;
+          cx.fillText(sym, cx_ + CELL / 2, cy_ + CELL / 2 + 9);
+        } else if (state.phase === 'recall') {
+          // dim ghost of symbol in unlit cells for reference
+          cx.textAlign = 'center';
+          if (isTapped) {
+            cx.fillStyle = 'rgba(11,13,18,0.8)';
+          } else {
+            cx.fillStyle = 'rgba(255,255,255,0.06)';
+          }
+          cx.font = '700 26px -apple-system, Helvetica, Arial';
+          cx.globalAlpha = 1;
+          cx.fillText(sym, cx_ + CELL / 2, cy_ + CELL / 2 + 9);
+        } else if (isRevealed || isMiss || isTapped) {
+          cx.textAlign = 'center';
+          cx.fillStyle = isMiss ? 'rgba(255,255,255,0.9)' : 'rgba(11,13,18,0.7)';
+          cx.font = '700 26px -apple-system, Helvetica, Arial';
+          cx.globalAlpha = 1;
+          cx.fillText(sym, cx_ + CELL / 2, cy_ + CELL / 2 + 9);
+        }
+      }
+    }
+
+    // progress indicator: circles showing how many tapped vs total
+    if (state.phase === 'recall' || state.phase === 'show') {
+      var dotsY = GRID_Y + GRID_H + 28;
+      var n = state.litCells.length;
+      var dotR = 5, dotGap = 14;
+      var dotsStartX = W / 2 - (n * dotGap) / 2 + dotGap / 2;
+      for (var d = 0; d < n; d++) {
+        var done = d < state.tapped.length;
+        cx.beginPath();
+        cx.arc(dotsStartX + d * dotGap, dotsY, dotR, 0, Math.PI * 2);
+        cx.fillStyle = done ? TEAL : 'rgba(255,255,255,0.2)';
+        cx.fill();
+      }
+    }
+
+    // "MEMORIZE!" or "TAP THE LIT CELLS" instructions
+    if (state.phase === 'show') {
+      var remain = Math.ceil(state.showTimer / 1000);
+      cx.textAlign = 'center';
+      cx.fillStyle = GOLD;
+      cx.font = '700 15px Menlo, monospace';
+      cx.globalAlpha = 0.9;
+      cx.fillText('MEMORIZE  ' + remain + 's', W / 2, GRID_Y - 18);
+      cx.globalAlpha = 1;
+    } else if (state.phase === 'recall') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('tap what lit up', W / 2, GRID_Y - 18);
+    }
+  }
+
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.6)';
+    cx.fillRect(0, 0, W, H);
+
+    cx.textAlign = 'center';
+    cx.fillStyle = VERM;
+    cx.font = '900 38px -apple-system, Helvetica, Arial';
+    cx.fillText('WRONG CELL.', W / 2, 300);
+    cx.fillStyle = '#fff';
+    cx.font = '800 24px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score + ' cells', W / 2, 338);
+
+    var pt = pctTop(state.score);
+    cx.fillStyle = GOLD;
+    cx.font = '900 22px -apple-system, Helvetica, Arial';
+    cx.fillText('TOP ' + pt + '% TODAY', W / 2, 378);
+    cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 400);
+
+    if (!DEMO && !BOT) {
+      var pulse = 0.6 + 0.4 * Math.sin(now / 290);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — ONE MORE TRY', W / 2, 450);
+      cx.globalAlpha = 1;
+      // share pill
+      cx.fillStyle = 'rgba(242,177,52,0.13)';
+      cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+      roundRect(cx, SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = GOLD;
+      cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+    }
+  }
+
+  function drawCTA(now) {
+    var t = (now - ctaAt) / 1000;
+    var ease = Math.min(1, t * 2.2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+    cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease;
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff';
+    cx.font = '900 44px -apple-system, Helvetica, Arial';
+    cx.fillText('GRID GHOST', W / 2, 300);
+    cx.fillStyle = 'rgba(255,255,255,0.7)';
+    cx.font = '700 19px -apple-system, Helvetica, Arial';
+    cx.fillText('they scored ' + (window.__demoScore || 27) + ' cells.', W / 2, 340);
+    var p3 = 0.7 + 0.3 * Math.sin(now / 250);
+    cx.fillStyle = VERM;
+    cx.globalAlpha = ease * p3;
+    cx.font = '900 28px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ BEAT ' + (window.__demoScore || 27), W / 2, 402);
+    cx.globalAlpha = ease;
+    cx.fillStyle = TEAL;
+    cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 432);
+    cx.globalAlpha = 1;
+  }
+
+  function roundRect(ctx, x, y, w, h, r) {
+    if (ctx.roundRect) {
+      ctx.beginPath();
+      ctx.roundRect(x, y, w, h, r);
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.lineTo(x + w - r, y);
+      ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+      ctx.lineTo(x + w, y + h - r);
+      ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      ctx.lineTo(x + r, y + h);
+      ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+      ctx.lineTo(x, y + r);
+      ctx.quadraticCurveTo(x, y, x + r, y);
+      ctx.closePath();
+    }
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

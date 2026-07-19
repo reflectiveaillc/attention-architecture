@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Word Span — Tilt</title>
+<!--
+  LOOP / attention-architecture — Word Span
+  Circuits: 01-rpe (variable word difficulty), 06-zeigarnik (one more round),
+            03-social (benchmark ego bait — 'I hit 9, what's yours?')
+  Modes:
+    ?demo=1&seed=7        mirror-neuron clip: challenge → human play → near-fail → fail → score → CTA
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'word-span';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- word pool ----
+  var WORD_POOL = [
+    'AMBER','BLAZE','CHESS','DRIFT','EMBER','FLAIR','GLOOM','HASTE',
+    'IVORY','JUMBLE','KNACK','LUNAR','MIRTH','NOBLE','OPTIC','PLUSH',
+    'QUIRK','REIGN','STARK','THRUM','ULTRA','VALOR','WHIRL','XENON',
+    'YIELD','ZEAL','BRAID','CLEFT','DWARF','ENVY','FROST','GRAZE',
+    'HAVEN','INGOT','JOUST','KARMA','LATCH','MAVEN','NEXUS','ORBIT',
+    'PIXEL','QUILL','RIDGE','SCOUT','THORN','UMBER','VOILA','WALTZ',
+    'EXILE','FORGE','GNASH','HOVER','IMPLY','JOIST','KNOLL','LEECH',
+    'MOCHA','NOTCH','OXIDE','PERCH','QUAFF','RAVEN','SCONE','TWIRL'
+  ];
+
+  function shuffle(arr) {
+    var a = arr.slice();
+    for (var i = a.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+    }
+    return a;
+  }
+
+  // ---- state ----
+  var phase;        // 'title' | 'show' | 'pick' | 'feedback' | 'over' | 'cta' | 'challenge'
+  var roundWords;   // words shown this round
+  var allWords;     // shown + distractors (randomised)
+  var selected;     // set of words player tapped
+  var span;         // current span size
+  var score;        // correct spans completed
+  var feedbackOk;
+  var feedbackTimer;
+  var showTimer;
+  var overAt;
+  var ctaAt;
+  var runStartTs;
+  var dareBeaten = false;
+  var best = 0;
+  var flashes = [];
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var challengeAt = 0;
+  try { best = +localStorage.getItem('ws_best') || 0; } catch (_) {}
+
+  function pctTop(s) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-s / 6)))); }
+
+  // ---- layout helpers ----
+  // Grid: 3 columns of word buttons
+  var COLS = 3, CELL_W = 120, CELL_H = 50, CELL_PAD = 8;
+  var GRID_X = (W - COLS * CELL_W - (COLS - 1) * CELL_PAD) / 2;
+  var GRID_Y = 300;
+
+  function cellRect(idx) {
+    var col = idx % COLS, row = Math.floor(idx / COLS);
+    return {
+      x: GRID_X + col * (CELL_W + CELL_PAD),
+      y: GRID_Y + row * (CELL_H + CELL_PAD),
+      w: CELL_W, h: CELL_H
+    };
+  }
+
+  var SHARE_R = { x: W / 2 - 125, y: 550, w: 250, h: 46 };
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---- game logic ----
+  function newGame() {
+    rng = mulberry32(SEED);   // reset RNG for determinism
+    span = 3; score = 0; dareBeaten = false; flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(function () { startRun(); }, 1250);
+      return;
+    }
+    if (BOT) { startRun(); return; }
+    phase = 'title';
+  }
+
+  function startRun() {
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    nextRound();
+  }
+
+  function nextRound() {
+    var pool = shuffle(WORD_POOL);
+    roundWords = pool.slice(0, span);
+    // distractors: span * 1.5 additional words (min 3, max fills to 9 for 3x3 grid)
+    var needed = Math.max(9, span + Math.ceil(span * 1.5));
+    needed = Math.min(needed, WORD_POOL.length);
+    var distCount = needed - span;
+    var distractors = pool.slice(span, span + distCount);
+    allWords = shuffle(roundWords.concat(distractors));
+    // trim to 9 for grid display
+    if (allWords.length > 9) allWords = allWords.slice(0, 9);
+    // ensure all roundWords appear in allWords
+    for (var i = 0; i < roundWords.length; i++) {
+      if (allWords.indexOf(roundWords[i]) < 0) {
+        allWords[allWords.length - 1] = roundWords[i];
+      }
+    }
+    allWords = shuffle(allWords);
+    selected = {};
+    showTimer = 3.0;   // seconds to show
+    phase = 'show';
+  }
+
+  function checkAnswer() {
+    var correct = true;
+    for (var i = 0; i < roundWords.length; i++) {
+      if (!selected[roundWords[i]]) { correct = false; break; }
+    }
+    // also penalise wrong taps
+    var selectedArr = Object.keys(selected);
+    for (var j = 0; j < selectedArr.length; j++) {
+      if (roundWords.indexOf(selectedArr[j]) < 0) { correct = false; break; }
+    }
+    return correct;
+  }
+
+  function submitAnswer() {
+    if (phase !== 'pick') return;
+    var ok = checkAnswer();
+    feedbackOk = ok;
+    feedbackTimer = ok ? 60 : 70;   // frames
+    phase = 'feedback';
+
+    if (ok) {
+      score++;
+      if (window.J) {
+        if (span >= 7) J.perfect(score);
+        else J.hit(score);
+        J.tension(Math.min(score / 12, 1));
+      }
+      hitStop = ok ? 4 : 0;
+      if (span >= 7) { zoom = 1.04; }
+      flash('CORRECT!', TEAL, 42);
+      if (window.LOOP) LOOP.emit('word_span_correct', { span: span, score: score });
+      span++;
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', GOLD, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(score);
+      }
+    } else {
+      // miss
+      shakeAmt = 8;
+      if (window.J) {
+        J.near();
+        J.death(Math.min(0.3 + score / 12, 1));
+      }
+      flash('MISS', VERM, 48);
+      if (window.LOOP) LOOP.emit('near_miss', { span: span, score: score });
+      if (window.LOOP) LOOP.emit('word_span_miss', { span: span, score: score });
+    }
+  }
+
+  function endRound(ok) {
+    if (ok) {
+      nextRound();
+    } else {
+      gameOver();
+    }
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = score > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + score / 12, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (newBest) { best = score; try { localStorage.setItem('ws_best', String(best)); } catch (_) {} }
+    if (DEMO) { window.__demoScore = score; }
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2500);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 800);
+    }
+  }
+
+  function resetRun() {
+    span = 3; score = 0; flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- input ----
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && !DEMO && !BOT && window.J && inR(MUTE_R, x, y)) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'pick') {
+      // tap a word cell
+      for (var i = 0; i < allWords.length; i++) {
+        var r = cellRect(i);
+        if (x !== undefined && inR(r, x, y)) {
+          var w = allWords[i];
+          selected[w] = !selected[w];
+          if (window.J) J.hit(1);
+          return;
+        }
+      }
+      // tap submit button
+      var sub = submitRect();
+      if (x !== undefined && inR(sub, x, y)) {
+        submitAnswer();
+        return;
+      }
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'words' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  function submitRect() {
+    var rows = Math.ceil(allWords.length / COLS);
+    var gridBottom = GRID_Y + rows * (CELL_H + CELL_PAD);
+    return { x: W / 2 - 90, y: gridBottom + 16, w: 180, h: 46 };
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilot ----
+  var demoStep = 0;
+  // demo script: each entry is {correct: bool, delay_frames}
+  // arc: 3 correct → sliver near-fail (wrong tap then quick save) → correct again → miss = spectacle
+  var demoScript = [
+    { correct: true,  wait: 55 },  // round 1 (span 3)
+    { correct: true,  wait: 65 },  // round 2 (span 4)
+    { correct: true,  wait: 75 },  // round 3 (span 5) — getting harder
+    { correct: true,  wait: 90 },  // round 4 (span 6) — near-fail hesitation
+    { correct: false, wait: 100 }  // round 5 (span 7) — the real fail
+  ];
+  var demoWait = 0, demoActed = false;
+
+  var botRunsDone = 0;
+  var BOT_ACC = [1, 1, 1, 0.9, 0.7, 0.5, 0.3]; // accuracy by round index
+
+  function autopilot() {
+    if (DEMO) {
+      demoPilot();
+    } else if (BOT) {
+      botPilot();
+    }
+  }
+
+  function demoPilot() {
+    if (phase === 'show') { demoActed = false; return; }
+    if (phase !== 'pick') return;
+    if (demoActed) return;
+    demoWait--;
+    if (demoWait > 0) return;
+    var step = demoScript[Math.min(demoStep, demoScript.length - 1)];
+    if (step.correct) {
+      // tap all correct words
+      for (var i = 0; i < roundWords.length; i++) selected[roundWords[i]] = true;
+    } else {
+      // tap most but miss one, simulate near-fail with a wrong pick
+      for (var i = 0; i < roundWords.length - 1; i++) selected[roundWords[i]] = true;
+      // add a distractor
+      for (var j = 0; j < allWords.length; j++) {
+        if (roundWords.indexOf(allWords[j]) < 0) { selected[allWords[j]] = true; break; }
+      }
+    }
+    demoActed = true;
+    demoStep++;
+    submitAnswer();
+  }
+
+  function demoPilotReset() { demoWait = 0; demoActed = false; }
+
+  var botRound = 0;
+  var botActed = false;
+  var botWait = 0;
+
+  function botPilot() {
+    if (phase === 'show') { botActed = false; return; }
+    if (phase !== 'pick') return;
+    if (botActed) return;
+    botWait--;
+    if (botWait > 0) return;
+    var acc = (botRound < BOT_ACC.length) ? BOT_ACC[botRound] : 0.2;
+    // select correct words with probability acc
+    for (var i = 0; i < roundWords.length; i++) {
+      if (rng() < acc) selected[roundWords[i]] = true;
+    }
+    // maybe add a distractor
+    if (rng() > acc) {
+      for (var j = 0; j < allWords.length; j++) {
+        if (roundWords.indexOf(allWords[j]) < 0 && rng() > 0.5) {
+          selected[allWords[j]] = true; break;
+        }
+      }
+    }
+    botActed = true;
+    botRound++;
+    submitAnswer();
+  }
+
+  // ---- render ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // tick timers
+    if (phase === 'show') {
+      showTimer -= dt / 60;
+      if (showTimer <= 0) {
+        // transition to pick
+        phase = 'pick';
+        demoWait = demoScript[Math.min(demoStep, demoScript.length - 1)].wait;
+        botWait = 30 + Math.floor(rng() * 30);
+      }
+    }
+    if (phase === 'feedback') {
+      feedbackTimer -= dt;
+      if (feedbackTimer <= 0) {
+        endRound(feedbackOk);
+        if (DEMO) demoPilotReset();
+        if (BOT) { botActed = false; botWait = 20 + Math.floor(rng() * 20); }
+      }
+    }
+
+    // decay juice
+    if (hitStop > 0) hitStop -= dt; else { /* autopilot runs below */ }
+    shakeAmt *= Math.pow(0.84, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // autopilot only fires when not frozen
+    if (hitStop <= 0) autopilot();
+
+    // juice transform wrapper
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // ---- draw phase ----
+    if (phase === 'title') {
+      drawTitle(now);
+    } else if (phase === 'challenge') {
+      drawChallenge(now);
+    } else if (phase === 'show') {
+      drawShowPhase(now);
+    } else if (phase === 'pick') {
+      drawPickPhase(now);
+    } else if (phase === 'feedback') {
+      drawFeedback(now);
+    } else if (phase === 'over') {
+      drawOver(now);
+    } else if (phase === 'cta') {
+      drawCTA(now);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + Math.round(fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 260 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // mute toggle
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawTitle(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+    cx.fillText('WORD SPAN', W / 2, 270);
+    cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '600 15px -apple-system, Helvetica, Arial';
+    cx.fillText('memorize the words — then find them', W / 2, 310);
+    cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + best + ' words', W / 2, 340);
+    var p = 0.6 + 0.4 * Math.sin(now / 300);
+    cx.globalAlpha = p; cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+    cx.fillText('TAP TO START', W / 2, 400); cx.globalAlpha = 1;
+  }
+
+  function drawChallenge(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+    cx.fillText('SCORE TO BEAT', W / 2, 295);
+    cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+    cx.fillText('9', W / 2, 398);
+    cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+    cx.fillText("today's best memory", W / 2, 432);
+  }
+
+  function drawShowPhase(now) {
+    // header
+    cx.textAlign = 'center';
+    cx.fillStyle = GOLD; cx.font = '700 13px Menlo, monospace';
+    cx.fillText('MEMORIZE — round ' + (score + 1) + '  (' + span + ' words)', W / 2, 80);
+
+    // countdown bar
+    var barW = 260, barX = (W - barW) / 2, barY = 96;
+    cx.fillStyle = 'rgba(255,255,255,0.1)'; cx.fillRect(barX, barY, barW, 5);
+    cx.fillStyle = GOLD;
+    cx.fillRect(barX, barY, barW * Math.max(0, showTimer / 3.0), 5);
+
+    // score
+    cx.fillStyle = 'rgba(255,255,255,0.92)'; cx.font = '800 60px -apple-system, Helvetica, Arial';
+    cx.fillText(score, W / 2, 190);
+    cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + best, W / 2, 210);
+
+    // word list centered
+    var startY = 290 - span * 28;
+    for (var i = 0; i < roundWords.length; i++) {
+      var alpha = Math.min(1, (3.0 - showTimer) * 3 + 0.1);
+      cx.globalAlpha = alpha;
+      cx.fillStyle = '#fff'; cx.font = '700 26px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText(roundWords[i], W / 2, startY + i * 56);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawPickPhase(now) {
+    cx.textAlign = 'center';
+    cx.fillStyle = TEAL; cx.font = '700 14px Menlo, monospace';
+    cx.fillText('PICK ' + span + ' WORDS YOU SAW', W / 2, 80);
+
+    // selected count indicator
+    var selCount = Object.keys(selected).length;
+    cx.fillStyle = selCount === span ? GOLD : 'rgba(255,255,255,0.4)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText(selCount + ' / ' + span + ' selected', W / 2, 100);
+
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 122);
+    }
+
+    // score
+    cx.fillStyle = 'rgba(255,255,255,0.92)'; cx.font = '800 54px -apple-system, Helvetica, Arial';
+    cx.fillText(score, W / 2, 195);
+    cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + best, W / 2, 214);
+
+    // word grid
+    for (var i = 0; i < allWords.length; i++) {
+      var r = cellRect(i);
+      var word = allWords[i];
+      var isSel = !!selected[word];
+      cx.fillStyle = isSel ? TEAL : 'rgba(255,255,255,0.07)';
+      cx.strokeStyle = isSel ? TEAL : 'rgba(255,255,255,0.18)';
+      cx.lineWidth = isSel ? 2 : 1;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(r.x, r.y, r.w, r.h, 8);
+      else cx.rect(r.x, r.y, r.w, r.h);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = isSel ? INK : 'rgba(255,255,255,0.85)';
+      cx.textAlign = 'center'; cx.font = '700 13px -apple-system, Helvetica, Arial';
+      cx.fillText(word, r.x + r.w / 2, r.y + r.h / 2 + 5);
+    }
+
+    // submit button
+    var sub = submitRect();
+    var isReady = Object.keys(selected).length === span;
+    cx.fillStyle = isReady ? VERM : 'rgba(255,255,255,0.07)';
+    cx.strokeStyle = isReady ? VERM : 'rgba(255,255,255,0.18)';
+    cx.lineWidth = 1.5;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(sub.x, sub.y, sub.w, sub.h, 23);
+    else cx.rect(sub.x, sub.y, sub.w, sub.h);
+    cx.fill(); cx.stroke();
+    cx.fillStyle = isReady ? '#fff' : 'rgba(255,255,255,0.3)';
+    cx.textAlign = 'center'; cx.font = '800 15px -apple-system, Helvetica, Arial';
+    cx.fillText('SUBMIT', sub.x + sub.w / 2, sub.y + sub.h / 2 + 5);
+  }
+
+  function drawFeedback(now) {
+    var ok = feedbackOk;
+    cx.textAlign = 'center';
+
+    // dim grid
+    for (var i = 0; i < allWords.length; i++) {
+      var r = cellRect(i);
+      var word = allWords[i];
+      var isTarget = roundWords.indexOf(word) >= 0;
+      var isSel = !!selected[word];
+      var hit = isTarget && isSel;
+      var wrong = !isTarget && isSel;
+      var missed = isTarget && !isSel;
+      cx.fillStyle = hit ? 'rgba(46,197,182,0.3)' : wrong ? 'rgba(232,80,46,0.3)' : missed ? 'rgba(242,177,52,0.15)' : 'rgba(255,255,255,0.04)';
+      cx.strokeStyle = hit ? TEAL : wrong ? VERM : missed ? GOLD : 'rgba(255,255,255,0.1)';
+      cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(r.x, r.y, r.w, r.h, 8);
+      else cx.rect(r.x, r.y, r.w, r.h);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = hit ? TEAL : wrong ? VERM : missed ? GOLD : 'rgba(255,255,255,0.3)';
+      cx.textAlign = 'center'; cx.font = '700 13px -apple-system, Helvetica, Arial';
+      cx.fillText(word, r.x + r.w / 2, r.y + r.h / 2 + 5);
+    }
+
+    cx.fillStyle = ok ? TEAL : VERM;
+    cx.font = '900 36px -apple-system, Helvetica, Arial';
+    cx.fillText(ok ? 'CORRECT!' : 'MISS', W / 2, 248);
+    if (!ok) {
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('span of ' + span + ' words', W / 2, 278);
+    }
+  }
+
+  function drawOver(now) {
+    cx.fillStyle = 'rgba(11,13,18,0.60)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = VERM; cx.font = '900 42px -apple-system, Helvetica, Arial';
+    cx.fillText('SPAN: ' + score, W / 2, 290);
+    cx.fillStyle = '#fff'; cx.font = '800 22px -apple-system, Helvetica, Arial';
+    cx.fillText(score + ' word' + (score !== 1 ? 's' : '') + ' remembered', W / 2, 330);
+    var pt = pctTop(score);
+    cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+    cx.fillText('TOP ' + pt + '% TODAY', W / 2, 374);
+    cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 400);
+    if (!DEMO && !BOT) {
+      var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+      cx.globalAlpha = p2; cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP — ONE MORE TRY', W / 2, 455); cx.globalAlpha = 1;
+      // share pill
+      cx.fillStyle = 'rgba(242,177,52,0.14)';
+      cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+      else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+      cx.fill(); cx.stroke();
+      cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+    }
+  }
+
+  function drawCTA(now) {
+    var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+    cx.fillStyle = 'rgba(11,13,18,' + (0.80 * ease) + ')'; cx.fillRect(0, 0, W, H);
+    cx.globalAlpha = ease; cx.textAlign = 'center';
+    cx.fillStyle = '#fff'; cx.font = '900 48px -apple-system, Helvetica, Arial';
+    cx.fillText('WORD SPAN', W / 2, 298);
+    cx.fillStyle = 'rgba(255,255,255,0.7)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+    cx.fillText('I hit ' + (window.__demoScore || 5) + '. what\'s yours?', W / 2, 340);
+    var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+    cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+    cx.font = '900 30px -apple-system, Helvetica, Arial';
+    cx.fillText('▶ BEAT ' + (window.__demoScore || 5), W / 2, 408);
+    cx.globalAlpha = ease;
+    cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+    cx.fillText('link in bio', W / 2, 440);
+    cx.globalAlpha = 1;
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

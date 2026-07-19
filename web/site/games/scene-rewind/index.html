@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Scene Rewind — Tilt</title>
+<!--
+  LOOP / attention-architecture — Scene Rewind
+  Circuits: 01-rpe (variable reward), 02-novelty (changed objects), 06-zeigarnik (one more try).
+  Modes:
+    ?demo=1&seed=7    scripted demo clip, sets window.__demoDone
+    ?bot=1&runs=N     imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'scene-rewind';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- Object library (drawn with canvas primitives, no images) ----
+  // Each object has: id, label, draw(cx, x, y, size, col)
+  var OBJS = [
+    { id: 'sun',       col: GOLD,   draw: drawSun },
+    { id: 'moon',      col: '#c8d4e8', draw: drawMoon },
+    { id: 'star',      col: GOLD,   draw: drawStar },
+    { id: 'cloud',     col: '#dce8f0', draw: drawCloud },
+    { id: 'tree',      col: '#2ec5b6', draw: drawTree },
+    { id: 'flower',    col: VERM,   draw: drawFlower },
+    { id: 'mushroom',  col: VERM,   draw: drawMushroom },
+    { id: 'cactus',    col: '#5ecb6b', draw: drawCactus },
+    { id: 'bird',      col: '#9ec5f2', draw: drawBird },
+    { id: 'fish',      col: '#2ec5b6', draw: drawFish },
+    { id: 'heart',     col: VERM,   draw: drawHeart },
+    { id: 'diamond',   col: '#9ec5f2', draw: drawDiamond },
+    { id: 'crown',     col: GOLD,   draw: drawCrown },
+    { id: 'lightning', col: GOLD,   draw: drawLightning },
+    { id: 'drop',      col: '#5bb8f0', draw: drawDrop },
+    { id: 'leaf',      col: '#5ecb6b', draw: drawLeaf },
+    { id: 'gem',       col: TEAL,   draw: drawGem },
+    { id: 'flame',     col: VERM,   draw: drawFlame },
+    { id: 'snowflake', col: '#c8d4e8', draw: drawSnowflake },
+    { id: 'butterfly', col: '#c584e8', draw: drawButterfly },
+    { id: 'rocket',    col: VERM,   draw: drawRocket },
+    { id: 'bell',      col: GOLD,   draw: drawBell },
+    { id: 'anchor',    col: '#9ec5f2', draw: drawAnchor },
+    { id: 'key',       col: GOLD,   draw: drawKey },
+  ];
+
+  // Drawing functions
+  function drawSun(cx, x, y, s) {
+    cx.beginPath(); cx.arc(x, y, s * 0.32, 0, Math.PI * 2); cx.fill();
+    for (var i = 0; i < 8; i++) {
+      var a = (i / 8) * Math.PI * 2;
+      cx.beginPath();
+      cx.moveTo(x + Math.cos(a) * s * 0.40, y + Math.sin(a) * s * 0.40);
+      cx.lineTo(x + Math.cos(a) * s * 0.50, y + Math.sin(a) * s * 0.50);
+      cx.lineWidth = s * 0.09; cx.strokeStyle = cx.fillStyle; cx.stroke();
+    }
+  }
+  function drawMoon(cx, x, y, s) {
+    cx.beginPath(); cx.arc(x, y, s * 0.35, 0, Math.PI * 2); cx.fill();
+    cx.save(); cx.fillStyle = INK;
+    cx.beginPath(); cx.arc(x + s * 0.12, y - s * 0.06, s * 0.27, 0, Math.PI * 2); cx.fill();
+    cx.restore();
+  }
+  function drawStar(cx, x, y, s) {
+    var pts = 5, r1 = s * 0.38, r2 = s * 0.16;
+    cx.beginPath();
+    for (var i = 0; i < pts * 2; i++) {
+      var a = (i / (pts * 2)) * Math.PI * 2 - Math.PI / 2;
+      var r = i % 2 === 0 ? r1 : r2;
+      i === 0 ? cx.moveTo(x + Math.cos(a)*r, y + Math.sin(a)*r) : cx.lineTo(x + Math.cos(a)*r, y + Math.sin(a)*r);
+    }
+    cx.closePath(); cx.fill();
+  }
+  function drawCloud(cx, x, y, s) {
+    cx.beginPath(); cx.arc(x, y, s * 0.22, 0, Math.PI * 2);
+    cx.arc(x + s*0.18, y - s*0.07, s*0.18, 0, Math.PI*2);
+    cx.arc(x - s*0.18, y - s*0.05, s*0.16, 0, Math.PI*2);
+    cx.arc(x + s*0.30, y + s*0.04, s*0.14, 0, Math.PI*2);
+    cx.fill();
+  }
+  function drawTree(cx, x, y, s) {
+    cx.save(); cx.fillStyle = '#8B6914';
+    cx.fillRect(x - s*0.07, y + s*0.1, s*0.14, s*0.28); cx.restore();
+    cx.beginPath();
+    cx.moveTo(x, y - s*0.40); cx.lineTo(x + s*0.30, y + s*0.12); cx.lineTo(x - s*0.30, y + s*0.12);
+    cx.closePath(); cx.fill();
+    cx.beginPath();
+    cx.moveTo(x, y - s*0.52); cx.lineTo(x + s*0.24, y - s*0.12); cx.lineTo(x - s*0.24, y - s*0.12);
+    cx.closePath(); cx.fill();
+  }
+  function drawFlower(cx, x, y, s) {
+    for (var i = 0; i < 6; i++) {
+      var a = (i / 6) * Math.PI * 2;
+      cx.beginPath(); cx.ellipse(x + Math.cos(a)*s*0.22, y + Math.sin(a)*s*0.22, s*0.14, s*0.10, a, 0, Math.PI*2); cx.fill();
+    }
+    cx.save(); cx.fillStyle = GOLD;
+    cx.beginPath(); cx.arc(x, y, s*0.15, 0, Math.PI*2); cx.fill(); cx.restore();
+  }
+  function drawMushroom(cx, x, y, s) {
+    cx.save(); cx.fillStyle = '#f0e8d0';
+    cx.fillRect(x - s*0.12, y, s*0.24, s*0.28); cx.restore();
+    cx.beginPath(); cx.ellipse(x, y + s*0.02, s*0.36, s*0.28, 0, Math.PI, 0); cx.fill();
+    cx.save(); cx.fillStyle = 'rgba(255,255,255,0.5)';
+    cx.beginPath(); cx.arc(x - s*0.12, y - s*0.08, s*0.07, 0, Math.PI*2); cx.fill();
+    cx.beginPath(); cx.arc(x + s*0.12, y - s*0.12, s*0.05, 0, Math.PI*2); cx.fill();
+    cx.restore();
+  }
+  function drawCactus(cx, x, y, s) {
+    cx.fillRect(x - s*0.09, y - s*0.36, s*0.18, s*0.54);
+    cx.fillRect(x - s*0.22, y - s*0.16, s*0.14, s*0.14);
+    cx.fillRect(x + s*0.09, y - s*0.22, s*0.14, s*0.14);
+    cx.beginPath(); cx.arc(x, y - s*0.36, s*0.09, Math.PI, 0); cx.fill();
+  }
+  function drawBird(cx, x, y, s) {
+    cx.beginPath(); cx.ellipse(x, y, s*0.24, s*0.14, 0, 0, Math.PI*2); cx.fill();
+    cx.save(); cx.fillStyle = '#f2b134';
+    cx.beginPath(); cx.moveTo(x + s*0.22, y); cx.lineTo(x + s*0.36, y - s*0.04); cx.lineTo(x + s*0.22, y + s*0.06); cx.closePath(); cx.fill(); cx.restore();
+    cx.beginPath(); cx.moveTo(x - s*0.22, y - s*0.06); cx.quadraticCurveTo(x - s*0.08, y - s*0.36, x + s*0.06, y - s*0.06);
+    cx.lineWidth = s*0.06; cx.strokeStyle = cx.fillStyle; cx.stroke();
+    cx.beginPath(); cx.moveTo(x - s*0.06, y - s*0.06); cx.quadraticCurveTo(x + s*0.08, y - s*0.30, x + s*0.22, y - s*0.06); cx.stroke();
+  }
+  function drawFish(cx, x, y, s) {
+    cx.beginPath(); cx.ellipse(x - s*0.04, y, s*0.28, s*0.16, 0, 0, Math.PI*2); cx.fill();
+    cx.beginPath(); cx.moveTo(x + s*0.22, y); cx.lineTo(x + s*0.40, y - s*0.16); cx.lineTo(x + s*0.40, y + s*0.16); cx.closePath(); cx.fill();
+    cx.save(); cx.fillStyle = INK;
+    cx.beginPath(); cx.arc(x - s*0.15, y - s*0.04, s*0.04, 0, Math.PI*2); cx.fill(); cx.restore();
+  }
+  function drawHeart(cx, x, y, s) {
+    cx.beginPath();
+    cx.moveTo(x, y + s*0.28);
+    cx.bezierCurveTo(x - s*0.40, y + s*0.06, x - s*0.48, y - s*0.24, x - s*0.24, y - s*0.30);
+    cx.bezierCurveTo(x - s*0.08, y - s*0.34, x, y - s*0.20, x, y - s*0.10);
+    cx.bezierCurveTo(x, y - s*0.20, x + s*0.08, y - s*0.34, x + s*0.24, y - s*0.30);
+    cx.bezierCurveTo(x + s*0.48, y - s*0.24, x + s*0.40, y + s*0.06, x, y + s*0.28);
+    cx.closePath(); cx.fill();
+  }
+  function drawDiamond(cx, x, y, s) {
+    cx.beginPath();
+    cx.moveTo(x, y - s*0.40); cx.lineTo(x + s*0.30, y); cx.lineTo(x, y + s*0.40); cx.lineTo(x - s*0.30, y);
+    cx.closePath(); cx.fill();
+    cx.save(); cx.globalAlpha = 0.35; cx.fillStyle = '#fff';
+    cx.beginPath(); cx.moveTo(x, y - s*0.40); cx.lineTo(x + s*0.30, y); cx.lineTo(x, y); cx.closePath(); cx.fill(); cx.restore();
+  }
+  function drawCrown(cx, x, y, s) {
+    cx.beginPath();
+    cx.moveTo(x - s*0.36, y + s*0.22); cx.lineTo(x - s*0.36, y - s*0.14);
+    cx.lineTo(x - s*0.12, y + s*0.04); cx.lineTo(x, y - s*0.28); cx.lineTo(x + s*0.12, y + s*0.04);
+    cx.lineTo(x + s*0.36, y - s*0.14); cx.lineTo(x + s*0.36, y + s*0.22);
+    cx.closePath(); cx.fill();
+  }
+  function drawLightning(cx, x, y, s) {
+    cx.beginPath();
+    cx.moveTo(x + s*0.10, y - s*0.42); cx.lineTo(x - s*0.14, y + s*0.04);
+    cx.lineTo(x + s*0.06, y + s*0.04); cx.lineTo(x - s*0.10, y + s*0.42);
+    cx.lineTo(x + s*0.18, y - s*0.04); cx.lineTo(x - s*0.02, y - s*0.04);
+    cx.closePath(); cx.fill();
+  }
+  function drawDrop(cx, x, y, s) {
+    cx.beginPath();
+    cx.moveTo(x, y - s*0.40);
+    cx.bezierCurveTo(x + s*0.30, y - s*0.08, x + s*0.28, y + s*0.22, x, y + s*0.36);
+    cx.bezierCurveTo(x - s*0.28, y + s*0.22, x - s*0.30, y - s*0.08, x, y - s*0.40);
+    cx.fill();
+  }
+  function drawLeaf(cx, x, y, s) {
+    cx.beginPath();
+    cx.moveTo(x, y - s*0.36); cx.bezierCurveTo(x + s*0.34, y - s*0.12, x + s*0.34, y + s*0.20, x, y + s*0.36);
+    cx.bezierCurveTo(x - s*0.34, y + s*0.20, x - s*0.34, y - s*0.12, x, y - s*0.36);
+    cx.fill();
+    cx.save(); cx.strokeStyle = 'rgba(0,0,0,0.2)'; cx.lineWidth = s*0.04;
+    cx.beginPath(); cx.moveTo(x, y - s*0.36); cx.lineTo(x, y + s*0.36); cx.stroke(); cx.restore();
+  }
+  function drawGem(cx, x, y, s) {
+    cx.beginPath();
+    cx.moveTo(x - s*0.18, y - s*0.36); cx.lineTo(x + s*0.18, y - s*0.36);
+    cx.lineTo(x + s*0.36, y - s*0.08); cx.lineTo(x, y + s*0.38); cx.lineTo(x - s*0.36, y - s*0.08);
+    cx.closePath(); cx.fill();
+    cx.save(); cx.globalAlpha = 0.4; cx.fillStyle = '#fff';
+    cx.beginPath(); cx.moveTo(x - s*0.18, y - s*0.36); cx.lineTo(x + s*0.18, y - s*0.36); cx.lineTo(x, y - s*0.08); cx.closePath(); cx.fill();
+    cx.restore();
+  }
+  function drawFlame(cx, x, y, s) {
+    cx.beginPath();
+    cx.moveTo(x, y + s*0.38);
+    cx.bezierCurveTo(x - s*0.28, y + s*0.14, x - s*0.22, y - s*0.14, x - s*0.06, y - s*0.28);
+    cx.bezierCurveTo(x - s*0.04, y - s*0.02, x + s*0.04, y - s*0.12, x, y - s*0.36);
+    cx.bezierCurveTo(x + s*0.20, y - s*0.16, x + s*0.28, y, x + s*0.24, y + s*0.18);
+    cx.bezierCurveTo(x + s*0.34, y + s*0.06, x + s*0.28, y + s*0.28, x, y + s*0.38);
+    cx.fill();
+  }
+  function drawSnowflake(cx, x, y, s) {
+    for (var i = 0; i < 6; i++) {
+      var a = (i / 6) * Math.PI * 2;
+      cx.save(); cx.translate(x, y); cx.rotate(a);
+      cx.beginPath(); cx.moveTo(0, -s*0.38); cx.lineTo(0, s*0.38);
+      cx.lineWidth = s*0.07; cx.strokeStyle = cx.fillStyle; cx.stroke();
+      cx.beginPath(); cx.moveTo(-s*0.13, -s*0.20); cx.lineTo(0, -s*0.30); cx.lineTo(s*0.13, -s*0.20); cx.stroke();
+      cx.restore();
+    }
+  }
+  function drawButterfly(cx, x, y, s) {
+    cx.beginPath();
+    cx.ellipse(x - s*0.20, y - s*0.10, s*0.24, s*0.16, -0.4, 0, Math.PI*2); cx.fill();
+    cx.beginPath();
+    cx.ellipse(x + s*0.20, y - s*0.10, s*0.24, s*0.16, 0.4, 0, Math.PI*2); cx.fill();
+    cx.beginPath();
+    cx.ellipse(x - s*0.14, y + s*0.14, s*0.16, s*0.10, 0.3, 0, Math.PI*2); cx.fill();
+    cx.beginPath();
+    cx.ellipse(x + s*0.14, y + s*0.14, s*0.16, s*0.10, -0.3, 0, Math.PI*2); cx.fill();
+    cx.save(); cx.fillStyle = INK;
+    cx.beginPath(); cx.ellipse(x, y, s*0.05, s*0.22, 0, 0, Math.PI*2); cx.fill(); cx.restore();
+  }
+  function drawRocket(cx, x, y, s) {
+    cx.beginPath();
+    cx.moveTo(x, y - s*0.42); cx.lineTo(x + s*0.16, y + s*0.18); cx.lineTo(x - s*0.16, y + s*0.18);
+    cx.closePath(); cx.fill();
+    cx.save(); cx.fillStyle = GOLD;
+    cx.beginPath(); cx.moveTo(x - s*0.16, y + s*0.18); cx.lineTo(x - s*0.28, y + s*0.38); cx.lineTo(x, y + s*0.18); cx.closePath(); cx.fill();
+    cx.beginPath(); cx.moveTo(x + s*0.16, y + s*0.18); cx.lineTo(x + s*0.28, y + s*0.38); cx.lineTo(x, y + s*0.18); cx.closePath(); cx.fill();
+    cx.restore();
+    cx.save(); cx.fillStyle = '#fff';
+    cx.beginPath(); cx.arc(x, y - s*0.08, s*0.08, 0, Math.PI*2); cx.fill(); cx.restore();
+  }
+  function drawBell(cx, x, y, s) {
+    cx.beginPath();
+    cx.moveTo(x - s*0.30, y + s*0.18); cx.lineTo(x + s*0.30, y + s*0.18);
+    cx.arc(x, y - s*0.04, s*0.32, 0, Math.PI, true);
+    cx.closePath(); cx.fill();
+    cx.save(); cx.fillStyle = GOLD;
+    cx.beginPath(); cx.arc(x, y + s*0.30, s*0.08, 0, Math.PI*2); cx.fill();
+    cx.fillRect(x - s*0.04, y + s*0.18, s*0.08, s*0.12); cx.restore();
+  }
+  function drawAnchor(cx, x, y, s) {
+    cx.save(); cx.strokeStyle = cx.fillStyle; cx.lineWidth = s*0.10;
+    cx.beginPath(); cx.arc(x, y - s*0.26, s*0.12, 0, Math.PI*2); cx.stroke();
+    cx.beginPath(); cx.moveTo(x, y - s*0.14); cx.lineTo(x, y + s*0.28); cx.stroke();
+    cx.beginPath(); cx.moveTo(x - s*0.26, y + s*0.28); cx.lineTo(x + s*0.26, y + s*0.28); cx.stroke();
+    cx.beginPath(); cx.arc(x, y, s*0.26, 0.2, Math.PI - 0.2, false);
+    cx.lineWidth = s*0.08; cx.stroke(); cx.restore();
+  }
+  function drawKey(cx, x, y, s) {
+    cx.save(); cx.strokeStyle = cx.fillStyle; cx.lineWidth = s*0.10;
+    cx.beginPath(); cx.arc(x - s*0.12, y - s*0.12, s*0.22, 0, Math.PI*2); cx.stroke();
+    cx.beginPath(); cx.moveTo(x + s*0.06, y + s*0.02); cx.lineTo(x + s*0.38, y + s*0.32); cx.stroke();
+    cx.lineWidth = s*0.08;
+    cx.beginPath(); cx.moveTo(x + s*0.22, y + s*0.22); cx.lineTo(x + s*0.28, y + s*0.16); cx.stroke();
+    cx.beginPath(); cx.moveTo(x + s*0.30, y + s*0.28); cx.lineTo(x + s*0.36, y + s*0.22); cx.stroke();
+    cx.restore();
+  }
+
+  // ---- Game state ----
+  var SCENE_COLS = 3, SCENE_ROWS = 4; // grid for object placement (up to 12 slots)
+  var CELL_W = Math.floor(W / SCENE_COLS);
+  var CELL_H = 140;
+  var SCENE_TOP = 120;
+  var OBJ_SIZE = 52;
+
+  var REMOVE_COUNT = 3;
+  var ADD_COUNT = 2;
+  var NEEDED_TAPS = ADD_COUNT; // must tap the 2 new ones
+
+  var phase; // 'title' | 'memorize' | 'recall' | 'over' | 'challenge' | 'cta'
+  var memorizeTimer, recallTimer;
+  var MEMORIZE_DUR = 4000; // 4s to study
+  var RECALL_DUR = 12000;  // 12s to recall (generous)
+  var recallStart;
+  var originalObjs, currentObjs, newObjIds;
+  var tappedObjs;
+  var score, combo, round;
+  var runStartTs;
+  var flashes = [], hitStop = 0, shakeAmt = 0, zoom = 1;
+  var dareBeaten = false, overAt = 0, ctaAt = 0;
+  var botRunsDone = 0;
+  var best = 0;
+  try { best = +localStorage.getItem('scr_best') || 0; } catch (_) {}
+
+  function pctTop(sc) { return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-sc / 4)))); }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size || 38, t: 0, vy: -0.4 }); }
+
+  // Pick N unique items from pool (uses rng)
+  function pick(pool, n) {
+    var copy = pool.slice();
+    var res = [];
+    for (var i = 0; i < n && copy.length > 0; i++) {
+      var idx = Math.floor(rng() * copy.length);
+      res.push(copy.splice(idx, 1)[0]);
+    }
+    return res;
+  }
+
+  // Generate grid positions for objects
+  function makeGrid(n) {
+    // Shuffle grid cells and pick n
+    var cells = [];
+    for (var r = 0; r < SCENE_ROWS; r++) {
+      for (var c = 0; c < SCENE_COLS; c++) {
+        cells.push({ col: c, row: r });
+      }
+    }
+    // shuffle
+    for (var i = cells.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = cells[i]; cells[i] = cells[j]; cells[j] = tmp;
+    }
+    var picked = cells.slice(0, n);
+    return picked.map(function(cell) {
+      return {
+        x: cell.col * CELL_W + CELL_W / 2 + (rng() - 0.5) * 22,
+        y: SCENE_TOP + cell.row * CELL_H + CELL_H / 2 + (rng() - 0.5) * 16
+      };
+    });
+  }
+
+  function buildScene() {
+    // Pick 8 objects for original scene
+    var chosen = pick(OBJS, 8);
+    var positions = makeGrid(chosen.length);
+    originalObjs = chosen.map(function(obj, i) {
+      return { id: obj.id, col: obj.col, draw: obj.draw, x: positions[i].x, y: positions[i].y, r: (rng() - 0.5) * 0.3 };
+    });
+  }
+
+  function buildRecallScene() {
+    // Remove REMOVE_COUNT objects, add ADD_COUNT new ones, shuffle positions
+    var remaining = originalObjs.slice();
+    // remove random 3
+    var removed = pick(remaining.map(function(_, i) { return i; }), REMOVE_COUNT);
+    removed.sort(function(a,b){return b-a;});
+    removed.forEach(function(i) { remaining.splice(i, 1); });
+
+    // pick ADD_COUNT new objects not in original scene
+    var usedIds = originalObjs.map(function(o) { return o.id; });
+    var pool = OBJS.filter(function(o) { return usedIds.indexOf(o.id) < 0; });
+    var added = pick(pool, ADD_COUNT);
+    newObjIds = added.map(function(o) { return o.id; });
+
+    // generate fresh positions for all objects
+    var total = remaining.length + added.length;
+    var positions = makeGrid(total);
+    var all = remaining.concat(added.map(function(o) { return { id: o.id, col: o.col, draw: o.draw }; }));
+
+    currentObjs = all.map(function(obj, i) {
+      return {
+        id: obj.id, col: obj.col, draw: obj.draw,
+        x: positions[i].x, y: positions[i].y,
+        r: (rng() - 0.5) * 0.3,
+        isNew: newObjIds.indexOf(obj.id) >= 0,
+        tapped: false, tapEffect: 0
+      };
+    });
+    tappedObjs = [];
+  }
+
+  function startMem() {
+    phase = 'memorize';
+    runStartTs = Date.now();
+    memorizeTimer = performance.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED, round: round });
+  }
+
+  function startRecall() {
+    buildRecallScene();
+    phase = 'recall';
+    recallStart = performance.now();
+  }
+
+  function checkRoundComplete() {
+    // Check if player found all new objects
+    var found = currentObjs.filter(function(o) { return o.isNew && o.tapped; }).length;
+    if (found >= NEEDED_TAPS) {
+      // Round complete!
+      var correct = currentObjs.filter(function(o) { return o.tapped && o.isNew; }).length;
+      var wrong = currentObjs.filter(function(o) { return o.tapped && !o.isNew; }).length;
+      score += correct;
+      if (wrong === 0) {
+        combo++;
+        if (window.J) J.perfect(combo);
+        flash('PERFECT!', TEAL, 44);
+        hitStop = 4; zoom = 1.03;
+      } else {
+        combo = 0;
+        if (window.J) J.hit(score);
+        flash('+' + correct, GOLD, 38);
+        if (wrong > 0 && window.J) J.near();
+      }
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && score > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN!', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(score);
+      }
+      if (window.LOOP) LOOP.emit('round_complete', { round: round, score: score, combo: combo });
+      round++;
+      // Start next round
+      setTimeout(function() { buildScene(); startMem(); }, 600);
+    }
+  }
+
+  function timeUp() {
+    // Time ran out on recall phase -> game over
+    gameOver();
+  }
+
+  function tapWrong() {
+    // Wrong tap — penalize: game over immediately
+    if (window.J) J.death(0.5);
+    shakeAmt = 8;
+    flash('WRONG!', VERM, 42);
+    setTimeout(function() { gameOver(); }, 400);
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) J.death(Math.min(0.4 + score / 10, 1));
+    var newBest = score > best;
+    if (newBest) { best = score; try { localStorage.setItem('scr_best', String(best)); } catch(_){} }
+    if (newBest && window.J) setTimeout(function() { J.fanfare(); }, 500);
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function() {
+        phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function() { window.__demoDone = true; }, 3600);
+      }, 2600);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function() { newGame(); }, 800);
+    }
+  }
+
+  function newGame() {
+    score = 0; combo = 0; round = 1; flashes = [];
+    hitStop = 0; shakeAmt = 0; zoom = 1; dareBeaten = false;
+    // reset rng for reproducibility in bot/demo
+    rng = mulberry32(SEED + (botRunsDone || 0));
+    buildScene();
+    if (DEMO) {
+      phase = 'challenge';
+      setTimeout(function() { startMem(); }, 1300);
+    } else if (BOT) {
+      startMem();
+    } else {
+      phase = 'title';
+    }
+  }
+
+  // ---- Input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 478, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(ex, ey) {
+    if (DEMO || BOT) return;
+    if (ex !== undefined && inR(MUTE_R, ex, ey) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startMem(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (ex !== undefined && inR(SHARE_R, ex, ey) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'found' }); return;
+      }
+      if (window.LOOP) LOOP.emit('restart', {});
+      newGame(); return;
+    }
+    if (phase === 'recall') {
+      // find tapped object
+      if (ex === undefined) return;
+      var hit = null;
+      for (var i = currentObjs.length - 1; i >= 0; i--) {
+        var obj = currentObjs[i];
+        if (obj.tapped) continue;
+        var dx = ex - obj.x, dy = ey - obj.y;
+        if (Math.sqrt(dx*dx + dy*dy) < OBJ_SIZE * 0.55) { hit = obj; break; }
+      }
+      if (!hit) return;
+      hit.tapped = true; hit.tapEffect = 1;
+      if (hit.isNew) {
+        tappedObjs.push(hit.id);
+        if (window.J) J.hit(combo + 1);
+        flash('+1', TEAL, 32);
+        if (window.LOOP) LOOP.emit('object_found', { id: hit.id, round: round });
+        checkRoundComplete();
+      } else {
+        // wrong tap
+        if (window.LOOP) LOOP.emit('near_miss', { id: hit.id, round: round });
+        tapWrong();
+      }
+    }
+  }
+
+  window.addEventListener('pointerdown', function(e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function(e) { if (e.code === 'Space') tap(); });
+
+  // ---- Bot / Demo autopilots ----
+  var botPhaseTimer = 0;
+  var demoState = { step: 0, wait: 0, hesWait: 0, phase: 'start' };
+  var demoWaits = [45, 30, 55, 28, 40, 35, 50, 32]; // hesitation in frames
+
+  function autopilot(now) {
+    if (phase === 'memorize') return; // just watch
+    if (phase !== 'recall') return;
+    if (DEMO) {
+      demoAuto(now);
+    } else if (BOT) {
+      botAuto(now);
+    }
+  }
+
+  var botAutoTimer = 0, botActed = false;
+  function botAuto(now) {
+    if (!botAutoTimer) botAutoTimer = now;
+    var elapsed = now - botAutoTimer;
+    if (elapsed < 800 + rng() * 1200) return; // wait a bit
+    botAutoTimer = now;
+    // find an untapped new obj to tap
+    var newUntapped = currentObjs.filter(function(o) { return o.isNew && !o.tapped; });
+    if (newUntapped.length > 0) {
+      var target = newUntapped[Math.floor(rng() * newUntapped.length)];
+      // bot occasionally taps wrong (miss on last round to cause game_over)
+      var shouldMiss = (round >= 3 && rng() < 0.5);
+      if (shouldMiss) {
+        var wrongObjs = currentObjs.filter(function(o) { return !o.isNew && !o.tapped; });
+        if (wrongObjs.length > 0) {
+          target = wrongObjs[Math.floor(rng() * wrongObjs.length)];
+        }
+      }
+      simulateTap(target.x, target.y);
+    }
+  }
+
+  var demoAutoTimer = 0, demoStep = 0, demoHesitating = false, demoHesStart = 0, demoHesWait = 0;
+  function demoAuto(now) {
+    if (!demoAutoTimer) demoAutoTimer = now;
+    var elapsed = now - demoAutoTimer;
+
+    // hesitate before tapping
+    if (demoHesitating) {
+      if (now - demoHesStart < demoHesWait) return;
+      demoHesitating = false;
+    }
+    if (elapsed < 300) return;
+    demoAutoTimer = now;
+
+    // find untapped new objects
+    var newUntapped = currentObjs.filter(function(o) { return o.isNew && !o.tapped; });
+    if (newUntapped.length === 0) return;
+
+    // On round 2 (near-fail): almost tap wrong, then correct
+    if (round === 2 && demoStep === 0) {
+      // near miss moment: emit a near_miss event
+      if (window.LOOP) LOOP.emit('near_miss', { demo: true });
+      if (window.J) J.near();
+      shakeAmt = 3;
+      flash('SO CLOSE...', VERM, 32);
+      demoStep = 1;
+      demoHesitating = true; demoHesStart = now; demoHesWait = 800;
+      return;
+    }
+
+    // On round 3+: fail deliberately on second tap (miss a wrong one)
+    if (round >= 3 && newUntapped.length === 1 && demoStep < 2) {
+      // tap wrong to fail
+      var wrongObjs = currentObjs.filter(function(o) { return !o.isNew && !o.tapped; });
+      if (wrongObjs.length > 0) {
+        demoStep = 2;
+        demoHesitating = true; demoHesStart = now; demoHesWait = 600;
+        simulateTap(wrongObjs[0].x, wrongObjs[0].y);
+        return;
+      }
+    }
+
+    // standard: tap first new object with hesitation
+    var target = newUntapped[0];
+    var hesIdx = Math.min(score + newUntapped.length, demoWaits.length - 1);
+    demoHesitating = true; demoHesStart = now; demoHesWait = demoWaits[hesIdx] * 16;
+    simulateTap(target.x, target.y);
+  }
+
+  function simulateTap(x, y) {
+    var hit = null;
+    for (var i = currentObjs.length - 1; i >= 0; i--) {
+      var obj = currentObjs[i];
+      if (obj.tapped) continue;
+      var dx = x - obj.x, dy = y - obj.y;
+      if (Math.sqrt(dx*dx + dy*dy) < OBJ_SIZE * 0.55) { hit = obj; break; }
+    }
+    if (!hit) return;
+    hit.tapped = true; hit.tapEffect = 1;
+    if (hit.isNew) {
+      tappedObjs.push(hit.id);
+      if (!DEMO && window.J) J.hit(combo + 1);
+      flash('+1', TEAL, 32);
+      checkRoundComplete();
+    } else {
+      if (window.LOOP) LOOP.emit('near_miss', { id: hit.id, round: round });
+      tapWrong();
+    }
+  }
+
+  // ---- Render ----
+  function drawObject(obj, alpha, glowNew) {
+    cx.save();
+    cx.globalAlpha = alpha || 1;
+    cx.translate(obj.x, obj.y);
+    cx.rotate(obj.r || 0);
+    if (glowNew && obj.isNew) {
+      // glow new objects
+      cx.shadowColor = TEAL;
+      cx.shadowBlur = 18;
+    }
+    cx.fillStyle = obj.col;
+    obj.draw(cx, 0, 0, OBJ_SIZE);
+    if (obj.tapped) {
+      cx.globalAlpha = (alpha || 1) * Math.max(0, obj.tapEffect);
+      if (obj.isNew) {
+        cx.fillStyle = TEAL;
+        cx.beginPath(); cx.arc(0, 0, OBJ_SIZE * 0.52, 0, Math.PI * 2);
+        cx.globalAlpha = (alpha || 1) * obj.tapEffect * 0.35; cx.fill();
+        cx.globalAlpha = (alpha || 1) * obj.tapEffect;
+        cx.strokeStyle = TEAL; cx.lineWidth = 3;
+        cx.beginPath(); cx.arc(0, 0, OBJ_SIZE * 0.52, 0, Math.PI * 2); cx.stroke();
+      } else {
+        cx.fillStyle = VERM;
+        cx.beginPath(); cx.arc(0, 0, OBJ_SIZE * 0.52, 0, Math.PI * 2);
+        cx.globalAlpha = (alpha || 1) * obj.tapEffect * 0.35; cx.fill();
+        cx.globalAlpha = (alpha || 1) * obj.tapEffect;
+        cx.strokeStyle = VERM; cx.lineWidth = 3;
+        cx.beginPath(); cx.arc(0, 0, OBJ_SIZE * 0.52, 0, Math.PI * 2); cx.stroke();
+      }
+    }
+    cx.restore();
+  }
+
+  function drawSceneBg() {
+    // Subtle grid lines
+    cx.save();
+    cx.strokeStyle = 'rgba(255,255,255,0.04)';
+    cx.lineWidth = 1;
+    for (var c = 1; c < SCENE_COLS; c++) {
+      cx.beginPath(); cx.moveTo(c * CELL_W, SCENE_TOP - 10); cx.lineTo(c * CELL_W, SCENE_TOP + SCENE_ROWS * CELL_H); cx.stroke();
+    }
+    for (var r = 1; r < SCENE_ROWS; r++) {
+      cx.beginPath(); cx.moveTo(10, SCENE_TOP + r * CELL_H); cx.lineTo(W - 10, SCENE_TOP + r * CELL_H); cx.stroke();
+    }
+    cx.restore();
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Juice timers
+    if (hitStop > 0) hitStop -= dt;
+    else autopilot(now);
+
+    zoom += (1 - zoom) * 0.12 * dt;
+    shakeAmt *= Math.pow(0.82, dt);
+
+    // Update flash particles
+    for (var fi = flashes.length - 1; fi >= 0; fi--) {
+      flashes[fi].t += dt;
+      if (flashes[fi].t > 42) flashes.splice(fi, 1);
+    }
+
+    // Update tap effects
+    if (currentObjs) {
+      for (var oi = 0; oi < currentObjs.length; oi++) {
+        if (currentObjs[oi].tapEffect > 0) currentObjs[oi].tapEffect -= 0.04 * dt;
+      }
+    }
+
+    // Memorize phase timer
+    if (phase === 'memorize') {
+      var elapsed = now - memorizeTimer;
+      if (elapsed >= MEMORIZE_DUR) {
+        startRecall();
+      }
+    }
+    // Recall phase timer
+    if (phase === 'recall') {
+      var recallElapsed = now - recallStart;
+      if (recallElapsed >= RECALL_DUR) {
+        if (window.J) J.tension(Math.min(recallElapsed / RECALL_DUR, 1));
+        if (phase === 'recall') timeUp();
+      } else {
+        // rising tension as time runs out
+        if (recallElapsed > RECALL_DUR * 0.6 && window.J) {
+          J.tension(Math.max(0, (recallElapsed - RECALL_DUR * 0.6) / (RECALL_DUR * 0.4)));
+        }
+      }
+    }
+
+    // ---- Draw ----
+    cx.save();
+
+    // Juice transforms
+    var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // Background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    drawSceneBg();
+
+    // ---- TITLE ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('SCENE REWIND', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '400 15px -apple-system, Helvetica, Arial';
+      cx.fillText('spot what changed', W / 2, 296);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse; cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 360);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.28)'; cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText('memorize · find what changed', W / 2, 410);
+    }
+
+    // ---- CHALLENGE CARD (demo beat 1) ----
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 15px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('6', W / 2, 406);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("objects found today's top run", W / 2, 436);
+    }
+
+    // ---- MEMORIZE PHASE ----
+    if (phase === 'memorize' && originalObjs) {
+      var memElapsed = now - memorizeTimer;
+      var memPct = Math.min(memElapsed / MEMORIZE_DUR, 1);
+      // Header
+      cx.textAlign = 'center';
+      cx.fillStyle = GOLD; cx.font = '700 14px -apple-system, Helvetica, Arial';
+      cx.fillText('MEMORIZE THE SCENE', W / 2, 50);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('Round ' + round, W / 2, 70);
+      // Timer bar
+      cx.fillStyle = 'rgba(255,255,255,0.10)'; cx.fillRect(30, 82, W - 60, 6);
+      var barW = (W - 60) * (1 - memPct);
+      cx.fillStyle = GOLD; cx.fillRect(30, 82, barW, 6);
+      // Objects
+      for (var i = 0; i < originalObjs.length; i++) {
+        drawObject(originalObjs[i], 1, false);
+      }
+    }
+
+    // ---- RECALL PHASE ----
+    if (phase === 'recall' && currentObjs) {
+      var recElapsed = now - recallStart;
+      var recPct = Math.min(recElapsed / RECALL_DUR, 1);
+      // Header
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '700 14px -apple-system, Helvetica, Arial';
+      cx.fillText('WHAT CHANGED?', W / 2, 50);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('tap the new objects (' + NEEDED_TAPS + ' added)', W / 2, 70);
+      // Timer bar (turns red)
+      var timeLeft = 1 - recPct;
+      cx.fillStyle = 'rgba(255,255,255,0.10)'; cx.fillRect(30, 82, W - 60, 6);
+      var barColor = recPct < 0.6 ? TEAL : recPct < 0.80 ? GOLD : VERM;
+      cx.fillStyle = barColor; cx.fillRect(30, 82, (W - 60) * timeLeft, 6);
+      // Score
+      cx.fillStyle = 'rgba(255,255,255,0.90)'; cx.font = '800 32px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 106);
+      // Objects
+      for (var j = 0; j < currentObjs.length; j++) {
+        drawObject(currentObjs[j], 1, false);
+      }
+      // Remaining indicators
+      var foundCount = currentObjs.filter(function(o) { return o.isNew && o.tapped; }).length;
+      cx.fillStyle = 'rgba(255,255,255,0.25)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText(foundCount + ' / ' + NEEDED_TAPS + ' found', W / 2, H - 28);
+      // Dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '700 13px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, H - 12);
+      }
+    }
+
+    // ---- GAME OVER ----
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.60)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('MISSED IT.', W / 2, 298);
+      cx.fillStyle = '#fff'; cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' found', W / 2, 340);
+      var pt = pctTop(score);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 382);
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 402);
+      if (!DEMO && !BOT) {
+        var pulse2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = pulse2; cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE ROUND', W / 2, 448);
+        cx.globalAlpha = 1;
+        // Share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- DEMO CTA ----
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.4);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('SCENE REWIND', W / 2, 298);
+      cx.fillStyle = 'rgba(255,255,255,0.72)'; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('she found ' + (window.__demoScore || 6) + '. can you?', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 6), W / 2, 408);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      cx.globalAlpha = Math.max(0, 1 - fl.t / 42);
+      cx.textAlign = 'center'; cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 240 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial'; cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
