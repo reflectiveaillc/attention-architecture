@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Sound Shape — Tilt</title>
+<!--
+  LOOP / attention-architecture — Sound Shape
+  Circuits: 02-novelty, 05-ease, 01-rpe
+  Engine: calm
+  Mechanic: tap tones → particles rearrange into standing-wave patterns → hold until locked
+  Modes:
+    ?demo=1&seed=7    scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'sound-shape';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TEAL2 = '#1aa89b', SOFT = '#c8f0ed';
+
+  // ---- Tones ----
+  // Five tones, each with a target Chladni-like pattern index
+  var TONES = [
+    { label: '174 Hz', color: '#7ecfcb', patternIdx: 0, freq: 174 },
+    { label: '285 Hz', color: '#2ec5b6', patternIdx: 1, freq: 285 },
+    { label: '396 Hz', color: '#f2b134', patternIdx: 2, freq: 396 },
+    { label: '528 Hz', color: '#a8d8ea', patternIdx: 3, freq: 528 },
+    { label: '741 Hz', color: '#c9b1ff', patternIdx: 4, freq: 741 }
+  ];
+
+  // Chladni-like target positions for each tone (standing wave nodes)
+  // Each pattern is a function(x,y) -> 0..1 density, particles cluster where density is low
+  function chladniPattern(idx, nx, ny) {
+    // nx, ny in -1..1 space
+    switch(idx) {
+      case 0: return Math.abs(Math.cos(Math.PI * nx) * Math.cos(Math.PI * ny));
+      case 1: return Math.abs(Math.cos(2 * Math.PI * nx) * Math.cos(Math.PI * ny));
+      case 2: return Math.abs(Math.cos(Math.PI * nx) * Math.cos(2 * Math.PI * ny));
+      case 3: return Math.abs(Math.cos(2 * Math.PI * nx) * Math.cos(2 * Math.PI * ny));
+      case 4: return Math.abs(Math.cos(3 * Math.PI * nx) * Math.cos(2 * Math.PI * ny));
+      default: return 0.5;
+    }
+  }
+
+  // ---- Particles ----
+  var NUM_PARTICLES = 200;
+  var particles = [];
+  var PX = W / 2, PY = H / 2 - 40; // particle field center
+  var PR = 140; // particle field radius
+
+  function initParticles() {
+    particles = [];
+    for (var i = 0; i < NUM_PARTICLES; i++) {
+      var angle = rng() * Math.PI * 2;
+      var r = rng() * PR;
+      particles.push({
+        x: PX + Math.cos(angle) * r,
+        y: PY + Math.sin(angle) * r,
+        tx: 0, ty: 0,   // target
+        vx: 0, vy: 0,
+        size: 1.5 + rng() * 2,
+        alpha: 0.4 + rng() * 0.5
+      });
+    }
+  }
+
+  function setTargets(patternIdx) {
+    // Sample target positions from Chladni nodes (where density is LOW = wave troughs)
+    // Generate candidate positions and pick ones where pattern value is below threshold
+    var candidates = [];
+    var tries = 0;
+    while (candidates.length < NUM_PARTICLES && tries < 8000) {
+      tries++;
+      var nx = (rng() * 2) - 1;
+      var ny = (rng() * 2) - 1;
+      var val = chladniPattern(patternIdx, nx, ny);
+      // Particles cluster at nodes = where value is SMALL (near-zero crossings)
+      if (val < 0.25) {
+        var px = PX + nx * PR;
+        var py = PY + ny * PR;
+        candidates.push({ x: px, y: py });
+      }
+    }
+    // If not enough candidates, fill with random spread
+    while (candidates.length < NUM_PARTICLES) {
+      var angle2 = rng() * Math.PI * 2;
+      var r2 = 20 + rng() * PR * 0.9;
+      candidates.push({ x: PX + Math.cos(angle2) * r2, y: PY + Math.sin(angle2) * r2 });
+    }
+    // Assign targets
+    for (var i = 0; i < NUM_PARTICLES; i++) {
+      var c = candidates[i % candidates.length];
+      // slight jitter so each particle gets a unique spot
+      particles[i].tx = c.x + (rng() - 0.5) * 8;
+      particles[i].ty = c.y + (rng() - 0.5) * 8;
+    }
+  }
+
+  function updateParticles(dt, lockProgress) {
+    var stiffness = 0.04 + lockProgress * 0.06;
+    var damping   = 0.85 + lockProgress * 0.08;
+    for (var i = 0; i < particles.length; i++) {
+      var p = particles[i];
+      var fx = (p.tx - p.x) * stiffness;
+      var fy = (p.ty - p.y) * stiffness;
+      p.vx = p.vx * damping + fx * dt;
+      p.vy = p.vy * damping + fy * dt;
+      p.x += p.vx;
+      p.y += p.vy;
+    }
+  }
+
+  function particleSettledness() {
+    var total = 0;
+    for (var i = 0; i < particles.length; i++) {
+      var p = particles[i];
+      var d = Math.hypot(p.x - p.tx, p.y - p.ty);
+      total += d;
+    }
+    return total / particles.length;
+  }
+
+  // ---- State ----
+  var phase, score, runStartTs, bestScore, toneSeq;
+  var activeTone, holdTimer, lockProgress, roundsTotal;
+  var hitStop, shakeAmt, zoom, flashes;
+  var botRunsDone, botAction, botTimer;
+  try { bestScore = +localStorage.getItem('ss_best') || 0; } catch(_) { bestScore = 0; }
+
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function newGame() {
+    phase       = 'title';
+    score       = 0;
+    activeTone  = -1;
+    holdTimer   = 0;
+    lockProgress= 0;
+    roundsTotal = 0;
+    hitStop        = 0;
+    shakeAmt       = 0;
+    zoom           = 1;
+    flashes        = [];
+    toneSeq        = [];
+    alreadyLocking = false;
+    botRunsDone    = 0;
+    botToneQueue   = null;
+    botWait        = 0;
+    botCurrentTone = -1;
+    rng = mulberry32(SEED);
+    initParticles();
+
+    if (DEMO) {
+      buildDemoToneSeq();
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED, mode: 'demo' });
+      startNextRound();
+      return;
+    }
+    if (BOT) {
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED, mode: 'bot' });
+      startNextRound();
+      return;
+    }
+  }
+
+  // Demo script: 5 tones in order 0→1→2→3→4 = escalating complexity
+  var demoScript = [0, 1, 2, 3, 4];
+  var demoIdx = 0;
+  function buildDemoToneSeq() {
+    toneSeq = demoScript.slice();
+  }
+
+  function startNextRound() {
+    activeTone  = -1;
+    holdTimer   = 0;
+    lockProgress= 0;
+    if (toneSeq.length === 0) {
+      // Generate a random sequence for human / bot
+      toneSeq = [];
+      for (var i = 0; i < 5; i++) toneSeq.push(i);
+      // shuffle
+      for (var j = toneSeq.length - 1; j > 0; j--) {
+        var k = Math.floor(rng() * (j + 1));
+        var tmp = toneSeq[j]; toneSeq[j] = toneSeq[k]; toneSeq[k] = tmp;
+      }
+    }
+    roundsTotal++;
+  }
+
+  var HOLD_NEEDED   = 90;  // frames to hold (~1.5s at 60fps)
+  var SETTLE_THRESH = 12;  // avg pixel dist to consider "settled" (generous)
+  var alreadyLocking = false;
+
+  function tapTone(toneIdx) {
+    if (phase !== 'play') return;
+    if (activeTone === toneIdx) return; // already active
+    activeTone    = toneIdx;
+    holdTimer     = 0;
+    lockProgress  = 0;
+    alreadyLocking= false;
+    setTargets(TONES[toneIdx].patternIdx);
+    if (window.J) J.calm(toneIdx);
+    if (window.LOOP) LOOP.emit('tone_tap', { tone: toneIdx, round: roundsTotal });
+  }
+
+  function tryFinish() {
+    if (activeTone < 0 || alreadyLocking) return;
+    var settle = particleSettledness();
+    // Lock fires when: held long enough AND either settled OR timeout safety net
+    var settled  = settle < SETTLE_THRESH && holdTimer > HOLD_NEEDED;
+    var forceLock = holdTimer > HOLD_NEEDED * 2.2; // safety net for bot / slow settle
+    if (settled || forceLock) {
+      alreadyLocking = true;
+      completeLock();
+    }
+  }
+
+  function completeLock() {
+    score++;
+    lockProgress = 1;
+    zoom = 1.025;
+    if (window.J) J.calm(score);
+    flash('LOCKED', TEAL, 36);
+    if (window.LOOP) LOOP.emit('tone_locked', { tone: activeTone, score: score });
+
+    // In demo/bot: after all 5 tones locked = end
+    if (DEMO && score >= 5) {
+      gameOver();
+      return;
+    }
+    if (BOT && score >= 5) {
+      gameOver();
+      return;
+    }
+    // Human: keep going, generate next random target
+    toneSeq = [];
+    activeTone = -1;
+    holdTimer  = 0;
+    lockProgress = 0;
+    if (!DEMO && !BOT) {
+      setTimeout(function() { startNextRound(); }, 600);
+    }
+  }
+
+  function gameOver() {
+    phase = 'over';
+    var dur = (Date.now() - runStartTs) / 1000;
+    window.__demoScore = score;
+    if (score > bestScore) {
+      bestScore = score;
+      try { localStorage.setItem('ss_best', String(bestScore)); } catch(_) {}
+    }
+    if (window.J) J.calm(score + 1);
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function() {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function() { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function() { resetGame(); }, 800);
+      }
+    }
+  }
+
+  function resetGame() {
+    score          = 0;
+    activeTone     = -1;
+    holdTimer      = 0;
+    lockProgress   = 0;
+    roundsTotal    = 0;
+    alreadyLocking = false;
+    flashes        = [];
+    toneSeq        = [];
+    botToneQueue   = null;
+    botWait        = 0;
+    botCurrentTone = -1;
+    rng = mulberry32(SEED + botRunsDone);
+    initParticles();
+    if (window.LOOP) LOOP.emit('restart', {});
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED, mode: 'bot' });
+    startNextRound();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- Bot autopilot ----
+  // State machine: wait → tap tone → hold (auto-locks via tryFinish) → next tone
+  var botToneQueue = null;
+  var botWait = 0;
+  var botCurrentTone = -1;
+
+  function botAutopilot(dt) {
+    if (phase !== 'play') return;
+    if (botToneQueue === null) {
+      // Build queue: tap tones 0..4 in order
+      botToneQueue = [0,1,2,3,4];
+      botWait = 50 + Math.floor(rng() * 30); // initial wait
+      botCurrentTone = -1;
+    }
+
+    // If no active tone yet, wait then tap the next queued tone
+    if (activeTone < 0) {
+      if (botToneQueue.length === 0) return; // all done, waiting for gameOver
+      botWait -= dt;
+      if (botWait <= 0) {
+        var next = botToneQueue.shift();
+        botCurrentTone = next;
+        botWait = 0;
+        tapTone(next);
+      }
+    }
+    // If holding a tone, do nothing — tryFinish() will call completeLock()
+    // completeLock() resets activeTone = -1, which lets us tap the next tone
+    // After completeLock, set a small wait before next tap
+    if (activeTone < 0 && botCurrentTone >= 0 && botWait === 0) {
+      botWait = 30 + Math.floor(rng() * 30);
+    }
+  }
+
+  // ---- Demo autopilot ----
+  var demoToneIdx = 0;
+  var demoWait    = 60;    // frames before first tap
+  var demoHolding = false;
+
+  function demoAutopilot(dt) {
+    if (phase !== 'play') return;
+    if (demoToneIdx >= 5) return;
+
+    if (demoWait > 0) { demoWait -= dt; return; }
+
+    if (activeTone !== demoToneIdx) {
+      tapTone(demoToneIdx);
+      demoHolding = true;
+      return;
+    }
+
+    // holding tone — wait for lock or timeout
+    if (holdTimer > HOLD_NEEDED + 10) {
+      // Move to next tone
+      demoToneIdx++;
+      demoWait = 40 + demoToneIdx * 15; // slight hesitation grows
+      demoHolding = false;
+    }
+  }
+
+  // ---- Input ----
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') {
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      startNextRound();
+      return;
+    }
+    if (phase === 'over' || phase === 'cta') {
+      // restart
+      if (x !== undefined && inR(MUTE_R, x, y)) return;
+      phase = 'play';
+      score = 0;
+      activeTone = -1;
+      holdTimer  = 0;
+      lockProgress = 0;
+      roundsTotal = 0;
+      flashes = [];
+      toneSeq = [];
+      rng = mulberry32(SEED + Date.now() % 1000);
+      initParticles();
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('restart', {});
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      startNextRound();
+      return;
+    }
+    // Check tone buttons
+    for (var i = 0; i < TONES.length; i++) {
+      var btn = toneBtn(i);
+      if (x !== undefined && inR(btn, x, y)) {
+        tapTone(i);
+        return;
+      }
+    }
+  }
+
+  window.addEventListener('pointerdown', function(e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function(e) {
+    if (e.code === 'Space') tap();
+    var num = parseInt(e.key);
+    if (num >= 1 && num <= 5) tapTone(num - 1);
+  });
+
+  // Tone button layout (vertical strip, bottom area)
+  function toneBtn(i) {
+    var bW = 70, bH = 44, bGap = 8;
+    var totalW = 5 * bW + 4 * bGap;
+    var startX = (W - totalW) / 2;
+    return {
+      x: startX + i * (bW + bGap),
+      y: H - 100,
+      w: bW,
+      h: bH
+    };
+  }
+
+  // ---- Render ----
+  var ctaAt = 0, last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Update hold timer and progress
+    if (phase === 'play' && activeTone >= 0) {
+      holdTimer += dt;
+      var settle = particleSettledness();
+      lockProgress = Math.min(1, holdTimer / HOLD_NEEDED) * Math.max(0, 1 - settle / 30);
+      tryFinish();
+    }
+
+    // Autopilots
+    if (hitStop > 0) { hitStop -= dt; }
+    else {
+      if (DEMO) demoAutopilot(dt);
+      if (BOT)  botAutopilot(dt);
+      updateParticles(dt, lockProgress);
+    }
+
+    // Juice: decay shake and zoom
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // Draw
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // Background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+
+    // Soft ambient glow based on active tone
+    if (activeTone >= 0 && phase === 'play') {
+      var tColor = TONES[activeTone].color;
+      var g = cx.createRadialGradient(PX, PY, 0, PX, PY, PR * 1.6);
+      g.addColorStop(0, tColor + '22');
+      g.addColorStop(1, 'transparent');
+      cx.fillStyle = g;
+      cx.fillRect(0, 0, W, H);
+    }
+
+    // Draw particle field
+    if (phase === 'play' || phase === 'over') {
+      drawParticles(now);
+    }
+
+    // Draw tone buttons
+    if (phase === 'play') {
+      drawToneButtons(now);
+    }
+
+    // HUD: score
+    if (phase === 'play') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '700 52px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 76);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + bestScore, W / 2, 98);
+
+      // Active tone label
+      if (activeTone >= 0) {
+        cx.fillStyle = TONES[activeTone].color;
+        cx.font = '700 14px Menlo, monospace';
+        cx.fillText(TONES[activeTone].label, W / 2, 124);
+      }
+
+      // Lock progress arc
+      if (activeTone >= 0) {
+        drawLockArc(lockProgress, TONES[activeTone].color);
+      }
+
+      // "hold to lock" hint when holding
+      if (activeTone >= 0 && holdTimer > 10 && lockProgress < 1) {
+        var hint = 0.4 + 0.3 * Math.sin(now / 400);
+        cx.globalAlpha = hint;
+        cx.fillStyle = SOFT;
+        cx.font = '600 12px -apple-system, Helvetica, Arial';
+        cx.fillText('hold until still', W / 2, H - 120);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // Title screen
+    if (phase === 'title') {
+      drawParticles(now);
+      cx.fillStyle = 'rgba(11,13,18,0.55)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '800 42px -apple-system, Helvetica, Arial';
+      cx.fillText('SOUND SHAPE', W / 2, 280);
+      cx.fillStyle = 'rgba(255,255,255,0.65)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('tap a tone. watch it shift.', W / 2, 318);
+      cx.fillText('hold until it goes still.', W / 2, 342);
+      var p = 0.6 + 0.4 * Math.sin(now / 500);
+      cx.globalAlpha = p;
+      cx.fillStyle = TEAL;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, 400);
+      cx.globalAlpha = 1;
+    }
+
+    // Game over / score card
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.65)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('SETTLED', W / 2, 310);
+      cx.fillStyle = '#fff';
+      cx.font = '700 24px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' patterns locked', W / 2, 354);
+      cx.fillStyle = GOLD;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST: ' + bestScore, W / 2, 390);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 400);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP TO GO AGAIN', W / 2, 444);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // Demo CTA card
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '800 44px -apple-system, Helvetica, Arial';
+      cx.fillText('SOUND SHAPE', W / 2, 294);
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '500 17px -apple-system, Helvetica, Arial';
+      cx.fillText('feel the pattern settle', W / 2, 332);
+      var p3 = 0.75 + 0.25 * Math.sin(now / 360);
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = ease * p3;
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 408);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 448);
+      cx.globalAlpha = 1;
+    }
+
+    // Floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 50);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 230 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  function drawParticles(now) {
+    for (var i = 0; i < particles.length; i++) {
+      var p = particles[i];
+      var col = activeTone >= 0 ? TONES[activeTone].color : TEAL;
+      // Blend brightness based on lockProgress
+      var glow = lockProgress * 0.5;
+      cx.globalAlpha = p.alpha * (0.4 + glow + 0.15 * Math.sin(now / 800 + i * 0.3));
+      cx.beginPath();
+      cx.arc(p.x, p.y, p.size * (1 + lockProgress * 0.4), 0, Math.PI * 2);
+      cx.fillStyle = col;
+      cx.fill();
+    }
+    cx.globalAlpha = 1;
+  }
+
+  function drawToneButtons(now) {
+    for (var i = 0; i < TONES.length; i++) {
+      var btn = toneBtn(i);
+      var tone = TONES[i];
+      var isActive = (activeTone === i);
+      var pulse = isActive ? (0.85 + 0.15 * Math.sin(now / 200)) : 1;
+
+      // Button background
+      cx.globalAlpha = isActive ? 0.95 * pulse : 0.35;
+      cx.fillStyle = isActive ? tone.color : '#1a2530';
+      cx.beginPath();
+      if (cx.roundRect) {
+        cx.roundRect(btn.x, btn.y, btn.w, btn.h, 10);
+      } else {
+        cx.rect(btn.x, btn.y, btn.w, btn.h);
+      }
+      cx.fill();
+
+      // Button border
+      cx.globalAlpha = isActive ? 1 : 0.25;
+      cx.strokeStyle = tone.color;
+      cx.lineWidth = isActive ? 2 : 1;
+      cx.beginPath();
+      if (cx.roundRect) {
+        cx.roundRect(btn.x, btn.y, btn.w, btn.h, 10);
+      } else {
+        cx.rect(btn.x, btn.y, btn.w, btn.h);
+      }
+      cx.stroke();
+
+      // Label
+      cx.globalAlpha = isActive ? 1 : 0.5;
+      cx.textAlign = 'center';
+      cx.fillStyle = isActive ? INK : tone.color;
+      cx.font = '700 11px Menlo, monospace';
+      cx.fillText(tone.label, btn.x + btn.w / 2, btn.y + btn.h / 2 + 4);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  function drawLockArc(progress, color) {
+    // Ring around the particle field showing lock progress
+    var r = PR + 16;
+    cx.beginPath();
+    cx.arc(PX, PY, r, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
+    cx.strokeStyle = color;
+    cx.lineWidth = 3;
+    cx.globalAlpha = 0.7 + 0.3 * progress;
+    cx.stroke();
+    cx.globalAlpha = 1;
+    cx.lineWidth = 1;
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

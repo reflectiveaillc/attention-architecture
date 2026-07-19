@@ -3,6 +3,26 @@
 > Started 2026-07-17 ~14:10. Goal: drain `engine/state/design-backlog.json` (100
 > designs) into live, validated, clipped games. Read this after any autocompact.
 
+## 📌 SESSION 2026-07-19 (state as of ~13:30)
+- ⛔ **drop-dodge LOCKED** — Manuel play-tested: "very engaging and addicting".
+  Difficulty frozen (registry `locked:true` + header comment + docs/locked-games.md).
+  Locked games get variants as NEW ids, never retunes.
+- ✅ **drop-dodge-face SHIPPED** — head-steered variant (headTilt/headYaw blend,
+  ±0.18 hysteresis, face-only, tap = restart only), deliberately EASIER
+  (vy 4.6 vs 6.2, ramp 0.9 vs 1.4, spawn 1.5→0.55s vs 1.1→0.32s). Passed
+  validate-game + face-response-test (24 lane_changes off injected signal);
+  clip captured + frame-QA'd (title font fixed 42→33px, was edge-clipped);
+  registered (registry 319) + site rendered. Added to face-response-test SIG map.
+- 🔧 **Round 4 recovery**: the interrupted batch left 19 games ON DISK but never
+  integrated (pinch-to-fit … squish-row, the sensory wave). Sampled ones all fail
+  validation (half-finished self-fix loops). Serial integrate loop killed
+  (4min/failure in timeouts); instead fix fan-out `tilt-fix.js` (NEW script,
+  repair-in-place variant of tilt-build) run wf_e70d3bd6-d08, 19 sonnet agents.
+- 🚀 **Round 5 launched**: wf_b3704a91-103, 18 builds (ink-drop … tap-twin,
+  rhythm wave). 27 designs remain unstarted after this round.
+- NEXT after both workflows: serial `integrate.mjs` per passed id (registry
+  races — never parallel), then commit. Then Round 6 (last 27).
+
 ## 🤖 CLAUDE BUILD ROUNDS (Ollama 429'd ~2h — sonnet fan-out is the build engine)
 - Round 1 (wf_b043157e-312): 16/16 built + integrating (badge-clear…grid-curate). 23 agents, 1.4M tokens, ~32min. 16/16 PASSED first workflow — sonnet self-validation is far more reliable than the Ollama workers (near-zero orchestrator fixes needed).
 - Round 2 (wf_9384107f-a29): 18 builds IN FLIGHT (doom-refresh save-later-guilt comment-cliff poll-fever going-live online-dot like-check link-bio unsent-draft story-archive filter-glow draft-courage double-tap-rush save-or-lose story-catch duet-sync fyp-train archive-walk).

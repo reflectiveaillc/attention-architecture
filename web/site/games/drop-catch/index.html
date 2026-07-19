@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Drop Catch — Tilt</title>
+<!--
+  LOOP / attention-architecture — Drop Catch
+  Circuits: 01-rpe (variable reward), 07-timing (exact-frame tap), 06-zeigarnik (one more try).
+  Conditioned path: bass-drop anticipation — tap the exact frame the beat lands.
+  Score = deviation in ms from the drop (lower is better). 0ms = perfect.
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip → window.__demoDone
+    ?bot=1&runs=N    imperfect autoplay → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'drop-catch';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game state ----
+  // Mechanic: a rising "noise" bar charges toward a drop point.
+  // The exact DROP_T is hidden. Tap within ±WINDOW_MS of it.
+  // Deviation score: ms off from perfect. 0ms = perfect. Lower = better.
+  // Three rounds per game. Final score = best single-round deviation (or 999 on miss).
+  var ROUNDS = 3;
+  var WINDOW_MS = 400;   // ±400ms = valid tap window
+  var PERFECT_MS = 30;   // within 30ms = "PERFECT"
+  var NEAR_MS = 100;     // within 100ms = near
+
+  var phase;             // 'title' | 'challenge' | 'play' | 'over' | 'cta'
+  var round, roundScores, runStartTs, dropAt, dropFiredAt;
+  var tapAt, tapDev, tapped;
+  var buildT;            // time since build phase started (ms into current round)
+  var buildDur;          // randomised build-up duration (ms)
+  var dropTriggered, tapRegistered;
+  var flashes, dareBeaten;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var phaseTs = 0;       // when current phase started (performance.now)
+  var ctaAt = 0, challengeAt = 0;
+  var botRunsDone = 0;
+  var last = performance.now();
+
+  // best stored score (deviation — lower is better)
+  var bestDev = 999;
+  try { bestDev = +localStorage.getItem('dc_best') || 999; } catch (_) {}
+
+  function newGame() {
+    round = 0; roundScores = [];
+    flashes = []; dareBeaten = false;
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+
+    if (DEMO) {
+      phase = 'challenge'; challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) { phase = 'play'; startRound(); return; }
+    phase = 'title';
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    round = 0; roundScores = [];
+    startRound();
+  }
+
+  // Per-round drop timing: each round has a randomised build-up (2000–4500ms),
+  // then the drop fires. Player taps any time; we record deviation.
+  function startRound() {
+    round++;
+    buildDur = 2000 + rng() * 2500;   // 2.0–4.5 s
+    buildT = 0;
+    dropTriggered = false;
+    tapRegistered = false;
+    tapped = false;
+    tapDev = null;
+    dropAt = null;
+    dropFiredAt = null;
+    phaseTs = performance.now();
+    // rising tension
+    if (window.J) J.tension(0.2);
+  }
+
+  // Called when the drop fires (visually + audibly)
+  function fireDrop() {
+    dropTriggered = true;
+    dropFiredAt = performance.now();
+    dropAt = dropFiredAt;
+    if (window.J) { J.hit(1); J.tension(0); }
+    shakeAmt = 3;
+    zoom = 1.025;
+    if (!tapped) {
+      // Player hasn't tapped yet — if they tap within WINDOW_MS they still score
+    }
+    // After WINDOW_MS + a grace, close the window
+    setTimeout(closeWindow, WINDOW_MS + 50);
+  }
+
+  // Close the timing window after drop
+  function closeWindow() {
+    if (tapRegistered) return; // already handled
+    // Player never tapped (or tapped outside window) — record as miss
+    if (!tapped || tapDev === null) {
+      tapDev = 999;
+    }
+    finishRound(tapDev);
+  }
+
+  function finishRound(dev) {
+    if (tapRegistered) return;
+    tapRegistered = true;
+    roundScores.push(dev);
+
+    var isMiss = dev >= 999;
+    var isPerfect = dev <= PERFECT_MS;
+    var isNear = dev <= NEAR_MS && !isPerfect;
+
+    if (window.J) {
+      if (isMiss) J.near();
+      else if (isPerfect) { hitStop = 60; J.perfect(1); }
+      else if (isNear) J.near();
+      else J.hit(1);
+    }
+    if (isPerfect) { hitStop = 60; zoom = 1.04; }
+    if (isNear) shakeAmt = 3;
+
+    var label = isMiss ? 'MISS' : isPerfect ? 'PERFECT' : isNear ? 'SO CLOSE' : dev + ' ms';
+    var col   = isMiss ? VERM : isPerfect ? GOLD : isNear ? TEAL : '#fff';
+    flash(label, col, 46);
+
+    if (!isMiss && !isPerfect && !isNear && window.LOOP) {
+      LOOP.emit('near_miss', { dev_ms: dev });
+    }
+
+    if (round < ROUNDS) {
+      // Short gap then next round
+      setTimeout(function () { if (phase === 'play') startRound(); }, 1200);
+    } else {
+      // All rounds done → game over
+      setTimeout(endGame, 1200);
+    }
+  }
+
+  function endGame() {
+    // Score = best deviation across rounds (0 = perfection, 999 = all miss)
+    var best999 = roundScores.reduce(function (b, v) { return Math.min(b, v); }, 999);
+    var finalScore = best999;   // lower is better, 0 = perfect
+
+    var isNewBest = finalScore < bestDev;
+    if (isNewBest) { bestDev = finalScore; try { localStorage.setItem('dc_best', String(bestDev)); } catch (_) {} }
+
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) {
+      J.death(0.4);
+      if (isNewBest) setTimeout(function () { J.fanfare(); }, 400);
+    }
+    shakeAmt = 6;
+    if (window.LOOP) LOOP.emit('game_over', { score: finalScore, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      window.__demoScore = finalScore;
+      phase = 'over';
+      setTimeout(function () { phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600); }, 2800);
+      return;
+    }
+    if (BOT) {
+      botRunsDone++;
+      phase = 'over';
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 600);
+      return;
+    }
+    phase = 'over';
+    phaseTs = performance.now();
+  }
+
+  function resetRun() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    flashes = [];
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0, x: W / 2, y: 340 });
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play' && !tapped) {
+      tapped = true;
+      var now = performance.now();
+      if (dropTriggered) {
+        // Tap after drop — measure deviation
+        var dev = Math.round(now - dropFiredAt);
+        if (dev <= WINDOW_MS) {
+          tapDev = dev;
+          // dare check
+          if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && dev < SHARE.dare) {
+            dareBeaten = true;
+            flash('DARE BEATEN', TEAL, 44);
+            if (window.J) J.fanfare();
+            SHARE.beaten(dev);
+          }
+          finishRound(dev);
+        } else {
+          tapDev = 999;
+          finishRound(999);
+        }
+      } else {
+        // Tapped before drop — early
+        var earlyMs = dropAt ? Math.round(dropAt - now) : WINDOW_MS;
+        tapDev = 999;   // early tap = miss
+        flash('TOO EARLY', VERM, 42);
+        if (window.J) J.near();
+        shakeAmt = 4;
+        setTimeout(function () { finishRound(999); }, 400);
+      }
+      return;
+    }
+    if (phase === 'over' && performance.now() - phaseTs > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: bestDev, unit: 'ms' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- demo / bot autopilot ----
+  // Demo script: offsets from perfect (positive = late, negative = early for miss)
+  // Round 1: land at +68ms, Round 2: near-miss (save) at +88ms, Round 3: miss (early tap)
+  var demoScript = [68, 88, 'early'], demoIdx = 0;
+  // Hesitation counts (frames of 16ms) before each demo action
+  var demoWaits = [0, 0, 0], demoHesitate = 0;
+  var demoTriggered = false;
+
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+    if (DEMO) {
+      if (tapped) return;
+      var want = demoScript[Math.min(demoIdx, demoScript.length - 1)];
+      if (want === 'early') {
+        // tap early (before drop)
+        if (!dropTriggered && buildT > buildDur * 0.82) {
+          tapped = true;
+          tapDev = 999;
+          flash('TOO EARLY', VERM, 42);
+          if (window.J) J.near();
+          shakeAmt = 4;
+          var captureIdx = demoIdx;
+          setTimeout(function () {
+            demoIdx++;
+            finishRound(999);
+          }, 400);
+        }
+      } else {
+        // tap `want` ms after drop fires
+        if (dropTriggered && !demoTriggered) {
+          demoTriggered = true;
+          var targetDelay = want;
+          setTimeout(function () {
+            if (tapped) return;
+            tapped = true;
+            tapDev = Math.round(Math.abs(targetDelay));
+            demoIdx++;
+            demoTriggered = false;
+            finishRound(tapDev);
+          }, targetDelay);
+        }
+      }
+    } else if (BOT) {
+      if (tapped) return;
+      if (dropTriggered && !demoTriggered) {
+        demoTriggered = true;
+        // imperfect bot: random offset ±120ms, sometimes misses
+        var err = (rng() - 0.5) * 240;
+        var delay = Math.max(0, err);
+        var isMiss = rng() < 0.25;  // 25% miss rate so bot loses, finishes runs
+        if (isMiss) delay = WINDOW_MS + 50;
+        setTimeout(function () {
+          if (tapped) return;
+          tapped = true;
+          demoTriggered = false;
+          if (delay > WINDOW_MS) {
+            tapDev = 999;
+            finishRound(999);
+          } else {
+            tapDev = Math.round(delay);
+            finishRound(tapDev);
+          }
+        }, delay);
+      } else if (!dropTriggered && !demoTriggered) {
+        // Bot might tap early sometimes
+        if (buildT > buildDur * 0.92 && rng() < 0.005) {
+          demoTriggered = true;
+          tapped = true;
+          tapDev = 999;
+          setTimeout(function () {
+            demoTriggered = false;
+            finishRound(999);
+          }, 300);
+        }
+      }
+    }
+  }
+
+  // ---- pct rank ----
+  function pctTop(dev) {
+    if (dev >= 999) return 99;
+    return Math.max(1, Math.min(99, Math.round(100 * (dev / 300))));
+  }
+
+  // ---- render helpers ----
+  // Draw the build-up "anticipation" bar and noise
+  function drawBuildUp(progress, t) {
+    // Background pulse — noise intensifies as drop approaches
+    var noiseA = progress * 0.18;
+    cx.fillStyle = 'rgba(232,80,46,' + noiseA + ')';
+    cx.fillRect(0, 0, W, H);
+
+    // Central "drop zone" circle that shrinks to zero at drop
+    var radius = 120 * (1 - progress) + 20;
+    var cx2 = W / 2, cy2 = H / 2;
+    var grd = cx.createRadialGradient(cx2, cy2, 0, cx2, cy2, radius);
+    grd.addColorStop(0, 'rgba(242,177,52,' + (0.12 + progress * 0.35) + ')');
+    grd.addColorStop(1, 'rgba(242,177,52,0)');
+    cx.fillStyle = grd;
+    cx.beginPath();
+    cx.arc(cx2, cy2, radius + 20, 0, Math.PI * 2);
+    cx.fill();
+
+    // Countdown ring
+    cx.save();
+    cx.translate(W / 2, H / 2);
+    // Outer ring (track)
+    cx.strokeStyle = 'rgba(255,255,255,0.08)';
+    cx.lineWidth = 6;
+    cx.beginPath();
+    cx.arc(0, 0, 100, 0, Math.PI * 2);
+    cx.stroke();
+    // Charged arc
+    var arcEnd = -Math.PI / 2 + progress * Math.PI * 2;
+    var ringColor = progress < 0.6 ? TEAL : progress < 0.85 ? GOLD : VERM;
+    cx.strokeStyle = ringColor;
+    cx.lineWidth = 6;
+    cx.lineCap = 'round';
+    cx.beginPath();
+    cx.arc(0, 0, 100, -Math.PI / 2, arcEnd);
+    cx.stroke();
+
+    // Pulsing center dot
+    var dotR = 12 + Math.sin(t / 80) * (3 + progress * 8);
+    cx.fillStyle = ringColor;
+    cx.globalAlpha = 0.8 + progress * 0.2;
+    cx.beginPath();
+    cx.arc(0, 0, dotR, 0, Math.PI * 2);
+    cx.fill();
+    cx.globalAlpha = 1;
+
+    // Random noise particles near the drop
+    if (progress > 0.5) {
+      var n = Math.floor(progress * 12);
+      for (var i = 0; i < n; i++) {
+        var angle = (t * 0.003 + i * 0.52) % (Math.PI * 2);
+        var dist = 120 + Math.sin(t * 0.007 + i) * 20;
+        var px = Math.cos(angle) * dist;
+        var py = Math.sin(angle) * dist;
+        cx.fillStyle = GOLD;
+        cx.globalAlpha = (progress - 0.5) * 0.8;
+        cx.beginPath();
+        cx.arc(px, py, 2 + i % 2, 0, Math.PI * 2);
+        cx.fill();
+        cx.globalAlpha = 1;
+      }
+    }
+    cx.restore();
+
+    // "WAIT FOR IT" label
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,' + (0.3 + progress * 0.4) + ')';
+    cx.font = '700 13px Menlo, monospace';
+    cx.fillText('WAIT FOR IT', W / 2, H / 2 + 140);
+
+    // Round indicator
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 13px -apple-system, Helvetica, Arial';
+    cx.fillText('ROUND ' + round + ' / ' + ROUNDS, W / 2, 80);
+
+    // Previous round scores
+    for (var ri = 0; ri < roundScores.length; ri++) {
+      var sc = roundScores[ri];
+      var scTxt = sc >= 999 ? 'MISS' : sc + 'ms';
+      cx.fillStyle = sc < PERFECT_MS ? GOLD : sc < NEAR_MS ? TEAL : 'rgba(255,255,255,0.5)';
+      cx.font = '700 13px Menlo, monospace';
+      cx.fillText('R' + (ri + 1) + ': ' + scTxt, W / 2, 100 + ri * 18);
+    }
+
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 15px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + 'ms', W / 2, H - 80);
+    }
+  }
+
+  // Draw the drop flash moment
+  function drawDropFlash(elapsed) {
+    var fade = Math.max(0, 1 - elapsed / 400);
+    cx.fillStyle = 'rgba(242,177,52,' + (fade * 0.6) + ')';
+    cx.fillRect(0, 0, W, H);
+
+    // Big DROP text
+    cx.textAlign = 'center';
+    cx.globalAlpha = fade;
+    cx.fillStyle = '#fff';
+    cx.font = '900 72px -apple-system, Helvetica, Arial';
+    cx.fillText('DROP', W / 2, H / 2 + 24);
+    cx.globalAlpha = 1;
+
+    // Tap prompt
+    if (fade > 0.3) {
+      cx.fillStyle = VERM;
+      cx.font = '800 22px -apple-system, Helvetica, Arial';
+      var pulse = 0.7 + 0.3 * Math.sin(elapsed / 60);
+      cx.globalAlpha = fade * pulse;
+      cx.fillText('TAP NOW', W / 2, H / 2 + 70);
+      cx.globalAlpha = 1;
+    }
+  }
+
+  // ---- main loop ----
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // decay juice
+    if (hitStop > 0) hitStop -= dt * 16.667;
+    if (hitStop < 0) hitStop = 0;
+    shakeAmt *= Math.pow(0.83, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // update build-up timer & fire drop
+    if (phase === 'play' && !dropTriggered && !tapped) {
+      buildT += dt * 16.667;
+      var progress = Math.min(buildT / buildDur, 1);
+      if (progress >= 1) {
+        fireDrop();
+      } else {
+        // Rising tension sound
+        if (window.J) J.tension(progress * 0.8);
+      }
+    }
+
+    // autopilot
+    if (hitStop <= 0) {
+      autopilot(dt);
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+
+    if (phase === 'challenge') {
+      // mirror-neuron beat 1: challenge card
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD; cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('41', W / 2, 410);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('ms from perfect', W / 2, 442);
+    }
+
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('DROP CATCH', W / 2, 280);
+      cx.fillStyle = 'rgba(255,255,255,0.6)'; cx.font = '400 16px -apple-system, Helvetica, Arial';
+      cx.fillText('tap the exact frame the beat drops.', W / 2, 320);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.fillStyle = VERM; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.globalAlpha = pulse;
+      cx.fillText('TAP TO PLAY', W / 2, 370);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.3)'; cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('best: ' + (bestDev >= 999 ? '—' : bestDev + ' ms'), W / 2, 402);
+    }
+
+    if (phase === 'play') {
+      if (!dropTriggered) {
+        var progress = Math.min(buildT / buildDur, 1);
+        drawBuildUp(progress, now);
+      } else {
+        var elapsed = now - dropFiredAt;
+        drawDropFlash(elapsed);
+        // Round indicator still visible
+        cx.textAlign = 'center';
+        cx.fillStyle = 'rgba(255,255,255,0.4)';
+        cx.font = '600 13px -apple-system, Helvetica, Arial';
+        cx.fillText('ROUND ' + round + ' / ' + ROUNDS, W / 2, 80);
+        // previous scores
+        for (var ri = 0; ri < roundScores.length; ri++) {
+          var sc2 = roundScores[ri];
+          var scTxt2 = sc2 >= 999 ? 'MISS' : sc2 + 'ms';
+          cx.fillStyle = sc2 < PERFECT_MS ? GOLD : sc2 < NEAR_MS ? TEAL : 'rgba(255,255,255,0.5)';
+          cx.font = '700 13px Menlo, monospace';
+          cx.fillText('R' + (ri + 1) + ': ' + scTxt2, W / 2, 100 + ri * 18);
+        }
+      }
+    }
+
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.7)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+
+      // Show round scores
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '700 14px Menlo, monospace';
+      for (var ri2 = 0; ri2 < roundScores.length; ri2++) {
+        var rsc = roundScores[ri2];
+        var rTxt = rsc >= 999 ? 'MISS' : rsc + ' ms';
+        var rCol = rsc < PERFECT_MS ? GOLD : rsc < NEAR_MS ? TEAL : rsc >= 999 ? VERM : '#fff';
+        cx.fillStyle = rCol;
+        cx.fillText('R' + (ri2 + 1) + ': ' + rTxt, W / 2, 210 + ri2 * 26);
+      }
+
+      // Best deviation
+      var fd = roundScores.reduce(function (b, v) { return Math.min(b, v); }, 999);
+      cx.fillStyle = VERM; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText(fd >= 999 ? 'ALL MISS' : fd + ' ms off', W / 2, 320);
+
+      cx.fillStyle = '#fff'; cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText(fd >= 999 ? 'train your ear' : (fd < PERFECT_MS ? 'PERFECT TIMING' : fd < NEAR_MS ? 'SO CLOSE' : 'keep feeling it'), W / 2, 360);
+
+      var pt = pctTop(fd);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 400);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 450);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(
+          window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND',
+          W / 2, SHARE_R.y + 30
+        );
+      }
+    }
+
+    // demo CTA card
+    if (phase === 'cta') {
+      var tC = (now - ctaAt) / 1000, ease = Math.min(1, tC * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('DROP CATCH', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)'; cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText((window.__demoScore || 41) + ' ms off. can you beat it?', W / 2, 344);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 41) + ' ms', W / 2, 414);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 448);
+      cx.globalAlpha = 1;
+    }
+
+    // floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

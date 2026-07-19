@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Drop Dodge FACE — Tilt</title>
+<!--
+  LOOP / attention-architecture — Drop Dodge FACE (FACE-CONTROL engine)
+  Head-steered version of the LOCKED drop-dodge: lean or turn your head left/right
+  to switch lanes and dodge the falling blocks. Same two-lane DNA, tuned EASIER —
+  head movement is slower than thumbs, so: slower fall, gentler ramp, wider gaps.
+  The ORIGINAL drop-dodge difficulty is locked (tester: "very engaging and
+  addicting") — never port these easier numbers back.
+  Control (MediaPipe FaceLandmarker via shared face-control.js):
+  FC.sig.headTilt blended with FC.sig.headYaw (whichever is stronger),
+  threshold ±0.18 with hysteresis. FACE-ONLY: tap/space only restarts after a crash.
+  Modes: ?demo=1&seed=7 scripted clip run · ?bot=1&runs=2 autoplay (no camera in both)
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:none;
+               font-family:-apple-system,'Helvetica Neue',Arial,sans-serif; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+  video { display:none; }
+  #ui { position:fixed; left:0; right:0; bottom:max(16px,env(safe-area-inset-bottom)); display:flex; gap:10px; justify-content:center; z-index:10; }
+  button { background:#12151d; color:#fff; border:1px solid rgba(255,255,255,.15); border-radius:99px;
+           padding:12px 20px; font-size:15px; font-weight:800; cursor:pointer; }
+  button.rec { background:#e8502e; border-color:#e8502e; }
+  button.rec.on { animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.55; } }
+  #perm { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; text-align:center; padding:24px; z-index:20; background:#0b0d12; }
+  #perm h1 { font-size:34px; font-weight:900; margin:0; }
+  #perm p { color:rgba(255,255,255,.6); font-size:15px; max-width:320px; margin:0; }
+  #perm .big { background:#e8502e; border-color:#e8502e; font-size:18px; padding:16px 28px; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="perm">
+  <h1>DROP DODGE FACE</h1>
+  <p>Move your head <b>side to side</b> to switch lanes and dodge the falling blocks. Lean left, lean right — that's the whole game.</p>
+  <button class="big" id="start">▶ ALLOW CAMERA &amp; PLAY</button>
+  <p style="font-size:12px;opacity:.5">camera stays on your device — nothing is uploaded</p>
+</div>
+<div id="ui" style="display:none">
+  <button id="rec" class="rec">● RECORD</button>
+</div>
+<script>window.LOOP_GAME = 'drop-dodge-face';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script src="../../js/face-control.js"></script>
+<script type="module">
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+  var AUTO = DEMO || BOT;
+
+  function mulberry32(a){ return function(){ a|=0; a=a+0x6D2B79F5|0; var t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return((t^t>>>14)>>>0)/4294967296; }; }
+  var rng = mulberry32(SEED);
+  function gauss(){ var u=1-rng(), v=rng(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio||1,2), scale=1;
+  function fit(){ var s=Math.min(window.innerWidth/W,window.innerHeight/H); scale=s; cv.style.width=(W*s)+'px'; cv.style.height=(H*s)+'px'; cv.width=W*dpr; cv.height=H*dpr; cx.setTransform(dpr,0,0,dpr,0,0); }
+  window.addEventListener('resize',fit); fit();
+
+  var VERM='#e8502e', TEAL='#2ec5b6', GOLD='#f2b134', INK='#0b0d12';
+  var FC = window.FaceControl;
+
+  var LANES = [W*0.27, W*0.73];
+  var PLAYER_Y = 620, PLAYER_R = 26;
+  var HAZARD_W = 56, HAZARD_H = 44;
+  var NEAR_R = 90;
+  // FACE-TUNED (easier than the locked original 6.2 / 1.4 ramp / 1.1→0.32s):
+  // a head lean is slower than a thumb tap, so everything gets more air.
+  var BASE_VY = 4.6;
+  var RAMP = 0.9;                    // original 1.4
+  var SPAWN_START = 1.5, SPAWN_MIN = 0.55; // original 1.1 / 0.32
+  var MAX_DUR = 60;
+
+  // head steering thresholds — lean OR turn, whichever is stronger
+  var STEER_ON = 0.18, STEER_OFF = 0.10;
+
+  var state, hazards, runStartTs, runClock=0;
+  var score=0, combo=0, best=0, dareBeaten=false, survived=false;
+  var hitStop=0, zoom=1, shakeAmt=0, flashes=[];
+  var spawnTimer=0, nextSpawnIn=0;
+  var ctaAt=0, botRunsDone=0;
+  var steerSmoothed=0, steerActive=false, lastSteerEmit=0;
+  var autoSteer=0, autoDir=0;
+
+  try{ best=+localStorage.getItem('ddf_best')||0; }catch(_){}
+
+  // test hook for auto-validation
+  window.__st = function(){ return { st:state, steerSmoothed:steerSmoothed, steerActive:steerActive, hazards:hazards, STEER_ON:STEER_ON, STEER_OFF:STEER_OFF }; };
+
+  function newGame(){
+    state = { phase:'ready', player:{ lane:0, x:LANES[0] } };
+    hazards=[]; runClock=0; score=0; combo=0; dareBeaten=false; survived=false;
+    hitStop=0; zoom=1; shakeAmt=0; flashes=[];
+    spawnTimer=0; nextSpawnIn=0; autoSteer=0; autoDir=0;
+    if(AUTO) startRun();
+  }
+
+  function pctTop(s){ return Math.max(1, Math.min(99, Math.round(100*Math.exp(-s/8)))); }
+
+  function startRun(){
+    state.phase='play';
+    runStartTs=Date.now(); runClock=0;
+    nextSpawnIn = SPAWN_START + rng()*0.3;
+    if(window.LOOP) LOOP.emit('play_start',{seed:SEED});
+  }
+
+  function makeHazard(lane, speed){
+    hazards.push({ lane:lane, x:LANES[lane], y:-HAZARD_H-10, w:HAZARD_W, h:HAZARD_H,
+                   vy:BASE_VY*speed, passed:false, nearMissed:false, r:(rng()-0.5)*0.1 });
+  }
+
+  function spawnHazard(){
+    var p = Math.min(runClock/MAX_DUR, 1);
+    var lane = rng()<0.5?0:1;
+    var speed = 1 + RAMP*p + gauss()*0.06;
+    makeHazard(lane, Math.max(0.85, speed));
+    var interval = SPAWN_START - (SPAWN_START-SPAWN_MIN)*p + gauss()*0.12;
+    nextSpawnIn = Math.max(SPAWN_MIN, interval);
+    spawnTimer = 0;
+  }
+
+  function switchLane(lane){
+    var p = state.player;
+    if(lane===p.lane) return;
+    var oldLane = p.lane;
+    var closeOne=null, bestDist=Infinity;
+    for(var i=0;i<hazards.length;i++){
+      var h=hazards[i];
+      if(h.lane!==oldLane || h.nearMissed || h.passed) continue;
+      var dist=(PLAYER_Y-PLAYER_R)-(h.y+h.h);
+      if(dist>0 && dist<NEAR_R && dist<bestDist){ bestDist=dist; closeOne=h; }
+    }
+    if(closeOne){
+      closeOne.nearMissed=true;
+      flash('SO CLOSE', VERM, 40);
+      hitStop=4; shakeAmt=6; zoom=1.03;
+      if(window.J) J.near();
+      if(window.LOOP) LOOP.emit('near_miss',{n:score,dist:Math.round(bestDist)});
+    }
+    p.lane=lane;
+    if(window.LOOP) LOOP.emit('lane_change',{lane:lane,near:!!closeOne});
+  }
+
+  function checkCollisions(){
+    var p=state.player;
+    for(var i=0;i<hazards.length;i++){
+      var h=hazards[i];
+      if(h.lane!==p.lane) continue;
+      if(h.y+h.h>=PLAYER_Y-PLAYER_R && h.y<=PLAYER_Y+PLAYER_R){ gameOver('hit'); return true; }
+    }
+    return false;
+  }
+
+  function checkPasses(){
+    for(var i=0;i<hazards.length;i++){
+      var h=hazards[i];
+      if(h.passed) continue;
+      if(h.y>H+30){
+        h.passed=true; score++; combo++;
+        flash('+1', TEAL, 32);
+        if(window.J){ J.hit(combo); J.tension(Math.min(runClock/MAX_DUR,1)); }
+        if(window.LOOP) LOOP.emit('dodge',{n:score,combo:combo});
+        if(!AUTO && window.SHARE && SHARE.dare!==null && !dareBeaten && score>SHARE.dare){ dareBeaten=true; if(window.J) J.fanfare(); SHARE.beaten(score); }
+        if(combo%10===0){ flash('×'+combo, GOLD, 46); zoom=1.03; if(window.J) J.gold(); }
+      }
+    }
+  }
+
+  function gameOver(reason){
+    state.phase='over';
+    state.overAt=performance.now();
+    survived = reason==='survived';
+    shakeAmt = survived?0:10;
+    var dur=(Date.now()-runStartTs)/1000;
+    var newBest=score>best;
+    if(window.J){
+      if(survived){ J.fanfare(); J.tension(0); }
+      else { J.death(Math.min(0.3+score/40,1)); J.tension(0); }
+      if(newBest && !survived) setTimeout(function(){ J.fanfare(); },450);
+    }
+    if(DEMO) window.__demoScore=score;
+    if(newBest){ best=score; try{ localStorage.setItem('ddf_best',String(best)); }catch(_){} }
+    if(window.LOOP) LOOP.emit('game_over',{score:score,dur_s:+dur.toFixed(1),reason:reason});
+    if(DEMO){
+      setTimeout(function(){
+        state.phase='cta'; ctaAt=performance.now();
+        setTimeout(function(){ window.__demoDone=true; },3400);
+      },2200);
+    }
+    if(BOT){
+      botRunsDone++;
+      if(botRunsDone>=BOT_RUNS){ window.__botDone=true; }
+      else setTimeout(function(){ newGame(); if(window.LOOP) LOOP.emit('restart',{}); },800);
+    }
+  }
+
+  function flash(txt,color,size){ flashes.push({txt:txt,color:color,size:size,t:0}); }
+
+  // ---- input: FACE ONLY. Tap/space ONLY restarts after a crash — never steers.
+  function tapRestart(){
+    if(AUTO) return;
+    if(state && state.phase==='over' && performance.now()-state.overAt>500){
+      newGame(); if(window.LOOP) LOOP.emit('restart',{});
+    }
+  }
+  window.addEventListener('keydown',function(e){ if(e.code==='Space'){ e.preventDefault(); tapRestart(); } });
+  cv.addEventListener('pointerdown', tapRestart);
+
+  // ---- camera start (shared FC lib) ----
+  async function startCamera(){
+    document.getElementById('perm').style.display='none';
+    document.getElementById('ui').style.display='flex';
+    await FC.start();
+    newGame();
+    requestAnimationFrame(frame);
+  }
+  document.getElementById('start').addEventListener('click', startCamera);
+
+  // ---- autopilot steer for demo/bot: lean away from the nearest same-lane threat ----
+  function computeAutoSteer(){
+    if(state.phase!=='play') return 0;
+    var giveUp = (DEMO && score>=11) || (BOT && score>=4+botRunsDone*3);
+    var p=state.player, threat=null, minY=-Infinity;
+    for(var i=0;i<hazards.length;i++){
+      var h=hazards[i];
+      if(h.lane!==p.lane || h.passed) continue;
+      if(h.y>minY && h.y+h.h<PLAYER_Y-PLAYER_R){ minY=h.y; threat=h; }
+    }
+    if(giveUp) return 0;                       // freeze → the fail lands the clip
+    if(threat && (PLAYER_Y-PLAYER_R)-(threat.y+threat.h) < 200){
+      autoDir = p.lane===0 ? 1 : -1;           // lean toward the other lane
+    } else if(Math.abs(autoSteer)<0.05){
+      autoDir = 0;
+    }
+    return autoDir*0.7;
+  }
+
+  // ---- frame loop ----
+  var last=performance.now();
+  function frame(now){
+    var dt=Math.min((now-last)/16.667,3); last=now;
+
+    // --- head steering ---
+    var raw;
+    if(AUTO){
+      raw=computeAutoSteer();
+      steerSmoothed += (raw-steerSmoothed)*0.25*dt;
+    } else {
+      FC.update(now);
+      // lean (roll) OR turn (yaw) — take whichever is stronger, so both gestures work
+      var tilt=FC.sig.headTilt, yaw=FC.sig.headYaw;
+      var sig = Math.abs(yaw)>Math.abs(tilt) ? yaw : tilt;
+      steerSmoothed += (sig-steerSmoothed)*0.4*dt;
+      // FACE STARTS THE RUN — continuous control has no discrete start tap
+      if(state && state.phase==='ready' && FC.faceSeen) startRun();
+    }
+    var wasActive=steerActive;
+    steerActive = steerActive ? Math.abs(steerSmoothed)>STEER_OFF : Math.abs(steerSmoothed)>STEER_ON;
+    if(!AUTO && steerActive && !wasActive && state && state.phase==='play' && now-lastSteerEmit>400){
+      lastSteerEmit=now; if(window.LOOP) LOOP.emit('steer',{dir:steerSmoothed>0?'r':'l'});
+    }
+
+    // sim step (frozen during hit-stop)
+    if(hitStop>0){ hitStop-=dt; }
+    else if(state && state.phase==='play'){
+      runClock += dt*0.016667;
+
+      // steering → lane: lean right = lane 1, lean left = lane 0 (hysteresis above)
+      if(steerActive) switchLane(steerSmoothed>0?1:0);
+
+      spawnTimer += dt*0.016667;
+      if(spawnTimer>=nextSpawnIn) spawnHazard();
+
+      for(var i=0;i<hazards.length;i++) hazards[i].y += hazards[i].vy*dt;
+
+      if(!checkCollisions()) checkPasses();
+
+      if(runClock>=MAX_DUR && state.phase==='play') gameOver('survived');
+    }
+
+    // ---- draw ----
+    cx.save();
+    if(shakeAmt>0.2 || zoom>1.001){
+      var sx=(Math.random()-0.5)*shakeAmt, sy=(Math.random()-0.5)*shakeAmt;
+      cx.translate(W/2+sx,H/2+sy); cx.scale(zoom,zoom); cx.translate(-W/2,-H/2);
+    }
+    shakeAmt*=Math.pow(0.85,dt); zoom+=(1-zoom)*0.12*dt;
+
+    cx.fillStyle=INK; cx.fillRect(-20,-20,W+40,H+40);
+    var bg=cx.createLinearGradient(0,0,0,H);
+    bg.addColorStop(0,'rgba(46,197,182,0.05)'); bg.addColorStop(1,'rgba(232,80,46,0.08)');
+    cx.fillStyle=bg; cx.fillRect(0,0,W,H);
+
+    // lanes
+    cx.globalAlpha=0.12; cx.fillStyle=TEAL;
+    for(var l=0;l<LANES.length;l++) cx.fillRect(LANES[l]-42,0,84,H);
+    cx.globalAlpha=1;
+
+    // hazards
+    for(var j=0;j<hazards.length;j++){
+      var h2=hazards[j];
+      cx.save();
+      cx.translate(h2.x,h2.y+h2.h/2); cx.rotate(h2.r);
+      var gr=cx.createLinearGradient(-h2.w/2,-h2.h/2,h2.w/2,h2.h/2);
+      gr.addColorStop(0,VERM); gr.addColorStop(1,'#b53a20');
+      cx.fillStyle=gr;
+      cx.beginPath();
+      if(cx.roundRect) cx.roundRect(-h2.w/2,-h2.h/2,h2.w,h2.h,8); else cx.rect(-h2.w/2,-h2.h/2,h2.w,h2.h);
+      cx.fill();
+      cx.strokeStyle='rgba(255,255,255,0.25)'; cx.lineWidth=1; cx.stroke();
+      cx.restore();
+    }
+
+    // player — lerp toward target lane, slight lean with the head
+    if(state){
+      var p=state.player, tx=LANES[p.lane];
+      p.x += (tx-p.x)*0.22;
+      var g=cx.createRadialGradient(p.x,PLAYER_Y,4,p.x,PLAYER_Y,PLAYER_R*2);
+      g.addColorStop(0,'rgba(46,197,182,0.55)'); g.addColorStop(1,'rgba(46,197,182,0)');
+      cx.fillStyle=g;
+      cx.beginPath(); cx.arc(p.x,PLAYER_Y,PLAYER_R*2,0,Math.PI*2); cx.fill();
+      cx.fillStyle=TEAL;
+      cx.beginPath(); cx.arc(p.x,PLAYER_Y,PLAYER_R,0,Math.PI*2); cx.fill();
+      cx.strokeStyle='rgba(255,255,255,0.5)'; cx.lineWidth=2; cx.stroke();
+      // face on the puck: eyes lean with the steer — it IS you
+      cx.fillStyle='#0b0d12';
+      var lean=steerSmoothed*7;
+      cx.beginPath(); cx.arc(p.x-8+lean,PLAYER_Y-4,3.4,0,Math.PI*2); cx.fill();
+      cx.beginPath(); cx.arc(p.x+8+lean,PLAYER_Y-4,3.4,0,Math.PI*2); cx.fill();
+      cx.strokeStyle='#0b0d12'; cx.lineWidth=2.4; cx.lineCap='round';
+      cx.beginPath(); cx.arc(p.x+lean,PLAYER_Y+5,6,0.15*Math.PI,0.85*Math.PI); cx.stroke();
+    }
+
+    // HUD
+    if(state && (state.phase==='play'||state.phase==='over')){
+      cx.textAlign='center';
+      cx.fillStyle='rgba(255,255,255,0.92)'; cx.font='800 64px -apple-system, Helvetica, Arial';
+      cx.fillText(score,W/2,96);
+      cx.fillStyle='rgba(255,255,255,0.4)'; cx.font='600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST '+best,W/2,120);
+      if(combo>1){
+        cx.fillStyle=combo>=10?GOLD:TEAL; cx.font='800 18px -apple-system, Helvetica, Arial';
+        cx.fillText('STREAK ×'+combo,W/2,146);
+      }
+      var prog=Math.min(runClock/MAX_DUR,1);
+      cx.fillStyle='rgba(255,255,255,0.12)'; cx.fillRect(40,160,W-80,4);
+      cx.fillStyle=prog>=1?GOLD:VERM; cx.fillRect(40,160,(W-80)*prog,4);
+      if(!AUTO && window.SHARE && SHARE.dare!==null && state.phase==='play'){
+        cx.fillStyle=dareBeaten?TEAL:GOLD; cx.font='800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten?'DARE BEATEN ✓':'BEAT '+SHARE.dare+(SHARE.by?' — dared by '+SHARE.by:''),W/2,188);
+      }
+    }
+
+    // flashes
+    for(var k=flashes.length-1;k>=0;k--){
+      var fl=flashes[k]; fl.t+=dt;
+      var a=Math.max(0,1-fl.t/40);
+      cx.globalAlpha=a; cx.textAlign='center'; cx.fillStyle=fl.color;
+      cx.font='900 '+(fl.size+fl.t*0.5)+'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt,W/2,260-fl.t*0.6);
+      cx.globalAlpha=1;
+      if(fl.t>40) flashes.splice(k,1);
+    }
+
+    // webcam PiP
+    var camW=118, camH=88, cpx=W-camW-12, cpy=12;
+    if(!AUTO){
+      var barMag=Math.min(1,Math.abs(steerSmoothed)*1.4);
+      FC.drawPiP(cx,cpx,cpy,camW,camH,steerActive,barMag,W,H);
+      var fcLabel=FC.statusLabel()||'MOVE YOUR HEAD';
+      cx.fillStyle=(fcLabel.indexOf('http')>=0||fcLabel.indexOf('blocked')>=0)?GOLD:'rgba(255,255,255,0.6)';
+      cx.font='700 9px Menlo,monospace'; cx.textAlign='center';
+      cx.fillText(fcLabel.toUpperCase(),cpx+camW/2,cpy+camH+22);
+    } else {
+      // AUTO: simulated leaning oval head in the PiP
+      cx.save();
+      cx.strokeStyle='rgba(255,255,255,0.3)'; cx.lineWidth=2;
+      cx.beginPath();
+      if(cx.roundRect) cx.roundRect(cpx,cpy,camW,camH,12); else cx.rect(cpx,cpy,camW,camH);
+      cx.stroke(); cx.clip();
+      cx.fillStyle='#1a1230'; cx.fillRect(cpx,cpy,camW,camH);
+      cx.save();
+      cx.translate(cpx+camW/2+steerSmoothed*20,cpy+camH/2-4);
+      cx.rotate(steerSmoothed*0.45);
+      cx.fillStyle=GOLD; cx.beginPath(); cx.ellipse(0,0,22,30,0,0,Math.PI*2); cx.fill();
+      cx.fillStyle='#111';
+      cx.beginPath(); cx.ellipse(-8,-8,4,3,0,0,Math.PI*2); cx.fill();
+      cx.beginPath(); cx.ellipse(8,-8,4,3,0,0,Math.PI*2); cx.fill();
+      cx.fillStyle=VERM;
+      cx.beginPath(); cx.ellipse(0,12,6+Math.abs(steerSmoothed)*8,4,0,0,Math.PI*2); cx.fill();
+      cx.restore();
+      cx.restore();
+      cx.fillStyle='rgba(255,255,255,0.6)'; cx.font='700 9px Menlo,monospace'; cx.textAlign='center';
+      cx.fillText('DEMO',cpx+camW/2,cpy+camH+22);
+    }
+
+    // phase overlays
+    if(state && state.phase==='ready'){
+      cx.textAlign='center';
+      cx.fillStyle='#fff'; cx.font='900 33px -apple-system, Helvetica, Arial';
+      cx.fillText('DROP DODGE FACE',W/2,280);
+      cx.fillStyle=VERM; cx.font='800 18px -apple-system, Helvetica, Arial';
+      cx.globalAlpha=0.6+0.4*Math.sin(now/300);
+      cx.fillText('MOVE YOUR HEAD SIDE TO SIDE',W/2,330);
+      cx.globalAlpha=1;
+      cx.fillStyle='rgba(255,255,255,0.35)'; cx.font='600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('60 seconds. lean or die.',W/2,360);
+    }
+    if(state && state.phase==='over'){
+      cx.fillStyle='rgba(11,13,18,0.55)'; cx.fillRect(0,0,W,H);
+      cx.textAlign='center';
+      cx.fillStyle=survived?GOLD:VERM; cx.font='900 40px -apple-system, Helvetica, Arial';
+      cx.fillText(survived?'SURVIVED.':'CLIPPED.',W/2,300);
+      cx.fillStyle='#fff'; cx.font='800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(score+' dodges',W/2,345);
+      var pt=pctTop(score);
+      cx.fillStyle=GOLD; cx.font='900 24px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP '+pt+'% TODAY',W/2,392);
+      cx.fillStyle='rgba(255,255,255,0.55)'; cx.font='600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than '+(100-pt)+'% of players',W/2,416);
+      if(!AUTO){
+        var p2=0.6+0.4*Math.sin(now/280);
+        cx.globalAlpha=p2; cx.fillStyle=TEAL; cx.font='700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY',W/2,462);
+        cx.globalAlpha=1;
+      }
+    }
+    if(state && state.phase==='cta'){
+      var tt=(now-ctaAt)/1000, ee=Math.min(1,tt*2.2);
+      cx.fillStyle='rgba(11,13,18,'+(0.78*ee)+')'; cx.fillRect(0,0,W,H);
+      cx.globalAlpha=ee; cx.textAlign='center';
+      cx.fillStyle='#fff'; cx.font='900 33px -apple-system, Helvetica, Arial';
+      cx.fillText('DROP DODGE FACE',W/2,300);
+      cx.fillStyle='rgba(255,255,255,0.75)'; cx.font='700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('he dodged '+(window.__demoScore||9)+' with his FACE.',W/2,340);
+      var p3=0.7+0.3*Math.sin(now/240);
+      cx.fillStyle=VERM; cx.globalAlpha=ee*p3; cx.font='900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT '+(window.__demoScore||9),W/2,410);
+      cx.globalAlpha=ee;
+      cx.fillStyle=TEAL; cx.font='700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio',W/2,442);
+      cx.globalAlpha=1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- recording (shared FaceControl lib) ----
+  var recBtn=document.getElementById('rec');
+  recBtn.addEventListener('click',function(){
+    var started=FC.toggleRecord(cv,'drop-dodge-face.webm',function(){
+      recBtn.textContent='● RECORD'; recBtn.classList.remove('on');
+      if(window.LOOP) LOOP.emit('recording_saved',{score:score});
+    });
+    if(started){ recBtn.textContent='■ STOP & SAVE'; recBtn.classList.add('on'); }
+  });
+
+  if(AUTO){ document.getElementById('perm').style.display='none'; newGame(); requestAnimationFrame(frame); }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Crinkle Press — Tilt</title>
+<!--
+  LOOP / attention-architecture — Crinkle Press
+  Engine: calm. Circuits: 05-ease, 01-rpe, 06-zeigarnik.
+  Mechanic: press and release a procedural foil surface; 15 presses smooth it flat.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA card → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'crinkle-press';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- foil surface state ----
+  // Grid of deformation points across the foil area
+  var FOIL_X = 72, FOIL_Y = 40;          // grid resolution
+  var FOIL_MARGIN = 48;                   // px from canvas edge
+  var FOIL_W = W - FOIL_MARGIN * 2;
+  var FOIL_TOP = 150, FOIL_H = 420;      // foil area in canvas coords
+
+  var MAX_PRESSES = 15;
+
+  // Each point has a height offset (dent depth, 0=flat, 1=fully dented)
+  var grid = [];
+  function initGrid() {
+    grid = [];
+    for (var j = 0; j <= FOIL_Y; j++) {
+      grid[j] = [];
+      for (var i = 0; i <= FOIL_X; i++) {
+        // small seed wrinkles to make it look pre-crinkled
+        grid[j][i] = rng() * 0.08;
+      }
+    }
+  }
+
+  // State
+  var state, pressCount, runStartTs;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var flashes = [];
+  var pressing = false, pressX = 0, pressY = 0, pressStrength = 0, pressAge = 0;
+  var botRunsDone = 0;
+
+  function newGame() {
+    initGrid();
+    pressCount = 0;
+    pressing = false;
+    pressStrength = 0;
+    pressAge = 0;
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    state = { phase: 'title', score: 0, overAt: 0, ctaAt: 0 };
+    if (DEMO) {
+      startRun();
+    } else if (BOT) {
+      startRun();
+    }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function gameOver() {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    state.score = pressCount;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    initGrid();
+    pressCount = 0;
+    pressing = false;
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    // rebuild bot script so next run has fresh state
+    if (BOT) buildBotScript();
+    // reset demo script pointer
+    demoIdx = 0; demoHold = 0; demoWait = 40; demoPhase = 'wait';
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- dent the foil at a canvas position with given radius and depth ----
+  function dentAt(cx2, cy2, radius, depth) {
+    // cx2, cy2 in canvas coords inside the foil area
+    var gx = (cx2 - FOIL_MARGIN) / FOIL_W * FOIL_X;
+    var gy = (cy2 - FOIL_TOP) / FOIL_H * FOIL_Y;
+    var gr = radius / FOIL_W * FOIL_X;
+    for (var j = 0; j <= FOIL_Y; j++) {
+      for (var i = 0; i <= FOIL_X; i++) {
+        var dx = i - gx, dy = (j - gy) * (FOIL_W / FOIL_H) * (FOIL_Y / FOIL_X);
+        var d = Math.sqrt(dx * dx + dy * dy);
+        if (d < gr) {
+          var influence = Math.pow(1 - d / gr, 2) * depth;
+          grid[j][i] = Math.min(1, grid[j][i] + influence);
+        }
+      }
+    }
+  }
+
+  // Gradually smooth grid toward flat (called after each full press cycle)
+  function smoothStep() {
+    // decay all deformations a little — simulates foil memory
+    var decay = 0.06;
+    for (var j = 0; j <= FOIL_Y; j++) {
+      for (var i = 0; i <= FOIL_X; i++) {
+        grid[j][i] = Math.max(0, grid[j][i] - decay);
+      }
+    }
+  }
+
+  // ---- press handling ----
+  function beginPress(px, py) {
+    if (state.phase !== 'play') return;
+    pressing = true;
+    pressX = px; pressY = py;
+    pressStrength = 0;
+    pressAge = 0;
+  }
+
+  function endPress() {
+    if (!pressing || state.phase !== 'play') { pressing = false; return; }
+    pressing = false;
+    pressCount++;
+
+    var depth = 0.35 + pressStrength * 0.55;  // 0.35–0.90
+    dentAt(pressX, pressY, 55 + pressStrength * 30, depth);
+
+    // emit sound based on strength
+    var step = Math.floor(pressStrength * 3);  // 0-3 → calm steps
+    if (window.J) J.calm(step);
+
+    // juice: stronger press = bigger zoom+shake
+    if (pressStrength > 0.7) {
+      zoom = 1.015; shakeAmt = 1.5;
+    } else if (pressStrength > 0.4) {
+      zoom = 1.008;
+    }
+
+    // after each press, smooth foil a tiny bit toward flat
+    smoothStep();
+
+    // floating label
+    var label = pressStrength > 0.7 ? 'DEEP PRESS' : pressStrength > 0.4 ? 'PRESS' : 'WHISPER';
+    flash(label, TEAL, 28);
+
+    if (window.LOOP) LOOP.emit('foil_pressed', { n: pressCount, strength: +pressStrength.toFixed(2) });
+
+    if (pressCount >= MAX_PRESSES) {
+      // foil smoothed to flat — session complete
+      // final full-smooth
+      for (var j = 0; j <= FOIL_Y; j++) {
+        for (var i = 0; i <= FOIL_X; i++) {
+          grid[j][i] = 0;
+        }
+      }
+      zoom = 1.02; shakeAmt = 0.5;
+      if (window.J) J.calm(4);
+      flash('SMOOTH', GOLD, 36);
+      setTimeout(function () { gameOver(); }, 800);
+    }
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function pointerInFoil(x, y) {
+    return x >= FOIL_MARGIN && x <= W - FOIL_MARGIN &&
+           y >= FOIL_TOP && y <= FOIL_TOP + FOIL_H;
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    var r = cv.getBoundingClientRect();
+    var x = (e.clientX - r.left) / scale;
+    var y = (e.clientY - r.top) / scale;
+    if (inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) { resetRun(); return; }
+    if (state.phase === 'play') {
+      if (pointerInFoil(x, y)) {
+        beginPress(x, y);
+      }
+    }
+  });
+
+  window.addEventListener('pointerup', function () {
+    if (DEMO || BOT) return;
+    endPress();
+  });
+
+  window.addEventListener('pointermove', function (e) {
+    if (DEMO || BOT || !pressing) return;
+    // allow dragging in foil
+  });
+
+  // ---- demo / bot autopilot ----
+  // Demo: scripted sequence of 15 presses with varied timing and strength
+  var demoScript = [
+    // [relX 0-1, relY 0-1, strength 0-1, holdFrames]
+    [0.50, 0.40, 0.30, 28],
+    [0.30, 0.55, 0.45, 32],
+    [0.70, 0.35, 0.55, 26],
+    [0.45, 0.65, 0.25, 35],
+    [0.60, 0.50, 0.70, 30],
+    [0.25, 0.45, 0.40, 33],
+    [0.75, 0.60, 0.60, 28],
+    [0.50, 0.30, 0.85, 22],   // deep press — visual payload
+    [0.40, 0.70, 0.35, 36],
+    [0.65, 0.40, 0.50, 29],
+    [0.35, 0.55, 0.45, 31],
+    [0.55, 0.62, 0.65, 27],
+    [0.48, 0.45, 0.80, 24],
+    [0.60, 0.35, 0.55, 30],
+    [0.50, 0.50, 0.90, 20],   // final full press
+  ];
+  var demoIdx = 0, demoHold = 0, demoWait = 40, demoPhase = 'wait'; // wait | hold | release
+
+  var botScript = [];
+  var botIdx = 0, botHold = 0, botWait = 0, botPhase = 'wait';
+  function buildBotScript() {
+    botScript = [];
+    for (var i = 0; i < MAX_PRESSES; i++) {
+      botScript.push([
+        0.2 + rng() * 0.6,
+        0.2 + rng() * 0.6,
+        0.3 + rng() * 0.6,
+        15 + Math.floor(rng() * 25)
+      ]);
+    }
+    botIdx = 0; botHold = 0; botWait = 20; botPhase = 'wait';
+  }
+  buildBotScript();
+
+  function autopilot() {
+    if (state.phase !== 'play') return;
+
+    if (DEMO) {
+      if (demoIdx >= demoScript.length) return;
+      var sc = demoScript[demoIdx];
+      if (demoPhase === 'wait') {
+        if (demoWait > 0) { demoWait--; return; }
+        // begin press
+        pressX = FOIL_MARGIN + sc[0] * FOIL_W;
+        pressY = FOIL_TOP + sc[1] * FOIL_H;
+        pressStrength = 0;
+        pressAge = 0;
+        pressing = true;
+        demoHold = sc[3];
+        demoPhase = 'hold';
+      } else if (demoPhase === 'hold') {
+        // ramp up strength
+        pressStrength = Math.min(sc[2], pressStrength + 0.04);
+        pressAge++;
+        // dent in real-time while holding
+        dentAt(pressX, pressY, 30, 0.015);
+        if (demoHold > 0) { demoHold--; return; }
+        demoPhase = 'release';
+      } else if (demoPhase === 'release') {
+        // finalize press
+        var depth2 = 0.35 + pressStrength * 0.55;
+        dentAt(pressX, pressY, 55 + pressStrength * 30, depth2);
+        if (window.J) J.calm(Math.floor(pressStrength * 3));
+        if (pressStrength > 0.7) { zoom = 1.015; shakeAmt = 1.5; }
+        else if (pressStrength > 0.4) { zoom = 1.008; }
+        smoothStep();
+        var lbl = pressStrength > 0.7 ? 'DEEP PRESS' : pressStrength > 0.4 ? 'PRESS' : 'WHISPER';
+        flash(lbl, TEAL, 28);
+        if (window.LOOP) LOOP.emit('foil_pressed', { n: pressCount + 1, strength: +pressStrength.toFixed(2) });
+        pressCount++;
+        pressing = false;
+        if (pressCount >= MAX_PRESSES) {
+          for (var j2 = 0; j2 <= FOIL_Y; j2++)
+            for (var i2 = 0; i2 <= FOIL_X; i2++) grid[j2][i2] = 0;
+          zoom = 1.02; shakeAmt = 0.5;
+          if (window.J) J.calm(4);
+          flash('SMOOTH', GOLD, 36);
+          setTimeout(function () { gameOver(); }, 800);
+          demoIdx = 999;
+          return;
+        }
+        demoIdx++;
+        demoWait = 25 + Math.floor(rng() * 20);
+        demoPhase = 'wait';
+      }
+    } else if (BOT) {
+      if (botIdx >= botScript.length) return;
+      var bsc = botScript[botIdx];
+      if (botPhase === 'wait') {
+        if (botWait > 0) { botWait--; return; }
+        pressX = FOIL_MARGIN + bsc[0] * FOIL_W;
+        pressY = FOIL_TOP + bsc[1] * FOIL_H;
+        pressStrength = 0;
+        pressing = true;
+        botHold = bsc[3];
+        botPhase = 'hold';
+      } else if (botPhase === 'hold') {
+        pressStrength = Math.min(bsc[2], pressStrength + 0.05);
+        dentAt(pressX, pressY, 25, 0.01);
+        if (botHold > 0) { botHold--; return; }
+        botPhase = 'release';
+      } else if (botPhase === 'release') {
+        var bdepth = 0.35 + pressStrength * 0.55;
+        dentAt(pressX, pressY, 55 + pressStrength * 30, bdepth);
+        if (window.J) J.calm(Math.floor(pressStrength * 3));
+        smoothStep();
+        if (window.LOOP) LOOP.emit('foil_pressed', { n: pressCount + 1, strength: +pressStrength.toFixed(2) });
+        pressCount++;
+        pressing = false;
+        if (pressCount >= MAX_PRESSES) {
+          for (var bj = 0; bj <= FOIL_Y; bj++)
+            for (var bi = 0; bi <= FOIL_X; bi++) grid[bj][bi] = 0;
+          setTimeout(function () { gameOver(); }, 400);
+          botIdx = 999;
+          return;
+        }
+        botIdx++;
+        botWait = 10 + Math.floor(rng() * 15);
+        botPhase = 'wait';
+      }
+    }
+  }
+
+  // ---- render ----
+  function drawFoil(now) {
+    var cellW = FOIL_W / FOIL_X;
+    var cellH = FOIL_H / FOIL_Y;
+
+    // Draw foil as a grid of quads shaded by height
+    for (var j = 0; j < FOIL_Y; j++) {
+      for (var i = 0; i < FOIL_X; i++) {
+        var h00 = grid[j][i];
+        var h10 = grid[j][i+1];
+        var h01 = grid[j+1][i];
+        var h11 = grid[j+1][i+1];
+        var avgH = (h00 + h10 + h01 + h11) * 0.25;
+
+        var px0 = FOIL_MARGIN + i * cellW;
+        var py0 = FOIL_TOP + j * cellH;
+
+        // Silver foil base color modulated by dent depth
+        var lightness = Math.round(72 - avgH * 38);  // dented = darker
+        var saturation = Math.round(8 + avgH * 4);
+        var hue = 190 + Math.round(avgH * 20);
+        cx.fillStyle = 'hsl(' + hue + ',' + saturation + '%,' + lightness + '%)';
+
+        // tiny normal-based highlight: top-left corner of each cell
+        cx.fillRect(px0, py0, cellW + 0.5, cellH + 0.5);
+
+        // specular glint along ridges (high gradient regions)
+        var gradX = Math.abs(h10 - h00);
+        var gradY = Math.abs(h01 - h00);
+        var edge = gradX + gradY;
+        if (edge > 0.08) {
+          cx.fillStyle = 'rgba(255,255,255,' + Math.min(0.55, edge * 1.8) + ')';
+          cx.fillRect(px0, py0, cellW * 0.5, cellH * 0.5);
+        }
+      }
+    }
+
+    // Active press ripple (live finger feedback)
+    if (pressing && state.phase === 'play') {
+      var rippleR = 35 + pressStrength * 25;
+      var g = cx.createRadialGradient(pressX, pressY, 0, pressX, pressY, rippleR);
+      g.addColorStop(0, 'rgba(46,197,182,0.22)');
+      g.addColorStop(1, 'rgba(46,197,182,0)');
+      cx.fillStyle = g;
+      cx.beginPath();
+      cx.arc(pressX, pressY, rippleR, 0, Math.PI * 2);
+      cx.fill();
+    }
+  }
+
+  function drawProgressBar() {
+    var barW = W - 80, barH = 8;
+    var barX = 40, barY = FOIL_TOP - 32;
+    cx.fillStyle = 'rgba(255,255,255,0.1)';
+    cx.fillRect(barX, barY, barW, barH);
+    var fill = (pressCount / MAX_PRESSES) * barW;
+    cx.fillStyle = TEAL;
+    cx.fillRect(barX, barY, fill, barH);
+    cx.fillStyle = 'rgba(255,255,255,0.45)';
+    cx.font = '500 11px -apple-system, Helvetica, Arial';
+    cx.textAlign = 'left';
+    cx.fillText(pressCount + '/' + MAX_PRESSES + ' presses', barX, barY - 6);
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // juice: decay hitStop, shake, zoom
+    if (hitStop > 0) { hitStop -= dt; }
+    else { autopilot(); }
+    shakeAmt *= Math.pow(0.88, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // during a live press, ramp pressure with time
+    if (pressing && state.phase === 'play' && !DEMO && !BOT) {
+      pressStrength = Math.min(1, pressStrength + 0.018 * dt);
+      pressAge += dt;
+      // live denting
+      dentAt(pressX, pressY, 25, 0.008 * dt);
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (rng() - 0.5) * shakeAmt * 2;
+      var sy = (rng() - 0.5) * shakeAmt * 2;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK;
+    cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.01)');
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, W, H);
+
+    // title screen
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('CRINKLE PRESS', W / 2, 280);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('press the foil. feel it settle.', W / 2, 320);
+      var pulse = 0.5 + 0.5 * Math.sin(now / 700);
+      cx.globalAlpha = 0.6 + 0.4 * pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, 370);
+      cx.globalAlpha = 1;
+    }
+
+    // play screen
+    if (state.phase === 'play') {
+      drawFoil(now);
+      drawProgressBar();
+
+      // hint text
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.25)';
+      cx.font = '500 12px -apple-system, Helvetica, Arial';
+      cx.fillText('hold to press deeper', W / 2, FOIL_TOP + FOIL_H + 30);
+    }
+
+    // over screen
+    if (state.phase === 'over') {
+      drawFoil(now);
+      cx.fillStyle = 'rgba(11,13,18,0.6)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('SMOOTHED.', W / 2, 300);
+      cx.fillStyle = '#fff';
+      cx.font = '700 22px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' presses', W / 2, 342);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('the foil found its rest.', W / 2, 372);
+      if (!DEMO && !BOT) {
+        var p2 = 0.55 + 0.45 * Math.sin(now / 500);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — PRESS AGAIN', W / 2, 430);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // demo CTA card
+    if (state.phase === 'cta') {
+      var t = (now - state.ctaAt) / 1000;
+      var ease = Math.min(1, t * 2.5);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('CRINKLE PRESS', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.65)';
+      cx.font = '500 18px -apple-system, Helvetica, Arial';
+      cx.fillText('press the foil flat', W / 2, 334);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 380);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 405);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.38)';
+      cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // floating flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k];
+      fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, FOIL_TOP - 60 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

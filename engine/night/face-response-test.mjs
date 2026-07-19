@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const SIG = { 'flappy-face': 'mouthOpen', 'brow-lift': 'browRaise', 'head-dodge': 'headTilt', 'big-smile': 'smile', 'blink-shoot': 'blink', 'kiss-cam': 'pucker', 'cheek-float': 'cheekPuff', 'look-away': 'headYaw', 'infinite-fall-face': 'headTilt' };
+const SIG = { 'flappy-face': 'mouthOpen', 'brow-lift': 'browRaise', 'head-dodge': 'headTilt', 'big-smile': 'smile', 'blink-shoot': 'blink', 'kiss-cam': 'pucker', 'cheek-float': 'cheekPuff', 'look-away': 'headYaw', 'infinite-fall-face': 'headTilt', 'drop-dodge-face': 'headTilt' };
 const games = process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(SIG);
 const { chromium } = await import('playwright');
 const b = await chromium.launch();

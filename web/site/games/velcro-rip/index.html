@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Velcro Rip — Tilt</title>
+<!--
+  LOOP / attention-architecture — Velcro Rip
+  Circuits: 01-rpe (variable reward per drag speed), 03-social (competitive rank),
+            05-ease (conditioned gesture from Instagram/TikTok).
+  Modes:
+    ?demo=1&seed=7   scripted mirror-neuron clip, sets window.__demoDone
+    ?bot=1&runs=N    imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'velcro-rip';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ── Game constants ──────────────────────────────────────────────────────────
+  var STRIP_X   = W / 2 - 140;   // velcro strip left edge
+  var STRIP_W   = 280;            // strip width
+  var STRIP_Y   = 360;            // strip centre Y
+  var STRIP_H   = 60;             // strip height
+  var MAX_RIPS  = 3;              // three rips per session
+  var DEMO_SCORE = 4120;          // challenge score shown in demo
+
+  // ── State ───────────────────────────────────────────────────────────────────
+  var phase;          // 'title' | 'challenge' | 'play' | 'between' | 'over' | 'cta'
+  var ripsLeft, bestPeak, sessionBest, runStartTs, overAt, ctaAt;
+  var dragging, dragStartX, dragStartTime, dragLastX, dragLastTime;
+  var peakSpeed, particles, flashes;
+  var hitStop = 0, zoom = 1, shakeAmt = 0, dareBeaten = false, challengeAt = 0;
+  var botRunsDone = 0;
+  var between_timer = 0;
+
+  try { sessionBest = +localStorage.getItem('vr_best') || 0; } catch (_) { sessionBest = 0; }
+
+  function newGame() {
+    phase       = 'title';
+    ripsLeft    = MAX_RIPS;
+    bestPeak    = 0;
+    peakSpeed   = 0;
+    particles   = [];
+    flashes     = [];
+    dragging    = false;
+    dareBeaten  = false;
+    hitStop     = 0; zoom = 1; shakeAmt = 0;
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function startRun() {
+    phase      = 'play';
+    ripsLeft   = MAX_RIPS;
+    bestPeak   = 0;
+    peakSpeed  = 0;
+    dragging   = false;
+    particles  = [];
+    flashes    = [];
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    if (window.J) J.tension(0);
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 3000))));
+  }
+
+  // ── Rip result ──────────────────────────────────────────────────────────────
+  function endRip(speed) {
+    // speed in px/s
+    peakSpeed = Math.max(peakSpeed, speed);
+
+    // juice
+    if (window.J) {
+      if (speed > 4000) { J.perfect(1); hitStop = 5; zoom = 1.025; }
+      else if (speed > 2500) { J.hit(2); hitStop = 3; }
+      else if (speed > 1200) { J.hit(1); }
+      else { J.near(); }
+      J.tension(Math.min(speed / 5000, 1));
+    }
+
+    // emit per-rip event
+    if (window.LOOP) LOOP.emit('rip_done', { speed: Math.round(speed), rips_left: ripsLeft - 1 });
+
+    // dare check (per-rip)
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && speed > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 40);
+      if (window.J) J.fanfare();
+      SHARE.beaten(Math.round(peakSpeed));
+    }
+
+    // floating reward text
+    var label = speed > 4000 ? 'PERFECT RIP!' : speed > 2500 ? 'FAST!' : speed > 1200 ? 'GOOD' : 'SLOW';
+    flash(label, speed > 4000 ? GOLD : speed > 2500 ? VERM : TEAL, speed > 4000 ? 46 : 36);
+
+    // velcro crack particles
+    spawnParticles(speed);
+
+    ripsLeft--;
+    if (ripsLeft <= 0) {
+      // small delay then game over
+      between_timer = 0;
+      phase = 'between';
+    } else {
+      // between rips: brief pause then next
+      between_timer = 0;
+      phase = 'between';
+    }
+  }
+
+  function triggerGameOver() {
+    phase  = 'over';
+    overAt = performance.now();
+    var finalScore = Math.round(bestPeak);
+    var dur = (Date.now() - runStartTs) / 1000;
+    shakeAmt = 6;
+
+    var newBest = finalScore > sessionBest;
+    if (window.J) {
+      J.death(0.4);
+      if (newBest) setTimeout(function () { J.fanfare(); }, 400);
+    }
+    if (newBest) {
+      sessionBest = finalScore;
+      try { localStorage.setItem('vr_best', String(sessionBest)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: finalScore, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      window.__demoScore = finalScore;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 900);
+    }
+  }
+
+  function resetRun() {
+    ripsLeft  = MAX_RIPS;
+    bestPeak  = 0;
+    peakSpeed = 0;
+    dragging  = false;
+    particles = [];
+    flashes   = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ── Particles ───────────────────────────────────────────────────────────────
+  function spawnParticles(speed) {
+    var count = Math.round(10 + speed / 300);
+    for (var i = 0; i < count; i++) {
+      var px = STRIP_X + rng() * STRIP_W;
+      var py = STRIP_Y + (rng() - 0.5) * STRIP_H;
+      var angle = -Math.PI / 2 + (rng() - 0.5) * Math.PI * 0.8;
+      var mag   = 1.5 + rng() * (speed / 800);
+      particles.push({
+        x: px, y: py,
+        vx: Math.cos(angle) * mag,
+        vy: Math.sin(angle) * mag,
+        life: 1, decay: 0.025 + rng() * 0.02,
+        r: 1 + rng() * 2,
+        color: rng() < 0.5 ? VERM : GOLD
+      });
+    }
+  }
+
+  // ── Floating text ────────────────────────────────────────────────────────────
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ── Input ────────────────────────────────────────────────────────────────────
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function onDragStart(x, y) {
+    if (DEMO || BOT) return;
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: Math.round(bestPeak), unit: 'px/s' }); return;
+      }
+      resetRun(); return;
+    }
+    if (phase !== 'play') return;
+    // require drag starting on the strip
+    if (y < STRIP_Y - STRIP_H / 2 - 20 || y > STRIP_Y + STRIP_H / 2 + 20) return;
+    dragging      = true;
+    dragStartX    = x;
+    dragStartTime = performance.now();
+    dragLastX     = x;
+    dragLastTime  = dragStartTime;
+  }
+
+  function onDragMove(x) {
+    if (!dragging || DEMO || BOT || phase !== 'play') return;
+    var now  = performance.now();
+    var dt_s = (now - dragLastTime) / 1000;
+    if (dt_s > 0.001) {
+      var v = Math.abs(x - dragLastX) / dt_s;
+      if (v > peakSpeed) peakSpeed = v;
+      // rising tension sound
+      if (window.J) J.tension(Math.min(peakSpeed / 5000, 1));
+    }
+    dragLastX   = x;
+    dragLastTime = now;
+  }
+
+  function onDragEnd(x) {
+    if (!dragging || DEMO || BOT || phase !== 'play') return;
+    dragging = false;
+    var totalDist = Math.abs(x - dragStartX);
+    if (totalDist < 15) return; // not a rip — too short
+    // use peakSpeed captured during drag
+    var speed = peakSpeed;
+    bestPeak = Math.max(bestPeak, speed);
+    endRip(speed);
+  }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (window.J && inR(MUTE_R, x, y)) { J.toggleMute(); return; }
+    onDragStart(x, y);
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    var cx_ = (e.clientX - r.left) / scale, cy_ = (e.clientY - r.top) / scale;
+    if (window.J && inR(MUTE_R, cx_, cy_)) { J.toggleMute(); return; }
+    onDragStart(cx_, cy_);
+  });
+  cv.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var r = cv.getBoundingClientRect();
+    onDragMove((e.clientX - r.left) / scale);
+  });
+  cv.addEventListener('pointerup', function (e) {
+    var r = cv.getBoundingClientRect();
+    onDragEnd((e.clientX - r.left) / scale);
+  });
+  cv.addEventListener('pointercancel', function (e) {
+    var r = cv.getBoundingClientRect();
+    onDragEnd((e.clientX - r.left) / scale);
+  });
+
+  // ── Demo / Bot autopilot ─────────────────────────────────────────────────────
+  // Demo: 3 rips with varied speeds simulating human hesitation
+  // rip 1 (modest ~2800), rip 2 (near-fail ~900), rip 3 recovery (fast ~3800)
+  // After rip 3: game over spectacle
+  var demoPhase = 0; // 0=wait, 1=ripping, 2=done
+  var demoRipTimer   = 0;   // frames until next rip starts
+  var demoRipActive  = false;
+  var demoRipX       = 0;
+  var demoRipSpeed   = 0;   // px per frame for this rip
+  var demoRipTarget  = 0;   // total x to cover
+  var demoRipProgress = 0;
+  var demoRipIdx     = 0;
+  // script: [waitFrames, speed_px_s, description]
+  var demoScript = [
+    { wait: 40, speed: 2800 },   // rip 1 — decent, builds expectation
+    { wait: 55, speed: 850  },   // rip 2 — near-fail, tension peak
+    { wait: 30, speed: 4200 },   // rip 3 — final fast rip, peak spectacle
+  ];
+
+  var botRipTimer  = 0;
+  var botRipActive = false;
+  var botRipX      = 0;
+  var botRipSpeed  = 0;
+  var botRipProgress = 0;
+  var botRipsDoneInRun = 0;
+
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      if (demoRipIdx >= demoScript.length) return;
+      var script = demoScript[demoRipIdx];
+
+      if (!demoRipActive) {
+        demoRipTimer -= dt;
+        if (demoRipTimer <= 0) {
+          // start the rip
+          demoRipActive   = true;
+          demoRipX        = STRIP_X + 10;
+          peakSpeed       = 0;
+          dragging        = true;
+          dragStartX      = demoRipX;
+          dragStartTime   = performance.now();
+          dragLastX       = demoRipX;
+          dragLastTime    = dragStartTime;
+          demoRipSpeed    = script.speed;
+          demoRipTarget   = STRIP_W - 20; // distance to cover
+          demoRipProgress = 0;
+        } else if (demoRipTimer === -1) {
+          // first call: initialize timer
+          demoRipTimer = script.wait;
+        }
+        return;
+      }
+
+      // rip is active: advance at demoRipSpeed
+      var step = demoRipSpeed * (dt / 60);
+      demoRipProgress += step;
+      demoRipX += step;
+      var now_ = performance.now();
+      var dt_s = Math.max(0.001, (now_ - dragLastTime) / 1000);
+      var inst  = step / dt_s;
+      if (inst > peakSpeed) peakSpeed = inst;
+      if (window.J) J.tension(Math.min(peakSpeed / 5000, 1));
+      dragLastX    = demoRipX;
+      dragLastTime = now_;
+
+      if (demoRipProgress >= demoRipTarget) {
+        // end rip
+        dragging      = false;
+        demoRipActive = false;
+        bestPeak = Math.max(bestPeak, peakSpeed);
+        var capturedSpeed = peakSpeed;
+        peakSpeed = 0;
+        demoRipIdx++;
+        demoRipTimer = -1; // will be set next call
+        endRip(capturedSpeed);
+      }
+      return;
+    }
+
+    if (BOT) {
+      if (!botRipActive) {
+        botRipTimer -= dt;
+        if (botRipTimer <= 0) {
+          botRipActive    = true;
+          botRipX         = STRIP_X + 10;
+          peakSpeed       = 0;
+          dragging        = true;
+          dragStartX      = botRipX;
+          dragStartTime   = performance.now();
+          dragLastX       = botRipX;
+          dragLastTime    = dragStartTime;
+          // varied speed with rng noise
+          botRipSpeed     = 800 + rng() * 3500;
+          botRipProgress  = 0;
+        }
+        return;
+      }
+
+      var bstep = botRipSpeed * (dt / 60);
+      botRipProgress += bstep;
+      botRipX += bstep;
+      var bnow = performance.now();
+      var bdt  = Math.max(0.001, (bnow - dragLastTime) / 1000);
+      var binst = bstep / bdt;
+      if (binst > peakSpeed) peakSpeed = binst;
+      dragLastX    = botRipX;
+      dragLastTime = bnow;
+
+      if (botRipProgress >= STRIP_W - 20) {
+        dragging        = false;
+        botRipActive    = false;
+        bestPeak = Math.max(bestPeak, peakSpeed);
+        var bspeed = peakSpeed;
+        peakSpeed = 0;
+        botRipsDoneInRun++;
+        botRipTimer = 30 + Math.round(rng() * 30);
+        endRip(bspeed);
+      }
+    }
+  }
+
+  // Initialize demo timer on first autopilot call
+  var demoInitialized = false;
+
+  // ── Strip draw ───────────────────────────────────────────────────────────────
+  function drawStrip(now) {
+    var sy = STRIP_Y - STRIP_H / 2;
+
+    // base velcro body
+    cx.fillStyle = '#1a1f2e';
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(STRIP_X, sy, STRIP_W, STRIP_H, 8);
+    else cx.rect(STRIP_X, sy, STRIP_W, STRIP_H);
+    cx.fill();
+
+    // velcro texture — rows of tiny hooks
+    var hookSpacingX = 8, hookSpacingY = 8;
+    var cols = Math.floor(STRIP_W / hookSpacingX);
+    var rows = Math.floor(STRIP_H / hookSpacingY);
+    for (var row = 0; row < rows; row++) {
+      for (var col = 0; col < cols; col++) {
+        var hx = STRIP_X + 4 + col * hookSpacingX + (row % 2) * 4;
+        var hy = sy + 4 + row * hookSpacingY;
+        cx.beginPath();
+        cx.arc(hx, hy, 1.5, 0, Math.PI * 2);
+        cx.fillStyle = 'rgba(255,255,255,0.18)';
+        cx.fill();
+      }
+    }
+
+    // highlight the rip zone if dragging
+    if (dragging || (DEMO && demoRipActive) || (BOT && botRipActive)) {
+      var progress = (DEMO ? demoRipProgress : BOT ? botRipProgress : 0) / (STRIP_W - 20);
+      var ripW = Math.min(progress * STRIP_W, STRIP_W);
+      var grd = cx.createLinearGradient(STRIP_X, 0, STRIP_X + ripW, 0);
+      grd.addColorStop(0, 'rgba(232,80,46,0.2)');
+      grd.addColorStop(1, 'rgba(242,177,52,0.5)');
+      cx.fillStyle = grd;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(STRIP_X, sy, ripW, STRIP_H, 8);
+      else cx.rect(STRIP_X, sy, ripW, STRIP_H);
+      cx.fill();
+    }
+
+    // border
+    cx.strokeStyle = 'rgba(255,255,255,0.15)';
+    cx.lineWidth = 1.5;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(STRIP_X, sy, STRIP_W, STRIP_H, 8);
+    else cx.rect(STRIP_X, sy, STRIP_W, STRIP_H);
+    cx.stroke();
+
+    // rip indicator label
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 11px Menlo, monospace';
+    cx.fillText('SWIPE TO RIP', W / 2, STRIP_Y + STRIP_H / 2 + 20);
+  }
+
+  function drawRipDots() {
+    // show how many rips remain
+    var dotR  = 7, spacing = 24, total = MAX_RIPS;
+    var startX = W / 2 - (total - 1) * spacing / 2;
+    var dotY   = STRIP_Y + STRIP_H / 2 + 48;
+    for (var i = 0; i < total; i++) {
+      var filled = i < ripsLeft;
+      cx.beginPath();
+      cx.arc(startX + i * spacing, dotY, dotR, 0, Math.PI * 2);
+      cx.fillStyle = filled ? VERM : 'rgba(255,255,255,0.12)';
+      cx.fill();
+    }
+  }
+
+  // ── Speed gauge ──────────────────────────────────────────────────────────────
+  function drawGauge(now) {
+    var gaugeX = W / 2 - 130, gaugeY = H - 140, gaugeW = 260, gaugeH = 14;
+    var displaySpeed = (DEMO && demoRipActive) ? peakSpeed : (BOT && botRipActive) ? peakSpeed : peakSpeed;
+    var pct = Math.min(displaySpeed / 5000, 1);
+
+    cx.fillStyle = 'rgba(255,255,255,0.07)';
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(gaugeX, gaugeY, gaugeW, gaugeH, 7);
+    else cx.rect(gaugeX, gaugeY, gaugeW, gaugeH);
+    cx.fill();
+
+    if (pct > 0) {
+      var g2 = cx.createLinearGradient(gaugeX, 0, gaugeX + gaugeW * pct, 0);
+      g2.addColorStop(0, TEAL);
+      g2.addColorStop(0.6, GOLD);
+      g2.addColorStop(1, VERM);
+      cx.fillStyle = g2;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(gaugeX, gaugeY, gaugeW * pct, gaugeH, 7);
+      else cx.rect(gaugeX, gaugeY, gaugeW * pct, gaugeH);
+      cx.fill();
+    }
+
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.font = '600 11px Menlo, monospace';
+    cx.fillText('PEAK SPEED', W / 2, gaugeY - 6);
+
+    if (bestPeak > 0) {
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(Math.round(bestPeak) + ' px/s', W / 2, gaugeY + 36);
+    }
+  }
+
+  // ── Render ───────────────────────────────────────────────────────────────────
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // initialize demo timer once
+    if (DEMO && !demoInitialized && phase === 'play') {
+      demoInitialized = true;
+      demoRipTimer    = demoScript[0].wait;
+    }
+
+    // between-rip brief pause (transition back to play)
+    if (phase === 'between') {
+      between_timer += dt;
+      if (between_timer > 45) { // ~0.75s pause
+        if (ripsLeft <= 0) {
+          triggerGameOver();
+        } else {
+          phase     = 'play';
+          peakSpeed = 0;
+          dragging  = false;
+          // reinit demo for next rip
+          if (DEMO && demoRipIdx < demoScript.length) {
+            demoRipTimer  = demoScript[demoRipIdx].wait;
+            demoRipActive = false;
+          }
+        }
+      }
+    }
+
+    // hit-stop decay then autopilot
+    if (hitStop > 0) { hitStop -= dt; }
+    else { autopilot(dt); }
+
+    // particles
+    for (var i = particles.length - 1; i >= 0; i--) {
+      var p = particles[i];
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vy += 0.08 * dt;
+      p.life -= p.decay * dt;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    // juice: shake + zoom decay
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy_ = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy_);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom     += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ── Title ──
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('VELCRO RIP', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('3 rips. fastest wins.', W / 2, 296);
+      drawStrip(now);
+      drawRipDots();
+      cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      var pulse = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse;
+      cx.fillText('SWIPE THE STRIP', W / 2, 490);
+      cx.globalAlpha = 1;
+    }
+
+    // ── Challenge card (demo beat 1) ──
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SPEED TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD;
+      cx.font = '900 72px -apple-system, Helvetica, Arial';
+      cx.fillText(DEMO_SCORE + '', W / 2, 390);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('px/s — today\'s top rip', W / 2, 420);
+    }
+
+    // ── Play / Between ──
+    if (phase === 'play' || phase === 'between') {
+      drawStrip(now);
+      drawRipDots();
+      drawGauge(now);
+
+      // incoming dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.textAlign = 'center';
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + ' px/s' + (SHARE.by ? ' — ' + SHARE.by : ''), W / 2, 140);
+      }
+    }
+
+    // ── Particles (drawn on top of strip during play) ──
+    for (var k = 0; k < particles.length; k++) {
+      var pt = particles[k];
+      cx.globalAlpha = Math.max(0, pt.life);
+      cx.beginPath();
+      cx.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2);
+      cx.fillStyle = pt.color;
+      cx.fill();
+    }
+    cx.globalAlpha = 1;
+
+    // ── Floating text ──
+    for (var f = flashes.length - 1; f >= 0; f--) {
+      var fl = flashes[f]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 260 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 42) flashes.splice(f, 1);
+    }
+
+    // ── Game over (score card) ──
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('FASTEST RIP', W / 2, 285);
+      cx.fillStyle = GOLD;
+      cx.font = '900 72px -apple-system, Helvetica, Arial';
+      cx.fillText(Math.round(bestPeak) + '', W / 2, 368);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('px/s', W / 2, 390);
+      var pt2 = pctTop(Math.round(bestPeak));
+      cx.fillStyle = TEAL;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt2 + '% TODAY', W / 2, 428);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('best: ' + sessionBest + ' px/s', W / 2, 452);
+
+      if (!DEMO && !BOT) {
+        var pulse2 = 0.65 + 0.35 * Math.sin(now / 280);
+        cx.globalAlpha = pulse2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — RIP AGAIN', W / 2, 476);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten && window.SHARE && SHARE.dare !== null ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ── Demo CTA card ──
+    if (phase === 'cta') {
+      var t  = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('VELCRO RIP', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText((window.__demoScore || DEMO_SCORE) + ' px/s. your move.', W / 2, 334);
+      var pulse3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM;
+      cx.globalAlpha = ease * pulse3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || DEMO_SCORE), W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // ── Mute toggle (human only) ──
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Wrap &amp; Rest — Tilt</title>
+<!--
+  LOOP / attention-architecture — Wrap & Rest (bubble-wrap-calm)
+  Engine: calm. Circuits: 05-ease, 06-zeigarnik, 07-timing.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'bubble-wrap-calm';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- bubble grid layout ----
+  var COLS = 7, ROWS = 12;
+  var BW = 46, BH = 46, PAD = 6;
+  var GRID_X = (W - (COLS * (BW + PAD) - PAD)) / 2;
+  var GRID_Y = 140;
+
+  // ---- state ----
+  var bubbles, flashes, phase, runStartTs, poppedCount, totalBubbles;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var ctaAt = 0;
+  var botRunsDone = 0;
+
+  // demo / bot autopilot indices
+  var botPopQueue = [];
+  var demoPopQueue = [];
+  var demoPopIdx = 0;
+  var lastDemoPopTime = 0;
+  var demoPhase = 'playing'; // 'playing' | 'done'
+
+  function makeBubbles() {
+    var arr = [];
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        var jx = (rng() - 0.5) * 3;
+        var jy = (rng() - 0.5) * 3;
+        arr.push({
+          col: c, row: r,
+          x: GRID_X + c * (BW + PAD) + BW / 2 + jx,
+          y: GRID_Y + r * (BH + PAD) + BH / 2 + jy,
+          popped: false,
+          popT: 0,       // animation time since pop
+          hue: 175 + Math.round(rng() * 30),  // teal family
+          radius: BW / 2 - 2 + (rng() - 0.5) * 4
+        });
+      }
+    }
+    return arr;
+  }
+
+  function initGame() {
+    bubbles = makeBubbles();
+    flashes = [];
+    phase = BOT ? 'play' : (DEMO ? 'play' : 'idle');
+    poppedCount = 0;
+    totalBubbles = COLS * ROWS;
+    hitStop = 0; shakeAmt = 0; zoom = 1;
+    ctaAt = 0;
+    demoPopIdx = 0;
+    lastDemoPopTime = 0;
+    demoPhase = 'playing';
+
+    if (DEMO) {
+      buildDemoQueue();
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    } else if (BOT) {
+      buildBotQueue();
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+  }
+
+  // demo: pop bubbles in a calm ordered pattern, ~16s total
+  // arc: top-left corner → sweep rows → gentle pace, slowing toward end
+  function buildDemoQueue() {
+    demoPopQueue = [];
+    // fill row by row, but skip the last row to prolong
+    for (var r = 0; r < ROWS - 1; r++) {
+      for (var c = 0; c < COLS; c++) {
+        demoPopQueue.push(r * COLS + c);
+      }
+    }
+    // last row pops one by one with increasing delays (resolve beat)
+    for (var c2 = 0; c2 < COLS; c2++) {
+      demoPopQueue.push((ROWS - 1) * COLS + c2);
+    }
+  }
+
+  // bot: pop bubbles in shuffled order, then game_over after all popped
+  function buildBotQueue() {
+    botPopQueue = [];
+    var indices = [];
+    for (var i = 0; i < totalBubbles; i++) indices.push(i);
+    // Fisher-Yates shuffle with seeded rng
+    for (var j = indices.length - 1; j > 0; j--) {
+      var k = Math.floor(rng() * (j + 1));
+      var tmp = indices[j]; indices[j] = indices[k]; indices[k] = tmp;
+    }
+    botPopQueue = indices;
+  }
+
+  function popBubble(idx) {
+    if (idx < 0 || idx >= bubbles.length) return;
+    var b = bubbles[idx];
+    if (b.popped) return;
+    b.popped = true;
+    b.popT = 0;
+    poppedCount++;
+
+    // juice
+    hitStop = 3;
+    if (poppedCount % 7 === 0) zoom = 1.02;
+    // very soft shake
+    shakeAmt = 1.2;
+    if (window.J) {
+      // J.calm(step) where step goes 0→1 as sheet fills
+      J.calm(poppedCount / totalBubbles);
+    }
+
+    var label = '';
+    if (poppedCount === 1)                       label = 'mmm';
+    else if (poppedCount === Math.floor(totalBubbles * 0.25)) label = '25%';
+    else if (poppedCount === Math.floor(totalBubbles * 0.5))  label = 'halfway';
+    else if (poppedCount === Math.floor(totalBubbles * 0.75)) label = 'almost…';
+    if (label) flash(label, TEAL, 28);
+
+    if (window.LOOP) LOOP.emit('bubble_popped', { n: poppedCount, total: totalBubbles });
+
+    if (poppedCount >= totalBubbles) {
+      finishSheet();
+    }
+  }
+
+  function finishSheet() {
+    phase = 'finishing';
+    shakeAmt = 3;
+    zoom = 1.04;
+    if (window.J) J.calm(1);
+    flash('done.', TEAL, 36);
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: poppedCount, dur_s: +dur.toFixed(1) });
+    if (window.__demoScore === undefined || DEMO) window.__demoScore = poppedCount;
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    } else if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { restartBot(); }, 600);
+      }
+    } else {
+      // human: show done card
+      setTimeout(function () { phase = 'done'; }, 1200);
+    }
+  }
+
+  function restartBot() {
+    bubbles = makeBubbles();
+    poppedCount = 0;
+    hitStop = 0; shakeAmt = 0; zoom = 1; flashes = [];
+    botPopTimer = 0;
+    botPopCursor = 0;
+    buildBotQueue();
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('restart', {});
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function restartHuman() {
+    bubbles = makeBubbles();
+    poppedCount = 0;
+    hitStop = 0; shakeAmt = 0; zoom = 1; flashes = [];
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('restart', {});
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // ---- autopilots ----
+  var botPopTimer = 0;
+  var BOT_POP_INTERVAL = 18; // frames between bot pops
+  var botPopCursor = 0;
+
+  // demo timing: early rows fast (~0.7s/bubble), later rows slower
+  function demoPace(idx) {
+    // first 60% of sheet: 700ms, next 30%: 900ms, last 10%: 1200ms
+    var frac = idx / demoPopQueue.length;
+    if (frac < 0.6)  return 700;
+    if (frac < 0.9)  return 900;
+    return 1200;
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function hitBubble(px, py) {
+    // find closest unpoped bubble within tap radius
+    var best = -1, bestD = 38;
+    for (var i = 0; i < bubbles.length; i++) {
+      var b = bubbles[i];
+      if (b.popped) continue;
+      var dx = px - b.x, dy = py - b.y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'idle') {
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      return;
+    }
+    if (phase === 'play') {
+      var idx = hitBubble(px, py);
+      if (idx !== -1) popBubble(idx);
+      return;
+    }
+    if (phase === 'done') {
+      restartHuman();
+      return;
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') tap(W / 2, H / 2);
+  });
+
+  // ---- render helpers ----
+  function drawBubble(b, now) {
+    var r = b.radius;
+    if (b.popped) {
+      // pop animation: expand + fade out ring
+      b.popT += 16.667;
+      var prog = Math.min(b.popT / 220, 1);
+      var a = 1 - prog;
+      if (a <= 0) return;
+      cx.globalAlpha = a * 0.5;
+      cx.strokeStyle = 'hsl(' + b.hue + ',70%,62%)';
+      cx.lineWidth = 2.5;
+      cx.beginPath();
+      cx.arc(b.x, b.y, r * (1 + prog * 0.6), 0, Math.PI * 2);
+      cx.stroke();
+      cx.globalAlpha = 1;
+      return;
+    }
+    // unpoped bubble: glossy dome
+    // base fill
+    var g = cx.createRadialGradient(b.x - r * 0.25, b.y - r * 0.3, r * 0.05, b.x, b.y, r);
+    g.addColorStop(0, 'hsl(' + b.hue + ',68%,72%)');
+    g.addColorStop(0.6, 'hsl(' + b.hue + ',58%,52%)');
+    g.addColorStop(1,   'hsl(' + b.hue + ',55%,38%)');
+    cx.beginPath();
+    cx.arc(b.x, b.y, r, 0, Math.PI * 2);
+    cx.fillStyle = g;
+    cx.fill();
+    // rim shadow
+    cx.strokeStyle = 'rgba(0,0,0,0.18)';
+    cx.lineWidth = 1.5;
+    cx.stroke();
+    // gloss highlight
+    var gh = cx.createRadialGradient(b.x - r * 0.28, b.y - r * 0.34, 0, b.x - r * 0.15, b.y - r * 0.25, r * 0.55);
+    gh.addColorStop(0, 'rgba(255,255,255,0.52)');
+    gh.addColorStop(1, 'rgba(255,255,255,0)');
+    cx.beginPath();
+    cx.arc(b.x, b.y, r, 0, Math.PI * 2);
+    cx.fillStyle = gh;
+    cx.fill();
+  }
+
+  // ---- frame loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // ---- autopilots (bot & demo) ----
+    if (BOT && phase === 'play') {
+      botPopTimer += dt;
+      if (botPopTimer >= BOT_POP_INTERVAL && botPopCursor < botPopQueue.length) {
+        botPopTimer = 0;
+        popBubble(botPopQueue[botPopCursor]);
+        botPopCursor++;
+      }
+    }
+
+    if (DEMO && phase === 'play' && demoPhase === 'playing') {
+      var elapsed = Date.now() - (runStartTs || Date.now());
+      // scheduled pop?
+      if (demoPopIdx < demoPopQueue.length) {
+        var pace = demoPace(demoPopIdx);
+        if (elapsed - lastDemoPopTime >= pace) {
+          lastDemoPopTime = elapsed;
+          popBubble(demoPopQueue[demoPopIdx]);
+          demoPopIdx++;
+          if (demoPopIdx >= demoPopQueue.length) {
+            demoPhase = 'done';
+          }
+        }
+      }
+    }
+
+    // ---- juice decay ----
+    if (hitStop > 0) hitStop -= dt;
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // ---- draw ----
+    cx.save();
+    // apply shake + zoom
+    if (shakeAmt > 0.15 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    // soft vignette
+    var vg = cx.createRadialGradient(W / 2, H / 2, H * 0.2, W / 2, H / 2, H * 0.8);
+    vg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    vg.addColorStop(1, 'rgba(11,13,18,0.30)');
+    cx.fillStyle = vg; cx.fillRect(0, 0, W, H);
+
+    // bubbles
+    for (var i = 0; i < bubbles.length; i++) {
+      drawBubble(bubbles[i], now);
+    }
+
+    // progress bar — thin strip at bottom
+    var frac = poppedCount / totalBubbles;
+    cx.fillStyle = 'rgba(46,197,182,0.15)';
+    cx.fillRect(30, H - 60, W - 60, 6);
+    if (frac > 0) {
+      cx.fillStyle = TEAL;
+      cx.fillRect(30, H - 60, (W - 60) * frac, 6);
+    }
+
+    // idle / title screen
+    if (phase === 'idle') {
+      cx.fillStyle = 'rgba(11,13,18,0.55)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '700 36px -apple-system, Helvetica, Arial';
+      cx.fillText('WRAP & REST', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.55)'; cx.font = '400 17px -apple-system, Helvetica, Arial';
+      cx.fillText('pop every bubble', W / 2, 335);
+      cx.fillStyle = 'rgba(255,255,255,0.35)'; cx.font = '400 13px -apple-system, Helvetica, Arial';
+      cx.fillText('no timer.  just you.', W / 2, 360);
+      var pulse = 0.55 + 0.45 * Math.sin(now / 600);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL; cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('tap to begin', W / 2, 410);
+      cx.globalAlpha = 1;
+    }
+
+    // count label while playing
+    if (phase === 'play') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.28)';
+      cx.font = '500 13px -apple-system, Helvetica, Arial';
+      cx.fillText(poppedCount + ' / ' + totalBubbles, W / 2, 120);
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 44);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '600 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 100 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 50) flashes.splice(k, 1);
+    }
+
+    // finishing / completion animation (folds away)
+    if (phase === 'finishing') {
+      cx.fillStyle = 'rgba(11,13,18,0.35)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '300 32px -apple-system, Helvetica, Arial';
+      cx.fillText('ahh.', W / 2, H / 2 - 10);
+      cx.fillStyle = 'rgba(46,197,182,0.45)'; cx.font = '400 15px -apple-system, Helvetica, Arial';
+      cx.fillText('all done', W / 2, H / 2 + 22);
+    }
+
+    // done card (human)
+    if (phase === 'done') {
+      cx.fillStyle = 'rgba(11,13,18,0.72)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '300 44px -apple-system, Helvetica, Arial';
+      cx.fillText('done.', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.65)'; cx.font = '400 16px -apple-system, Helvetica, Arial';
+      cx.fillText(totalBubbles + ' bubbles — just like that.', W / 2, 338);
+      var p2 = 0.6 + 0.4 * Math.sin(now / 700);
+      cx.globalAlpha = p2;
+      cx.fillStyle = TEAL; cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('tap for a fresh sheet', W / 2, 395);
+      cx.globalAlpha = 1;
+    }
+
+    // demo CTA card — calm soft invitation (not a dare)
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000;
+      var ease = Math.min(1, t * 1.8);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL; cx.font = '300 54px -apple-system, Helvetica, Arial';
+      cx.fillText('WRAP & REST', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.65)'; cx.font = '400 18px -apple-system, Helvetica, Arial';
+      cx.fillText('pop a whole sheet at your own pace.', W / 2, 344);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 500);
+      cx.globalAlpha = ease * p3;
+      cx.fillStyle = TEAL; cx.font = '600 22px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ REACH IT', W / 2, 408);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '400 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  initGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
