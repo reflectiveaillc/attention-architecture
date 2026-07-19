@@ -15,7 +15,15 @@ const CLIPS = path.join(ROOT, 'ig/clips');
 
 const argStart = process.argv.indexOf('--start');
 const startDay = argStart >= 0 ? process.argv[argStart + 1] : '2026-07-20';
-const SLOTS = ['10:00', '13:30', '17:00', '20:30']; // ET, 4/day = engine cap
+// BLITZ mode (Manuel 2026-07-19: max speed): 12/day — the survivable ceiling.
+// IG's own API caps at 25/24h; browser accounts get action-blocked well below.
+// Client cfg maxPerDay=12 matches; engine hard-ceilings at 12.
+const SLOTS = ['09:00', '10:10', '11:20', '12:30', '13:40', '14:50',
+               '16:00', '17:10', '18:20', '19:30', '20:40', '21:50'];
+// Day 0 can start mid-day: pass --today-from HH:MM to use only the remaining
+// evening slots (40-min spacing) for the first day.
+const argFrom = process.argv.indexOf('--today-from');
+const todayFrom = argFrom >= 0 ? process.argv[argFrom + 1] : null;
 
 function caption(g) {
   const cp = path.join(ROOT, 'web/site/games', g.id, 'copy.md');
@@ -47,11 +55,26 @@ for (let i = 0; interleaved.length < rest.length; i++)
   for (const c of cats) { if (byCat[c][i]) interleaved.push(byCat[c][i]); }
 const ordered = [...face, ...dd, ...interleaved];
 
+// build the full slot timeline: day 0 may be a partial evening (blitz start)
+const slotTimes = [];
+if (todayFrom) {
+  let [h, m] = todayFrom.split(':').map(Number);
+  while (h < 24) {
+    slotTimes.push({ dayOff: 0, hh: h, mm: m });
+    m += 40; if (m >= 60) { m -= 60; h++; }
+  }
+}
+for (let d = todayFrom ? 1 : 0; slotTimes.length < ordered.length; d++)
+  for (const s of SLOTS) {
+    const [hh, mm] = s.split(':').map(Number);
+    slotTimes.push({ dayOff: d, hh, mm });
+  }
+
 const items = ordered.map((g, i) => {
   const day = new Date(`${startDay}T00:00:00-04:00`);
-  day.setDate(day.getDate() + Math.floor(i / SLOTS.length));
-  const [hh, mm] = SLOTS[i % SLOTS.length].split(':');
-  const iso = `${day.toISOString().slice(0, 10)}T${hh}:${mm}:00-04:00`;
+  const sl = slotTimes[i];
+  day.setDate(day.getDate() + sl.dayOff);
+  const iso = `${day.toISOString().slice(0, 10)}T${String(sl.hh).padStart(2, '0')}:${String(sl.mm).padStart(2, '0')}:00-04:00`;
   return {
     id: `tilt-${g.id}`,
     type: 'reel',
@@ -68,4 +91,4 @@ fs.writeFileSync(path.join(outDir, 'queue.json'), JSON.stringify({
   note: 'Tilt games launch queue — one reel per game, 4/day. Built by attention-architecture/ig/build-queue.mjs (re-run to rebuild; posted items are protected by the autopilot ledger).',
   items,
 }, null, 2));
-console.log(JSON.stringify({ queued: items.length, first: items[0]?.id, firstAt: items[0]?.scheduledAt, lastAt: items[items.length - 1]?.scheduledAt, runwayDays: Math.ceil(items.length / 4) }));
+console.log(JSON.stringify({ queued: items.length, first: items[0]?.id, firstAt: items[0]?.scheduledAt, lastAt: items[items.length - 1]?.scheduledAt, runwayDays: Math.ceil(slotTimes[items.length-1].dayOff+1) }));

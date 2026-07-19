@@ -23,4 +23,4 @@ MANUEL GATES (one-time):
 - Set the IG bio link to https://tilt-games.vercel.app
 - Arm the drip: `launchctl load ~/Library/LaunchAgents/com.manuel.tilt-post.plist`
 
-Runway: 383 reels / 4 per day ≈ 96 days of daily content.
+Runway (BLITZ, Manuel 2026-07-19): 12/day (cfg maxPerDay, engine hard-ceiling 12 — IG API itself caps 25/24h; more = action-block risk) ≈ 32 days. First night: 7 posts 19:30→23:30 ET.
