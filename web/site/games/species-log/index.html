@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Species Log — Tilt</title>
+<!--
+  LOOP / attention-architecture — Species Log
+  Engine: calm. Circuits: 06-zeigarnik, 05-ease, 02-novelty.
+  Modes:
+    ?demo=1&seed=7    scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N     imperfect autopilot, N runs → window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'species-log';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 130, y: 490, w: 260, h: 48 };
+
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // 15 species silhouettes — drawn with pure canvas paths
+  // Each has: name, drawFn(cx, cx_center, cy_center, size, alpha)
+  var SPECIES = [
+    { name: 'Great Blue Heron',  draw: drawHeron },
+    { name: 'Snowy Owl',         draw: drawOwl },
+    { name: 'Bald Eagle',        draw: drawEagle },
+    { name: 'Mallard Duck',      draw: drawDuck },
+    { name: 'Painted Bunting',   draw: drawBunting },
+    { name: 'Red Fox',           draw: drawFox },
+    { name: 'White-tail Deer',   draw: drawDeer },
+    { name: 'River Otter',       draw: drawOtter },
+    { name: 'Eastern Bluebird',  draw: drawBluebird },
+    { name: 'Wild Turkey',       draw: drawTurkey },
+    { name: 'Luna Moth',         draw: drawMoth },
+    { name: 'Black Bear Cub',    draw: drawBearCub },
+    { name: 'Monarch Butterfly', draw: drawButterfly },
+    { name: 'Roseate Spoonbill', draw: drawSpoonbill },
+    { name: 'Northern Cardinal', draw: drawCardinal }
+  ];
+
+  // --- silhouette draw functions (pure canvas, no images) ---
+  function drawHeron(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    cx2.beginPath();
+    // body
+    cx2.ellipse(cx2x, cy + sz * 0.1, sz * 0.18, sz * 0.32, -0.2, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // long neck + head
+    cx2.beginPath();
+    cx2.moveTo(cx2x - sz * 0.05, cy - sz * 0.15);
+    cx2.quadraticCurveTo(cx2x - sz * 0.25, cy - sz * 0.45, cx2x - sz * 0.1, cy - sz * 0.62);
+    cx2.lineTo(cx2x + sz * 0.05, cy - sz * 0.58);
+    cx2.lineTo(cx2x + sz * 0.18, cy - sz * 0.62); // beak
+    cx2.lineTo(cx2x + sz * 0.06, cy - sz * 0.56);
+    cx2.quadraticCurveTo(cx2x, cy - sz * 0.42, cx2x + sz * 0.05, cy - sz * 0.18);
+    cx2.closePath(); cx2.fill(); cx2.stroke();
+    // long legs
+    cx2.beginPath();
+    cx2.moveTo(cx2x - sz * 0.06, cy + sz * 0.4); cx2.lineTo(cx2x - sz * 0.08, cy + sz * 0.72);
+    cx2.moveTo(cx2x + sz * 0.06, cy + sz * 0.4); cx2.lineTo(cx2x + sz * 0.08, cy + sz * 0.72);
+    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 2; cx2.stroke();
+    cx2.restore();
+  }
+
+  function drawOwl(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    // round body
+    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.15, sz * 0.28, sz * 0.38, 0, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // round head
+    cx2.beginPath(); cx2.arc(cx2x, cy - sz * 0.2, sz * 0.22, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // ear tufts
+    cx2.beginPath();
+    cx2.moveTo(cx2x - sz * 0.1, cy - sz * 0.38); cx2.lineTo(cx2x - sz * 0.16, cy - sz * 0.52); cx2.lineTo(cx2x - sz * 0.04, cy - sz * 0.4);
+    cx2.fillStyle = '#2ec5b6'; cx2.fill();
+    cx2.beginPath();
+    cx2.moveTo(cx2x + sz * 0.1, cy - sz * 0.38); cx2.lineTo(cx2x + sz * 0.16, cy - sz * 0.52); cx2.lineTo(cx2x + sz * 0.04, cy - sz * 0.4);
+    cx2.fill();
+    // eyes
+    cx2.fillStyle = INK;
+    cx2.beginPath(); cx2.arc(cx2x - sz * 0.09, cy - sz * 0.18, sz * 0.06, 0, Math.PI * 2); cx2.fill();
+    cx2.beginPath(); cx2.arc(cx2x + sz * 0.09, cy - sz * 0.18, sz * 0.06, 0, Math.PI * 2); cx2.fill();
+    cx2.restore();
+  }
+
+  function drawEagle(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    // body
+    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.05, sz * 0.2, sz * 0.3, 0, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // wings spread wide
+    cx2.beginPath();
+    cx2.moveTo(cx2x, cy);
+    cx2.bezierCurveTo(cx2x - sz * 0.2, cy - sz * 0.15, cx2x - sz * 0.52, cy - sz * 0.08, cx2x - sz * 0.62, cy + sz * 0.08);
+    cx2.bezierCurveTo(cx2x - sz * 0.5, cy, cx2x - sz * 0.25, cy + sz * 0.05, cx2x, cy + sz * 0.1);
+    cx2.fill(); cx2.stroke();
+    cx2.beginPath();
+    cx2.moveTo(cx2x, cy);
+    cx2.bezierCurveTo(cx2x + sz * 0.2, cy - sz * 0.15, cx2x + sz * 0.52, cy - sz * 0.08, cx2x + sz * 0.62, cy + sz * 0.08);
+    cx2.bezierCurveTo(cx2x + sz * 0.5, cy, cx2x + sz * 0.25, cy + sz * 0.05, cx2x, cy + sz * 0.1);
+    cx2.fill(); cx2.stroke();
+    // head + beak
+    cx2.fillStyle = '#cceae8';
+    cx2.beginPath(); cx2.arc(cx2x, cy - sz * 0.3, sz * 0.14, 0, Math.PI * 2); cx2.fill(); cx2.stroke();
+    cx2.beginPath();
+    cx2.moveTo(cx2x + sz * 0.08, cy - sz * 0.28); cx2.lineTo(cx2x + sz * 0.22, cy - sz * 0.22); cx2.lineTo(cx2x + sz * 0.07, cy - sz * 0.18);
+    cx2.fill();
+    cx2.restore();
+  }
+
+  function drawDuck(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    // body on water
+    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.15, sz * 0.3, sz * 0.22, 0.15, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // head
+    cx2.beginPath(); cx2.arc(cx2x + sz * 0.18, cy - sz * 0.08, sz * 0.14, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // bill
+    cx2.beginPath();
+    cx2.moveTo(cx2x + sz * 0.29, cy - sz * 0.06); cx2.lineTo(cx2x + sz * 0.45, cy - sz * 0.04); cx2.lineTo(cx2x + sz * 0.3, cy + sz * 0.02);
+    cx2.fillStyle = GOLD; cx2.fill();
+    // tail curl
+    cx2.beginPath();
+    cx2.moveTo(cx2x - sz * 0.26, cy + sz * 0.04);
+    cx2.quadraticCurveTo(cx2x - sz * 0.38, cy - sz * 0.18, cx2x - sz * 0.22, cy - sz * 0.22);
+    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 2; cx2.stroke();
+    cx2.restore();
+  }
+
+  function drawBunting(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    // plump body
+    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.05, sz * 0.2, sz * 0.26, 0, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // head
+    cx2.beginPath(); cx2.arc(cx2x + sz * 0.08, cy - sz * 0.24, sz * 0.14, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // short beak
+    cx2.beginPath();
+    cx2.moveTo(cx2x + sz * 0.2, cy - sz * 0.25); cx2.lineTo(cx2x + sz * 0.32, cy - sz * 0.22); cx2.lineTo(cx2x + sz * 0.2, cy - sz * 0.18);
+    cx2.fillStyle = GOLD; cx2.fill();
+    // perching feet
+    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    cx2.beginPath(); cx2.moveTo(cx2x - sz * 0.04, cy + sz * 0.3); cx2.lineTo(cx2x - sz * 0.04, cy + sz * 0.42); cx2.stroke();
+    cx2.beginPath(); cx2.moveTo(cx2x + sz * 0.04, cy + sz * 0.3); cx2.lineTo(cx2x + sz * 0.04, cy + sz * 0.42); cx2.stroke();
+    cx2.restore();
+  }
+
+  function drawFox(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    // body
+    cx2.beginPath(); cx2.ellipse(cx2x - sz * 0.05, cy + sz * 0.12, sz * 0.28, sz * 0.2, 0.2, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // head
+    cx2.beginPath(); cx2.arc(cx2x + sz * 0.22, cy - sz * 0.1, sz * 0.18, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // pointed ears
+    cx2.beginPath();
+    cx2.moveTo(cx2x + sz * 0.12, cy - sz * 0.25); cx2.lineTo(cx2x + sz * 0.06, cy - sz * 0.46); cx2.lineTo(cx2x + sz * 0.2, cy - sz * 0.3);
+    cx2.fill();
+    cx2.beginPath();
+    cx2.moveTo(cx2x + sz * 0.28, cy - sz * 0.25); cx2.lineTo(cx2x + sz * 0.34, cy - sz * 0.46); cx2.lineTo(cx2x + sz * 0.38, cy - sz * 0.28);
+    cx2.fill();
+    // snout
+    cx2.beginPath();
+    cx2.moveTo(cx2x + sz * 0.36, cy - sz * 0.07); cx2.lineTo(cx2x + sz * 0.48, cy - sz * 0.04); cx2.lineTo(cx2x + sz * 0.36, cy + sz * 0.01);
+    cx2.fill();
+    // fluffy tail
+    cx2.beginPath();
+    cx2.moveTo(cx2x - sz * 0.3, cy + sz * 0.08);
+    cx2.bezierCurveTo(cx2x - sz * 0.55, cy + sz * 0.0, cx2x - sz * 0.6, cy - sz * 0.28, cx2x - sz * 0.44, cy - sz * 0.36);
+    cx2.bezierCurveTo(cx2x - sz * 0.32, cy - sz * 0.3, cx2x - sz * 0.38, cy - sz * 0.1, cx2x - sz * 0.26, cy + sz * 0.04);
+    cx2.fill(); cx2.stroke();
+    cx2.restore();
+  }
+
+  function drawDeer(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    // body
+    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.1, sz * 0.26, sz * 0.22, 0, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // neck + head
+    cx2.beginPath(); cx2.moveTo(cx2x + sz * 0.12, cy - sz * 0.1);
+    cx2.lineTo(cx2x + sz * 0.18, cy - sz * 0.38); cx2.arc(cx2x + sz * 0.18, cy - sz * 0.5, sz * 0.14, Math.PI / 2, -Math.PI / 2, true);
+    cx2.lineTo(cx2x + sz * 0.04, cy - sz * 0.38); cx2.closePath(); cx2.fill(); cx2.stroke();
+    // antlers
+    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 2;
+    cx2.beginPath(); cx2.moveTo(cx2x + sz * 0.08, cy - sz * 0.6);
+    cx2.lineTo(cx2x - sz * 0.04, cy - sz * 0.82); cx2.moveTo(cx2x - sz * 0.04, cy - sz * 0.75);
+    cx2.lineTo(cx2x - sz * 0.14, cy - sz * 0.78); cx2.stroke();
+    cx2.beginPath(); cx2.moveTo(cx2x + sz * 0.28, cy - sz * 0.6);
+    cx2.lineTo(cx2x + sz * 0.4, cy - sz * 0.82); cx2.moveTo(cx2x + sz * 0.4, cy - sz * 0.75);
+    cx2.lineTo(cx2x + sz * 0.5, cy - sz * 0.78); cx2.stroke();
+    // legs
+    cx2.lineWidth = 2;
+    [[-0.14, 0], [-0.06, 0], [0.06, 0], [0.14, 0]].forEach(function(l) {
+      cx2.beginPath(); cx2.moveTo(cx2x + l[0] * sz, cy + sz * 0.3); cx2.lineTo(cx2x + l[0] * sz, cy + sz * 0.62); cx2.stroke();
+    });
+    cx2.restore();
+  }
+
+  function drawOtter(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    // long body (streamlined)
+    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.05, sz * 0.36, sz * 0.18, 0.1, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // head
+    cx2.beginPath(); cx2.arc(cx2x + sz * 0.3, cy - sz * 0.04, sz * 0.15, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // nose dot
+    cx2.fillStyle = '#2ec5b6';
+    cx2.beginPath(); cx2.arc(cx2x + sz * 0.42, cy - sz * 0.04, sz * 0.04, 0, Math.PI * 2); cx2.fill();
+    // tail
+    cx2.fillStyle = '#cceae8';
+    cx2.beginPath();
+    cx2.moveTo(cx2x - sz * 0.34, cy + sz * 0.06);
+    cx2.bezierCurveTo(cx2x - sz * 0.54, cy + sz * 0.08, cx2x - sz * 0.58, cy + sz * 0.22, cx2x - sz * 0.46, cy + sz * 0.28);
+    cx2.bezierCurveTo(cx2x - sz * 0.4, cy + sz * 0.22, cx2x - sz * 0.44, cy + sz * 0.14, cx2x - sz * 0.3, cy + sz * 0.1);
+    cx2.fill(); cx2.stroke();
+    cx2.restore();
+  }
+
+  function drawBluebird(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    // perched body
+    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.05, sz * 0.16, sz * 0.22, 0, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // head
+    cx2.beginPath(); cx2.arc(cx2x, cy - sz * 0.2, sz * 0.13, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // wing fold
+    cx2.beginPath();
+    cx2.moveTo(cx2x - sz * 0.14, cy);
+    cx2.bezierCurveTo(cx2x - sz * 0.28, cy + sz * 0.05, cx2x - sz * 0.3, cy + sz * 0.18, cx2x - sz * 0.14, cy + sz * 0.2);
+    cx2.stroke();
+    // beak
+    cx2.beginPath();
+    cx2.moveTo(cx2x + sz * 0.11, cy - sz * 0.2); cx2.lineTo(cx2x + sz * 0.24, cy - sz * 0.18); cx2.lineTo(cx2x + sz * 0.11, cy - sz * 0.14);
+    cx2.fillStyle = GOLD; cx2.fill();
+    // feet
+    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    cx2.beginPath(); cx2.moveTo(cx2x - sz * 0.04, cy + sz * 0.26); cx2.lineTo(cx2x - sz * 0.04, cy + sz * 0.38); cx2.stroke();
+    cx2.beginPath(); cx2.moveTo(cx2x + sz * 0.04, cy + sz * 0.26); cx2.lineTo(cx2x + sz * 0.04, cy + sz * 0.38); cx2.stroke();
+    cx2.restore();
+  }
+
+  function drawTurkey(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    // fan tail
+    cx2.beginPath();
+    for (var i = -4; i <= 4; i++) {
+      var angle = (i / 4) * 0.7 - Math.PI / 2;
+      cx2.moveTo(cx2x - sz * 0.05, cy + sz * 0.1);
+      cx2.lineTo(cx2x - sz * 0.05 + Math.cos(angle) * sz * 0.45, cy + sz * 0.1 + Math.sin(angle) * sz * 0.45);
+    }
+    cx2.stroke();
+    // body
+    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.12, sz * 0.22, sz * 0.28, 0, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // small head on neck
+    cx2.beginPath(); cx2.arc(cx2x + sz * 0.15, cy - sz * 0.2, sz * 0.1, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // wattle
+    cx2.fillStyle = '#e07070';
+    cx2.beginPath(); cx2.ellipse(cx2x + sz * 0.22, cy - sz * 0.14, sz * 0.04, sz * 0.07, 0.3, 0, Math.PI * 2);
+    cx2.fill();
+    cx2.restore();
+  }
+
+  function drawMoth(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    // upper wings
+    cx2.beginPath();
+    cx2.moveTo(cx2x, cy);
+    cx2.bezierCurveTo(cx2x - sz * 0.1, cy - sz * 0.22, cx2x - sz * 0.42, cy - sz * 0.28, cx2x - sz * 0.48, cy + sz * 0.04);
+    cx2.bezierCurveTo(cx2x - sz * 0.36, cy + sz * 0.14, cx2x - sz * 0.14, cy + sz * 0.12, cx2x, cy);
+    cx2.fill(); cx2.stroke();
+    cx2.beginPath();
+    cx2.moveTo(cx2x, cy);
+    cx2.bezierCurveTo(cx2x + sz * 0.1, cy - sz * 0.22, cx2x + sz * 0.42, cy - sz * 0.28, cx2x + sz * 0.48, cy + sz * 0.04);
+    cx2.bezierCurveTo(cx2x + sz * 0.36, cy + sz * 0.14, cx2x + sz * 0.14, cy + sz * 0.12, cx2x, cy);
+    cx2.fill(); cx2.stroke();
+    // lower wings (smaller)
+    cx2.beginPath();
+    cx2.moveTo(cx2x, cy + sz * 0.04);
+    cx2.bezierCurveTo(cx2x - sz * 0.08, cy + sz * 0.1, cx2x - sz * 0.3, cy + sz * 0.28, cx2x - sz * 0.24, cy + sz * 0.36);
+    cx2.bezierCurveTo(cx2x - sz * 0.12, cy + sz * 0.3, cx2x - sz * 0.04, cy + sz * 0.18, cx2x, cy + sz * 0.06);
+    cx2.fill(); cx2.stroke();
+    cx2.beginPath();
+    cx2.moveTo(cx2x, cy + sz * 0.04);
+    cx2.bezierCurveTo(cx2x + sz * 0.08, cy + sz * 0.1, cx2x + sz * 0.3, cy + sz * 0.28, cx2x + sz * 0.24, cy + sz * 0.36);
+    cx2.bezierCurveTo(cx2x + sz * 0.12, cy + sz * 0.3, cx2x + sz * 0.04, cy + sz * 0.18, cx2x, cy + sz * 0.06);
+    cx2.fill(); cx2.stroke();
+    // body
+    cx2.fillStyle = '#2ec5b6';
+    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.14, sz * 0.04, sz * 0.2, 0, 0, Math.PI * 2); cx2.fill();
+    // antennae
+    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    cx2.beginPath(); cx2.moveTo(cx2x, cy - sz * 0.04);
+    cx2.quadraticCurveTo(cx2x - sz * 0.12, cy - sz * 0.28, cx2x - sz * 0.08, cy - sz * 0.4); cx2.stroke();
+    cx2.beginPath(); cx2.moveTo(cx2x, cy - sz * 0.04);
+    cx2.quadraticCurveTo(cx2x + sz * 0.12, cy - sz * 0.28, cx2x + sz * 0.08, cy - sz * 0.4); cx2.stroke();
+    cx2.restore();
+  }
+
+  function drawBearCub(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    // round body
+    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.14, sz * 0.26, sz * 0.3, 0, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // head
+    cx2.beginPath(); cx2.arc(cx2x, cy - sz * 0.18, sz * 0.22, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // round ears
+    cx2.beginPath(); cx2.arc(cx2x - sz * 0.18, cy - sz * 0.38, sz * 0.09, 0, Math.PI * 2); cx2.fill(); cx2.stroke();
+    cx2.beginPath(); cx2.arc(cx2x + sz * 0.18, cy - sz * 0.38, sz * 0.09, 0, Math.PI * 2); cx2.fill(); cx2.stroke();
+    // snout
+    cx2.beginPath(); cx2.ellipse(cx2x, cy - sz * 0.1, sz * 0.1, sz * 0.07, 0, 0, Math.PI * 2); cx2.fill(); cx2.stroke();
+    // eyes
+    cx2.fillStyle = INK;
+    cx2.beginPath(); cx2.arc(cx2x - sz * 0.09, cy - sz * 0.2, sz * 0.04, 0, Math.PI * 2); cx2.fill();
+    cx2.beginPath(); cx2.arc(cx2x + sz * 0.09, cy - sz * 0.2, sz * 0.04, 0, Math.PI * 2); cx2.fill();
+    // stubs legs
+    cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6';
+    cx2.beginPath(); cx2.ellipse(cx2x - sz * 0.16, cy + sz * 0.42, sz * 0.1, sz * 0.08, 0, 0, Math.PI * 2); cx2.fill(); cx2.stroke();
+    cx2.beginPath(); cx2.ellipse(cx2x + sz * 0.16, cy + sz * 0.42, sz * 0.1, sz * 0.08, 0, 0, Math.PI * 2); cx2.fill(); cx2.stroke();
+    cx2.restore();
+  }
+
+  function drawButterfly(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    // upper wings (large)
+    cx2.beginPath();
+    cx2.moveTo(cx2x, cy);
+    cx2.bezierCurveTo(cx2x - sz * 0.06, cy - sz * 0.18, cx2x - sz * 0.38, cy - sz * 0.32, cx2x - sz * 0.44, cy - sz * 0.06);
+    cx2.bezierCurveTo(cx2x - sz * 0.38, cy + sz * 0.1, cx2x - sz * 0.1, cy + sz * 0.08, cx2x, cy);
+    cx2.fill(); cx2.stroke();
+    cx2.beginPath();
+    cx2.moveTo(cx2x, cy);
+    cx2.bezierCurveTo(cx2x + sz * 0.06, cy - sz * 0.18, cx2x + sz * 0.38, cy - sz * 0.32, cx2x + sz * 0.44, cy - sz * 0.06);
+    cx2.bezierCurveTo(cx2x + sz * 0.38, cy + sz * 0.1, cx2x + sz * 0.1, cy + sz * 0.08, cx2x, cy);
+    cx2.fill(); cx2.stroke();
+    // lower wings (smaller, rounder)
+    cx2.beginPath();
+    cx2.moveTo(cx2x, cy + sz * 0.04);
+    cx2.bezierCurveTo(cx2x - sz * 0.06, cy + sz * 0.12, cx2x - sz * 0.32, cy + sz * 0.32, cx2x - sz * 0.22, cy + sz * 0.42);
+    cx2.bezierCurveTo(cx2x - sz * 0.1, cy + sz * 0.38, cx2x - sz * 0.02, cy + sz * 0.2, cx2x, cy + sz * 0.06);
+    cx2.fill(); cx2.stroke();
+    cx2.beginPath();
+    cx2.moveTo(cx2x, cy + sz * 0.04);
+    cx2.bezierCurveTo(cx2x + sz * 0.06, cy + sz * 0.12, cx2x + sz * 0.32, cy + sz * 0.32, cx2x + sz * 0.22, cy + sz * 0.42);
+    cx2.bezierCurveTo(cx2x + sz * 0.1, cy + sz * 0.38, cx2x + sz * 0.02, cy + sz * 0.2, cx2x, cy + sz * 0.06);
+    cx2.fill(); cx2.stroke();
+    // body
+    cx2.fillStyle = '#2ec5b6';
+    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.18, sz * 0.04, sz * 0.24, 0, 0, Math.PI * 2); cx2.fill();
+    cx2.restore();
+  }
+
+  function drawSpoonbill(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    // body
+    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.12, sz * 0.2, sz * 0.3, 0, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // long S-curve neck + head
+    cx2.beginPath();
+    cx2.moveTo(cx2x - sz * 0.02, cy - sz * 0.16);
+    cx2.bezierCurveTo(cx2x - sz * 0.18, cy - sz * 0.35, cx2x + sz * 0.1, cy - sz * 0.55, cx2x - sz * 0.02, cy - sz * 0.66);
+    cx2.lineTo(cx2x + sz * 0.06, cy - sz * 0.62);
+    cx2.bezierCurveTo(cx2x + sz * 0.2, cy - sz * 0.5, cx2x - sz * 0.06, cy - sz * 0.3, cx2x + sz * 0.08, cy - sz * 0.14);
+    cx2.closePath(); cx2.fill(); cx2.stroke();
+    // spatula bill
+    cx2.beginPath();
+    cx2.moveTo(cx2x - sz * 0.04, cy - sz * 0.64);
+    cx2.bezierCurveTo(cx2x - sz * 0.12, cy - sz * 0.78, cx2x - sz * 0.12, cy - sz * 0.86, cx2x, cy - sz * 0.86);
+    cx2.bezierCurveTo(cx2x + sz * 0.12, cy - sz * 0.86, cx2x + sz * 0.12, cy - sz * 0.78, cx2x + sz * 0.04, cy - sz * 0.64);
+    cx2.fill(); cx2.stroke();
+    // legs
+    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 2;
+    cx2.beginPath(); cx2.moveTo(cx2x - sz * 0.06, cy + sz * 0.4); cx2.lineTo(cx2x - sz * 0.08, cy + sz * 0.72); cx2.stroke();
+    cx2.beginPath(); cx2.moveTo(cx2x + sz * 0.06, cy + sz * 0.4); cx2.lineTo(cx2x + sz * 0.08, cy + sz * 0.72); cx2.stroke();
+    cx2.restore();
+  }
+
+  function drawCardinal(cx2, cx2x, cy, sz, a) {
+    cx2.save(); cx2.globalAlpha = a; cx2.fillStyle = '#cceae8'; cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    // body
+    cx2.beginPath(); cx2.ellipse(cx2x, cy + sz * 0.05, sz * 0.18, sz * 0.24, 0, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // head with crest
+    cx2.beginPath(); cx2.arc(cx2x + sz * 0.06, cy - sz * 0.2, sz * 0.15, 0, Math.PI * 2);
+    cx2.fill(); cx2.stroke();
+    // pointed crest
+    cx2.beginPath();
+    cx2.moveTo(cx2x + sz * 0.04, cy - sz * 0.32); cx2.lineTo(cx2x + sz * 0.08, cy - sz * 0.52); cx2.lineTo(cx2x + sz * 0.16, cy - sz * 0.34);
+    cx2.fill();
+    // cone beak
+    cx2.beginPath();
+    cx2.moveTo(cx2x + sz * 0.18, cy - sz * 0.22); cx2.lineTo(cx2x + sz * 0.32, cy - sz * 0.18); cx2.lineTo(cx2x + sz * 0.18, cy - sz * 0.13);
+    cx2.fillStyle = GOLD; cx2.fill();
+    // tail
+    cx2.fillStyle = '#cceae8';
+    cx2.beginPath();
+    cx2.moveTo(cx2x - sz * 0.12, cy + sz * 0.18);
+    cx2.bezierCurveTo(cx2x - sz * 0.28, cy + sz * 0.1, cx2x - sz * 0.32, cy + sz * 0.3, cx2x - sz * 0.18, cy + sz * 0.38);
+    cx2.bezierCurveTo(cx2x - sz * 0.1, cy + sz * 0.3, cx2x - sz * 0.08, cy + sz * 0.22, cx2x - sz * 0.04, cy + sz * 0.18);
+    cx2.fill(); cx2.stroke();
+    // feet
+    cx2.strokeStyle = '#2ec5b6'; cx2.lineWidth = 1.5;
+    cx2.beginPath(); cx2.moveTo(cx2x - sz * 0.04, cy + sz * 0.28); cx2.lineTo(cx2x - sz * 0.04, cy + sz * 0.4); cx2.stroke();
+    cx2.beginPath(); cx2.moveTo(cx2x + sz * 0.04, cy + sz * 0.28); cx2.lineTo(cx2x + sz * 0.04, cy + sz * 0.4); cx2.stroke();
+    cx2.restore();
+  }
+
+  // --- game state ---
+  var TOTAL_SPECIES = 15;
+  var logged = [];       // indices of logged species (in order)
+  var loggedSet = {};    // fast lookup
+  var cards = [];        // drifting cards on screen
+  var flashes = [];
+  var shakeAmt = 0, zoom = 1, hitStop = 0;
+  var phase, runStartTs;
+  var botRunsDone = 0, botTarget = null;
+  var ctaAt = 0, overAt = 0;
+  var sessionScore = 0;   // = number of species logged in this run
+  var demoStep = 0, demoWait = 0;
+  var demoWaits = [30, 22, 34, 26, 40, 18, 28, 36, 20, 24, 32, 14, 28, 22, 18];
+  var demoLog = []; // which to log in demo
+  // card dimensions
+  var CARD_W = 260, CARD_H = 130;
+  var CARD_SPAWN_X_RANGE = [80, W - 80];
+  var CARD_MIN_DY = 0.35, CARD_MAX_DY = 0.75;  // drift speed
+  var GUIDE_Y_BASE = H - 200;  // field guide log strip at bottom
+
+  function shuffleSpecies() {
+    // shuffle a copy using seeded rng
+    var arr = SPECIES.map(function(s, i) { return i; });
+    for (var i = arr.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+    }
+    return arr;
+  }
+  var speciesOrder = shuffleSpecies(); // shuffled order for this seed
+
+  function spawnCard() {
+    // pick a not-yet-logged species to show
+    var available = speciesOrder.filter(function(idx) { return !loggedSet[idx]; });
+    if (available.length === 0) return;
+    // also avoid duplicating cards already on screen
+    var onScreen = {};
+    cards.forEach(function(c) { onScreen[c.sIdx] = true; });
+    var pool = available.filter(function(idx) { return !onScreen[idx]; });
+    if (pool.length === 0) pool = available;
+    var sIdx = pool[Math.floor(rng() * pool.length)];
+    var cx2 = CARD_SPAWN_X_RANGE[0] + rng() * (CARD_SPAWN_X_RANGE[1] - CARD_SPAWN_X_RANGE[0]);
+    var dy = CARD_MIN_DY + rng() * (CARD_MAX_DY - CARD_MIN_DY);
+    cards.push({
+      sIdx: sIdx,
+      x: cx2,
+      y: -CARD_H / 2,
+      dy: dy,
+      hitRadius: Math.max(CARD_W, CARD_H) / 2,
+      // tween on log
+      logAnim: 0,    // 0 = normal, >0 = zooming to guide
+      logTarget: null
+    });
+  }
+
+  function newGame() {
+    logged = []; loggedSet = {}; cards = []; flashes = [];
+    shakeAmt = 0; zoom = 1; hitStop = 0; sessionScore = 0;
+    demoStep = 0; demoWait = 0; botRunsDone = 0; botTarget = null;
+    phase = 'title';
+    speciesOrder = shuffleSpecies();
+    demoLog = speciesOrder.slice(0, TOTAL_SPECIES);
+    if (BOT) {
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      spawnCard(); spawnCard();
+    } else if (DEMO) {
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      spawnCard(); spawnCard();
+    }
+  }
+
+  function logCard(card) {
+    if (loggedSet[card.sIdx]) return;
+    loggedSet[card.sIdx] = true;
+    logged.push(card.sIdx);
+    sessionScore = logged.length;
+    hitStop = 3;
+    zoom = 1.015;
+    if (window.J) J.calm(logged.length);
+    flash('+1  ' + SPECIES[card.sIdx].name, TEAL, 22);
+    if (window.LOOP) LOOP.emit('species_logged', { species: SPECIES[card.sIdx].name, n: logged.length });
+    // remove card from active
+    var idx = cards.indexOf(card);
+    if (idx >= 0) cards.splice(idx, 1);
+    // spawn replacement if more to find
+    if (logged.length < TOTAL_SPECIES) {
+      spawnCard();
+      if (cards.length < 2) spawnCard();
+    } else {
+      // guide complete!
+      endRun();
+    }
+  }
+
+  function endRun() {
+    phase = 'over';
+    overAt = performance.now();
+    zoom = 1.025;
+    if (window.J) J.calm(TOTAL_SPECIES + 1);
+    var dur = (Date.now() - runStartTs) / 1000;
+    window.__demoScore = sessionScore;
+    if (window.LOOP) LOOP.emit('game_over', { score: sessionScore, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2200);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else {
+        setTimeout(function () {
+          logged = []; loggedSet = {}; cards = []; sessionScore = 0;
+          speciesOrder = shuffleSpecies();
+          phase = 'play'; runStartTs = Date.now();
+          if (window.LOOP) LOOP.emit('restart', {});
+          spawnCard(); spawnCard();
+        }, 600);
+      }
+    }
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0, x: W / 2, y: H / 2 - 60 });
+  }
+
+  // ---- input ----
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (!px && !py) return; // keyboard (not used here)
+    if (phase !== 'play' && phase !== 'over' && phase !== 'title') return;
+    if (inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') {
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      spawnCard(); spawnCard();
+      return;
+    }
+    if (phase === 'over') {
+      if (performance.now() - overAt < 400) return;
+      if (inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: sessionScore, unit: 'species' }); return;
+      }
+      // restart
+      logged = []; loggedSet = {}; cards = []; sessionScore = 0;
+      speciesOrder = shuffleSpecies();
+      phase = 'play'; runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('restart', {});
+      spawnCard(); spawnCard();
+      return;
+    }
+    if (phase === 'play') {
+      // check if tap hits any card
+      for (var i = cards.length - 1; i >= 0; i--) {
+        var c = cards[i];
+        var dx = px - c.x, dy = py - c.y;
+        if (Math.abs(dx) < CARD_W / 2 && Math.abs(dy) < CARD_H / 2) {
+          logCard(c); return;
+        }
+      }
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+
+  // ---- autopilot (demo + bot) ----
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+    if (DEMO) {
+      if (demoWait > 0) { demoWait -= dt; return; }
+      // log one species at a time via demo script
+      if (demoStep >= TOTAL_SPECIES) return;
+      // find a card for the next species to log
+      var wantIdx = demoLog[demoStep];
+      var target = null;
+      for (var i = 0; i < cards.length; i++) {
+        if (cards[i].sIdx === wantIdx) { target = cards[i]; break; }
+      }
+      if (target) {
+        logCard(target);
+        demoStep++;
+        demoWait = demoWaits[demoStep % demoWaits.length] || 28;
+      }
+      return;
+    }
+    if (BOT) {
+      // bot: tap the first card available after short wait, but miss 1 in 6 (imperfect)
+      if (botTarget === null) {
+        botTarget = 20 + rng() * 40; // wait frames before tapping
+      }
+      botTarget -= dt;
+      if (botTarget <= 0) {
+        botTarget = null;
+        if (cards.length > 0 && rng() > 0.16) {
+          // tap it
+          logCard(cards[0]);
+        }
+        // else miss (imperfect bot)
+      }
+    }
+  }
+
+  // ---- draw guide strip ----
+  function drawGuide() {
+    // Bottom strip: shows filled slots
+    var stripH = 80, stripY = H - stripH - 10, slotSize = 44, gap = 4;
+    var totalW = TOTAL_SPECIES * (slotSize + gap) - gap;
+    var startX = (W - totalW) / 2;
+    cx.fillStyle = 'rgba(46,197,182,0.06)';
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(startX - 8, stripY - 6, totalW + 16, stripH + 10, 12);
+    else cx.rect(startX - 8, stripY - 6, totalW + 16, stripH + 10);
+    cx.fill();
+
+    for (var i = 0; i < TOTAL_SPECIES; i++) {
+      var sx = startX + i * (slotSize + gap);
+      var sy = stripY + 6;
+      var filled = i < logged.length;
+      cx.strokeStyle = filled ? TEAL : 'rgba(46,197,182,0.3)';
+      cx.lineWidth = 1.5;
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(sx, sy, slotSize, slotSize, 6);
+      else cx.rect(sx, sy, slotSize, slotSize);
+      cx.stroke();
+      if (filled) {
+        // draw tiny silhouette in slot
+        cx.save();
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(sx, sy, slotSize, slotSize, 6);
+        else cx.rect(sx, sy, slotSize, slotSize);
+        cx.clip();
+        SPECIES[logged[i]].draw(cx, sx + slotSize / 2, sy + slotSize / 2, slotSize * 0.55, 0.9);
+        cx.restore();
+      }
+    }
+    // label
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(46,197,182,0.6)';
+    cx.font = '600 11px -apple-system, Helvetica, Arial';
+    cx.fillText(logged.length + ' / ' + TOTAL_SPECIES + ' SPECIES LOGGED', W / 2, H - 8);
+  }
+
+  // ---- render frame ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // manage card spawning — keep 2-3 cards on screen
+    if (phase === 'play') {
+      if (cards.length < 2 && logged.length < TOTAL_SPECIES) spawnCard();
+    }
+
+    // update cards
+    if (phase === 'play') {
+      for (var i = cards.length - 1; i >= 0; i--) {
+        var c = cards[i];
+        c.y += c.dy * dt;
+        if (c.y > H + CARD_H) {
+          // card drifted off — respawn it later
+          cards.splice(i, 1);
+          if (logged.length < TOTAL_SPECIES) spawnCard();
+        }
+      }
+      // autopilot (only for demo/bot)
+      if (hitStop > 0) hitStop -= dt;
+      else autopilot(dt);
+    }
+
+    // juice: shake + zoom
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx2 = (Math.random() - 0.5) * shakeAmt, sy2 = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx2, H / 2 + sy2);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.1 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    // subtle gradient
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)'); bg.addColorStop(1, 'rgba(11,13,18,0)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('SPECIES LOG', W / 2, 290);
+      cx.fillStyle = 'rgba(46,197,182,0.85)'; cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('tap each silhouette to log it', W / 2, 326);
+      cx.fillStyle = GOLD; cx.font = '400 14px -apple-system, Helvetica, Arial';
+      cx.fillText('15 species. one guide.', W / 2, 352);
+      var pulse = 0.5 + 0.5 * Math.sin(now / 380);
+      cx.globalAlpha = 0.6 + 0.4 * pulse;
+      cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ TAP TO BEGIN', W / 2, 400);
+      cx.globalAlpha = 1;
+    }
+
+    if (phase === 'play') {
+      // draw drifting cards
+      for (var ci = 0; ci < cards.length; ci++) {
+        var card = cards[ci];
+        // card bg
+        var alpha = 0.92;
+        cx.globalAlpha = alpha;
+        cx.fillStyle = 'rgba(46,197,182,0.1)';
+        cx.strokeStyle = 'rgba(46,197,182,0.55)';
+        cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(card.x - CARD_W / 2, card.y - CARD_H / 2, CARD_W, CARD_H, 14);
+        else cx.rect(card.x - CARD_W / 2, card.y - CARD_H / 2, CARD_W, CARD_H);
+        cx.fill(); cx.stroke();
+        cx.globalAlpha = 1;
+
+        // silhouette in card
+        SPECIES[card.sIdx].draw(cx, card.x, card.y - CARD_H * 0.06, CARD_H * 0.46, 1.0);
+
+        // question mark at bottom of card (hint: tap to identify)
+        cx.textAlign = 'center';
+        cx.fillStyle = 'rgba(46,197,182,0.55)';
+        cx.font = '600 11px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP TO LOG', card.x, card.y + CARD_H / 2 - 10);
+      }
+
+      // progress in top-center
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(46,197,182,0.7)';
+      cx.font = '700 13px Menlo, monospace';
+      cx.fillText(logged.length + ' / ' + TOTAL_SPECIES, W / 2, 46);
+
+      drawGuide();
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 1.2);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.7)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      // guide complete visual
+      cx.fillStyle = TEAL; cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('GUIDE COMPLETE', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.82)'; cx.font = '700 52px -apple-system, Helvetica, Arial';
+      cx.fillText(sessionScore + ' species', W / 2, 320);
+      cx.fillStyle = GOLD; cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('every page filled', W / 2, 355);
+      // guide grid in completion
+      drawGuide();
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 340);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — KEEP YOUR LIST', W / 2, 440);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(46,197,182,0.12)';
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 24);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = TEAL; cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ GROW YOURS', W / 2, SHARE_R.y + 31);
+      }
+    }
+
+    if (phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.0);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('SPECIES LOG', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.72)'; cx.font = '500 18px -apple-system, Helvetica, Arial';
+      cx.fillText('15 species. nothing missing.', W / 2, 338);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 280);
+      cx.fillStyle = TEAL; cx.globalAlpha = ease * p3;
+      cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ GROW YOURS', W / 2, 406);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.45)'; cx.font = '500 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.globalAlpha = 0.5; cx.textAlign = 'center';
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

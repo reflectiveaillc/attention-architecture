@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Stamp Rally — Tilt</title>
+<!--
+  LOOP / attention-architecture — Stamp Rally
+  Circuits: 06-zeigarnik, 01-rpe, 04-loss
+  Conditioned path: loyalty-stamp FOMO — the thumb already knows this move.
+  Mechanic: 3 cards × 9 stamps = 27 taps. Each stamp fades before you can claim it.
+  Modes:
+    ?demo=1&seed=7   mirror-neuron clip: challenge card → near-fail → fail → CTA
+    ?bot=1&runs=N    imperfect autopilot, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'stamp-rally';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- Game state ----
+  // 3 cards × 9 slots. A stamp appears in one slot, fades. Tap it before it goes.
+  var CARDS = 3, SLOTS = 9;          // 3×3 grid per card
+  var STAMP_ICONS = ['★','✦','⬟','◈','⬡','✿','⊕','⊗','◉'];
+
+  // grid layout
+  var CARD_X = W / 2 - 120, CARD_Y = 260, CARD_W = 240, CARD_H = 240;
+  var COL = 3, ROW = 3;
+  var CELL_W = CARD_W / COL, CELL_H = CARD_H / ROW;
+
+  var state, flashes;
+  var hitStop = 0, shakeAmt = 0, zoom = 1;
+  var dareBeaten = false;
+  var runStartTs;
+  var best = 0;
+  try { best = +localStorage.getItem('stmp_best') || 0; } catch(_) {}
+
+  // ---- Stamp slot timing ----
+  // Each active slot has a fade window (FADE_IN → HOLD → FADE_OUT)
+  var FADE_IN_MS  = 200;
+  var HOLD_BASE   = 1800;  // ms the stamp is fully visible
+  var FADE_OUT_MS = 500;   // ms to fully vanish after window closes
+
+  function newGame() {
+    state = {
+      phase:      'title',    // title | challenge | play | over | cta
+      cardIdx:    0,          // which card (0-2)
+      slots:      [],         // Array[9] of slot objects (claimed/visible/etc.)
+      activeSlot: -1,         // which slot currently has an active stamp
+      score:      0,          // total stamps claimed (0-27)
+      overAt:     0,
+      nextSlotAt: 0,          // when to spawn the next stamp
+      stampsMissed: 0,        // missed on current card
+      cardDone:   false
+    };
+    flashes = []; dareBeaten = false;
+    buildCard();
+    if (DEMO) {
+      state.phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+      return;
+    }
+    if (BOT) startRun();
+  }
+
+  function buildCard() {
+    var icons = STAMP_ICONS.slice();
+    // shuffle icons for this card using seeded rng
+    for (var i = icons.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = icons[i]; icons[i] = icons[j]; icons[j] = tmp;
+    }
+    state.slots = [];
+    for (var s = 0; s < SLOTS; s++) {
+      state.slots.push({
+        icon:    icons[s],
+        claimed: false,
+        visible: false,
+        alpha:   0,
+        spawnAt: 0,
+        holdEnd: 0,
+        dying:   false
+      });
+    }
+    state.activeSlot = -1;
+    state.stampsMissed = 0;
+    state.cardDone = false;
+    state.nextSlotAt = performance.now() + 400;
+  }
+
+  function pctTop(score) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-score / 9))));
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // pick a random unclaimed, non-active slot
+  function pickNextSlot() {
+    var avail = [];
+    for (var i = 0; i < SLOTS; i++) {
+      if (!state.slots[i].claimed) avail.push(i);
+    }
+    if (!avail.length) return -1;
+    return avail[Math.floor(rng() * avail.length)];
+  }
+
+  function spawnStamp(now) {
+    var idx = pickNextSlot();
+    if (idx === -1) return;
+    var sl = state.slots[idx];
+    sl.visible  = true;
+    sl.claimed  = false;
+    sl.dying    = false;
+    sl.alpha    = 0;
+    sl.spawnAt  = now;
+    sl.holdEnd  = now + FADE_IN_MS + holdForCard();
+    state.activeSlot = idx;
+  }
+
+  function holdForCard() {
+    // cards get harder: card 0 = generous, card 2 = tighter
+    var tightness = state.cardIdx * 250;
+    return HOLD_BASE - tightness + (rng() - 0.5) * 300;
+  }
+
+  function claimStamp(idx) {
+    var sl = state.slots[idx];
+    if (!sl.visible || sl.claimed || sl.dying) return false;
+    sl.claimed = true;
+    sl.visible = false;
+    state.activeSlot = -1;
+    state.score++;
+
+    var combo = state.score;
+    if (window.J) {
+      if (combo % 9 === 0) { J.perfect(Math.floor(combo / 9)); J.gold(); }
+      else J.hit(combo);
+      if (state.score >= 24) J.tension(Math.min((state.score - 18) / 9, 1));
+    }
+
+    if (combo % 9 === 0) { hitStop = 5; zoom = 1.03; flash('CARD COMPLETE!', GOLD, 38); }
+    else if (combo % 3 === 0) { zoom = 1.015; flash('+STAMP', TEAL, 30); }
+
+    if (window.LOOP) LOOP.emit('stamp_claimed', { n: state.score, card: state.cardIdx });
+
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && state.score > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 40);
+      if (window.J) J.fanfare();
+      SHARE.beaten(state.score);
+    }
+
+    // check if card complete
+    var allClaimed = state.slots.every(function(s){ return s.claimed; });
+    if (allClaimed) {
+      state.cardDone = true;
+      if (window.J) J.fanfare();
+      hitStop = 8;
+      if (state.cardIdx < CARDS - 1) {
+        // advance to next card after delay
+        setTimeout(function() {
+          state.cardIdx++;
+          buildCard();
+          state.nextSlotAt = performance.now() + 600;
+        }, 900);
+      } else {
+        // final card complete — game complete (win)
+        setTimeout(function() { gameOver(true); }, 900);
+      }
+    }
+    return true;
+  }
+
+  function missStamp(idx) {
+    // stamp expired without being tapped
+    var sl = state.slots[idx];
+    sl.visible = false;
+    sl.dying   = false;
+    state.activeSlot = -1;
+    state.stampsMissed++;
+
+    if (window.J) { J.near(); }
+    flash('MISSED!', VERM, 28);
+    shakeAmt = 4;
+    if (window.LOOP) LOOP.emit('near_miss', { n: state.score, card: state.cardIdx });
+
+    // after 3 misses on current card → lose that card and it counts as a game over
+    if (state.stampsMissed >= 3) {
+      if (window.J) J.death(0.5 + state.cardIdx * 0.2);
+      flash('TOO SLOW', VERM, 36);
+      shakeAmt = 9;
+      setTimeout(function() { gameOver(false); }, 700);
+    }
+    // else just spawn next stamp
+  }
+
+  function gameOver(won) {
+    state.phase = 'over';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = state.score > best;
+    if (!won && window.J) J.death(Math.min(0.3 + state.score / 27, 1));
+    if (newBest) {
+      best = state.score;
+      try { localStorage.setItem('stmp_best', String(best)); } catch(_) {}
+      if (window.J) setTimeout(function(){ J.fanfare(); }, 400);
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function() {
+        state.phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function() { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function() { resetRun(); }, 800);
+    }
+  }
+
+  function resetRun() {
+    rng = mulberry32(SEED + botRunsDone * 17);
+    state.cardIdx = 0;
+    state.score = 0;
+    dareBeaten = false;
+    flashes = [];
+    buildCard();
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- Input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function slotHitTest(px, py) {
+    for (var i = 0; i < SLOTS; i++) {
+      var col = i % COL, row = Math.floor(i / COL);
+      var sx = CARD_X + col * CELL_W + CELL_W / 2;
+      var sy = CARD_Y + row * CELL_H + CELL_H / 2;
+      var r = CELL_W * 0.45;
+      var dx = px - sx, dy = py - sy;
+      if (dx*dx + dy*dy < r*r) return i;
+    }
+    return -1;
+  }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') {
+      if (px !== undefined) {
+        var si = slotHitTest(px, py);
+        if (si >= 0 && si === state.activeSlot) { claimStamp(si); return; }
+        // tapped wrong spot — small penalty shake
+        shakeAmt = 2;
+      }
+      return;
+    }
+    if (state.phase === 'over' && performance.now() - state.overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'stamps' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function(e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function(e) { if (e.code === 'Space') tap(); });
+
+  // ---- Flash text ----
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0, y: H / 2 - 60 }); }
+
+  // ---- Demo / Bot autopilots ----
+  // Demo arc:
+  // stamps 1-16: claims each with human-feeling hesitation
+  // near-fail beat (~60%): at stamp ~17, intentionally MISS 2 in a row (tension peak)
+  // recovery: claims next stamp reliably
+  // real fail: at stamp ~21, let 3 misses trigger game_over (spectacle)
+  var demoStep = 0;
+  // demoWaits[i] = ms to wait before tapping (human hesitation)
+  var demoWaits = [
+    320, 280, 410, 260, 370, 290, 340, 280, 380,  // card 1 (stamps 1-9)
+    310, 450, 270, 390, 260, 340, 300, 500,        // card 2 early (stamps 10-16)
+    // near-fail: intentional MISS (let these expire) — tracked by demoMisses
+  ];
+  var demoMissPhase = false, demoMissDone = 0, demoRecovery = false;
+  var demoWaitUntil = 0;
+  var botRunsDone = 0, botActAt = 0;
+
+  function autopilot(now) {
+    if (state.phase !== 'play') return;
+    var si = state.activeSlot;
+    if (si < 0) return;
+    var sl = state.slots[si];
+    if (!sl.visible || sl.claimed || sl.dying) return;
+
+    if (DEMO) {
+      if (now < demoWaitUntil) return;
+
+      // near-fail phase: miss 2 stamps to create tension
+      if (!demoMissPhase && demoStep >= 16) {
+        demoMissPhase = true;
+      }
+      if (demoMissPhase && !demoRecovery) {
+        // let stamps expire naturally (demoMissDone counts via missStamp)
+        if (state.stampsMissed >= 2) {
+          demoRecovery = true;
+        }
+        return; // intentional no-tap = miss
+      }
+
+      // recovery: claim next stamps normally
+      if (demoRecovery) {
+        // claim stamp
+        var recovered = claimStamp(si);
+        if (recovered) {
+          demoStep++;
+          demoWaitUntil = now + (280 + rng() * 180);
+          // after 2 recovery stamps, stop claiming so the 3rd miss triggers game over
+          if (demoStep >= 20) {
+            demoRecovery = false;
+            demoMissPhase = true;
+            demoMissDone = 0;
+          }
+        }
+        return;
+      }
+
+      // normal early phase
+      var wait = demoWaits[demoStep] || 300;
+      wait += (rng() - 0.5) * 120; // human variance
+      // wait until slightly before the stamp expires
+      var timeLeft = sl.holdEnd - now;
+      if (timeLeft < wait) wait = Math.max(60, timeLeft - 80);
+      if (now - sl.spawnAt - FADE_IN_MS < wait) return;
+      var ok = claimStamp(si);
+      if (ok) {
+        demoStep++;
+        demoWaitUntil = now + 80;
+      }
+
+    } else if (BOT) {
+      // Bot: usually hits stamps but sometimes misses to feel natural
+      if (now < botActAt) return;
+      // decide: miss ~20% of stamps
+      var willMiss = rng() < 0.20;
+      if (willMiss) {
+        // let it expire — don't tap
+        return;
+      }
+      // tap with some delay into the window
+      var elapsed = now - sl.spawnAt - FADE_IN_MS;
+      var minWait = 150 + rng() * 400;
+      if (elapsed < minWait) return;
+      claimStamp(si);
+      botActAt = now + 80;
+    }
+  }
+
+  // ---- Render helpers ----
+  function slotPos(i) {
+    var col = i % COL, row = Math.floor(i / COL);
+    return {
+      x: CARD_X + col * CELL_W + CELL_W / 2,
+      y: CARD_Y + row * CELL_H + CELL_H / 2
+    };
+  }
+
+  function drawCard(now) {
+    // card background
+    cx.save();
+    cx.globalAlpha = 0.92;
+    cx.fillStyle = '#12151e';
+    cx.strokeStyle = 'rgba(255,255,255,0.08)';
+    cx.lineWidth = 1.5;
+    if (cx.roundRect) cx.roundRect(CARD_X - 8, CARD_Y - 8, CARD_W + 16, CARD_H + 16, 14);
+    else cx.rect(CARD_X - 8, CARD_Y - 8, CARD_W + 16, CARD_H + 16);
+    cx.fill(); cx.stroke();
+    cx.restore();
+
+    // grid lines
+    cx.strokeStyle = 'rgba(255,255,255,0.05)';
+    cx.lineWidth = 1;
+    for (var c = 1; c < COL; c++) {
+      var gx = CARD_X + c * CELL_W;
+      cx.beginPath(); cx.moveTo(gx, CARD_Y); cx.lineTo(gx, CARD_Y + CARD_H); cx.stroke();
+    }
+    for (var r = 1; r < ROW; r++) {
+      var gy = CARD_Y + r * CELL_H;
+      cx.beginPath(); cx.moveTo(CARD_X, gy); cx.lineTo(CARD_X + CARD_W, gy); cx.stroke();
+    }
+
+    for (var i = 0; i < SLOTS; i++) {
+      var sl = state.slots[i];
+      var pos = slotPos(i);
+
+      if (sl.claimed) {
+        // claimed stamp: solid ink
+        cx.save();
+        cx.globalAlpha = 0.95;
+        cx.fillStyle = GOLD;
+        cx.font = 'bold 28px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.textBaseline = 'middle';
+        cx.fillText(sl.icon, pos.x, pos.y);
+        // small check mark below
+        cx.font = '11px -apple-system, Helvetica, Arial';
+        cx.fillStyle = TEAL;
+        cx.fillText('✓', pos.x, pos.y + 20);
+        cx.restore();
+      } else if (sl.visible) {
+        // compute alpha based on fade in/out
+        var a = 0;
+        var elapsed = now - sl.spawnAt;
+        if (elapsed < FADE_IN_MS) {
+          a = elapsed / FADE_IN_MS;
+        } else if (!sl.dying) {
+          a = 1.0;
+        } else {
+          a = Math.max(0, 1 - (now - sl.holdEnd) / FADE_OUT_MS);
+        }
+        sl.alpha = a;
+
+        // pulse while active
+        var pulse = 1 + 0.06 * Math.sin(now / 120);
+
+        cx.save();
+        cx.globalAlpha = a;
+        cx.translate(pos.x, pos.y);
+        cx.scale(pulse, pulse);
+
+        // glow ring
+        var gradient = cx.createRadialGradient(0, 0, 8, 0, 0, 34);
+        gradient.addColorStop(0, 'rgba(232,80,46,0.25)');
+        gradient.addColorStop(1, 'rgba(232,80,46,0)');
+        cx.fillStyle = gradient;
+        cx.beginPath(); cx.arc(0, 0, 34, 0, Math.PI * 2); cx.fill();
+
+        // circle border
+        cx.strokeStyle = VERM;
+        cx.lineWidth = 2.5;
+        cx.beginPath(); cx.arc(0, 0, 24, 0, Math.PI * 2); cx.stroke();
+
+        // icon
+        cx.fillStyle = '#fff';
+        cx.font = 'bold 24px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.textBaseline = 'middle';
+        cx.fillText(sl.icon, 0, 0);
+
+        // time bar at bottom of circle
+        var timeRatio = Math.max(0, (sl.holdEnd - now) / holdForCard());
+        cx.strokeStyle = timeRatio > 0.35 ? TEAL : VERM;
+        cx.lineWidth = 3;
+        cx.beginPath();
+        cx.arc(0, 0, 26, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * timeRatio, false);
+        cx.stroke();
+
+        cx.restore();
+      } else {
+        // empty unclaimed slot — faint circle
+        cx.save();
+        cx.globalAlpha = 0.12;
+        cx.strokeStyle = '#fff';
+        cx.lineWidth = 1;
+        cx.beginPath(); cx.arc(pos.x, pos.y, 22, 0, Math.PI * 2); cx.stroke();
+        cx.restore();
+      }
+    }
+  }
+
+  // ---- Card progress indicator ----
+  function drawProgress() {
+    cx.textAlign = 'center';
+    // card index pips
+    var pipY = CARD_Y - 28;
+    for (var i = 0; i < CARDS; i++) {
+      cx.beginPath();
+      cx.arc(W / 2 + (i - 1) * 22, pipY, 5, 0, Math.PI * 2);
+      if (i < state.cardIdx) {
+        cx.fillStyle = GOLD;
+      } else if (i === state.cardIdx) {
+        cx.fillStyle = VERM;
+      } else {
+        cx.fillStyle = 'rgba(255,255,255,0.18)';
+      }
+      cx.fill();
+    }
+    // card label
+    cx.fillStyle = 'rgba(255,255,255,0.4)';
+    cx.font = '600 12px Menlo, monospace';
+    cx.fillText('CARD ' + (state.cardIdx + 1) + ' / ' + CARDS, W / 2, pipY - 12);
+  }
+
+  // ---- Stamp count ----
+  function drawStampCount() {
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(255,255,255,0.92)';
+    cx.font = '800 64px -apple-system, Helvetica, Arial';
+    cx.fillText(state.score, W / 2, 96);
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 12px -apple-system, Helvetica, Arial';
+    cx.fillText('BEST ' + best, W / 2, 118);
+    // miss counter
+    if (state.stampsMissed > 0) {
+      cx.fillStyle = VERM;
+      cx.font = '700 13px -apple-system, Helvetica, Arial';
+      cx.fillText('MISSED: ' + state.stampsMissed + ' / 3', W / 2, 140);
+    }
+    // dare banner
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare, W / 2, 158);
+    }
+  }
+
+  // ---- Card complete celebration ----
+  function drawCardComplete(now) {
+    // quick burst overlay
+    cx.fillStyle = 'rgba(242,177,52,0.12)';
+    cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = GOLD;
+    cx.font = '900 32px -apple-system, Helvetica, Arial';
+    cx.fillText('CARD COMPLETE!', W / 2, H / 2 - 20);
+    cx.fillStyle = 'rgba(255,255,255,0.6)';
+    cx.font = '700 16px -apple-system, Helvetica, Arial';
+    var remaining = CARDS - 1 - state.cardIdx;
+    if (remaining > 0) cx.fillText(remaining + ' card' + (remaining > 1 ? 's' : '') + ' to go', W / 2, H / 2 + 18);
+  }
+
+  var challengeAt = 0, ctaAt = 0, last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // ---- Sim update ----
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else if (state.phase === 'play') {
+      // Manage active stamp lifecycle
+      if (state.activeSlot >= 0) {
+        var sl = state.slots[state.activeSlot];
+        if (sl.visible && !sl.claimed && !sl.dying && now >= sl.holdEnd) {
+          // start fade-out
+          sl.dying = true;
+        }
+        if (sl.dying && now >= sl.holdEnd + FADE_OUT_MS) {
+          // fully expired
+          missStamp(state.activeSlot);
+          if (state.phase === 'play') {
+            state.nextSlotAt = now + 350;
+          }
+        }
+      } else if (!state.cardDone && state.stampsMissed < 3 && now >= state.nextSlotAt) {
+        spawnStamp(now);
+      }
+      autopilot(now);
+    }
+
+    // juice decay
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // ---- Draw ----
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(242,177,52,0.05)');
+    bg.addColorStop(1, 'rgba(46,197,182,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- Phases ----
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('STAMP RALLY', W / 2, 260);
+      cx.fillStyle = GOLD;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('tap each stamp before it fades', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('3 cards · 9 stamps each', W / 2, 326);
+      // pulse cta
+      var p = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = p;
+      cx.fillStyle = VERM;
+      cx.font = '800 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 400);
+      cx.globalAlpha = 1;
+    }
+
+    if (state.phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('STAMPS TO BEAT', W / 2, 290);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('21', W / 2, 400);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's top run", W / 2, 432);
+    }
+
+    if (state.phase === 'play') {
+      drawStampCount();
+      drawProgress();
+      drawCard(now);
+      if (state.cardDone && state.cardIdx < CARDS - 1) {
+        drawCardComplete(now);
+      }
+    }
+
+    if (state.phase === 'over') {
+      // draw last card state faintly behind
+      cx.globalAlpha = 0.35; drawCard(now); cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(11,13,18,0.65)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      // heading
+      var won = state.score >= CARDS * SLOTS;
+      cx.fillStyle = won ? GOLD : VERM;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText(won ? 'RALLY COMPLETE!' : 'TOO SLOW.', W / 2, 270);
+      cx.fillStyle = '#fff';
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(state.score + ' stamps', W / 2, 318);
+      var pt = pctTop(state.score);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 360);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 384);
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 290);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — RALLY AGAIN', W / 2, 434);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    if (state.phase === 'cta') {
+      var t = (now - ctaAt) / 1000, ease = Math.min(1, t * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.82 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('STAMP RALLY', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('they got ' + (window.__demoScore || 21) + '. can you beat it?', W / 2, 332);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 30px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 21), W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 436);
+      cx.globalAlpha = 1;
+    }
+
+    // flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, H / 2 - 60 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

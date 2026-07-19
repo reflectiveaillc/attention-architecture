@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Color Set — Tilt</title>
+<!--
+  LOOP / attention-architecture — Color Set
+  Conditioned path: palette-collection (makeup unboxing). Tap swatches drifting
+  across canvas to fill 16 palette slots left→right. Full spectrum = calm completion.
+  Circuits: 06-zeigarnik, 05-ease, 02-novelty. Engine: calm.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft CTA, sets window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'color-set';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // Seeded RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // Palette
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // 16 hues for the full spectrum (red→violet)
+  var SPECTRUM_HUES = [0, 23, 40, 60, 80, 100, 130, 160, 185, 200, 220, 240, 260, 280, 310, 340];
+  var SLOT_COUNT = 16;
+  var SWATCH_R = 26; // radius of a swatch circle
+  var SWATCH_SPEED_BASE = 1.2;
+
+  // --- State ---
+  var phase, slots, swatches, flashes, runStartTs, best, hitStop, zoom, shakeAmt;
+  var score, collected, botRunsDone, demoStep, demoTimer;
+  best = 0;
+  try { best = +localStorage.getItem('cs_best') || 0; } catch (_) {}
+
+  // Palette slot positions (bottom band)
+  var SLOT_Y = H - 88;
+  var SLOT_SPACING = (W - 32) / SLOT_COUNT;
+  var SLOT_X0 = 16 + SLOT_SPACING / 2;
+
+  function slotX(i) { return SLOT_X0 + i * SLOT_SPACING; }
+
+  // --- Init ---
+  function newGame() {
+    phase     = DEMO ? 'play' : (BOT ? 'play' : 'title');
+    slots     = new Array(SLOT_COUNT).fill(null); // null = empty, hue when filled
+    swatches  = [];
+    flashes   = [];
+    collected = 0;
+    score     = 0;
+    hitStop   = 0;
+    zoom      = 1;
+    shakeAmt  = 0;
+    demoStep  = 0;
+    demoTimer = 0;
+    botRunsDone = 0;
+
+    if (phase === 'play') {
+      runStartTs = Date.now();
+      spawnInitialSwatches();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    }
+  }
+
+  function spawnInitialSwatches() {
+    // Spawn some starting swatches
+    var count = DEMO ? 4 : (BOT ? 4 : 3);
+    for (var i = 0; i < count; i++) {
+      spawnSwatch();
+    }
+  }
+
+  // Track which hues are already active (drifting) so we don't double-spawn
+  function huesInFlight() {
+    var set = {};
+    for (var s = 0; s < swatches.length; s++) set[swatches[s].hueIdx] = true;
+    return set;
+  }
+
+  function spawnSwatch() {
+    // Pick a hue index that isn't collected yet and isn't already flying
+    var inFlight = huesInFlight();
+    var available = [];
+    for (var i = 0; i < SLOT_COUNT; i++) {
+      if (slots[i] === null && !inFlight[i]) available.push(i);
+    }
+    if (available.length === 0) return;
+    var idx = available[Math.floor(rng() * available.length)];
+    var hue = SPECTRUM_HUES[idx];
+    // Start from left or right edge, drift across
+    var fromLeft = rng() > 0.5;
+    var yPos = 120 + rng() * (SLOT_Y - 160 - SWATCH_R * 2);
+    swatches.push({
+      hueIdx: idx,
+      hue: hue,
+      x: fromLeft ? -SWATCH_R - 10 : W + SWATCH_R + 10,
+      y: yPos,
+      vx: fromLeft ? (SWATCH_SPEED_BASE + rng() * 0.8) : -(SWATCH_SPEED_BASE + rng() * 0.8),
+      vy: (rng() - 0.5) * 0.4,
+      pulsePhase: rng() * Math.PI * 2,
+      opacity: 1,
+      glow: 0
+    });
+  }
+
+  // --- Input ---
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(px, py) {
+    if (DEMO || BOT) return;
+    if (px !== undefined && inR(MUTE_R, px, py) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') {
+      phase = 'play';
+      runStartTs = Date.now();
+      spawnInitialSwatches();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      return;
+    }
+    if (phase === 'play' && px !== undefined) {
+      tryTapSwatch(px, py);
+      return;
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (px !== undefined && inR(SHARE_R, px, py) && window.SHARE) {
+        SHARE.send({ score: score, unit: 'shades' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  function tryTapSwatch(px, py) {
+    // Find nearest swatch within tap radius
+    var best_d = SWATCH_R + 18, best_i = -1;
+    for (var i = 0; i < swatches.length; i++) {
+      var s = swatches[i];
+      var d = Math.sqrt((px - s.x) * (px - s.x) + (py - s.y) * (py - s.y));
+      if (d < best_d) { best_d = d; best_i = i; }
+    }
+    if (best_i >= 0) collectSwatch(best_i);
+  }
+
+  function collectSwatch(i) {
+    var sw = swatches[i];
+    swatches.splice(i, 1);
+    var slotIdx = sw.hueIdx;
+    slots[slotIdx] = sw.hue;
+    collected++;
+    score = collected;
+
+    var step = collected;
+    if (window.J) J.calm(step);
+
+    // Juice: mild zoom pulse on collect
+    zoom = 1.02;
+    hitStop = 2; // very brief freeze (calm game — minimal)
+
+    // Flash text
+    var labels = ['LOVELY', 'SOFT', 'WARM', 'PURE', 'GENTLE', 'FRESH'];
+    var lbl = labels[Math.floor(rng() * labels.length)];
+    flash(lbl, TEAL, 28);
+
+    if (window.LOOP) LOOP.emit('swatch_collected', { slot: slotIdx, n: collected });
+
+    // Check if complete
+    if (collected >= SLOT_COUNT) {
+      paletteComplete();
+    } else {
+      // Spawn a new swatch to keep 2-3 in flight
+      var targetCount = BOT ? 3 : (DEMO ? 3 : 3);
+      while (swatches.length < targetCount) spawnSwatch();
+    }
+  }
+
+  var overAt = 0, ctaAt = 0, completeAt = 0;
+
+  function paletteComplete() {
+    phase = 'complete';
+    completeAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    shakeAmt = 3;
+    zoom = 1.04;
+    if (window.J) { J.calm(16); }
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+
+    var newBest = score > best;
+    if (newBest) { best = score; try { localStorage.setItem('cs_best', String(best)); } catch (_) {} }
+
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 3000);
+      return;
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 800);
+    }
+  }
+
+  // Bot mode: swatches time out after a while forcing a game_over
+  // We track missed swatches; after MISS_LIMIT, bot triggers game-over path
+  var MISS_LIMIT = 6;
+  var missCount = 0;
+
+  function swatchMissed(sw) {
+    // Swatch drifted offscreen without being collected; in bot, count misses
+    if (BOT || DEMO) {
+      missCount++;
+      if (missCount >= MISS_LIMIT && collected < SLOT_COUNT) {
+        // Force game_over (bot loses naturally)
+        forceGameOver();
+        return;
+      }
+    }
+    // Respawn
+    var targetCount = 3;
+    while (swatches.length < targetCount) spawnSwatch();
+  }
+
+  function forceGameOver() {
+    if (phase !== 'play') return;
+    phase = 'over';
+    overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    shakeAmt = 5;
+    if (window.J) J.calm(0);
+    if (window.LOOP) LOOP.emit('game_over', { score: score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = score;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2500);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetRun(); }, 800);
+    }
+  }
+
+  function resetRun() {
+    slots     = new Array(SLOT_COUNT).fill(null);
+    swatches  = [];
+    flashes   = [];
+    collected = 0;
+    score     = 0;
+    hitStop   = 0;
+    zoom      = 1;
+    shakeAmt  = 0;
+    missCount = 0;
+    phase     = 'play';
+    runStartTs = Date.now();
+    spawnInitialSwatches();
+    if (window.LOOP) LOOP.emit('restart', {});
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  // --- Demo / Bot autopilot ---
+  var demoPlan = null; // filled on first frame in demo
+
+  function buildDemoPlan() {
+    // Scripted demo: tap swatches in a calm left-to-right arc
+    // We'll let swatches drift and auto-collect them in order with small hesitations
+    demoPlan = {
+      waitMs: 1200, // initial wait (settle)
+      tapDelay: 900, // time between taps
+      lastTap: -9999
+    };
+  }
+
+  function autopilot(now) {
+    if (phase !== 'play') return;
+    if (swatches.length === 0) return;
+
+    if (DEMO) {
+      if (!demoPlan) { buildDemoPlan(); return; }
+      if (now - demoPlan.lastTap < demoPlan.tapDelay) return;
+      // Collect the leftmost-slot swatch with a slight hesitation bias
+      // (prefer earlier hue indices for a calm sweep)
+      var best_i = -1, best_slot = 999;
+      for (var i = 0; i < swatches.length; i++) {
+        if (swatches[i].hueIdx < best_slot) { best_slot = swatches[i].hueIdx; best_i = i; }
+      }
+      if (best_i >= 0) {
+        collectSwatch(best_i);
+        demoPlan.lastTap = now;
+        // Vary tap tempo: slow at start (settle), faster as palette fills (deepen), hold at end (resolve)
+        var progress = collected / SLOT_COUNT;
+        if (progress < 0.3) demoPlan.tapDelay = 900 + rng() * 200;
+        else if (progress < 0.8) demoPlan.tapDelay = 700 + rng() * 300;
+        else demoPlan.tapDelay = 800 + rng() * 400; // slow down near the end for resolve
+      }
+    } else if (BOT) {
+      // Bot: randomly misses some swatches (imperfect)
+      if (swatches.length === 0) return;
+      // Collect a random swatch with ~75% chance each 600ms window
+      if (!botData) botData = { lastTap: -9999, tapInterval: 600 + rng() * 400 };
+      if (now - botData.lastTap < botData.tapInterval) return;
+      botData.lastTap = now;
+      botData.tapInterval = 500 + rng() * 700;
+      if (rng() > 0.25 && swatches.length > 0) {
+        var idx = Math.floor(rng() * swatches.length);
+        collectSwatch(idx);
+      }
+    }
+  }
+
+  var botData = null;
+
+  // --- Render helpers ---
+  function drawSwatch(s, now) {
+    var pulse = 1 + 0.04 * Math.sin(now / 400 + s.pulsePhase);
+    var r = SWATCH_R * pulse;
+    cx.save();
+    cx.globalAlpha = s.opacity;
+    // Glow
+    if (s.glow > 0) {
+      cx.shadowColor = 'hsl(' + s.hue + ',80%,70%)';
+      cx.shadowBlur  = 18 * s.glow;
+    }
+    // Circle swatch
+    cx.beginPath();
+    cx.arc(s.x, s.y, r, 0, Math.PI * 2);
+    var g = cx.createRadialGradient(s.x - r * 0.3, s.y - r * 0.3, 0, s.x, s.y, r);
+    g.addColorStop(0, 'hsl(' + s.hue + ',72%,72%)');
+    g.addColorStop(1, 'hsl(' + s.hue + ',68%,48%)');
+    cx.fillStyle = g;
+    cx.fill();
+    // Subtle rim
+    cx.strokeStyle = 'rgba(255,255,255,0.25)';
+    cx.lineWidth = 1.5;
+    cx.stroke();
+    cx.shadowBlur = 0;
+    cx.globalAlpha = 1;
+    cx.restore();
+  }
+
+  function drawSlot(i, now) {
+    var x = slotX(i), y = SLOT_Y;
+    var filled = slots[i] !== null;
+    var hue = filled ? slots[i] : null;
+    var r = 12;
+
+    cx.save();
+    cx.beginPath();
+    cx.arc(x, y, r, 0, Math.PI * 2);
+
+    if (filled) {
+      // Completed swatch — gentle glow on last filled
+      var age = now - completeAt;
+      var glow = phase === 'complete' ? Math.max(0, 1 - age / 3000) : 0;
+      if (glow > 0) {
+        cx.shadowColor = 'hsl(' + hue + ',80%,70%)';
+        cx.shadowBlur  = 12 * glow;
+      }
+      var g2 = cx.createRadialGradient(x - 3, y - 3, 0, x, y, r);
+      g2.addColorStop(0, 'hsl(' + hue + ',75%,72%)');
+      g2.addColorStop(1, 'hsl(' + hue + ',68%,50%)');
+      cx.fillStyle = g2;
+      cx.fill();
+      cx.shadowBlur = 0;
+      // Tiny shimmer ring on complete
+      if (phase === 'complete') {
+        var shimmer = 0.4 + 0.4 * Math.sin(now / 200 + i * 0.5);
+        cx.strokeStyle = 'rgba(255,255,255,' + shimmer + ')';
+        cx.lineWidth = 1;
+        cx.stroke();
+      }
+    } else {
+      // Empty slot
+      cx.strokeStyle = 'rgba(255,255,255,0.18)';
+      cx.lineWidth = 1.5;
+      cx.fillStyle = 'rgba(255,255,255,0.04)';
+      cx.fill();
+      cx.stroke();
+    }
+    cx.restore();
+  }
+
+  function drawPaletteBar(now) {
+    // Background tray
+    cx.save();
+    cx.fillStyle = 'rgba(255,255,255,0.05)';
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(10, SLOT_Y - 18, W - 20, 36, 18);
+    else cx.rect(10, SLOT_Y - 18, W - 20, 36);
+    cx.fill();
+    cx.strokeStyle = 'rgba(255,255,255,0.08)';
+    cx.lineWidth = 1;
+    cx.stroke();
+    cx.restore();
+
+    for (var i = 0; i < SLOT_COUNT; i++) {
+      drawSlot(i, now);
+    }
+  }
+
+  // --- Main loop ---
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Update swatches
+    if (phase === 'play') {
+      for (var i = swatches.length - 1; i >= 0; i--) {
+        var s = swatches[i];
+        s.x += s.vx * dt;
+        s.y += s.vy * dt;
+        // Gentle vertical drift bounce
+        if (s.y < 100 + SWATCH_R) { s.y = 100 + SWATCH_R; s.vy = Math.abs(s.vy); }
+        if (s.y > SLOT_Y - 50 - SWATCH_R) { s.y = SLOT_Y - 50 - SWATCH_R; s.vy = -Math.abs(s.vy); }
+        // Off-screen?
+        if (s.x < -SWATCH_R - 40 || s.x > W + SWATCH_R + 40) {
+          swatches.splice(i, 1);
+          swatchMissed(s);
+        }
+      }
+      // Keep swatches flowing
+      if (!BOT && !DEMO && swatches.length < 3 && collected < SLOT_COUNT) {
+        spawnSwatch();
+      }
+    }
+
+    // Hit-stop + autopilot
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      if ((DEMO || BOT) && phase === 'play') autopilot(now);
+    }
+
+    // Juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt, sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.10 * dt;
+
+    // BG
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(100,80,200,0.05)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // Title screen
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 42px -apple-system, Helvetica, Arial';
+      cx.fillText('COLOR SET', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '500 16px -apple-system, Helvetica, Arial';
+      cx.fillText('collect every shade', W / 2, 328);
+      var pulse = 0.5 + 0.5 * Math.sin(now / 350);
+      cx.globalAlpha = 0.6 + 0.4 * pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP A SWATCH TO START', W / 2, 374);
+      cx.globalAlpha = 1;
+      // Draw preview spectrum dots
+      for (var pi = 0; pi < SLOT_COUNT; pi++) {
+        cx.beginPath();
+        cx.arc(slotX(pi), SLOT_Y, 12, 0, Math.PI * 2);
+        cx.fillStyle = 'hsl(' + SPECTRUM_HUES[pi] + ',65%,58%)';
+        cx.fill();
+      }
+      // Palette tray
+      drawPaletteBar(now);
+    }
+
+    // Play state
+    if (phase === 'play') {
+      // Count label
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '800 56px -apple-system, Helvetica, Arial';
+      cx.fillText(collected, W / 2, 88);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('of ' + SLOT_COUNT + ' shades', W / 2, 112);
+
+      // Progress hint label
+      cx.fillStyle = 'rgba(255,255,255,0.22)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('collect the full spectrum', W / 2, 140);
+
+      // Swatches
+      for (var si = 0; si < swatches.length; si++) {
+        drawSwatch(swatches[si], now);
+      }
+
+      // Palette tray
+      drawPaletteBar(now);
+    }
+
+    // Complete phase
+    if (phase === 'complete') {
+      var tComp = (now - completeAt) / 1000;
+      var ease = Math.min(1, tComp * 1.8);
+
+      // Swatches (still rendered fading)
+      for (var ci = 0; ci < swatches.length; ci++) drawSwatch(swatches[ci], now);
+
+      // Palette bar (all filled, glowing)
+      drawPaletteBar(now);
+
+      // Soft glow over palette on completion
+      cx.save();
+      cx.globalAlpha = Math.min(0.35, ease * 0.35);
+      var glowGrad = cx.createLinearGradient(0, SLOT_Y - 30, W, SLOT_Y + 30);
+      for (var gi = 0; gi < SLOT_COUNT; gi++) {
+        glowGrad.addColorStop(gi / (SLOT_COUNT - 1), 'hsl(' + SPECTRUM_HUES[gi] + ',70%,60%)');
+      }
+      cx.fillStyle = glowGrad;
+      cx.fillRect(0, SLOT_Y - 30, W, 60);
+      cx.restore();
+
+      // Score text
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 56px -apple-system, Helvetica, Arial';
+      cx.fillText(score, W / 2, 90);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('all ' + SLOT_COUNT + ' shades', W / 2, 114);
+
+      if (ease > 0.5) {
+        cx.globalAlpha = (ease - 0.5) * 2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 22px -apple-system, Helvetica, Arial';
+        cx.fillText('FULL SPECTRUM', W / 2, 300);
+        cx.fillStyle = 'rgba(255,255,255,0.45)';
+        cx.font = '500 15px -apple-system, Helvetica, Arial';
+        cx.fillText('every shade, side by side', W / 2, 332);
+      }
+      cx.globalAlpha = 1;
+
+      // Restart (human)
+      if (!DEMO && !BOT && tComp > 1.5) {
+        var pp = 0.6 + 0.4 * Math.sin(now / 320);
+        cx.globalAlpha = pp;
+        cx.fillStyle = TEAL;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP TO COLLECT AGAIN', W / 2, 420);
+        cx.globalAlpha = 1;
+        // Share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // Over phase (bot lost before completing)
+    if (phase === 'over') {
+      for (var osi = 0; osi < swatches.length; osi++) drawSwatch(swatches[osi], now);
+      drawPaletteBar(now);
+      cx.fillStyle = 'rgba(11,13,18,0.55)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '900 36px -apple-system, Helvetica, Arial';
+      cx.fillText('SO CLOSE', W / 2, 300);
+      cx.fillStyle = '#fff';
+      cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText(score + ' of ' + SLOT_COUNT + ' shades', W / 2, 340);
+      if (!DEMO && !BOT) {
+        var op = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = op;
+        cx.fillStyle = TEAL;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — TRY AGAIN', W / 2, 395);
+        cx.globalAlpha = 1;
+        // Share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // CTA card (demo)
+    if (phase === 'cta') {
+      var tCta = (now - ctaAt) / 1000;
+      var ctaEase = Math.min(1, tCta * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ctaEase) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ctaEase;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 44px -apple-system, Helvetica, Arial';
+      cx.fillText('COLOR SET', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.65)';
+      cx.font = '500 17px -apple-system, Helvetica, Arial';
+      cx.fillText('grow your own palette', W / 2, 328);
+      var ctaPulse = 0.7 + 0.3 * Math.sin(now / 260);
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = ctaEase * ctaPulse;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('REACH IT', W / 2, 396);
+      cx.globalAlpha = ctaEase;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // Floating flash texts
+    for (var fi = flashes.length - 1; fi >= 0; fi--) {
+      var fl = flashes[fi]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '700 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.5);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(fi, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    // Human: tap to start from title/over/complete
+    if (!DEMO && !BOT && (phase === 'complete' || phase === 'over')) {
+      // Listen for any tap outside share zone
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  // Tap on complete/over resets
+  window.addEventListener('pointerdown', function (e) {
+    if (DEMO || BOT) return;
+    if (phase === 'complete' || phase === 'over') {
+      var r = cv.getBoundingClientRect();
+      var px2 = (e.clientX - r.left) / scale;
+      var py2 = (e.clientY - r.top) / scale;
+      if (inR(SHARE_R, px2, py2)) return; // handled by tap()
+      if (performance.now() - (phase === 'complete' ? completeAt : overAt) > 400) {
+        resetRun();
+      }
+    }
+  });
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>No-Cash Gacha — Tilt</title>
+<!--
+  LOOP / attention-architecture — No-Cash Gacha
+  Mechanic: tap capsule → spin pull → 15 unique collectibles, no dupes, fills tracker.
+  Circuits: 01-rpe (variable reward), 06-zeigarnik (incomplete tracker), 02-novelty.
+  Modes:
+    ?demo=1&seed=7   scripted run, sets window.__demoDone when CTA expires
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'no-cash-gacha';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var TOTAL = 15;
+
+  // Collectibles: name + rarity color (common/rare/epic)
+  var ITEMS = [
+    { name: 'COMMON ★',  rarity: 0 },
+    { name: 'SWIFT ★',   rarity: 0 },
+    { name: 'JADE ★',    rarity: 0 },
+    { name: 'BLAZE ★',   rarity: 0 },
+    { name: 'FROST ★',   rarity: 0 },
+    { name: 'RARE ★★',   rarity: 1 },
+    { name: 'STORM ★★',  rarity: 1 },
+    { name: 'ECHO ★★',   rarity: 1 },
+    { name: 'VOID ★★',   rarity: 1 },
+    { name: 'NOVA ★★',   rarity: 1 },
+    { name: 'EPIC ★★★',  rarity: 2 },
+    { name: 'APEX ★★★',  rarity: 2 },
+    { name: 'PRIME★★★',  rarity: 2 },
+    { name: 'OMEGA★★★',  rarity: 2 },
+    { name: 'GOLDEN★★★', rarity: 2 }
+  ];
+  var RARITY_COLOR = ['#8ec4ff', TEAL, GOLD];
+  var RARITY_LABEL = ['Common', 'Rare', 'Epic'];
+
+  // shuffle a copy of items array using seeded rng
+  function shuffleItems() {
+    var arr = ITEMS.slice();
+    for (var i = arr.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+    }
+    return arr;
+  }
+
+  // ---- state ----
+  var phase;           // title | challenge | play | spinning | result | over | cta
+  var pullOrder;       // shuffled item draw order (guaranteed unique)
+  var collected;       // Set of indices already drawn
+  var pullCount;       // how many pulls done
+  var spinning;        // bool: capsule is animating
+  var spinT;           // spin elapsed frames
+  var spinDur;         // duration for this spin (frames)
+  var lastItem;        // item drawn from this pull
+  var flashes;
+  var hitStop, zoom, shakeAmt;
+  var dareBeaten;
+  var runStartTs;
+  var botRunsDone;
+  var overAt, ctaAt;
+  var challengeAt;
+  var resultT;         // frames shown in result phase
+  // For capsule glow animation
+  var glowPulse;
+
+  // Demo: scripted pull sequence — which items to show in which order
+  // (indices into pullOrder). We just let it run naturally since order is pre-seeded.
+  var demoIdx, demoWait, demoWaits, demoPhase;
+
+  function newGame() {
+    rng = mulberry32(SEED);
+    pullOrder = shuffleItems();
+    collected = {};
+    pullCount = 0;
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    dareBeaten = false;
+    glowPulse = 0;
+    lastItem = null;
+    spinning = false; spinT = 0; spinDur = 0;
+    resultT = 0;
+    botRunsDone = 0;
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      demoIdx = 0;
+      demoWait = 75;  // ~1.25s at 60fps before first pull
+      demoWaits = [45, 30, 55, 25, 60, 30, 40, 28, 35, 25, 50, 28, 20, 30, 0];
+      demoPhase = 'pre'; // 'pre' -> wait -> pull
+      setTimeout(function () { phase = 'play'; runStartTs = Date.now(); if (window.LOOP) LOOP.emit('play_start', { seed: SEED }); }, 1200);
+      return;
+    }
+    if (BOT) {
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      return;
+    }
+    phase = 'title';
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  // Draw the next guaranteed-unique item
+  function doPull() {
+    if (spinning || phase !== 'play') return;
+    if (pullCount >= TOTAL) return;
+
+    var item = pullOrder[pullCount];
+    pullCount++;
+    lastItem = item;
+    collected[pullCount - 1] = true;
+
+    spinning = true;
+    spinT = 0;
+    // Spin duration varies by rarity (gold = longer reveal)
+    spinDur = item.rarity === 2 ? 90 : item.rarity === 1 ? 65 : 48;
+    phase = 'spinning';
+
+    if (window.LOOP) LOOP.emit('pull', { n: pullCount, rarity: item.rarity, name: item.name });
+  }
+
+  function onSpinComplete() {
+    spinning = false;
+    var item = lastItem;
+    // Sound
+    if (window.J) {
+      if (item.rarity === 2) { J.gold(); }
+      else if (item.rarity === 1) { J.perfect(pullCount); }
+      else { J.hit(pullCount); }
+      J.tension(Math.min(pullCount / TOTAL, 1));
+    }
+    // Juice
+    if (item.rarity === 2) { hitStop = 5; zoom = 1.035; shakeAmt = 4; }
+    else if (item.rarity === 1) { hitStop = 3; zoom = 1.02; shakeAmt = 2; }
+
+    var label = item.name;
+    var col = RARITY_COLOR[item.rarity];
+    flash(label, col, item.rarity === 2 ? 42 : 34);
+
+    // Near-miss feel at pull 14 (one left!)
+    if (pullCount === 14) {
+      if (window.J) J.near();
+      if (window.LOOP) LOOP.emit('near_miss', { n: pullCount });
+      flash('ONE LEFT!', VERM, 28);
+    }
+
+    // Dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && pullCount > SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN!', TEAL, 36);
+      if (window.J) J.fanfare();
+      SHARE.beaten(pullCount);
+    }
+
+    phase = 'result';
+    resultT = 0;
+
+    // Check complete
+    if (pullCount >= TOTAL) {
+      // Complete! wait a moment then end
+      setTimeout(function () { gameOver(); }, 1400);
+    } else {
+      // Return to play after brief result display
+      setTimeout(function () { if (phase === 'result') phase = 'play'; }, 900);
+    }
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 6;
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) { J.fanfare(); }
+    if (DEMO) { window.__demoScore = pullCount; }
+    if (window.LOOP) LOOP.emit('game_over', { score: pullCount, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetBot(); }, 800);
+      }
+    }
+  }
+
+  function resetBot() {
+    rng = mulberry32(SEED + botRunsDone * 13);
+    pullOrder = shuffleItems();
+    collected = {}; pullCount = 0; flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0; glowPulse = 0;
+    lastItem = null; spinning = false; spinT = 0; dareBeaten = false;
+    phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('restart', {});
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED + botRunsDone * 13 });
+  }
+
+  function resetRun() {
+    rng = mulberry32(SEED);
+    pullOrder = shuffleItems();
+    collected = {}; pullCount = 0; flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0; glowPulse = 0;
+    lastItem = null; spinning = false; spinT = 0; dareBeaten = false;
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size || 32, t: 0 });
+  }
+
+  // ---- Input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 520, w: 250, h: 46 };
+  var CAPSULE_CX = W / 2, CAPSULE_CY = 420;
+  var CAPSULE_R = 70; // tap radius
+
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function inCircle(cx2, cy2, r2, x, y) { var dx = x - cx2, dy = y - cy2; return dx*dx+dy*dy <= r2*r2; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') {
+      if (x === undefined || inCircle(CAPSULE_CX, CAPSULE_CY, CAPSULE_R + 30, x, y)) {
+        doPull();
+        return;
+      }
+    }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: pullCount, unit: 'pulls' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- Autopilot (demo + bot) ----
+  var botWait = 0;
+
+  function autopilot(now) {
+    if (DEMO) {
+      if (phase !== 'play') return;
+      if (demoWait > 0) { demoWait--; return; }
+      if (demoIdx < TOTAL) {
+        doPull();
+        demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 30;
+        demoIdx++;
+      }
+    } else if (BOT) {
+      if (phase !== 'play') return;
+      if (botWait > 0) { botWait--; return; }
+      // Bot pulls all 15 then game ends naturally → bot loses via "wins" which fires game_over
+      doPull();
+      botWait = Math.floor(rng() * 20) + 8;
+    }
+  }
+
+  // ---- Drawing helpers ----
+  function drawCapsule(cx2, cy2, t, totalDur, now) {
+    // Capsule body: tall pill shape
+    var cw = 90, ch = 130;
+    var spinning2 = phase === 'spinning';
+    var progress = spinning2 ? t / totalDur : 0;
+
+    // Outer glow
+    if (phase === 'play' && !DEMO && !BOT) {
+      var pulse = 0.4 + 0.6 * Math.abs(Math.sin(now / 500));
+      var grd = cx.createRadialGradient(cx2, cy2, 20, cx2, cy2, 90);
+      grd.addColorStop(0, 'rgba(242,177,52,' + (0.22 * pulse) + ')');
+      grd.addColorStop(1, 'rgba(242,177,52,0)');
+      cx.fillStyle = grd;
+      cx.beginPath(); cx.arc(cx2, cy2, 90, 0, Math.PI * 2); cx.fill();
+    }
+
+    // Spin: wobble/squish the capsule
+    var scaleX = 1, scaleY = 1;
+    if (spinning2) {
+      var s = Math.sin(progress * Math.PI * 6);
+      scaleX = 1 + 0.12 * s;
+      scaleY = 1 - 0.08 * s;
+    }
+
+    cx.save();
+    cx.translate(cx2, cy2);
+    cx.scale(scaleX, scaleY);
+
+    // Capsule shadow
+    cx.fillStyle = 'rgba(0,0,0,0.35)';
+    roundedRect(cx, -cw / 2 + 3, -ch / 2 + 6, cw, ch, cw / 2);
+    cx.fill();
+
+    // Capsule body gradient
+    var bodyGrd = cx.createLinearGradient(-cw / 2, -ch / 2, cw / 2, ch / 2);
+    if (spinning2) {
+      var hue = (progress * 720) % 360;
+      bodyGrd.addColorStop(0, 'hsl(' + hue + ',70%,65%)');
+      bodyGrd.addColorStop(0.5, 'hsl(' + ((hue + 40) % 360) + ',80%,55%)');
+      bodyGrd.addColorStop(1, 'hsl(' + ((hue + 80) % 360) + ',70%,45%)');
+    } else {
+      bodyGrd.addColorStop(0, '#3a4a6a');
+      bodyGrd.addColorStop(0.5, '#2a3a5a');
+      bodyGrd.addColorStop(1, '#1a2a3a');
+    }
+    cx.fillStyle = bodyGrd;
+    roundedRect(cx, -cw / 2, -ch / 2, cw, ch, cw / 2);
+    cx.fill();
+
+    // Capsule shine
+    cx.fillStyle = 'rgba(255,255,255,0.12)';
+    roundedRect(cx, -cw / 2 + 8, -ch / 2 + 8, cw / 2 - 4, ch * 0.55, cw / 3);
+    cx.fill();
+
+    // Middle seam line
+    cx.strokeStyle = 'rgba(255,255,255,0.25)';
+    cx.lineWidth = 2;
+    cx.beginPath();
+    cx.moveTo(-cw / 2, 0);
+    cx.lineTo(cw / 2, 0);
+    cx.stroke();
+
+    // Question mark or spinning dots
+    if (!spinning2) {
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('?', 0, 18);
+    } else {
+      // Spinning: show animated dots
+      for (var d = 0; d < 3; d++) {
+        var angle = (now / 120 + d * (Math.PI * 2 / 3));
+        var dx = Math.cos(angle) * 18, dy = Math.sin(angle) * 10;
+        cx.fillStyle = 'rgba(255,255,255,0.9)';
+        cx.beginPath(); cx.arc(dx, dy, 5, 0, Math.PI * 2); cx.fill();
+      }
+    }
+    cx.restore();
+  }
+
+  function roundedRect(c, x, y, w, h, r) {
+    if (c.roundRect) { c.beginPath(); c.roundRect(x, y, w, h, r); }
+    else {
+      c.beginPath();
+      c.moveTo(x + r, y);
+      c.arcTo(x + w, y, x + w, y + h, r);
+      c.arcTo(x + w, y + h, x, y + h, r);
+      c.arcTo(x, y + h, x, y, r);
+      c.arcTo(x, y, x + w, y, r);
+      c.closePath();
+    }
+  }
+
+  function drawTracker(now) {
+    // 5x3 grid of collectible slots at top
+    var cols = 5, rows = 3;
+    var slotW = 56, slotH = 48, gap = 6;
+    var totalW = cols * slotW + (cols - 1) * gap;
+    var startX = (W - totalW) / 2;
+    var startY = 32;
+    cx.textAlign = 'center';
+    for (var row = 0; row < rows; row++) {
+      for (var col = 0; col < cols; col++) {
+        var idx = row * cols + col;
+        var x = startX + col * (slotW + gap);
+        var y = startY + row * (slotH + gap);
+        var filled = idx < pullCount;
+        var item = pullOrder[idx];
+
+        if (filled) {
+          // Filled slot: colored by rarity
+          var col2 = RARITY_COLOR[item.rarity];
+          cx.fillStyle = col2 + '33'; // 20% opacity bg
+          roundedRect(cx, x, y, slotW, slotH, 8);
+          cx.fill();
+          cx.strokeStyle = col2;
+          cx.lineWidth = 1.5;
+          roundedRect(cx, x, y, slotW, slotH, 8);
+          cx.stroke();
+          // Star count
+          var stars = item.rarity + 1;
+          cx.fillStyle = col2;
+          cx.font = '700 ' + (slotH * 0.35) + 'px -apple-system, Helvetica, Arial';
+          cx.fillText(stars === 3 ? '★★★' : stars === 2 ? '★★' : '★', x + slotW / 2, y + slotH * 0.55);
+          cx.fillStyle = 'rgba(255,255,255,0.6)';
+          cx.font = '500 7px -apple-system, Helvetica, Arial';
+          cx.fillText(RARITY_LABEL[item.rarity].toUpperCase(), x + slotW / 2, y + slotH * 0.85);
+        } else {
+          // Empty slot
+          cx.fillStyle = 'rgba(255,255,255,0.04)';
+          roundedRect(cx, x, y, slotW, slotH, 8);
+          cx.fill();
+          cx.strokeStyle = 'rgba(255,255,255,0.1)';
+          cx.lineWidth = 1;
+          roundedRect(cx, x, y, slotW, slotH, 8);
+          cx.stroke();
+          cx.fillStyle = 'rgba(255,255,255,0.18)';
+          cx.font = '500 18px -apple-system, Helvetica, Arial';
+          cx.fillText('?', x + slotW / 2, y + slotH * 0.65);
+        }
+      }
+    }
+    // Pull counter below tracker
+    var trackerBottom = startY + rows * slotH + (rows - 1) * gap + 8;
+    cx.fillStyle = 'rgba(255,255,255,0.35)';
+    cx.font = '600 13px Menlo, monospace';
+    cx.textAlign = 'center';
+    cx.fillText(pullCount + ' / ' + TOTAL + ' COLLECTED', W / 2, trackerBottom + 14);
+
+    // Progress bar
+    var barW = totalW, barH = 3;
+    var barX = startX, barY = trackerBottom + 20;
+    cx.fillStyle = 'rgba(255,255,255,0.1)';
+    cx.fillRect(barX, barY, barW, barH);
+    cx.fillStyle = GOLD;
+    cx.fillRect(barX, barY, barW * (pullCount / TOTAL), barH);
+  }
+
+  function drawResult(item, t) {
+    if (!item) return;
+    var col = RARITY_COLOR[item.rarity];
+    var alpha = Math.min(1, t / 12);
+    cx.globalAlpha = alpha;
+    // Result reveal card (subtle box)
+    cx.fillStyle = col + '22';
+    roundedRect(cx, W / 2 - 120, 340, 240, 90, 14);
+    cx.fill();
+    cx.strokeStyle = col;
+    cx.lineWidth = 1.5;
+    roundedRect(cx, W / 2 - 120, 340, 240, 90, 14);
+    cx.stroke();
+    cx.textAlign = 'center';
+    cx.fillStyle = col;
+    cx.font = '900 22px -apple-system, Helvetica, Arial';
+    cx.fillText(item.name, W / 2, 382);
+    cx.fillStyle = 'rgba(255,255,255,0.55)';
+    cx.font = '600 12px Menlo, monospace';
+    cx.fillText(RARITY_LABEL[item.rarity].toUpperCase() + '  ·  ' + pullCount + ' / ' + TOTAL, W / 2, 404);
+    cx.globalAlpha = 1;
+  }
+
+  // ---- Render loop ----
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Spin timer
+    if (phase === 'spinning') {
+      spinT += dt;
+      if (spinT >= spinDur) {
+        onSpinComplete();
+      }
+    }
+
+    // Hit-stop decay
+    if (hitStop > 0) hitStop -= dt;
+    else autopilot(now);
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // BG
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bgGrd = cx.createLinearGradient(0, 0, 0, H);
+    bgGrd.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bgGrd.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bgGrd; cx.fillRect(0, 0, W, H);
+
+    // --- Title ---
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('NO-CASH GACHA', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('15 pulls. all free. guaranteed.', W / 2, 335);
+      var pulse = 0.6 + 0.4 * Math.sin(now / 280);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM;
+      cx.font = '800 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP THE CAPSULE', W / 2, 390);
+      cx.globalAlpha = 1;
+      // Draw idle capsule
+      drawCapsule(W / 2, 470, 0, 1, now);
+    }
+
+    // --- Challenge card (demo beat 1) ---
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 15px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 290);
+      cx.fillStyle = GOLD;
+      cx.font = '900 88px -apple-system, Helvetica, Arial';
+      cx.fillText('15', W / 2, 395);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('all 15 pulls — today\'s full run', W / 2, 422);
+    }
+
+    // --- Play / Spinning / Result ---
+    if (phase === 'play' || phase === 'spinning' || phase === 'result') {
+      // Tracker
+      drawTracker(now);
+
+      // Capsule label
+      cx.textAlign = 'center';
+      if (phase === 'play') {
+        cx.fillStyle = 'rgba(255,255,255,0.25)';
+        cx.font = '600 12px Menlo, monospace';
+        cx.fillText('FREE PULL  ·  NO PREMIUM CURRENCY', W / 2, 360);
+      } else if (phase === 'spinning') {
+        cx.fillStyle = TEAL;
+        cx.font = '700 13px Menlo, monospace';
+        cx.fillText('PULLING...', W / 2, 360);
+      }
+
+      // Capsule
+      drawCapsule(CAPSULE_CX, CAPSULE_CY, spinT, spinDur, now);
+
+      // TAP hint (play mode only, not demo/bot)
+      if (phase === 'play' && !DEMO && !BOT) {
+        var pulse2 = 0.5 + 0.5 * Math.sin(now / 350);
+        cx.globalAlpha = pulse2;
+        cx.fillStyle = GOLD;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText('TAP TO PULL', W / 2, 510);
+        cx.globalAlpha = 1;
+      }
+
+      // Result reveal
+      if (phase === 'result') {
+        resultT += dt;
+        drawResult(lastItem, resultT);
+      }
+
+      // Dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.textAlign = 'center';
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '700 13px -apple-system, Helvetica, Arial';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + ' PULLS', W / 2, 578);
+      }
+    }
+
+    // --- Flashes ---
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 44);
+      cx.globalAlpha = fa;
+      cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 260 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 44) flashes.splice(k, 1);
+    }
+
+    // --- Game Over (collection complete) ---
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.70)';
+      cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = GOLD;
+      cx.font = '900 38px -apple-system, Helvetica, Arial';
+      cx.fillText('COMPLETE!', W / 2, 270);
+      cx.fillStyle = '#fff';
+      cx.font = '800 22px -apple-system, Helvetica, Arial';
+      cx.fillText('All 15 collected', W / 2, 312);
+      cx.fillStyle = TEAL;
+      cx.font = '700 16px Menlo, monospace';
+      cx.fillText('FREE. ZERO PREMIUM CURRENCY.', W / 2, 345);
+
+      // Tracker mini-recap
+      var pt = 2; // everyone who finishes is top 2%
+      cx.fillStyle = GOLD;
+      cx.font = '900 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 388);
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('most quit halfway', W / 2, 410);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 15px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP TO PLAY AGAIN', W / 2, 458);
+        cx.globalAlpha = 1;
+        // Share button
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        roundedRect(cx, SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 15px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // --- Demo CTA ---
+    if (phase === 'cta') {
+      var t2 = (now - ctaAt) / 1000, ease = Math.min(1, t2 * 2.5);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('NO-CASH GACHA', W / 2, 295);
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('all 15 pulls. free.', W / 2, 330);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM;
+      cx.globalAlpha = ease * p3;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 15), W / 2, 400);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL;
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 432);
+      cx.globalAlpha = 1;
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.45;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

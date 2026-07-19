@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Garden Grow — Tilt</title>
+<!--
+  LOOP / attention-architecture — Garden Grow (CALM engine, contract v2)
+  Circuits: 08-investment, 06-zeigarnik, 05-ease.
+  Conditioned path: plant-collection and seed-haul videos; the player's thumb
+  already knows this tap-to-plant gesture from Instagram/TikTok.
+  Modes (query params):
+    ?demo=1&seed=7        scripted calm arc ~16s → soft CTA → window.__demoDone
+    ?bot=1&runs=N&seed=5  imperfect autoplay, sets window.__botDone
+    ?clip=ID&src=tiktok   attribution (see js/loop-events.js)
+    ?sink=URL             event sink override
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'garden-grow';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // CALM palette — vermillion avoided
+  var INK  = '#0b0d12';
+  var TEAL = '#2ec5b6';
+  var GOLD = '#f2b134';
+  // soft greens / earth tones
+  var SAGE  = '#7ec87e';
+  var MOSS  = '#4a8c50';
+  var EARTH = '#6b4c2a';
+  var CREAM = '#f5ebd4';
+
+  // ---- 10 plant species ----
+  var SPECIES = [
+    { name: 'Fern',       hue: 120, petals: 0,  leafStyle: 'fern'    },
+    { name: 'Daisy',      hue: 55,  petals: 8,  leafStyle: 'round'   },
+    { name: 'Tulip',      hue: 330, petals: 6,  leafStyle: 'tall'    },
+    { name: 'Cactus',     hue: 145, petals: 0,  leafStyle: 'cactus'  },
+    { name: 'Sunflower',  hue: 42,  petals: 14, leafStyle: 'sun'     },
+    { name: 'Lavender',   hue: 275, petals: 5,  leafStyle: 'spike'   },
+    { name: 'Succulent',  hue: 160, petals: 0,  leafStyle: 'rosette' },
+    { name: 'Cosmos',     hue: 300, petals: 8,  leafStyle: 'cosmos'  },
+    { name: 'Mint',       hue: 165, petals: 0,  leafStyle: 'mint'    },
+    { name: 'Marigold',   hue: 35,  petals: 12, leafStyle: 'marig'   }
+  ];
+
+  // ---- garden grid: 3 × 4 soil patches ----
+  var COLS = 3, ROWS = 4;
+  var GRID_MARGIN_X = 48;
+  var GRID_MARGIN_Y = 200;
+  var CELL_W = (W - GRID_MARGIN_X * 2) / COLS;
+  var CELL_H = (H - GRID_MARGIN_Y - 80) / ROWS;    // 80 = bottom bar
+
+  // water drops per session
+  var MAX_WATER = 14;
+
+  // state
+  var phase;         // 'title' | 'play' | 'complete' | 'cta'
+  var patches;       // [{speciesIdx, growPct, grown, x, y, label, watered}]
+  var waterLeft;
+  var grownCount;
+  var flashes, particles;
+  var hitStop, zoom, shakeAmt;
+  var runStartTs, completeAt, ctaAt, runsDone;
+  var botRunsDone;
+  var last = performance.now(), NOW = 0;
+
+  // mute rect
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  // ---------- init ----------
+  function newGame() {
+    rng = mulberry32(SEED + (runsDone || 0) * 2654435761 | 0);
+    phase = DEMO ? 'play' : 'title';
+    waterLeft = MAX_WATER;
+    grownCount = 0;
+    flashes = []; particles = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    completeAt = 0; ctaAt = 0;
+
+    // assign species to 12 patches (10 unique + 2 bonus = guaranteed 10 visible)
+    // shuffle SPECIES, assign one per patch; last two patches share species with first two
+    var order = SPECIES.slice();
+    shuffleArr(order);
+    patches = [];
+    for (var row = 0; row < ROWS; row++) {
+      for (var col = 0; col < COLS; col++) {
+        var idx = row * COLS + col;
+        var sp = order[idx % 10];
+        var cx2 = GRID_MARGIN_X + col * CELL_W + CELL_W / 2;
+        var cy2 = GRID_MARGIN_Y + row * CELL_H + CELL_H * 0.65;
+        patches.push({
+          col: col, row: row,
+          x: cx2, y: cy2,
+          speciesIdx: SPECIES.indexOf(sp),
+          growPct: 0,       // 0..1
+          grown: false,
+          watered: false,   // watered this session (shows sprout)
+          bloomT: 0         // time since fully grown (animation)
+        });
+      }
+    }
+
+    if (DEMO) {
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED, mode: 'demo' });
+      demoStart();
+    } else if (BOT) {
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED, mode: 'bot' });
+    } else {
+      // human: start on title
+    }
+  }
+
+  function shuffleArr(a) {
+    for (var i = a.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+    }
+  }
+
+  // ---------- core action: water a patch ----------
+  function waterPatch(patchIdx) {
+    if (waterLeft <= 0) return;
+    var p = patches[patchIdx];
+    if (p.grown) return;                   // already bloomed
+    waterLeft--;
+    p.watered = true;
+    p.growPct = Math.min(1, p.growPct + 0.35 + rng() * 0.25);  // 35-60% per water
+
+    if (window.J) J.calm(grownCount);
+    // zoom-pulse on water
+    zoom = 1.018;
+
+    if (p.growPct >= 1) {
+      p.grown = true;
+      p.growPct = 1;
+      grownCount++;
+      hitStop = 3;
+      zoom = 1.025;
+      var sp = SPECIES[p.speciesIdx];
+      addFlash(sp.name + ' grown!', TEAL, 32, p.x, p.y - 40);
+      spawnParticles(p.x, p.y);
+      if (window.J) J.calm(grownCount + 2);
+      if (window.LOOP) LOOP.emit('plant_grown', { species: sp.name, total: grownCount, water_left: waterLeft });
+
+      if (grownCount >= 10) {
+        // garden complete!
+        setTimeout(function () { gardenComplete(); }, 600);
+      }
+    } else {
+      addFlash('+water', SAGE, 22, p.x, p.y - 30);
+      if (window.LOOP) LOOP.emit('patch_watered', { patch: patchIdx, growPct: +(p.growPct).toFixed(2) });
+    }
+
+    // water ran out → game_over (not complete)
+    if (waterLeft <= 0 && grownCount < 10) {
+      setTimeout(function () { gardenOver(); }, 800);
+    }
+  }
+
+  function gardenComplete() {
+    phase = 'complete';
+    completeAt = performance.now();
+    shakeAmt = 2;    // gentle ripple
+    if (window.J) J.calm(12);
+    var dur = (Date.now() - runStartTs) / 1000;
+    window.__demoScore = grownCount;
+    if (window.LOOP) LOOP.emit('game_over', { score: grownCount, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () { phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 3000);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetBot(); }, 1200);
+    }
+  }
+
+  function gardenOver() {
+    // water ran out before all 10 grown
+    phase = 'complete';   // same card, different message
+    completeAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    window.__demoScore = grownCount;
+    if (window.J) J.calm(grownCount);
+    if (window.LOOP) LOOP.emit('game_over', { score: grownCount, dur_s: +dur.toFixed(1) });
+
+    if (DEMO) {
+      setTimeout(function () { phase = 'cta'; ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 3000);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(function () { resetBot(); }, 1200);
+    }
+  }
+
+  function resetBot() {
+    runsDone = (runsDone || 0) + 1;
+    grownCount = 0;
+    waterLeft = MAX_WATER;
+    phase = 'play';
+    flashes = []; particles = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    rng = mulberry32(SEED + runsDone * 2654435761 | 0);
+    var order = SPECIES.slice(); shuffleArr(order);
+    for (var i = 0; i < patches.length; i++) {
+      patches[i].growPct = 0;
+      patches[i].grown = false;
+      patches[i].watered = false;
+      patches[i].bloomT = 0;
+      patches[i].speciesIdx = SPECIES.indexOf(order[i % 10]);
+    }
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('restart', {});
+  }
+
+  // ---------- DEMO scripted arc ----------
+  // settle (taps 1-3) → deepen (taps 4-7) → resolve (taps 8-10 grow all 10) → CTA
+  var demoStep = 0, demoTimer = 0;
+  var demoSequence = [0,4,8, 1,5,9, 2,6,10, 3,7,11, 0,1,2];   // patch indices
+  var demoWaits  = [90,70,80, 65,75,70, 60,55,70, 50,55,60, 45,40,35];
+
+  function demoStart() {
+    demoStep = 0; demoTimer = 100;
+  }
+
+  function demoPump(dt) {
+    if (phase !== 'play') return;
+    demoTimer -= dt;
+    if (demoTimer > 0) return;
+    var pi = demoSequence[Math.min(demoStep, demoSequence.length - 1)];
+    waterPatch(pi);
+    demoStep++;
+    demoTimer = demoWaits[Math.min(demoStep, demoWaits.length - 1)] || 60;
+  }
+
+  // ---------- BOT autopilot ----------
+  var botTimer = 0, botTargetPatch = -1;
+  function botPump(dt) {
+    if (phase !== 'play') return;
+    botTimer -= dt;
+    if (botTimer > 0) return;
+    // pick ungrown patch with lowest growPct (simulate imperfect — sometimes random)
+    var pick = -1;
+    if (rng() < 0.7) {
+      // greedy: lowest growPct that isn't fully grown
+      var best = 2;
+      for (var i = 0; i < patches.length; i++) {
+        if (!patches[i].grown && patches[i].growPct < best) { best = patches[i].growPct; pick = i; }
+      }
+    } else {
+      // random
+      var pool = [];
+      for (var j = 0; j < patches.length; j++) { if (!patches[j].grown) pool.push(j); }
+      if (pool.length) pick = pool[Math.floor(rng() * pool.length)];
+    }
+    if (pick >= 0) waterPatch(pick);
+    botTimer = 45 + rng() * 35;
+  }
+
+  // ---------- particles ----------
+  function spawnParticles(x, y) {
+    for (var i = 0; i < 12; i++) {
+      var ang = rng() * Math.PI * 2;
+      var spd = 1.5 + rng() * 2.5;
+      particles.push({
+        x: x, y: y,
+        vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - 1.5,
+        life: 1, hue: 120 + rng() * 80
+      });
+    }
+  }
+
+  function addFlash(txt, color, size, x, y) {
+    flashes.push({ txt: txt, color: color, size: size, x: x || W/2, y: y || H/2, t: 0 });
+  }
+
+  // ---------- drawing helpers ----------
+  function drawSoilPatch(px, py, cw, ch, watered) {
+    var pw = cw * 0.72, ph = ch * 0.22;
+    cx.fillStyle = watered ? '#5c3d1e' : '#3d2612';
+    cx.beginPath();
+    cx.ellipse(px, py, pw/2, ph/2, 0, 0, Math.PI * 2);
+    cx.fill();
+    // soil texture dots
+    cx.fillStyle = watered ? '#7a5030' : '#553320';
+    for (var d = 0; d < 5; d++) {
+      var dx = (rng() - 0.5) * pw * 0.7;
+      var dy = (rng() - 0.5) * ph * 0.55;
+      cx.beginPath(); cx.arc(px + dx, py + dy, 2 + rng() * 2, 0, Math.PI * 2); cx.fill();
+    }
+  }
+
+  function drawPlant(px, py, sp, growPct, bloomT, cw, ch) {
+    if (growPct <= 0) return;
+    var t = NOW / 1000;
+    cx.save();
+    cx.translate(px, py);
+
+    var stemH = ch * 0.52 * growPct;
+    var sway = Math.sin(t * 0.8 + px * 0.05) * 2 * growPct;
+
+    // stem
+    cx.strokeStyle = 'hsl(' + sp.hue + ',55%,32%)';
+    cx.lineWidth = 2.5;
+    cx.beginPath();
+    cx.moveTo(0, 0);
+    cx.quadraticCurveTo(sway * 0.5, -stemH * 0.5, sway, -stemH);
+    cx.stroke();
+
+    if (growPct < 0.5) {
+      // sprout stage — just a small leaf bud
+      cx.fillStyle = 'hsl(' + sp.hue + ',60%,42%)';
+      cx.beginPath();
+      cx.ellipse(sway, -stemH, 5, 8, sway * 0.1, 0, Math.PI * 2);
+      cx.fill();
+      cx.restore(); return;
+    }
+
+    // full plant by style
+    var top = { x: sway, y: -stemH };
+    cx.translate(top.x, top.y);
+
+    var bloom = Math.max(0, (growPct - 0.5) * 2);   // 0..1 bloom phase
+
+    switch (sp.leafStyle) {
+      case 'fern': drawFern(bloom, sp.hue, t, sway); break;
+      case 'round': drawFlower(bloom, sp.hue, sp.petals, 18, t, false); break;
+      case 'tall': drawTulip(bloom, sp.hue, t); break;
+      case 'cactus': drawCactus(bloom, sp.hue, t); break;
+      case 'sun': drawFlower(bloom, sp.hue, sp.petals, 22, t, true); break;
+      case 'spike': drawLavender(bloom, sp.hue, t); break;
+      case 'rosette': drawSucculent(bloom, sp.hue, t); break;
+      case 'cosmos': drawFlower(bloom, sp.hue, sp.petals, 16, t, false); break;
+      case 'mint': drawMint(bloom, sp.hue, t); break;
+      case 'marig': drawFlower(bloom, sp.hue, sp.petals, 14, t, false); break;
+    }
+    cx.restore();
+  }
+
+  function drawFern(bloom, hue, t, sway) {
+    for (var i = 0; i < 6; i++) {
+      var side = i % 2 === 0 ? 1 : -1;
+      var frac = (i + 1) / 7;
+      var fy = -frac * 20 * bloom;
+      var len = 16 * bloom * (1 - frac * 0.4);
+      cx.strokeStyle = 'hsl(' + hue + ',' + (50 + bloom * 15) + '%,38%)';
+      cx.lineWidth = 1.5;
+      cx.beginPath();
+      cx.moveTo(0, fy);
+      cx.quadraticCurveTo(side * len * 0.5, fy - 6, side * len, fy - 4);
+      cx.stroke();
+    }
+  }
+
+  function drawFlower(bloom, hue, nPetals, r, t, isSun) {
+    var pulse = isSun ? Math.sin(t * 0.9) * 1.5 * bloom : 0;
+    // petals
+    for (var i = 0; i < nPetals; i++) {
+      var ang = (i / nPetals) * Math.PI * 2;
+      var pr = (r + pulse) * bloom;
+      cx.fillStyle = 'hsl(' + (hue + (isSun ? 0 : i * 5)) + ',72%,62%)';
+      cx.beginPath();
+      cx.ellipse(Math.cos(ang) * pr, Math.sin(ang) * pr, pr * 0.38, pr * 0.22, ang, 0, Math.PI * 2);
+      cx.fill();
+    }
+    // center
+    cx.fillStyle = isSun ? '#3a2200' : 'hsl(' + (hue + 180) + ',60%,70%)';
+    cx.beginPath();
+    cx.arc(0, 0, (isSun ? 8 : 6) * bloom, 0, Math.PI * 2);
+    cx.fill();
+  }
+
+  function drawTulip(bloom, hue, t) {
+    var h = 20 * bloom;
+    var w = 12 * bloom;
+    var sway = Math.sin(t * 0.7) * 1.5 * bloom;
+    cx.fillStyle = 'hsl(' + hue + ',70%,58%)';
+    cx.beginPath();
+    cx.moveTo(sway, -h * 0.1);
+    cx.bezierCurveTo(sway - w, -h * 0.4, sway - w * 0.8, -h * 0.85, sway, -h);
+    cx.bezierCurveTo(sway + w * 0.8, -h * 0.85, sway + w, -h * 0.4, sway, -h * 0.1);
+    cx.fill();
+  }
+
+  function drawCactus(bloom, hue, t) {
+    var h = 22 * bloom;
+    var w = 7 * bloom;
+    cx.fillStyle = 'hsl(' + hue + ',55%,38%)';
+    // body
+    cx.beginPath(); cx.roundRect(-w, -h, w * 2, h, 4 * bloom); cx.fill();
+    // arms
+    if (bloom > 0.6) {
+      var ab = (bloom - 0.6) / 0.4;
+      cx.beginPath(); cx.roundRect(-w * 2.2, -h * 0.65, w * 1.2, h * 0.4, 3); cx.fill();
+      cx.beginPath(); cx.roundRect(w, -h * 0.5, w * 1.2, h * 0.35, 3); cx.fill();
+    }
+    // spines
+    cx.strokeStyle = '#d4c9a0';
+    cx.lineWidth = 0.8;
+    for (var i = 0; i < 6; i++) {
+      var sy2 = -h * 0.2 * i;
+      cx.beginPath(); cx.moveTo(-w, sy2); cx.lineTo(-w - 4 * bloom, sy2 - 3 * bloom); cx.stroke();
+      cx.beginPath(); cx.moveTo(w, sy2); cx.lineTo(w + 4 * bloom, sy2 - 3 * bloom); cx.stroke();
+    }
+  }
+
+  function drawLavender(bloom, hue, t) {
+    for (var i = 0; i < 5; i++) {
+      var side = i % 2 === 0 ? 1 : -1;
+      var fy = -i * 7 * bloom;
+      var spd2 = Math.sin(t * 1.1 + i) * 1.2 * bloom;
+      cx.fillStyle = 'hsl(' + hue + ',65%,62%)';
+      cx.beginPath();
+      cx.ellipse(spd2 * side * 3, fy, 4 * bloom, 5 * bloom, spd2 * 0.2, 0, Math.PI * 2);
+      cx.fill();
+    }
+  }
+
+  function drawSucculent(bloom, hue, t) {
+    var layers = [6, 4, 2];
+    var radii = [16, 10, 5];
+    for (var l = 0; l < 3; l++) {
+      var lb = Math.max(0, Math.min(1, (bloom - l * 0.3) / 0.4));
+      if (lb <= 0) continue;
+      var n = layers[l]; var r2 = radii[l] * lb;
+      for (var i = 0; i < n; i++) {
+        var ang = (i / n) * Math.PI * 2;
+        cx.fillStyle = 'hsl(' + (hue + i * 8) + ',55%,' + (38 + l * 8) + '%)';
+        cx.beginPath();
+        cx.ellipse(Math.cos(ang) * r2, Math.sin(ang) * r2 - l * 2 * lb, r2 * 0.4, r2 * 0.6, ang, 0, Math.PI * 2);
+        cx.fill();
+      }
+    }
+  }
+
+  function drawMint(bloom, hue, t) {
+    for (var i = 0; i < 4; i++) {
+      var side = i % 2 === 0 ? 1 : -1;
+      var fy = -i * 8 * bloom;
+      var ang2 = side * (0.5 + Math.sin(t * 0.6 + i) * 0.1) * bloom;
+      cx.fillStyle = 'hsl(' + hue + ',60%,46%)';
+      cx.beginPath();
+      cx.save(); cx.translate(side * 8 * bloom, fy); cx.rotate(ang2);
+      cx.ellipse(0, 0, 9 * bloom, 6 * bloom, 0, 0, Math.PI * 2);
+      cx.fill(); cx.restore();
+    }
+  }
+
+  // ---------- human input ----------
+  function hitTest(ex, ey) {
+    for (var i = 0; i < patches.length; i++) {
+      var p = patches[i];
+      var dx = ex - p.x, dy = ey - p.y;
+      if (Math.abs(dx) < CELL_W * 0.48 && Math.abs(dy) < CELL_H * 0.48) return i;
+    }
+    return -1;
+  }
+
+  function tap(ex, ey) {
+    if (DEMO || BOT) return;
+    if (ex !== undefined && inR(MUTE_R, ex, ey) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') {
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+      return;
+    }
+    if (phase === 'play') {
+      var pi = ex !== undefined ? hitTest(ex, ey) : -1;
+      if (pi >= 0) waterPatch(pi);
+      return;
+    }
+    if (phase === 'complete') {
+      // restart
+      runsDone = (runsDone || 0) + 1;
+      newGame();
+      phase = 'play';
+      runStartTs = Date.now();
+      if (window.LOOP) LOOP.emit('restart', {});
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---------- render ----------
+  var last2 = performance.now();
+  function frame(now2) {
+    var dt = Math.min((now2 - last2) / 16.667, 3); last2 = now2; NOW = now2;
+
+    // decay juice
+    if (hitStop > 0) { hitStop -= dt; }
+    shakeAmt *= Math.pow(0.88, dt);
+    zoom += (1 - zoom) * 0.14 * dt;
+
+    // update bloom times
+    for (var i = 0; i < patches.length; i++) {
+      if (patches[i].grown) patches[i].bloomT += dt;
+    }
+
+    // autopilots
+    if (DEMO && hitStop <= 0) demoPump(dt);
+    if (BOT  && hitStop <= 0) botPump(dt);
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.3 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W/2 + sx, H/2 + sy); cx.scale(zoom, zoom); cx.translate(-W/2, -H/2);
+    }
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-10, -10, W + 20, H + 20);
+    // soft ambient glow at bottom (garden area)
+    var bg = cx.createLinearGradient(0, GRID_MARGIN_Y, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(122,200,130,0.08)');
+    cx.fillStyle = bg; cx.fillRect(0, GRID_MARGIN_Y, W, H - GRID_MARGIN_Y);
+
+    // ---- title ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = SAGE;
+      cx.font = '900 46px -apple-system, Helvetica, Arial';
+      cx.fillText('GARDEN GROW', W/2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.6)';
+      cx.font = '600 17px -apple-system, Helvetica, Arial';
+      cx.fillText('tap soil to plant · fill all 10 species', W/2, 340);
+      var pulse = 0.55 + 0.45 * Math.sin(now2 / 500);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = TEAL;
+      cx.font = '700 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W/2, 400);
+      cx.globalAlpha = 1;
+      cx.restore(); requestAnimationFrame(frame); return;
+    }
+
+    // ---- play / complete ----
+    if (phase === 'play' || phase === 'complete') {
+
+      // header: water drops
+      cx.textAlign = 'left';
+      cx.fillStyle = 'rgba(255,255,255,0.85)';
+      cx.font = '700 15px -apple-system, Helvetica, Arial';
+      cx.fillText('WATER', 26, 48);
+      // drop icons
+      for (var d = 0; d < MAX_WATER; d++) {
+        var dropX = 26 + d * 18;
+        var dropY = 62;
+        cx.fillStyle = d < waterLeft ? '#50c8e0' : 'rgba(255,255,255,0.12)';
+        cx.beginPath();
+        cx.arc(dropX, dropY, 6, 0, Math.PI * 2);
+        cx.fill();
+      }
+
+      // progress bar: 10 species circles
+      var barY = 100;
+      cx.textAlign = 'left';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('SPECIES', 26, barY - 10);
+      for (var s = 0; s < 10; s++) {
+        var grown2 = false;
+        for (var pp = 0; pp < patches.length; pp++) {
+          if (patches[pp].speciesIdx === SPECIES.indexOf(SPECIES[s]) && patches[pp].grown) { grown2 = true; break; }
+        }
+        // find the species among patches
+        var hasGrown = false;
+        for (var pp2 = 0; pp2 < patches.length; pp2++) {
+          if (patches[pp2].grown && patches[pp2].speciesIdx < 10 && SPECIES[patches[pp2].speciesIdx] === SPECIES[s]) {
+            hasGrown = true; break;
+          }
+        }
+        var bx = 26 + s * 36, by = barY;
+        cx.fillStyle = hasGrown ? TEAL : 'rgba(255,255,255,0.1)';
+        cx.beginPath(); cx.arc(bx, by, 12, 0, Math.PI * 2); cx.fill();
+        if (hasGrown) {
+          cx.fillStyle = INK;
+          cx.font = '700 9px -apple-system, Helvetica, Arial';
+          cx.textAlign = 'center';
+          cx.fillText(SPECIES[s].name.slice(0,3).toUpperCase(), bx, by + 4);
+          cx.textAlign = 'left';
+        }
+      }
+
+      // soil patches + plants
+      for (var i = 0; i < patches.length; i++) {
+        var p = patches[i];
+        var sp = SPECIES[p.speciesIdx];
+        // soil
+        drawSoilPatch(p.x, p.y + 8, CELL_W, CELL_H, p.watered);
+        // plant
+        if (p.growPct > 0) {
+          drawPlant(p.x, p.y, sp, p.growPct, p.bloomT, CELL_W, CELL_H);
+        }
+        // species label under fully grown
+        if (p.grown) {
+          cx.textAlign = 'center';
+          cx.fillStyle = 'rgba(255,255,255,0.5)';
+          cx.font = '500 9px -apple-system, Helvetica, Arial';
+          cx.fillText(sp.name, p.x, p.y + CELL_H * 0.28);
+        }
+      }
+
+      // score line
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(grownCount + ' / 10', W/2, 166);
+
+      // complete overlay
+      if (phase === 'complete') {
+        cx.fillStyle = 'rgba(11,13,18,0.60)'; cx.fillRect(0, 0, W, H);
+        var allGrown = grownCount >= 10;
+        cx.textAlign = 'center';
+        if (allGrown) {
+          cx.fillStyle = TEAL;
+          cx.font = '900 38px -apple-system, Helvetica, Arial';
+          cx.fillText('GARDEN FULL', W/2, 310);
+          cx.fillStyle = 'rgba(255,255,255,0.8)';
+          cx.font = '600 18px -apple-system, Helvetica, Arial';
+          cx.fillText('all 10 species grown', W/2, 348);
+        } else {
+          cx.fillStyle = SAGE;
+          cx.font = '900 38px -apple-system, Helvetica, Arial';
+          cx.fillText(grownCount + ' SPECIES', W/2, 305);
+          cx.fillStyle = 'rgba(255,255,255,0.7)';
+          cx.font = '600 18px -apple-system, Helvetica, Arial';
+          cx.fillText('water ran out', W/2, 342);
+        }
+        cx.fillStyle = GOLD;
+        cx.font = '800 22px -apple-system, Helvetica, Arial';
+        cx.fillText(grownCount + ' of 10 plants grown', W/2, 392);
+        if (!DEMO && !BOT) {
+          var p3 = 0.6 + 0.4 * Math.sin(now2 / 350);
+          cx.globalAlpha = p3;
+          cx.fillStyle = TEAL;
+          cx.font = '700 18px -apple-system, Helvetica, Arial';
+          cx.fillText('TAP TO GROW AGAIN', W/2, 450);
+          cx.globalAlpha = 1;
+        }
+      }
+    }
+
+    // ---- demo CTA ----
+    if (phase === 'cta') {
+      // still show garden in background
+      for (var i = 0; i < patches.length; i++) {
+        var p = patches[i]; var sp = SPECIES[p.speciesIdx];
+        drawSoilPatch(p.x, p.y + 8, CELL_W, CELL_H, p.watered);
+        if (p.growPct > 0) drawPlant(p.x, p.y, sp, p.growPct, p.bloomT, CELL_W, CELL_H);
+      }
+      var te = (now2 - ctaAt) / 1000, ease = Math.min(1, te * 2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * ease) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease; cx.textAlign = 'center';
+      cx.fillStyle = SAGE;
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('GARDEN GROW', W/2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('the garden finished.', W/2, 338);
+      cx.fillText('nothing more to add.', W/2, 362);
+      var p4 = 0.7 + 0.3 * Math.sin(now2 / 300);
+      cx.globalAlpha = ease * p4;
+      cx.fillStyle = TEAL;
+      cx.font = '800 24px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ GROW YOURS', W/2, 424);
+      cx.globalAlpha = ease;
+      cx.fillStyle = 'rgba(255,255,255,0.45)';
+      cx.font = '600 15px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W/2, 456);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- particles ----
+    for (var i = particles.length - 1; i >= 0; i--) {
+      var pt = particles[i];
+      pt.vy += 0.08 * dt; pt.x += pt.vx * dt; pt.y += pt.vy * dt;
+      pt.life -= 0.025 * dt;
+      if (pt.life <= 0) { particles.splice(i, 1); continue; }
+      cx.globalAlpha = pt.life;
+      cx.fillStyle = 'hsl(' + pt.hue + ',70%,62%)';
+      cx.beginPath(); cx.arc(pt.x, pt.y, 3.5, 0, Math.PI * 2); cx.fill();
+      cx.globalAlpha = 1;
+    }
+
+    // ---- floating flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 45);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + (fl.size + fl.t * 0.3) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, fl.x, fl.y - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 45) flashes.splice(k, 1);
+    }
+
+    // ---- mute toggle (human only) ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w/2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  runsDone = 0; botRunsDone = 0;
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

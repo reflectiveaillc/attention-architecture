@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Sticker Book — Tilt</title>
+<!--
+  LOOP / attention-architecture — Sticker Book
+  Circuits: 06-zeigarnik (incomplete album begs completion), 05-ease (tap to place),
+            08-investment (your collection, your album).
+  Engine: calm. Video trick: full album sealed — the completion moment.
+  Modes:
+    ?demo=1&seed=7   scripted calm arc ~16s → soft invitation CTA → __demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot, N runs, __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'sticker-book';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+  var CREAM = '#faf3e8', SOFT_BLUE = '#a8d8ea', SOFT_PINK = '#f9c4d0';
+  var SOFT_GREEN = '#b8e0d2', SOFT_LAVENDER = '#d4b8e0', SOFT_YELLOW = '#f9e4a0';
+
+  // Album layout: 9 slots in a 3×3 grid on a spread
+  var ALBUM_COLS = 3, ALBUM_ROWS = 3;
+  var TOTAL_STICKERS = ALBUM_COLS * ALBUM_ROWS; // 9
+  var SLOT_W = 90, SLOT_H = 80, SLOT_GAP = 14;
+  var ALBUM_LEFT = (W - (ALBUM_COLS * SLOT_W + (ALBUM_COLS - 1) * SLOT_GAP)) / 2;
+  var ALBUM_TOP  = 200;
+
+  // Sticker shapes: each has a theme color and simple icon drawn with canvas
+  var STICKER_THEMES = [
+    { color: SOFT_BLUE,     label: 'CLOUD',   icon: 'cloud'   },
+    { color: SOFT_PINK,     label: 'HEART',   icon: 'heart'   },
+    { color: SOFT_GREEN,    label: 'LEAF',    icon: 'leaf'     },
+    { color: SOFT_YELLOW,   label: 'STAR',    icon: 'star'    },
+    { color: SOFT_LAVENDER, label: 'MOON',    icon: 'moon'    },
+    { color: SOFT_BLUE,     label: 'WAVE',    icon: 'wave'    },
+    { color: SOFT_PINK,     label: 'BLOOM',   icon: 'bloom'   },
+    { color: SOFT_GREEN,    label: 'GEM',     icon: 'gem'     },
+    { color: SOFT_YELLOW,   label: 'SUN',     icon: 'sun'     }
+  ];
+
+  var state, flashes, runStartTs;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var botRunsDone = 0, botIdleCount = 0;
+
+  // Flutter particle for sticker arriving
+  function makeFlutter(idx) {
+    var col = idx % ALBUM_COLS, row = Math.floor(idx / ALBUM_COLS);
+    var tx = ALBUM_LEFT + col * (SLOT_W + SLOT_GAP) + SLOT_W / 2;
+    var ty = ALBUM_TOP  + row * (SLOT_H + SLOT_GAP) + SLOT_H / 2;
+    // Arrive from a random edge
+    var side = Math.floor(rng() * 4);
+    var sx, sy;
+    if (side === 0) { sx = rng() * W; sy = -60; }
+    else if (side === 1) { sx = W + 60; sy = rng() * H; }
+    else if (side === 2) { sx = rng() * W; sy = H + 60; }
+    else { sx = -60; sy = rng() * H; }
+    return {
+      idx: idx,
+      x: sx, y: sy,
+      tx: tx, ty: ty,
+      rot: (rng() - 0.5) * 0.8,
+      targetRot: 0,
+      scale: 0.4 + rng() * 0.3,
+      targetScale: 1,
+      alpha: 0,
+      theme: STICKER_THEMES[idx],
+      phase: 'flying',  // flying | landing | placed
+      t: 0
+    };
+  }
+
+  function newGame() {
+    state = {
+      phase: 'title',  // title | play | complete | over | cta
+      slots: [],       // true/false for each slot placed
+      placed: 0,
+      incoming: null,  // current sticker fluttering in
+      queue: [],       // indices waiting to be tapped/placed
+      overAt: 0,
+      ctaAt: 0,
+      score: 0
+    };
+    // Build slots
+    for (var i = 0; i < TOTAL_STICKERS; i++) {
+      state.slots[i] = false;
+    }
+    // Randomize order
+    var order = [];
+    for (var j = 0; j < TOTAL_STICKERS; j++) order.push(j);
+    // shuffle order with rng
+    for (var k = order.length - 1; k > 0; k--) {
+      var r = Math.floor(rng() * (k + 1));
+      var tmp = order[k]; order[k] = order[r]; order[r] = tmp;
+    }
+    state.queue = order;
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+
+    if (DEMO) { startRun(); return; }
+    if (BOT)  { startRun(); return; }
+  }
+
+  function startRun() {
+    state.phase = 'play';
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    spawnNextSticker();
+  }
+
+  function spawnNextSticker() {
+    if (state.queue.length === 0) {
+      // All stickers placed — complete!
+      completeAlbum();
+      return;
+    }
+    var idx = state.queue.shift();
+    state.incoming = makeFlutter(idx);
+  }
+
+  function placeSticker() {
+    if (!state.incoming || state.incoming.phase !== 'flying') return;
+    var s = state.incoming;
+    s.phase = 'landing';
+    s.t = 0;
+  }
+
+  function landSticker(s) {
+    state.slots[s.idx] = true;
+    state.placed++;
+    state.score = state.placed;
+    state.incoming = null;
+
+    // calm bell sound
+    if (window.J) J.calm(state.placed);
+
+    // Hit-stop on every place (soft, 30ms)
+    hitStop = 1.8;
+    zoom = 1.015;
+    if (state.placed === TOTAL_STICKERS - 1) {
+      // Second-to-last: gentle shake of anticipation
+      shakeAmt = 1.5;
+    }
+    if (state.placed === TOTAL_STICKERS) {
+      zoom = 1.04;
+      shakeAmt = 2;
+    }
+
+    flash('+' + state.placed, TEAL, 36);
+
+    if (window.LOOP) LOOP.emit('sticker_placed', { n: state.placed, idx: s.idx });
+
+    if (state.placed < TOTAL_STICKERS) {
+      // Delay next sticker slightly for calm pacing
+      var delay = DEMO ? 800 : BOT ? 300 : 900;
+      setTimeout(spawnNextSticker, delay);
+    } else {
+      // Last one — complete after a beat
+      setTimeout(completeAlbum, 600);
+    }
+  }
+
+  function completeAlbum() {
+    state.phase = 'complete';
+    state.overAt = performance.now();
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.J) { J.calm(10); }
+    zoom = 1.06; shakeAmt = 1;
+    flash('COMPLETE', TEAL, 44);
+    if (window.LOOP) LOOP.emit('game_over', { score: state.score, dur_s: +dur.toFixed(1) });
+    if (DEMO) {
+      window.__demoScore = state.score;
+      setTimeout(function () {
+        state.phase = 'cta';
+        state.ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3500);
+      }, 2800);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 600);
+      }
+    }
+  }
+
+  function resetRun() {
+    // Reset RNG for next bot run with offset
+    rng = mulberry32(SEED + botRunsDone * 1000);
+    state.slots = [];
+    for (var i = 0; i < TOTAL_STICKERS; i++) state.slots[i] = false;
+    var order = [];
+    for (var j = 0; j < TOTAL_STICKERS; j++) order.push(j);
+    for (var k = order.length - 1; k > 0; k--) {
+      var r = Math.floor(rng() * (k + 1));
+      var tmp = order[k]; order[k] = order[r]; order[r] = tmp;
+    }
+    state.queue = order;
+    state.placed = 0;
+    state.score = 0;
+    state.incoming = null;
+    state.phase = 'play';
+    flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    botIdleCount = 0;
+    if (window.LOOP) LOOP.emit('restart', {});
+    runStartTs = Date.now();
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+    spawnNextSticker();
+  }
+
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- Demo autopilot ----
+  var demoStep = 0;
+  // Demo waits (frames) before tapping each sticker — longer early, brisk near end
+  var demoWaits = [90, 70, 55, 48, 42, 38, 34, 30, 28];
+  var demoWaitLeft = 90;
+
+  // ---- Bot autopilot ----
+  var botWaitLeft = 0;
+
+  function autopilot(dt) {
+    if (!state.incoming || state.incoming.phase !== 'flying') return;
+    if (state.phase !== 'play') return;
+
+    if (DEMO) {
+      demoWaitLeft -= dt;
+      if (demoWaitLeft <= 0) {
+        placeSticker();
+        var nextWait = demoWaits[Math.min(demoStep, demoWaits.length - 1)];
+        demoWaitLeft = nextWait;
+        demoStep++;
+      }
+    } else if (BOT) {
+      botWaitLeft -= dt;
+      if (botWaitLeft <= 0) {
+        // Bot: slightly imperfect timing, occasional early tap
+        botWaitLeft = 25 + rng() * 30;
+        placeSticker();
+      }
+    }
+  }
+
+  // ---- Input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 510, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (state.phase === 'title') { startRun(); return; }
+    if (state.phase === 'play') {
+      if (state.incoming && state.incoming.phase === 'flying') {
+        placeSticker();
+      }
+      return;
+    }
+    if (state.phase === 'complete' && performance.now() - state.overAt > 400) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: state.score, unit: 'stickers' }); return;
+      }
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- Draw helpers ----
+  function drawStickerIcon(icon, cx2, x, y, size) {
+    cx2.save();
+    cx2.translate(x, y);
+    switch (icon) {
+      case 'cloud':
+        cx2.beginPath();
+        cx2.arc(0, 4, size * 0.28, 0, Math.PI * 2);
+        cx2.arc(-size * 0.22, 8, size * 0.22, 0, Math.PI * 2);
+        cx2.arc(size * 0.22, 8, size * 0.22, 0, Math.PI * 2);
+        cx2.rect(-size * 0.38, 8, size * 0.76, size * 0.3);
+        cx2.fill();
+        break;
+      case 'heart':
+        cx2.beginPath();
+        cx2.moveTo(0, size * 0.2);
+        cx2.bezierCurveTo(0, 0, -size * 0.4, 0, -size * 0.4, -size * 0.12);
+        cx2.bezierCurveTo(-size * 0.4, -size * 0.34, 0, -size * 0.34, 0, -size * 0.12);
+        cx2.bezierCurveTo(0, -size * 0.34, size * 0.4, -size * 0.34, size * 0.4, -size * 0.12);
+        cx2.bezierCurveTo(size * 0.4, 0, 0, 0, 0, size * 0.2);
+        cx2.fill();
+        break;
+      case 'leaf':
+        cx2.beginPath();
+        cx2.moveTo(0, -size * 0.35);
+        cx2.bezierCurveTo(size * 0.3, -size * 0.1, size * 0.3, size * 0.2, 0, size * 0.35);
+        cx2.bezierCurveTo(-size * 0.3, size * 0.2, -size * 0.3, -size * 0.1, 0, -size * 0.35);
+        cx2.fill();
+        break;
+      case 'star':
+        cx2.beginPath();
+        for (var i = 0; i < 5; i++) {
+          var outerR = size * 0.36, innerR = size * 0.16;
+          var oA = -Math.PI / 2 + (i * 2 * Math.PI) / 5;
+          var iA = oA + Math.PI / 5;
+          if (i === 0) cx2.moveTo(Math.cos(oA) * outerR, Math.sin(oA) * outerR);
+          else cx2.lineTo(Math.cos(oA) * outerR, Math.sin(oA) * outerR);
+          cx2.lineTo(Math.cos(iA) * innerR, Math.sin(iA) * innerR);
+        }
+        cx2.closePath(); cx2.fill();
+        break;
+      case 'moon':
+        cx2.beginPath();
+        cx2.arc(0, 0, size * 0.3, 0.4, Math.PI * 1.6);
+        cx2.arc(-size * 0.08, -size * 0.04, size * 0.22, Math.PI * 1.6, 0.4, true);
+        cx2.closePath(); cx2.fill();
+        break;
+      case 'wave':
+        cx2.beginPath();
+        cx2.moveTo(-size * 0.38, 0);
+        cx2.bezierCurveTo(-size * 0.18, -size * 0.22, size * 0.08, -size * 0.22, size * 0.18, 0);
+        cx2.bezierCurveTo(size * 0.28, size * 0.22, size * 0.48, size * 0.22, size * 0.38, 0);
+        cx2.lineWidth = size * 0.1;
+        cx2.strokeStyle = cx2.fillStyle;
+        cx2.stroke();
+        cx2.moveTo(-size * 0.38, size * 0.14);
+        cx2.bezierCurveTo(-size * 0.18, -size * 0.08, size * 0.08, -size * 0.08, size * 0.18, size * 0.14);
+        cx2.bezierCurveTo(size * 0.28, size * 0.36, size * 0.48, size * 0.36, size * 0.38, size * 0.14);
+        cx2.stroke();
+        break;
+      case 'bloom':
+        for (var p = 0; p < 6; p++) {
+          var pa = (p * Math.PI) / 3;
+          cx2.beginPath();
+          cx2.ellipse(
+            Math.cos(pa) * size * 0.18, Math.sin(pa) * size * 0.18,
+            size * 0.16, size * 0.1, pa, 0, Math.PI * 2
+          );
+          cx2.fill();
+        }
+        cx2.beginPath();
+        cx2.arc(0, 0, size * 0.12, 0, Math.PI * 2);
+        cx2.fillStyle = GOLD;
+        cx2.fill();
+        break;
+      case 'gem':
+        cx2.beginPath();
+        cx2.moveTo(0, -size * 0.35);
+        cx2.lineTo(size * 0.32, -size * 0.1);
+        cx2.lineTo(size * 0.26, size * 0.3);
+        cx2.lineTo(-size * 0.26, size * 0.3);
+        cx2.lineTo(-size * 0.32, -size * 0.1);
+        cx2.closePath(); cx2.fill();
+        cx2.globalAlpha *= 0.35;
+        cx2.fillStyle = '#fff';
+        cx2.beginPath();
+        cx2.moveTo(0, -size * 0.35);
+        cx2.lineTo(size * 0.32, -size * 0.1);
+        cx2.lineTo(0, -size * 0.05);
+        cx2.closePath(); cx2.fill();
+        cx2.globalAlpha /= 0.35;
+        break;
+      case 'sun':
+        cx2.beginPath();
+        cx2.arc(0, 0, size * 0.22, 0, Math.PI * 2);
+        cx2.fill();
+        for (var r2 = 0; r2 < 8; r2++) {
+          var sa2 = (r2 * Math.PI) / 4;
+          cx2.beginPath();
+          cx2.moveTo(Math.cos(sa2) * size * 0.26, Math.sin(sa2) * size * 0.26);
+          cx2.lineTo(Math.cos(sa2) * size * 0.38, Math.sin(sa2) * size * 0.38);
+          cx2.lineWidth = size * 0.07;
+          cx2.strokeStyle = cx2.fillStyle;
+          cx2.stroke();
+        }
+        break;
+    }
+    cx2.restore();
+  }
+
+  function drawSticker(theme, x, y, w, h, alpha, rot, sc) {
+    cx.save();
+    cx.globalAlpha = alpha;
+    cx.translate(x, y);
+    cx.rotate(rot);
+    cx.scale(sc, sc);
+
+    // Sticker background with soft border
+    var hw = w / 2, hh = h / 2;
+    cx.shadowColor = 'rgba(0,0,0,0.18)';
+    cx.shadowBlur = 8;
+    cx.shadowOffsetY = 2;
+    cx.fillStyle = theme.color;
+    cx.beginPath();
+    if (cx.roundRect) cx.roundRect(-hw, -hh, w, h, 10);
+    else cx.rect(-hw, -hh, w, h);
+    cx.fill();
+    cx.shadowBlur = 0; cx.shadowOffsetY = 0;
+
+    // Icon
+    cx.fillStyle = 'rgba(0,0,0,0.55)';
+    drawStickerIcon(theme.icon, cx, 0, -8, w * 0.9);
+
+    // Label
+    cx.fillStyle = 'rgba(0,0,0,0.7)';
+    cx.textAlign = 'center';
+    cx.font = '700 9px -apple-system, Helvetica, Arial';
+    cx.fillText(theme.label, 0, hh - 7);
+
+    cx.restore();
+  }
+
+  function drawSlot(col, row, filled, theme) {
+    var x = ALBUM_LEFT + col * (SLOT_W + SLOT_GAP) + SLOT_W / 2;
+    var y = ALBUM_TOP  + row * (SLOT_H + SLOT_GAP) + SLOT_H / 2;
+    if (filled && theme) {
+      drawSticker(theme, x, y, SLOT_W - 6, SLOT_H - 6, 1, 0, 1);
+    } else {
+      // Empty slot: dashed outline
+      cx.save();
+      cx.strokeStyle = 'rgba(255,255,255,0.12)';
+      cx.lineWidth = 1.5;
+      cx.setLineDash([4, 4]);
+      cx.beginPath();
+      if (cx.roundRect) cx.roundRect(x - SLOT_W / 2 + 3, y - SLOT_H / 2 + 3, SLOT_W - 6, SLOT_H - 6, 8);
+      else cx.rect(x - SLOT_W / 2 + 3, y - SLOT_H / 2 + 3, SLOT_W - 6, SLOT_H - 6);
+      cx.stroke();
+      cx.restore();
+    }
+  }
+
+  function drawAlbum(now) {
+    // Album page background
+    cx.save();
+    cx.fillStyle = 'rgba(250,243,232,0.06)';
+    cx.strokeStyle = 'rgba(250,243,232,0.14)';
+    cx.lineWidth = 1;
+    var albumW = ALBUM_COLS * SLOT_W + (ALBUM_COLS - 1) * SLOT_GAP + 28;
+    var albumH = ALBUM_ROWS * SLOT_H + (ALBUM_ROWS - 1) * SLOT_GAP + 40;
+    var albumX = ALBUM_LEFT - 14;
+    var albumY = ALBUM_TOP - 20;
+    if (cx.roundRect) cx.roundRect(albumX, albumY, albumW, albumH, 14);
+    else cx.rect(albumX, albumY, albumW, albumH);
+    cx.fill(); cx.stroke();
+
+    // Album title line
+    cx.textAlign = 'center';
+    cx.fillStyle = 'rgba(250,243,232,0.4)';
+    cx.font = '700 11px Menlo, monospace';
+    cx.fillText('STICKER BOOK', W / 2, ALBUM_TOP - 5);
+    cx.restore();
+
+    // Slots
+    for (var row = 0; row < ALBUM_ROWS; row++) {
+      for (var col = 0; col < ALBUM_COLS; col++) {
+        var idx = row * ALBUM_COLS + col;
+        var filled = state.slots[idx];
+        drawSlot(col, row, filled, filled ? STICKER_THEMES[idx] : null);
+      }
+    }
+  }
+
+  function drawIncoming(now) {
+    var s = state.incoming;
+    if (!s) return;
+
+    if (s.phase === 'flying') {
+      // Animate toward center (gentle hover before tap)
+      var progress = Math.min(1, s.t / 45);
+      var eased = 1 - Math.pow(1 - progress, 3);
+      var cx2 = s.tx, cy2 = s.ty - 40; // hover just above target slot
+      var px = s.x + (cx2 - s.x) * eased;
+      var py = s.y + (cy2 - s.y) * eased;
+      var rot = s.rot + (0 - s.rot) * eased;
+      var sc = s.scale + (1.1 - s.scale) * eased;
+      var alpha = Math.min(1, s.t / 18);
+
+      // Gentle hover wobble after arriving
+      if (progress >= 1) {
+        var wobble = Math.sin(now / 380) * 4;
+        py = cy2 + wobble;
+        rot = Math.sin(now / 500) * 0.08;
+      }
+
+      // Highlight incoming sticker with soft glow
+      cx.save();
+      cx.shadowColor = s.theme.color;
+      cx.shadowBlur = 16;
+      drawSticker(s.theme, px, py, SLOT_W - 6, SLOT_H - 6, alpha, rot, sc);
+      cx.shadowBlur = 0;
+      cx.restore();
+
+      // Tap prompt (human only)
+      if (!DEMO && !BOT && progress >= 1) {
+        var pulse = 0.5 + 0.5 * Math.sin(now / 350);
+        cx.globalAlpha = pulse * 0.85;
+        cx.textAlign = 'center';
+        cx.fillStyle = TEAL;
+        cx.font = '700 13px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP TO PEEL', W / 2, py + SLOT_H / 2 + 22);
+        cx.globalAlpha = 1;
+      }
+
+      s.t += 1;
+    } else if (s.phase === 'landing') {
+      // Snap into slot with zoom-down animation
+      var lt = s.t / 18;
+      var lp = Math.min(1, lt);
+      var ls = 1.1 - lp * 0.1; // shrinks from 1.1 to 1.0
+      drawSticker(s.theme, s.tx, s.ty, SLOT_W - 6, SLOT_H - 6, 1, 0, ls);
+      s.t += 1;
+      if (lp >= 1) {
+        landSticker(s);
+      }
+    }
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    // Hit-stop decay
+    if (hitStop > 0) {
+      hitStop -= dt;
+    } else {
+      autopilot(dt);
+    }
+
+    // Juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx2 = (Math.random() - 0.5) * shakeAmt, sy2 = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx2, H / 2 + sy2);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.88, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // BG
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.04)');
+    bg.addColorStop(1, 'rgba(168,216,234,0.06)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // Title screen
+    if (state.phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 42px -apple-system, Helvetica, Arial';
+      cx.fillText('STICKER BOOK', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.55)';
+      cx.font = '600 16px -apple-system, Helvetica, Arial';
+      cx.fillText('collect them all', W / 2, 328);
+      var pulse2 = 0.6 + 0.4 * Math.sin(now / 340);
+      cx.globalAlpha = pulse2;
+      cx.fillStyle = TEAL;
+      cx.font = '700 17px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO BEGIN', W / 2, 374);
+      cx.globalAlpha = 1;
+    }
+
+    // Play / complete screens
+    if (state.phase === 'play' || state.phase === 'complete') {
+      // Progress header
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.9)';
+      cx.font = '800 52px -apple-system, Helvetica, Arial';
+      cx.fillText(state.placed + ' / ' + TOTAL_STICKERS, W / 2, 100);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('STICKERS PLACED', W / 2, 122);
+
+      // Dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && state.phase === 'play') {
+        cx.fillStyle = GOLD;
+        cx.font = '700 13px -apple-system, Helvetica, Arial';
+        cx.fillText('BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 148);
+      }
+
+      drawAlbum(now);
+      drawIncoming(now);
+    }
+
+    // Complete card
+    if (state.phase === 'complete') {
+      var elapsed = (performance.now() - state.overAt) / 1000;
+      var fadeIn = Math.min(1, elapsed * 1.4);
+
+      // Soft glow overlay on the completed album
+      cx.save();
+      cx.globalAlpha = fadeIn * 0.18;
+      cx.fillStyle = TEAL;
+      cx.fillRect(0, 0, W, H);
+      cx.restore();
+
+      cx.globalAlpha = fadeIn;
+      cx.textAlign = 'center';
+      cx.fillStyle = TEAL;
+      cx.font = '800 32px -apple-system, Helvetica, Arial';
+      cx.fillText('ALBUM COMPLETE', W / 2, 650);
+      cx.fillStyle = 'rgba(255,255,255,0.65)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('all ' + TOTAL_STICKERS + ' stickers found', W / 2, 678);
+      cx.globalAlpha = 1;
+
+      // Share zone (human only)
+      if (!DEMO && !BOT && elapsed > 0.5) {
+        var pp = 0.65 + 0.35 * Math.sin(now / 320);
+        cx.globalAlpha = pp;
+        cx.fillStyle = 'rgba(46,197,182,0.15)';
+        cx.strokeStyle = TEAL; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = TEAL;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.fillText('⚡ SHOW A FRIEND', W / 2, SHARE_R.y + 30);
+        cx.globalAlpha = 1;
+      }
+    }
+
+    // Demo CTA
+    if (state.phase === 'cta') {
+      var ct = (performance.now() - state.ctaAt) / 1000;
+      var ce = Math.min(1, ct * 2);
+      cx.globalAlpha = ce;
+
+      // Keep album visible underneath
+      drawAlbum(now);
+
+      cx.fillStyle = 'rgba(11,13,18,' + (0.7 * ce) + ')';
+      cx.fillRect(0, 0, W, H);
+
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '800 40px -apple-system, Helvetica, Arial';
+      cx.fillText('STICKER BOOK', W / 2, 300);
+
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '600 18px -apple-system, Helvetica, Arial';
+      cx.fillText('your album is waiting', W / 2, 336);
+
+      var cp3 = 0.72 + 0.28 * Math.sin(now / 280);
+      cx.fillStyle = TEAL;
+      cx.globalAlpha = ce * cp3;
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ FILL YOURS', W / 2, 406);
+
+      cx.globalAlpha = ce;
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 440);
+      cx.globalAlpha = 1;
+    }
+
+    // Floating reward flashes
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '800 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 175 - fl.t * 0.9);
+      cx.globalAlpha = 1;
+      if (fl.t > 38) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
