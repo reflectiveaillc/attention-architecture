@@ -18,10 +18,15 @@
   validation (half-finished self-fix loops). Serial integrate loop killed
   (4min/failure in timeouts); instead fix fan-out `tilt-fix.js` (NEW script,
   repair-in-place variant of tilt-build) run wf_e70d3bd6-d08, 19 sonnet agents.
-- 🚀 **Round 5 launched**: wf_b3704a91-103, 18 builds (ink-drop … tap-twin,
-  rhythm wave). 27 designs remain unstarted after this round.
-- NEXT after both workflows: serial `integrate.mjs` per passed id (registry
-  races — never parallel), then commit. Then Round 6 (last 27).
+- ✅ **Round 4 recovered**: tilt-fix 19/19 repaired (667k tokens, ~15min), then
+  19/19 integrated clean. ✅ **Round 5**: 18/18 built (985k tokens) + 18/18
+  integrated. **Registry = 356.**
+- 🚀 **Round 6 (FINAL)**: last 27 designs (rhythm tail + memory wave:
+  rhythm-wean … echo-fade). After integration the 360-design backlog is DRAINED
+  (356 + 27 ≈ 383 incl. non-backlog face/originals; some ids overlap categories).
+- Lesson: interrupted build agents leave half-finished games on disk — recover
+  with `tilt-fix.js` (repair-in-place fan-out), NOT the serial integrate loop
+  (4min of timeouts per failure).
 
 ## 🤖 CLAUDE BUILD ROUNDS (Ollama 429'd ~2h — sonnet fan-out is the build engine)
 - Round 1 (wf_b043157e-312): 16/16 built + integrating (badge-clear…grid-curate). 23 agents, 1.4M tokens, ~32min. 16/16 PASSED first workflow — sonnet self-validation is far more reliable than the Ollama workers (near-zero orchestrator fixes needed).

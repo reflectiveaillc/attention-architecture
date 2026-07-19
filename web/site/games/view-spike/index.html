@@ -231,6 +231,7 @@
     state.score = 0; state.combo = 0; state.lastGain = 0; state.runTicks = 0; state.overAt = 0;
     resetSim();
     flashes = []; particles = [];
+    botGoodTaps = 0; botTarget = null; botWait = 0;
     if (window.LOOP) LOOP.emit('restart', {});
     startRun();
   }
@@ -267,7 +268,7 @@
   window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
 
   // ---- demo / bot autopilots ----
-  var botRunsDone = 0, botTarget = null;
+  var botRunsDone = 0, botTarget = null, botWait = 0, botGoodTaps = 0;
   var demoStep = 0, demoWait = 0;
   // intent sequence for the mirror-neuron arc:
   // success, success, success, near-fail (sliver), recovery, success, real miss
@@ -283,6 +284,8 @@
       if (intent === 'fall') {
         // the spectacle fail: tap once trend is clearly falling
         if (tr < -3) { demoStep++; demoWait = demoWaits[Math.min(demoStep, demoWaits.length - 1)] || 30; boost(); }
+        // failsafe: if we've been waiting too long (trend won't go low enough), tap anyway
+        else if (tr < -1) { demoStep++; demoWait = 30; boost(); }
         return;
       }
       if (intent === 'sliver') {
@@ -299,9 +302,28 @@
         demoWait = demoWaits[Math.min(demoStep, demoWaits.length - 1)] || 30;
       }
     } else if (BOT) {
-      // ~18% of the time the bot misjudges and taps while the trend is falling → loses
-      if (botTarget === null) botTarget = (rng() < 0.18 ? -0.6 - rng() * 0.5 : gauss() * BOT_ERR);
-      if (tr > botTarget) { botTarget = null; boost(); }
+      // throttle: wait a minimum of 20 frames between taps
+      if (botWait > 0) { botWait--; return; }
+      // After 4 good taps per run, intentionally tap while falling to lose
+      var BOT_LOSE_AFTER = 4;
+      if (botGoodTaps >= BOT_LOSE_AFTER) {
+        // Tap on a falling trend to trigger game_over; wait for clear fall or force after a bit
+        if (tr < -1.5 || (botGoodTaps > BOT_LOSE_AFTER + 60)) {
+          botGoodTaps = 0;
+          botTarget = null;
+          botWait = 20;
+          boost(); // tap while falling → gameOver
+        }
+        return;
+      }
+      // Normal good taps: tap when trend is clearly rising
+      if (botTarget === null) botTarget = 0.8 + rng() * 2.0; // wait for tr > 0.8..2.8
+      if (tr > botTarget) {
+        botGoodTaps++;
+        botTarget = null;
+        botWait = 25 + Math.floor(rng() * 30); // 25-55 frame gap
+        boost();
+      }
     }
   }
 

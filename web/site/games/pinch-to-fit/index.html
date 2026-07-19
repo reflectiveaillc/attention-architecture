@@ -34,6 +34,7 @@
   var BOT  = qs.get('bot') === '1';
   var BOT_RUNS = +qs.get('runs') || 3;
   var BOT_ERR  = +qs.get('err') || 0.16;
+  var BOT_MAX_ROUNDS = 5;   // after this many rounds, bot deliberately fails
   var SEED = +qs.get('seed') || 42;
 
   // deterministic RNG
@@ -112,6 +113,8 @@
     state.ghostFlash = 0;
     state.pulse = 0;
     state.botTarget = null;
+    state.demoPending = false;
+    state.botPending = false;
     runStartTs = Date.now();
     nextRound();
     if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
@@ -123,6 +126,9 @@
     state.ghostFlash = 0;
     state.pulse = 0;
     state.roundAge = 0;
+    state.roundStart = performance.now();  // wall-clock for timeout (robust in headless)
+    state.demoPending = false;
+    state.botPending = false;
     if (DEMO) {
       var s = DEMO_TARGETS[Math.min(state.round, DEMO_TARGETS.length - 1)];
       state.targetScale = s.t;
@@ -131,7 +137,14 @@
     } else if (BOT) {
       state.targetScale = 0.5 + rng() * 1.0;
       state.baseScale = 0.7 + rng() * 0.6;
-      state.botTarget = clamp(state.targetScale * (1 + gauss() * BOT_ERR), MIN_SCALE, MAX_SCALE);
+      // After BOT_MAX_ROUNDS rounds, pick a target far from target to guarantee failure
+      // match = 1 - |base - target|/target < PASS=0.70 means |base - target|/target > 0.30
+      // Use MIN_SCALE to ensure maximum miss regardless of targetScale
+      if (state.round >= BOT_MAX_ROUNDS) {
+        state.botTarget = MIN_SCALE;  // always fails (target >= 0.5, MIN_SCALE=0.32 → miss ≥ 0.36)
+      } else {
+        state.botTarget = clamp(state.targetScale * (1 + gauss() * BOT_ERR), MIN_SCALE, MAX_SCALE);
+      }
     } else {
       state.targetScale = 0.5 + rng() * 1.0;
       state.baseScale = 1.0;
@@ -325,20 +338,45 @@
   });
 
   // ---- autopilots ----
+  // Uses performance.now() for wall-clock timing — reliable in headless where rAF dt≈0
+  function scheduleCommit(delayMs, targetScale) {
+    setTimeout(function () {
+      if (state.phase === 'play' && !state.releaseLock) {
+        state.baseScale = targetScale;
+        commit();
+      }
+    }, delayMs);
+  }
+
   function autopilot(dt) {
     if (state.phase !== 'play' || state.releaseLock) return;
     state.roundAge = (state.roundAge || 0) + dt;
+    var elapsed = performance.now() - (state.roundStart || performance.now());
     if (DEMO) {
       var s = DEMO_TARGETS[Math.min(state.round, DEMO_TARGETS.length - 1)];
       var release = s.t * (1 + s.rel);
-      state.baseScale += (release - state.baseScale) * 0.08 * dt;
-      if (Math.abs(state.baseScale - release) < 0.02 && state.demoWait > 0) state.demoWait -= dt;
-      // commit when settled+waited OR after a per-round timeout (never hang)
-      if (state.demoWait <= 0 || state.roundAge > 150) { state.baseScale = release; commit(); }
+      // Smoothly lerp visible scale toward release position (visual only)
+      state.baseScale += (release - state.baseScale) * 0.08 * Math.min(dt, 1);
+      // Wall-clock commit: after demoWait×17ms of hold, or 2s hard cap
+      if (!state.demoPending) {
+        var holdMs = s.wait * 17;
+        state.demoPending = true;
+        setTimeout(function () {
+          if (state.phase === 'play' && !state.releaseLock) {
+            state.baseScale = release;
+            commit();
+          }
+        }, Math.min(holdMs, 1800));
+      }
     } else if (BOT) {
-      state.baseScale += (state.botTarget - state.baseScale) * 0.08 * dt;
+      // Smoothly lerp visible scale toward botTarget
+      state.baseScale += (state.botTarget - state.baseScale) * 0.08 * Math.min(dt, 1);
       state.baseScale = clamp(state.baseScale, MIN_SCALE, MAX_SCALE);
-      if (Math.abs(state.baseScale - state.botTarget) < 0.015 || state.roundAge > 150) { state.baseScale = state.botTarget; commit(); }
+      // Wall-clock commit: 900ms after round start
+      if (!state.botPending) {
+        state.botPending = true;
+        scheduleCommit(900, state.botTarget);
+      }
     }
   }
 

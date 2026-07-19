@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Silent Bar — Tilt</title>
+<!--
+  LOOP / attention-architecture — Silent Bar
+  Circuits: 01-rpe (variable reward per tap accuracy), 07-timing (phantom beat),
+            06-zeigarnik (one more try — you almost had it).
+  Mechanic: 3 bars of rhythm, then silence. Tap the phantom beat 4.
+  Score = timing accuracy: lower ms = better. Perfect = <30ms.
+  Modes:
+    ?demo=1&seed=7   mirror-neuron arc, sets window.__demoDone
+    ?bot=1&runs=N    imperfect autoplay, sets window.__botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'silent-bar';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot') === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
+    cv.width = W * dpr; cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- Game constants ----
+  // BPM for the 3 audible bars (140 BPM — club tempo, feels urgent)
+  var BPM = 140;
+  var BEAT_MS = 60000 / BPM;          // ~428ms per beat
+  var BEATS_PER_BAR = 4;
+  var BAR_MS = BEAT_MS * BEATS_PER_BAR;  // ~1714ms per bar
+  var AUDIBLE_BARS = 3;               // 3 bars of rhythm, then silence
+  var AUDIBLE_MS = BAR_MS * AUDIBLE_BARS;
+  // The phantom beat: bar 4, beat 1 — exactly BAR_MS after bar 3 started
+  // = AUDIBLE_MS + 0 extra (beat 1 of bar 4 is right at the silence boundary)
+  // Actually phantom beat is right when bar 4 beat 1 would land
+  var PERFECT_WINDOW_MS = 30;         // ±30ms = perfect
+  var NEAR_MS = 100;                  // ±100ms = near miss
+  var WINDOW_MS = 400;                // total tap window (BEAT_MS)
+  var RESPONSE_WINDOW_MS = BEAT_MS;   // how long after silence to accept taps
+
+  // ---- Audio ----
+  // Use Web Audio API to synthesize beats — no external resources
+  var actx = null;
+  function getAudio() {
+    if (!actx) {
+      try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e) {}
+    }
+    return actx;
+  }
+
+  function playBeat(time, isBeat1, velocity) {
+    var ac = getAudio();
+    if (!ac) return;
+    var v = velocity || 1;
+    // Kick on beat 1
+    if (isBeat1) {
+      var osc = ac.createOscillator();
+      var gain = ac.createGain();
+      osc.connect(gain); gain.connect(ac.destination);
+      osc.frequency.setValueAtTime(150, time);
+      osc.frequency.exponentialRampToValueAtTime(50, time + 0.08);
+      gain.gain.setValueAtTime(0.7 * v, time);
+      gain.gain.exponentialRampToValueAtTime(0.001, time + 0.15);
+      osc.start(time); osc.stop(time + 0.2);
+    }
+    // Hi-hat on every beat
+    var buf = ac.createBuffer(1, ac.sampleRate * 0.05, ac.sampleRate);
+    var data = buf.getChannelData(0);
+    for (var i = 0; i < data.length; i++) { data[i] = (rng() * 2 - 1) * Math.exp(-i / (ac.sampleRate * 0.015)); }
+    var src = ac.createBufferSource();
+    var hgain = ac.createGain();
+    src.buffer = buf; src.connect(hgain); hgain.connect(ac.destination);
+    hgain.gain.setValueAtTime(isBeat1 ? 0.25 * v : 0.15 * v, time);
+    hgain.gain.exponentialRampToValueAtTime(0.001, time + 0.04);
+    src.start(time); src.stop(time + 0.06);
+    // Snare on beats 2 and 4
+    var beatInBar = Math.round((time * 1000 / BEAT_MS)) % BEATS_PER_BAR;
+    // We'll handle snare separately in scheduleBeats
+  }
+
+  function playSnare(time, velocity) {
+    var ac = getAudio();
+    if (!ac) return;
+    var v = velocity || 0.5;
+    var buf = ac.createBuffer(1, ac.sampleRate * 0.12, ac.sampleRate);
+    var data = buf.getChannelData(0);
+    for (var i = 0; i < data.length; i++) {
+      var env = Math.exp(-i / (ac.sampleRate * 0.04));
+      data[i] = (rng() * 2 - 1) * env;
+    }
+    var src = ac.createBufferSource();
+    var sgain = ac.createGain();
+    src.buffer = buf; src.connect(sgain); sgain.connect(ac.destination);
+    sgain.gain.setValueAtTime(0.4 * v, time);
+    sgain.gain.exponentialRampToValueAtTime(0.001, time + 0.1);
+    src.start(time); src.stop(time + 0.15);
+  }
+
+  function scheduleBeats(startSec) {
+    var ac = getAudio();
+    if (!ac) return;
+    var totalBeats = AUDIBLE_BARS * BEATS_PER_BAR;
+    for (var b = 0; b < totalBeats; b++) {
+      var t = startSec + (b * BEAT_MS) / 1000;
+      var beatInBar = b % BEATS_PER_BAR;
+      playBeat(t, beatInBar === 0, 1);
+      if (beatInBar === 1 || beatInBar === 3) playSnare(t, 1);
+    }
+  }
+
+  // ---- State ----
+  var phase = 'title';   // title | challenge | play | over | cta
+  var playStartMs = 0;   // when play phase started (performance.now)
+  var silenceStartMs = 0; // when silence begins (= playStartMs + AUDIBLE_MS)
+  var phantomBeatMs = 0;  // absolute time of phantom beat (bar 4, beat 1)
+  var tapTime = null;     // performance.now() when player tapped (null = no tap yet)
+  var tapError = null;    // ms from phantom beat (signed)
+  var tapScore = null;    // score = max(0, 500 - abs(error)); lower ms = better
+  var overAt = 0;
+  var runStartTs = 0;
+  var best = 999999;
+  var bestLabel = '--';
+  var dareBeaten = false;
+  var flashes = [];
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var challengeAt = 0, ctaAt = 0;
+  var last = performance.now();
+
+  // bar/beat animation state
+  var curBeat = -1;          // which beat we're on (0..11 for 3 bars)
+  var beatFlash = 0;         // 0..1, decays
+  var beatFlashIdx = -1;     // which beat flashed
+
+  try { var s = localStorage.getItem('sb_best'); if (s !== null) { best = +s; bestLabel = best + 'ms'; } } catch (_) {}
+
+  function saveBest(ms) {
+    if (ms < best) {
+      best = ms;
+      bestLabel = ms + 'ms';
+      try { localStorage.setItem('sb_best', String(ms)); } catch (_) {}
+      return true;
+    }
+    return false;
+  }
+
+  // ---- score helpers ----
+  function errToScore(absErr) {
+    // score = ms error. Lower = better. Cap at 500ms.
+    return Math.min(500, Math.round(absErr));
+  }
+  function pctTop(ms) {
+    // 0ms = top 1%; 500ms = top 80%
+    return Math.max(1, Math.min(99, Math.round(1 + 79 * (ms / 500))));
+  }
+  function qualityLabel(absErr) {
+    if (absErr <= PERFECT_WINDOW_MS) return 'PERFECT';
+    if (absErr <= 60) return 'GREAT';
+    if (absErr <= NEAR_MS) return 'CLOSE';
+    return 'MISSED IT';
+  }
+
+  // ---- flash ----
+  function flash(txt, color, size) { flashes.push({ txt: txt, color: color, size: size, t: 0 }); }
+
+  // ---- game flow ----
+  function newGame() {
+    phase = 'title';
+    tapTime = null; tapError = null; tapScore = null;
+    dareBeaten = false; flashes = [];
+    hitStop = 0; zoom = 1; shakeAmt = 0;
+    curBeat = -1; beatFlash = 0;
+
+    if (DEMO) {
+      phase = 'challenge';
+      challengeAt = performance.now();
+      setTimeout(startRun, 1300);
+      return;
+    }
+    if (BOT) {
+      setTimeout(startRun, 100);
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    tapTime = null; tapError = null; tapScore = null;
+    flashes = []; dareBeaten = false;
+    curBeat = -1; beatFlash = 0;
+    runStartTs = Date.now();
+    playStartMs = performance.now();
+    silenceStartMs = playStartMs + AUDIBLE_MS;
+    phantomBeatMs = silenceStartMs + 0;  // bar 4 beat 1 lands exactly when bar 3 ends
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED, bpm: BPM });
+
+    // Schedule audio
+    if (!DEMO && !BOT && window.J && !J.muted) {
+      var ac = getAudio();
+      if (ac) {
+        if (ac.state === 'suspended') ac.resume().then(doSchedule);
+        else doSchedule();
+      }
+    }
+    function doSchedule() {
+      var ac = getAudio();
+      if (!ac) return;
+      scheduleBeats(ac.currentTime + 0.05);
+    }
+
+    // Start beat tracking for visual
+    scheduleBeatTick();
+
+    // After silence begins, show the waiting state
+    // After response window, auto-miss if no tap
+    setTimeout(function () {
+      if (phase === 'play' && tapTime === null) {
+        // They missed the window entirely — worst score
+        tapTime = phantomBeatMs + BEAT_MS; // very late
+        tapError = BEAT_MS;
+        tapScore = errToScore(Math.abs(tapError));
+        finishRound();
+      }
+    }, AUDIBLE_MS + RESPONSE_WINDOW_MS + 100);
+  }
+
+  function scheduleBeatTick() {
+    var TOTAL = AUDIBLE_BARS * BEATS_PER_BAR;
+    for (var b = 0; b < TOTAL; b++) {
+      (function(beat) {
+        setTimeout(function () {
+          if (phase === 'play') {
+            curBeat = beat;
+            beatFlash = 1;
+            beatFlashIdx = beat;
+          }
+        }, beat * BEAT_MS);
+      })(b);
+    }
+  }
+
+  function doTap() {
+    if (phase !== 'play' || tapTime !== null) return;
+    tapTime = performance.now();
+    tapError = tapTime - phantomBeatMs;  // signed: negative=early, positive=late
+    tapScore = errToScore(Math.abs(tapError));
+    finishRound();
+  }
+
+  function finishRound() {
+    var absErr = Math.abs(tapError);
+    var label = qualityLabel(absErr);
+    var isNewBest = saveBest(tapScore);
+
+    // juice
+    if (absErr <= PERFECT_WINDOW_MS) {
+      hitStop = 5; zoom = 1.04;
+      if (window.J) { J.perfect(1); }
+      flash('PERFECT', TEAL, 52);
+    } else if (absErr <= 60) {
+      hitStop = 3; zoom = 1.02;
+      if (window.J) { J.hit(1); }
+      flash('GREAT', TEAL, 44);
+    } else if (absErr <= NEAR_MS) {
+      shakeAmt = 4;
+      if (window.J) { J.near(); }
+      flash('SO CLOSE', GOLD, 40);
+      if (window.LOOP) LOOP.emit('near_miss', { err_ms: Math.round(absErr) });
+    } else {
+      shakeAmt = 8;
+      if (window.J) { J.death(0.4 + Math.min(0.5, absErr / 500)); }
+      flash('TOO ' + (tapError < 0 ? 'EARLY' : 'LATE'), VERM, 40);
+    }
+    if (isNewBest && absErr <= 60) { setTimeout(function () { if (window.J) J.fanfare(); }, 500); }
+
+    // dare check
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && tapScore < SHARE.dare) {
+      dareBeaten = true;
+      flash('DARE BEATEN', TEAL, 44);
+      if (window.J) J.fanfare();
+      SHARE.beaten(tapScore);
+    }
+
+    var dur = (Date.now() - runStartTs) / 1000;
+    if (window.LOOP) LOOP.emit('game_over', { score: tapScore, dur_s: +dur.toFixed(1), err_ms: Math.round(tapError), quality: label });
+
+    if (DEMO) window.__demoScore = tapScore;
+    overAt = performance.now();
+    phase = 'over';
+
+    if (DEMO) {
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3700);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) { window.__botDone = true; }
+      else setTimeout(resetRun, 700);
+    }
+  }
+
+  function resetRun() {
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // ---- bot / demo autopilot ----
+  var botRunsDone = 0;
+  // Demo script: tap errors in ms (signed). First few are great, then a near-miss recovery, then over.
+  var demoScript = [-55, 18, -22, 88, -12, 180]; // ms errors for each attempt
+  var demoCurIdx = 0;
+  var demoBotArmed = false;
+  var demoBotFired = false;
+
+  function armDemoTap() {
+    if (!DEMO || phase !== 'play' || demoBotFired) return;
+    demoBotFired = true;
+    var errMs = demoScript[Math.min(demoCurIdx, demoScript.length - 1)] || 50;
+    demoCurIdx++;
+    var targetDelay = AUDIBLE_MS + errMs;  // delay from play start
+    var elapsed = performance.now() - playStartMs;
+    var remaining = targetDelay - elapsed;
+    if (remaining < 10) remaining = 10;
+    setTimeout(function () {
+      if (phase === 'play' && tapTime === null) doTap();
+    }, remaining);
+  }
+
+  var botBotArmed = false;
+  var botBotFired = false;
+  function armBotTap() {
+    if (!BOT || phase !== 'play' || botBotFired) return;
+    botBotFired = true;
+    // Bot: random error within ±250ms of phantom beat, gaussian-ish
+    var errMs = (rng() - 0.5) * 300;
+    var targetDelay = AUDIBLE_MS + errMs;
+    var elapsed = performance.now() - playStartMs;
+    var remaining = targetDelay - elapsed;
+    if (remaining < 10) remaining = 10;
+    setTimeout(function () {
+      if (phase === 'play' && tapTime === null) doTap();
+    }, remaining);
+  }
+
+  // ---- input ----
+  var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 490, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') { doTap(); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: tapScore, unit: 'ms' }); return;
+      }
+      resetRun();
+    }
+  }
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- render helpers ----
+  function barY(beatIdx) {
+    // position of beat in the beat-grid display
+    // we display 4 beats per bar, 3 bars + 1 phantom
+    var GRID_X = W / 2 - 160;
+    var GRID_Y = H / 2 - 40;
+    var CELL_W = 80;
+    var CELL_H = 54;
+    var bar = Math.floor(beatIdx / 4);
+    var beat = beatIdx % 4;
+    return { x: GRID_X + beat * CELL_W, y: GRID_Y + bar * CELL_H, w: CELL_W, h: CELL_H };
+  }
+
+  function drawGrid(now, progress) {
+    // 3 bars of 4 beats + 1 phantom bar
+    cx.save();
+    var GRID_X = W / 2 - 160;
+    var GRID_Y = 300;
+    var CELL_W = 76;
+    var CELL_H = 50;
+    var GAP = 4;
+
+    for (var bar = 0; bar < 4; bar++) {
+      for (var beat = 0; beat < 4; beat++) {
+        var bIdx = bar * 4 + beat;
+        var x = GRID_X + beat * (CELL_W + GAP);
+        var y = GRID_Y + bar * (CELL_H + GAP);
+        var isPhantom = bar === 3;
+        var isPast = bIdx <= curBeat;
+        var isActive = bIdx === curBeat;
+
+        cx.save();
+        // cell bg
+        if (isPhantom) {
+          // phantom bar — show as dashed/ghosted
+          cx.strokeStyle = 'rgba(242,177,52,0.3)';
+          cx.lineWidth = 1.5;
+          cx.setLineDash([4, 4]);
+          cx.strokeRect(x, y, CELL_W, CELL_H);
+          cx.setLineDash([]);
+          if (beat === 0) {
+            // Beat 1 of phantom bar — the target
+            cx.strokeStyle = 'rgba(242,177,52,0.6)';
+            cx.lineWidth = 2;
+            cx.setLineDash([]);
+            cx.strokeRect(x, y, CELL_W, CELL_H);
+            cx.fillStyle = 'rgba(242,177,52,0.08)';
+            cx.fillRect(x, y, CELL_W, CELL_H);
+            // Question mark
+            cx.fillStyle = 'rgba(242,177,52,0.5)';
+            cx.font = '700 20px -apple-system, Helvetica, Arial';
+            cx.textAlign = 'center';
+            cx.fillText('?', x + CELL_W / 2, y + CELL_H / 2 + 7);
+          } else {
+            cx.fillStyle = 'rgba(255,255,255,0.04)';
+            cx.fillRect(x, y, CELL_W, CELL_H);
+          }
+        } else if (isPast || isActive) {
+          // beat has played
+          var flash2 = (isActive && beatFlash > 0) ? beatFlash : 0;
+          var beatInBar = beat % 4;
+          var isKick = beatInBar === 0;
+          var isSnare = beatInBar === 1 || beatInBar === 3;
+          cx.fillStyle = isKick ? 'rgba(46,197,182,0.25)' : (isSnare ? 'rgba(232,80,46,0.2)' : 'rgba(255,255,255,0.1)');
+          if (flash2 > 0) {
+            cx.fillStyle = isKick ? 'rgba(46,197,182,' + (0.5 + flash2 * 0.4) + ')' :
+              (isSnare ? 'rgba(232,80,46,' + (0.5 + flash2 * 0.4) + ')' : 'rgba(255,255,255,' + (0.3 + flash2 * 0.3) + ')');
+          }
+          cx.fillRect(x, y, CELL_W, CELL_H);
+          // beat number dot
+          cx.fillStyle = isKick ? TEAL : (isSnare ? VERM : 'rgba(255,255,255,0.5)');
+          if (flash2 > 0) cx.fillStyle = '#fff';
+          cx.beginPath();
+          cx.arc(x + CELL_W / 2, y + CELL_H / 2, isKick ? 8 : (isSnare ? 6 : 4), 0, Math.PI * 2);
+          cx.fill();
+        } else {
+          // future beat — dim
+          cx.fillStyle = 'rgba(255,255,255,0.05)';
+          cx.fillRect(x, y, CELL_W, CELL_H);
+          cx.strokeStyle = 'rgba(255,255,255,0.1)';
+          cx.lineWidth = 1;
+          cx.strokeRect(x, y, CELL_W, CELL_H);
+        }
+        cx.restore();
+      }
+    }
+    // Bar labels
+    cx.textAlign = 'left';
+    cx.font = '600 10px Menlo, monospace';
+    for (var b2 = 0; b2 < 4; b2++) {
+      var ly = GRID_Y + b2 * (CELL_H + GAP);
+      cx.fillStyle = b2 === 3 ? 'rgba(242,177,52,0.6)' : 'rgba(255,255,255,0.3)';
+      cx.fillText(b2 === 3 ? 'BAR 4 ?' : 'BAR ' + (b2 + 1), GRID_X - 2, ly - 4);
+    }
+    cx.restore();
+  }
+
+  // ---- frame loop ----
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+    beatFlash = Math.max(0, beatFlash - dt * 0.07);
+
+    // arm autopilots once play starts
+    if (DEMO && phase === 'play' && !demoBotFired) armDemoTap();
+    if (BOT && phase === 'play' && !botBotFired) armBotTap();
+
+    // hit-stop and autopilot decay
+    if (hitStop > 0) hitStop -= dt;
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (rng() - 0.5) * shakeAmt * 2, sy = (rng() - 0.5) * shakeAmt * 2;
+      cx.translate(W / 2 + sx, H / 2 + sy); cx.scale(zoom, zoom); cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.82, dt); zoom += (1 - zoom) * 0.14 * dt;
+
+    // bg
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bgG = cx.createLinearGradient(0, 0, 0, H);
+    bgG.addColorStop(0, 'rgba(46,197,182,0.04)'); bgG.addColorStop(1, 'rgba(232,80,46,0.06)');
+    cx.fillStyle = bgG; cx.fillRect(0, 0, W, H);
+
+    var elapsed = phase === 'play' ? (now - playStartMs) : 0;
+    var progress = Math.min(1, elapsed / AUDIBLE_MS);
+    var inSilence = phase === 'play' && elapsed >= AUDIBLE_MS;
+
+    // ---- TITLE ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('SILENT BAR', W / 2, 260);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('3 bars. then silence.', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('tap the phantom beat.', W / 2, 325);
+      // pulse cta
+      var pulse = 0.6 + 0.4 * Math.sin(now / 320);
+      cx.globalAlpha = pulse;
+      cx.fillStyle = VERM;
+      cx.font = '800 20px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 400);
+      cx.globalAlpha = 1;
+      // best
+      if (best < 999999) {
+        cx.fillStyle = 'rgba(255,255,255,0.3)';
+        cx.font = '600 13px -apple-system, Helvetica, Arial';
+        cx.fillText('BEST ' + bestLabel, W / 2, 440);
+      }
+    }
+
+    // ---- CHALLENGE CARD (demo) ----
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)'; cx.font = '800 15px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 295);
+      cx.fillStyle = GOLD; cx.font = '900 100px -apple-system, Helvetica, Arial';
+      cx.fillText('38', W / 2, 405);
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 14px -apple-system, Helvetica, Arial';
+      cx.fillText('ms off the beat', W / 2, 432);
+    }
+
+    // ---- PLAY ----
+    if (phase === 'play') {
+      // Progress bar (audible phase)
+      if (!inSilence) {
+        var PBY = 200;
+        cx.fillStyle = 'rgba(255,255,255,0.1)';
+        cx.fillRect(60, PBY, W - 120, 4);
+        cx.fillStyle = TEAL;
+        cx.fillRect(60, PBY, (W - 120) * progress, 4);
+        // beat pulse orb
+        var orb = 0.5 + 0.5 * Math.sin(now / (BEAT_MS / Math.PI));
+        cx.fillStyle = 'rgba(46,197,182,' + (0.3 + orb * 0.4) + ')';
+        cx.beginPath();
+        cx.arc(60 + (W - 120) * progress, PBY + 2, 6 + orb * 3, 0, Math.PI * 2);
+        cx.fill();
+      }
+
+      // BPM / bar indicator
+      cx.textAlign = 'center';
+      if (!inSilence) {
+        cx.fillStyle = 'rgba(255,255,255,0.25)';
+        cx.font = '700 12px Menlo, monospace';
+        cx.fillText(BPM + ' BPM', W / 2, 185);
+        var curBar = Math.floor(elapsed / BAR_MS) + 1;
+        cx.fillStyle = TEAL;
+        cx.font = '700 12px Menlo, monospace';
+        cx.fillText('BAR ' + Math.min(curBar, 3), W / 2, 168);
+      } else {
+        // SILENCE — anticipation
+        var silElapsed = elapsed - AUDIBLE_MS;
+        var silPulse = 0.5 + 0.5 * Math.sin((now - silenceStartMs) / (BEAT_MS / Math.PI * 0.5));
+        cx.fillStyle = 'rgba(242,177,52,' + (0.5 + silPulse * 0.4) + ')';
+        cx.font = '900 22px -apple-system, Helvetica, Arial';
+        cx.fillText('· · · ·', W / 2, 185);
+        cx.fillStyle = 'rgba(255,255,255,0.4)';
+        cx.font = '600 13px Menlo, monospace';
+        cx.fillText('TAP THE BEAT', W / 2, 210);
+      }
+
+      drawGrid(now, progress);
+
+      // tap hint
+      cx.textAlign = 'center';
+      if (!inSilence) {
+        cx.fillStyle = 'rgba(255,255,255,0.2)';
+        cx.font = '600 13px -apple-system, Helvetica, Arial';
+        cx.fillText('feel the beat...', W / 2, 640);
+      }
+    }
+
+    // ---- OVER ----
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.60)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      var aErr = Math.abs(tapError);
+      var lbl = qualityLabel(aErr);
+
+      // quality label
+      var lColor = aErr <= PERFECT_WINDOW_MS ? TEAL : (aErr <= 60 ? TEAL : (aErr <= NEAR_MS ? GOLD : VERM));
+      cx.fillStyle = lColor; cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText(lbl, W / 2, 280);
+
+      // ms error
+      cx.fillStyle = '#fff'; cx.font = '800 28px -apple-system, Helvetica, Arial';
+      cx.fillText(Math.round(aErr) + ' ms ' + (tapError < 0 ? 'EARLY' : 'LATE'), W / 2, 328);
+
+      // rank
+      var pt = pctTop(tapScore);
+      cx.fillStyle = GOLD; cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 370);
+      cx.fillStyle = 'rgba(255,255,255,0.4)'; cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('best ' + (best < 999999 ? best + 'ms' : '--'), W / 2, 395);
+
+      // grid overlay with answer
+      drawGrid(now, 1);
+
+      // show where they tapped vs phantom
+      var GRID_X = W / 2 - 160;
+      var GRID_Y = 300;
+      var CELL_W = 76; var CELL_H = 50; var GAP = 4;
+      var px = GRID_X + 0 * (CELL_W + GAP);
+      var py = GRID_Y + 3 * (CELL_H + GAP);
+      // highlight phantom beat cell
+      cx.strokeStyle = GOLD; cx.lineWidth = 2;
+      cx.strokeRect(px + 1, py + 1, CELL_W - 2, CELL_H - 2);
+      cx.fillStyle = 'rgba(242,177,52,0.15)'; cx.fillRect(px + 1, py + 1, CELL_W - 2, CELL_H - 2);
+      cx.fillStyle = GOLD; cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('♩', px + CELL_W / 2, py + CELL_H / 2 + 7);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2; cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — NEXT BAR', W / 2, 470);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD; cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- CTA (demo) ----
+    if (phase === 'cta') {
+      var tCta = (now - ctaAt) / 1000, easeCta = Math.min(1, tCta * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.78 * easeCta) + ')'; cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = easeCta; cx.textAlign = 'center';
+      cx.fillStyle = '#fff'; cx.font = '900 48px -apple-system, Helvetica, Arial';
+      cx.fillText('SILENT BAR', W / 2, 290);
+      cx.fillStyle = 'rgba(255,255,255,0.65)'; cx.font = '700 19px -apple-system, Helvetica, Arial';
+      cx.fillText('can you feel the beat?', W / 2, 332);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = easeCta * p3;
+      cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('BEAT ' + (window.__demoScore || 38) + 'ms', W / 2, 406);
+      cx.globalAlpha = easeCta;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 442);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- FLASHES ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var fa = Math.max(0, 1 - fl.t / 38);
+      cx.globalAlpha = fa; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 235 - fl.t * 0.7);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // ---- MUTE toggle ----
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center'; cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    // incoming dare banner (human play)
+    if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && phase === 'play') {
+      cx.textAlign = 'center';
+      cx.fillStyle = dareBeaten ? TEAL : GOLD;
+      cx.font = '800 14px -apple-system, Helvetica, Arial';
+      cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + 'ms' + (SHARE.by ? ' — by ' + SHARE.by : ''), W / 2, 152);
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -99,6 +99,8 @@
   function spawnBadge() {
     var count = 1 + Math.floor(rng() * 24);          // notification-count flavor
     badge = { count: count, born: performance.now(), scale: 0, life: BADGE_LIFE };
+    // clamp born to now so age is never negative even under RAF/perf.now() skew
+    badge.born = Math.min(badge.born, performance.now());
   }
 
   // the whole game: let it fade. Dissolve is the reward.
@@ -171,10 +173,11 @@
   function autopilot() {
     if (state.phase !== 'play') return;
     if (DEMO) {
-      if (state.score >= demoTarget && !badge && performance.now() > nextBadgeAt + 250) {
-        // resolve → soft invitation
+      // transition to CTA as soon as demoTarget dissolves; clear the badge so we end cleanly
+      if (state.score >= demoTarget) {
+        badge = null;   // clear any in-flight badge; no more will spawn
         state.phase = 'cta'; ctaAt = performance.now();
-        setTimeout(function () { window.__demoDone = true; }, 3500);
+        setTimeout(function () { window.__demoDone = true; }, 2000);
       }
     } else if (BOT) {
       if (state.score >= botGiveInAt) giveIn();
@@ -211,8 +214,8 @@
       if (!badge && now >= nextBadgeAt) spawnBadge();
       if (badge) {
         var age = now - badge.born;
-        // pop-in ease
-        badge.scale = Math.min(1, age / 180);
+        // pop-in ease — clamp scale to [0,1] guarding against negative age (RAF/perf.now skew)
+        badge.scale = Math.max(0, Math.min(1, age / 180));
         if (age >= badge.life) dissolve();
       }
       autopilot();
@@ -255,7 +258,7 @@
     if (state.phase === 'play' && badge) {
       var pulse = 1 + 0.10 * Math.sin(now / 170);
       var s = badge.scale * pulse;
-      var rad = 22 * s;
+      var rad = Math.max(0.5, 22 * s);
       // glow
       cx.globalAlpha = 0.35; cx.fillStyle = VERM;
       cx.beginPath(); cx.arc(BX, BY, rad * 1.5, 0, Math.PI * 2); cx.fill();

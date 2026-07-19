@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Off-Beat Trap — Tilt</title>
+<!--
+  LOOP / attention-architecture — Off-Beat Trap
+  Circuits: 01-rpe, 02-novelty, 07-timing
+  Mechanic: most beats flash; the scoring beat is the SILENT gap — tap there.
+  Modes:
+    ?demo=1&seed=7     mirror-neuron clip → __demoDone
+    ?bot=1&runs=N&seed=5  imperfect autopilot → __botDone
+-->
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d12; overflow:hidden;
+               -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0b0d12; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>window.LOOP_GAME = 'off-beat-trap';</script>
+<script src="../../js/loop-events.js"></script>
+<script src="../../js/juice.js"></script>
+<script src="../../js/share.js"></script>
+<script>
+(function () {
+  'use strict';
+  var W = 405, H = 720;
+  var qs = new URLSearchParams(location.search);
+  var DEMO = qs.get('demo') === '1';
+  var BOT  = qs.get('bot')  === '1';
+  var BOT_RUNS = +qs.get('runs') || 3;
+  var SEED = +qs.get('seed') || 42;
+
+  // mulberry32 seeded RNG
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(SEED);
+
+  var cv = document.getElementById('c'), cx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2), scale = 1;
+  function fit() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    cv.style.width  = (W * scale) + 'px';
+    cv.style.height = (H * scale) + 'px';
+    cv.width  = W * dpr;
+    cv.height = H * dpr;
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fit); fit();
+
+  var VERM = '#e8502e', TEAL = '#2ec5b6', GOLD = '#f2b134', INK = '#0b0d12';
+
+  // ---- game constants ----
+  // Beat interval in ms. Beats flash. The GAP beat is silent → score there.
+  var BEAT_MS   = 600;   // ms per beat
+  var GAP_EVERY = 4;     // every N beats is a silent scoring beat (1-indexed)
+  var TAP_WINDOW = 180;  // ±ms around the gap beat centre to score
+  var FLASH_MS  = 200;   // how long a flash beat glows
+
+  // ---- state ----
+  var phase;   // 'title' | 'challenge' | 'play' | 'over' | 'cta'
+  var streak, lives, combo, overAt, runStartTs;
+  var best = 0;
+  var hitStop = 0, zoom = 1, shakeAmt = 0;
+  var flashes = [];
+  var dareBeaten = false;
+  var challengeAt = 0, ctaAt = 0;
+  try { best = +localStorage.getItem('obt_best') || 0; } catch (_) {}
+
+  // Beat engine state
+  var beatClock = 0;      // ms since last beat start
+  var beatIdx = 0;        // which beat in the pattern (0-based, cycles GAP_EVERY)
+  var flashActive = false;// is the current beat a flash?
+  var flashAge = 0;       // ms the flash has been showing
+  var scored = false;     // has player already tapped this gap window?
+  var tapResult = null;   // null | 'good' | 'bad' | 'miss' — for this gap/flash beat
+  var tapResultAge = 0;
+
+  // Round state
+  var ROUND_BEATS = 12;   // beats before the round ends (pattern: fff+gap × ROUND_BEATS/GAP_EVERY times)
+  var beatCount = 0;      // total beats elapsed in this run
+  var MAX_LIVES = 3;
+
+  // Bot/demo autopilot
+  var botRunsDone = 0;
+  var botActionsLeft = 0; // bot plays this many gap beats correctly then goes passive → loses
+
+  function newGame() {
+    phase = DEMO ? 'challenge' : (BOT ? 'play' : 'title');
+    streak = 0; lives = MAX_LIVES; combo = 0; dareBeaten = false;
+    beatClock = 0; beatIdx = 0; beatCount = 0;
+    flashActive = false; flashAge = 0; scored = false;
+    tapResult = null; tapResultAge = 0;
+    flashes = [];
+
+    if (DEMO) {
+      challengeAt = performance.now();
+      setTimeout(startRun, 1250);
+    } else if (BOT) {
+      botActionsLeft = 6 + Math.floor(rng() * 4); // bot scores 6–9 gaps then misses
+      startRun();
+    }
+  }
+
+  function startRun() {
+    phase = 'play';
+    runStartTs = Date.now();
+    beatClock = 0; beatIdx = 0; beatCount = 0;
+    flashActive = false; flashAge = 0; scored = false;
+    tapResult = null;
+    if (window.LOOP) LOOP.emit('play_start', { seed: SEED });
+  }
+
+  function gameOver() {
+    phase = 'over';
+    overAt = performance.now();
+    shakeAmt = 10;
+    var dur = (Date.now() - runStartTs) / 1000;
+    var newBest = streak > best;
+    if (window.J) {
+      J.death(Math.min(0.3 + streak / 20, 1));
+      if (newBest) setTimeout(function () { J.fanfare(); }, 450);
+    }
+    if (newBest) {
+      best = streak;
+      try { localStorage.setItem('obt_best', String(best)); } catch (_) {}
+    }
+    if (window.LOOP) LOOP.emit('game_over', { score: streak, dur_s: +(dur.toFixed(1)) });
+
+    if (DEMO) {
+      window.__demoScore = streak;
+      setTimeout(function () {
+        phase = 'cta';
+        ctaAt = performance.now();
+        setTimeout(function () { window.__demoDone = true; }, 3600);
+      }, 2400);
+    }
+    if (BOT) {
+      botRunsDone++;
+      if (botRunsDone >= BOT_RUNS) {
+        window.__botDone = true;
+      } else {
+        setTimeout(function () { resetRun(); }, 800);
+      }
+    }
+  }
+
+  function resetRun() {
+    streak = 0; lives = MAX_LIVES; combo = 0;
+    beatClock = 0; beatIdx = 0; beatCount = 0;
+    flashActive = false; flashAge = 0; scored = false;
+    tapResult = null; tapResultAge = 0;
+    flashes = [];
+    if (window.LOOP) LOOP.emit('restart', {});
+    startRun();
+  }
+
+  // Is the current beat a scoring (silent/gap) beat?
+  // beatIdx is 0-based; the gap is at position GAP_EVERY-1 in the cycle
+  function isGapBeat() { return (beatIdx % GAP_EVERY) === (GAP_EVERY - 1); }
+
+  // Called when a new beat starts
+  function advanceBeat(dt) {
+    // check if the previous beat was a gap and player didn't tap → miss
+    if (isGapBeat() && !scored) {
+      loseLife('MISSED IT');
+    }
+    // Advance
+    beatIdx = (beatIdx + 1) % GAP_EVERY;
+    beatCount++;
+    scored = false;
+    tapResult = null;
+    flashActive = !isGapBeat(); // gap beats are silent (no flash)
+    flashAge = 0;
+
+    if (window.J && flashActive) {
+      // tension rises with streak
+      J.tension(Math.min(streak / 15, 1));
+    }
+
+    // Check run limit (variable length keeps it spicy)
+    if (beatCount >= ROUND_BEATS + streak * 2) {
+      // New round — speed up slightly
+      BEAT_MS = Math.max(280, BEAT_MS - 20);
+      ROUND_BEATS += 4;
+    }
+  }
+
+  function loseLife(reason) {
+    lives--;
+    shakeAmt = 6;
+    flash(reason || 'WRONG', VERM, 40);
+    if (window.J) J.near();
+    if (lives <= 0) {
+      gameOver();
+    }
+  }
+
+  // Player taps
+  function doTap(fromInput) {
+    if (phase !== 'play') return;
+    if (DEMO || BOT) return; // autopilots don't call doTap directly
+
+    var gap = isGapBeat();
+    var withinWindow = beatClock < TAP_WINDOW || (BEAT_MS - beatClock) < TAP_WINDOW;
+
+    if (gap && !scored) {
+      // Tap in the silent gap — score!
+      scored = true;
+      tapResult = 'good'; tapResultAge = 0;
+      var perfect = Math.abs(beatClock - BEAT_MS / 2) < 60;
+      combo++;
+      streak++;
+
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null && !dareBeaten && streak > SHARE.dare) {
+        dareBeaten = true;
+        flash('DARE BEATEN', TEAL, 44);
+        if (window.J) J.fanfare();
+        SHARE.beaten(streak);
+      }
+
+      if (perfect) {
+        hitStop = 60; zoom = 1.03;
+        if (window.J) J.perfect(combo);
+        flash('PERFECT', TEAL, 48);
+        if (window.LOOP) LOOP.emit('perfect_tap', { streak: streak });
+      } else if (combo >= 5) {
+        if (window.J) J.gold();
+        flash('×' + combo, GOLD, 46);
+        if (window.LOOP) LOOP.emit('combo_tap', { combo: combo, streak: streak });
+      } else {
+        if (window.J) J.hit(combo);
+        flash('+1', TEAL, 38);
+        if (window.LOOP) LOOP.emit('tap', { streak: streak, combo: combo });
+      }
+    } else if (!gap) {
+      // Tapped on a flash beat — punish
+      tapResult = 'bad'; tapResultAge = 0;
+      combo = 0;
+      loseLife('CAUGHT!');
+      if (window.LOOP) LOOP.emit('flash_tap', { streak: streak });
+    }
+    // Tapping in gap beat but already scored → ignore silently
+  }
+
+  // Autopilot for demo/bot
+  var demoScriptIdx = 0;
+  // Demo script: array of { action: 'gap'|'flash'|'miss', beat: absolute beatCount to act on }
+  // We drive it purely by beat events to keep it human-feeling
+  var demoBeatActions = {};
+  function buildDemoScript() {
+    // Pattern: tap gap correctly a few times, a few hesitations (miss), a near-miss recovery, then fail
+    // Gap beats occur at beatCount: GAP_EVERY-1, 2*GAP_EVERY-1, etc. (0-based)
+    // beatCount is 0-based index of beats elapsed
+    var gapBeats = [];
+    for (var i = 0; i < 20; i++) {
+      if ((i % GAP_EVERY) === (GAP_EVERY - 1)) gapBeats.push(i);
+    }
+    // gapBeats = [3, 7, 11, 15, 19]
+    // Actions: hit, hit, hit, miss (near-fail), hit (recovery), fail (flash tap)
+    var actions = ['hit', 'hit', 'hit', 'miss', 'hit', 'flash'];
+    for (var j = 0; j < gapBeats.length && j < actions.length; j++) {
+      demoBeatActions[gapBeats[j]] = actions[j];
+    }
+    // The 'flash' action: at beat 17 (first flash in the 5th pattern cycle), tap on a flash
+    // Flash beats: 16, 17, 18 are flash beats before gap at 19
+    demoBeatActions[17] = 'flash_tap'; // tap on a lit beat → lose
+  }
+  buildDemoScript();
+
+  // Demo hesitation timing (frames to wait after beat starts before acting)
+  var demoHesitations = { 3: 180, 7: 140, 11: 220, 15: 400, 19: 160 }; // ms
+  var demoActionFired = {};
+
+  function autopilot(dt) {
+    if (phase !== 'play') return;
+
+    if (DEMO) {
+      var action = demoBeatActions[beatCount];
+      if (!action || demoActionFired[beatCount]) return;
+
+      var hesitate = demoHesitations[beatCount] || 120;
+      if (beatClock < hesitate) return;
+
+      demoActionFired[beatCount] = true;
+      var gap = isGapBeat();
+
+      if (action === 'hit' && gap && !scored) {
+        // Simulate tap in gap
+        scored = true;
+        tapResult = 'good'; tapResultAge = 0;
+        combo++;
+        streak++;
+        if (window.J) J.hit(combo);
+        flash('+1', TEAL, 38);
+        if (window.LOOP) LOOP.emit('tap', { streak: streak, combo: combo });
+      } else if (action === 'miss') {
+        // Don't tap — let the gap expire naturally (loseLife called in advanceBeat)
+        // (do nothing here)
+      } else if (action === 'flash_tap') {
+        // Tap on a lit flash → lose
+        combo = 0;
+        loseLife('CAUGHT!');
+        if (window.LOOP) LOOP.emit('flash_tap', { streak: streak });
+        if (lives <= 0) gameOver();
+      }
+    } else if (BOT) {
+      var gap2 = isGapBeat();
+      if (gap2 && !scored && beatClock > 100) {
+        if (botActionsLeft > 0) {
+          // Act correctly
+          botActionsLeft--;
+          scored = true;
+          tapResult = 'good'; tapResultAge = 0;
+          combo++;
+          streak++;
+          if (window.J) J.hit(combo);
+          if (window.LOOP) LOOP.emit('tap', { streak: streak, combo: combo });
+        }
+        // else: don't tap → miss → loseLife → eventually gameOver
+      }
+    }
+  }
+
+  function flash(txt, color, size) {
+    flashes.push({ txt: txt, color: color, size: size, t: 0 });
+  }
+
+  function pctTop(sc) {
+    return Math.max(1, Math.min(99, Math.round(100 * Math.exp(-sc / 8))));
+  }
+
+  // ---- input ----
+  var MUTE_R  = { x: W - 46, y: 10, w: 38, h: 38 };
+  var SHARE_R = { x: W / 2 - 125, y: 486, w: 250, h: 46 };
+  function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+  function tap(x, y) {
+    if (DEMO || BOT) return;
+    if (x !== undefined && inR(MUTE_R, x, y) && window.J) { J.toggleMute(); return; }
+    if (phase === 'title') { startRun(); return; }
+    if (phase === 'play') { doTap(true); return; }
+    if (phase === 'over' && performance.now() - overAt > 350) {
+      if (x !== undefined && inR(SHARE_R, x, y) && window.SHARE) {
+        SHARE.send({ score: streak, unit: 'streak' }); return;
+      }
+      resetRun();
+    }
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    tap((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
+  });
+  window.addEventListener('keydown', function (e) { if (e.code === 'Space') tap(); });
+
+  // ---- render helpers ----
+  function drawHearts(x, y) {
+    for (var i = 0; i < MAX_LIVES; i++) {
+      cx.globalAlpha = i < lives ? 1 : 0.2;
+      cx.fillStyle = VERM;
+      cx.font = '20px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'left';
+      cx.fillText('♥', x + i * 26, y);
+    }
+    cx.globalAlpha = 1;
+  }
+
+  // Draw the beat rail — circles across the canvas
+  // beat positions: GAP_EVERY circles, the gap one is hollow/dark
+  function drawBeatRail(now) {
+    var railY = H / 2 + 40;
+    var spacing = 72;
+    var startX = W / 2 - ((GAP_EVERY - 1) * spacing) / 2;
+
+    for (var i = 0; i < GAP_EVERY; i++) {
+      var bx = startX + i * spacing;
+      var isThisGap = i === (GAP_EVERY - 1);
+      var isCurrent = i === (beatIdx % GAP_EVERY);
+      var r2 = 24;
+
+      if (isThisGap) {
+        // Silent/gap beat: hollow circle with dashed border
+        cx.save();
+        cx.strokeStyle = isCurrent ? GOLD : 'rgba(242,177,52,0.4)';
+        cx.lineWidth = isCurrent ? 3 : 2;
+        cx.setLineDash([5, 4]);
+        cx.beginPath();
+        cx.arc(bx, railY, r2, 0, Math.PI * 2);
+        cx.stroke();
+        cx.setLineDash([]);
+        if (isCurrent) {
+          // Pulse to hint the player
+          var pulse = 0.5 + 0.5 * Math.sin(now / 120);
+          cx.strokeStyle = GOLD;
+          cx.lineWidth = 1.5;
+          cx.globalAlpha = pulse * 0.6;
+          cx.beginPath();
+          cx.arc(bx, railY, r2 + 8, 0, Math.PI * 2);
+          cx.stroke();
+          cx.globalAlpha = 1;
+        }
+        cx.restore();
+        // Label
+        cx.fillStyle = isCurrent ? GOLD : 'rgba(242,177,52,0.5)';
+        cx.font = '600 10px Menlo, monospace';
+        cx.textAlign = 'center';
+        cx.fillText('TAP', bx, railY + r2 + 16);
+      } else {
+        // Flash beat: solid circle, glows when active
+        var isFlashing = isCurrent && flashActive && flashAge < FLASH_MS;
+        var glowAlpha = isFlashing ? 1 : 0.25;
+        cx.save();
+        if (isFlashing) {
+          // Glow
+          var grd = cx.createRadialGradient(bx, railY, r2 * 0.4, bx, railY, r2 * 1.8);
+          grd.addColorStop(0, 'rgba(232,80,46,0.6)');
+          grd.addColorStop(1, 'rgba(232,80,46,0)');
+          cx.fillStyle = grd;
+          cx.beginPath(); cx.arc(bx, railY, r2 * 1.8, 0, Math.PI * 2); cx.fill();
+        }
+        cx.fillStyle = isFlashing ? VERM : 'rgba(232,80,46,' + glowAlpha + ')';
+        cx.beginPath(); cx.arc(bx, railY, r2, 0, Math.PI * 2); cx.fill();
+        cx.restore();
+      }
+    }
+
+    // Beat progress bar below rail
+    var barY = railY + 58;
+    var progress = beatClock / BEAT_MS;
+    cx.fillStyle = 'rgba(255,255,255,0.08)';
+    cx.fillRect(startX - 30, barY, (GAP_EVERY - 1) * spacing + 60, 4);
+    cx.fillStyle = isGapBeat() ? GOLD : VERM;
+    cx.fillRect(startX - 30, barY, ((GAP_EVERY - 1) * spacing + 60) * Math.min(progress, 1), 4);
+  }
+
+  // Central tap zone — big hit area in the lower portion
+  function drawTapZone(now) {
+    var cx2 = W / 2, cy2 = H / 2 + 180;
+    var gap = isGapBeat();
+    var r3 = 68;
+    if (gap) {
+      // Silent beat — big glowing tap zone
+      var pulse = 0.7 + 0.3 * Math.sin(now / 100);
+      var grd2 = cx.createRadialGradient(cx2, cy2, r3 * 0.3, cx2, cy2, r3 * 1.5);
+      grd2.addColorStop(0, 'rgba(242,177,52,' + (0.35 * pulse) + ')');
+      grd2.addColorStop(1, 'rgba(242,177,52,0)');
+      cx.fillStyle = grd2;
+      cx.beginPath(); cx.arc(cx2, cy2, r3 * 1.5, 0, Math.PI * 2); cx.fill();
+
+      cx.strokeStyle = GOLD;
+      cx.lineWidth = 3;
+      cx.globalAlpha = pulse;
+      cx.beginPath(); cx.arc(cx2, cy2, r3, 0, Math.PI * 2); cx.stroke();
+      cx.globalAlpha = 1;
+      // Icon
+      cx.fillStyle = GOLD;
+      cx.font = '900 28px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('NOW', cx2, cy2 + 10);
+    } else {
+      // Flash beat — danger zone, don't tap
+      var flashPulse = flashActive && flashAge < FLASH_MS ? 1 : 0;
+      cx.strokeStyle = 'rgba(232,80,46,' + (0.2 + flashPulse * 0.5) + ')';
+      cx.lineWidth = 2;
+      cx.beginPath(); cx.arc(cx2, cy2, r3, 0, Math.PI * 2); cx.stroke();
+      cx.fillStyle = 'rgba(232,80,46,' + (0.05 + flashPulse * 0.15) + ')';
+      cx.beginPath(); cx.arc(cx2, cy2, r3, 0, Math.PI * 2); cx.fill();
+      cx.fillStyle = 'rgba(232,80,46,' + (0.35 + flashPulse * 0.45) + ')';
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.textAlign = 'center';
+      cx.fillText('WAIT', cx2, cy2 + 6);
+    }
+  }
+
+  // ---- main loop ----
+  var last = performance.now();
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 16.667, 3); last = now;
+
+    if (phase === 'play') {
+      // Advance beat engine
+      if (hitStop > 0) {
+        hitStop -= dt;
+      } else {
+        beatClock += dt * 16.667; // dt in frames → ms
+        flashAge  += dt * 16.667;
+
+        if (beatClock >= BEAT_MS) {
+          beatClock -= BEAT_MS;
+          advanceBeat(dt);
+        }
+        autopilot(dt);
+      }
+    }
+
+    // juice transforms
+    cx.save();
+    if (shakeAmt > 0.2 || zoom > 1.001) {
+      var sx = (Math.random() - 0.5) * shakeAmt;
+      var sy = (Math.random() - 0.5) * shakeAmt;
+      cx.translate(W / 2 + sx, H / 2 + sy);
+      cx.scale(zoom, zoom);
+      cx.translate(-W / 2, -H / 2);
+    }
+    shakeAmt *= Math.pow(0.85, dt);
+    zoom += (1 - zoom) * 0.12 * dt;
+
+    // background
+    cx.fillStyle = INK; cx.fillRect(-20, -20, W + 40, H + 40);
+    var bg = cx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, 'rgba(46,197,182,0.05)');
+    bg.addColorStop(1, 'rgba(232,80,46,0.07)');
+    cx.fillStyle = bg; cx.fillRect(0, 0, W, H);
+
+    // ---- TITLE ----
+    if (phase === 'title') {
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('OFF-BEAT TRAP', W / 2, 260);
+      cx.fillStyle = GOLD;
+      cx.font = '700 16px Menlo, monospace';
+      cx.fillText('TAP THE SILENCE', W / 2, 300);
+      var pulse2 = 0.6 + 0.4 * Math.sin(now / 300);
+      cx.globalAlpha = pulse2;
+      cx.fillStyle = VERM;
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('TAP TO START', W / 2, 380);
+      cx.globalAlpha = 1;
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('flash = danger. silence = score.', W / 2, 410);
+    }
+
+    // ---- CHALLENGE CARD (demo beat 1) ----
+    if (phase === 'challenge') {
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '800 16px Menlo, monospace';
+      cx.fillText('SCORE TO BEAT', W / 2, 300);
+      cx.fillStyle = GOLD;
+      cx.font = '900 96px -apple-system, Helvetica, Arial';
+      cx.fillText('7', W / 2, 410);
+      cx.fillStyle = 'rgba(255,255,255,0.35)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText("today's best streak", W / 2, 440);
+    }
+
+    // ---- PLAY ----
+    if (phase === 'play') {
+      // Score display
+      cx.textAlign = 'center';
+      cx.fillStyle = 'rgba(255,255,255,0.92)';
+      cx.font = '800 72px -apple-system, Helvetica, Arial';
+      cx.fillText(streak, W / 2, 110);
+      cx.fillStyle = 'rgba(255,255,255,0.4)';
+      cx.font = '600 12px -apple-system, Helvetica, Arial';
+      cx.fillText('BEST ' + best, W / 2, 132);
+
+      // Combo display
+      if (combo >= 2) {
+        var comboSize = Math.min(28 + combo * 2, 48);
+        var glow = Math.min(combo / 8, 1);
+        cx.fillStyle = combo >= 5 ? GOLD : TEAL;
+        cx.font = '900 ' + comboSize + 'px -apple-system, Helvetica, Arial';
+        cx.globalAlpha = 0.9;
+        cx.fillText('×' + combo + ' STREAK', W / 2, 160);
+        cx.globalAlpha = 1;
+      }
+
+      // Dare banner
+      if (!DEMO && !BOT && window.SHARE && SHARE.dare !== null) {
+        cx.fillStyle = dareBeaten ? TEAL : GOLD;
+        cx.font = '800 14px -apple-system, Helvetica, Arial';
+        cx.textAlign = 'center';
+        cx.fillText(dareBeaten ? 'DARE BEATEN ✓' : 'BEAT ' + SHARE.dare + (SHARE.by ? ' — dared by ' + SHARE.by : ''), W / 2, 185);
+      }
+
+      drawBeatRail(now);
+      drawTapZone(now);
+
+      // Lives
+      drawHearts(W / 2 - MAX_LIVES * 13, H - 80);
+
+      // Label
+      cx.fillStyle = 'rgba(255,255,255,0.25)';
+      cx.font = '600 11px Menlo, monospace';
+      cx.textAlign = 'center';
+      cx.fillText('flash = wrong  ·  silence = score', W / 2, H - 40);
+    }
+
+    // ---- OVER ----
+    if (phase === 'over') {
+      cx.fillStyle = 'rgba(11,13,18,0.6)'; cx.fillRect(0, 0, W, H);
+      cx.textAlign = 'center';
+      cx.fillStyle = VERM;
+      cx.font = '900 40px -apple-system, Helvetica, Arial';
+      cx.fillText('TRAPPED.', W / 2, 300);
+      cx.fillStyle = '#fff';
+      cx.font = '800 26px -apple-system, Helvetica, Arial';
+      cx.fillText(streak + ' silent', W / 2, 346);
+      var pt = pctTop(streak);
+      cx.fillStyle = GOLD;
+      cx.font = '900 22px -apple-system, Helvetica, Arial';
+      cx.fillText('TOP ' + pt + '% TODAY', W / 2, 392);
+      cx.fillStyle = 'rgba(255,255,255,0.5)';
+      cx.font = '600 13px -apple-system, Helvetica, Arial';
+      cx.fillText('better than ' + (100 - pt) + '% of players', W / 2, 416);
+
+      if (!DEMO && !BOT) {
+        var p2 = 0.6 + 0.4 * Math.sin(now / 280);
+        cx.globalAlpha = p2;
+        cx.fillStyle = TEAL;
+        cx.font = '700 17px -apple-system, Helvetica, Arial';
+        cx.fillText('TAP — ONE MORE TRY', W / 2, 462);
+        cx.globalAlpha = 1;
+        // share pill
+        cx.fillStyle = 'rgba(242,177,52,0.14)';
+        cx.strokeStyle = GOLD; cx.lineWidth = 1.5;
+        cx.beginPath();
+        if (cx.roundRect) cx.roundRect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h, 23);
+        else cx.rect(SHARE_R.x, SHARE_R.y, SHARE_R.w, SHARE_R.h);
+        cx.fill(); cx.stroke();
+        cx.fillStyle = GOLD;
+        cx.font = '800 16px -apple-system, Helvetica, Arial';
+        cx.fillText(window.SHARE && SHARE.dare !== null && dareBeaten ? '⚡ DARE THEM BACK' : '⚡ DARE A FRIEND', W / 2, SHARE_R.y + 30);
+      }
+    }
+
+    // ---- CTA (demo) ----
+    if (phase === 'cta') {
+      var t2 = (now - ctaAt) / 1000, ease = Math.min(1, t2 * 2.2);
+      cx.fillStyle = 'rgba(11,13,18,' + (0.8 * ease) + ')';
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = ease;
+      cx.textAlign = 'center';
+      cx.fillStyle = '#fff';
+      cx.font = '900 42px -apple-system, Helvetica, Arial';
+      cx.fillText('OFF-BEAT TRAP', W / 2, 300);
+      cx.fillStyle = 'rgba(255,255,255,0.7)';
+      cx.font = '700 18px -apple-system, Helvetica, Arial';
+      cx.fillText('scored ' + (window.__demoScore || 7) + ' silent beats.', W / 2, 340);
+      var p3 = 0.7 + 0.3 * Math.sin(now / 240);
+      cx.fillStyle = VERM; cx.globalAlpha = ease * p3;
+      cx.font = '900 32px -apple-system, Helvetica, Arial';
+      cx.fillText('▶ BEAT ' + (window.__demoScore || 7), W / 2, 410);
+      cx.globalAlpha = ease;
+      cx.fillStyle = TEAL; cx.font = '700 16px -apple-system, Helvetica, Arial';
+      cx.fillText('link in bio', W / 2, 445);
+      cx.globalAlpha = 1;
+    }
+
+    // ---- Floating flashes ----
+    for (var k = flashes.length - 1; k >= 0; k--) {
+      var fl = flashes[k]; fl.t += dt;
+      var a = Math.max(0, 1 - fl.t / 40);
+      cx.globalAlpha = a; cx.textAlign = 'center';
+      cx.fillStyle = fl.color;
+      cx.font = '900 ' + (fl.size + fl.t * 0.4) + 'px -apple-system, Helvetica, Arial';
+      cx.fillText(fl.txt, W / 2, 220 - fl.t * 0.8);
+      cx.globalAlpha = 1;
+      if (fl.t > 40) flashes.splice(k, 1);
+    }
+
+    // Mute toggle (human only)
+    if (!DEMO && !BOT && window.J) {
+      cx.textAlign = 'center';
+      cx.globalAlpha = 0.5;
+      cx.font = '16px -apple-system, Helvetica, Arial';
+      cx.fillStyle = '#fff';
+      cx.fillText(J.muted ? '🔇' : '🔊', MUTE_R.x + MUTE_R.w / 2, MUTE_R.y + 26);
+      cx.globalAlpha = 1;
+    }
+
+    cx.restore();
+    requestAnimationFrame(frame);
+  }
+
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

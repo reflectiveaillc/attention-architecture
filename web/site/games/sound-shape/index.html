@@ -169,35 +169,38 @@
   // ---- State ----
   var phase, score, runStartTs, bestScore, toneSeq;
   var activeTone, holdTimer, lockProgress, roundsTotal;
-  var hitStop, shakeAmt, zoom, flashes;
-  var botRunsDone, botAction, botTimer;
+  var hitStop, shakeAmt, zoom, flashes, alreadyLocking;
+  var botRunsDone, botToneQueue, botWait, botCurrentTone;
+  var demoStep, demoState, demoWaitF;
   try { bestScore = +localStorage.getItem('ss_best') || 0; } catch(_) { bestScore = 0; }
 
   var MUTE_R = { x: W - 46, y: 10, w: 38, h: 38 };
   function inR(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
 
   function newGame() {
-    phase       = 'title';
-    score       = 0;
-    activeTone  = -1;
-    holdTimer   = 0;
-    lockProgress= 0;
-    roundsTotal = 0;
+    phase          = 'title';
+    score          = 0;
+    activeTone     = -1;
+    holdTimer      = 0;
+    lockProgress   = 0;
+    roundsTotal    = 0;
+    alreadyLocking = false;
     hitStop        = 0;
     shakeAmt       = 0;
     zoom           = 1;
     flashes        = [];
     toneSeq        = [];
-    alreadyLocking = false;
     botRunsDone    = 0;
     botToneQueue   = null;
     botWait        = 0;
     botCurrentTone = -1;
+    demoStep       = 0;
+    demoState      = 'wait';
+    demoWaitF      = 60;
     rng = mulberry32(SEED);
     initParticles();
 
     if (DEMO) {
-      buildDemoToneSeq();
       phase = 'play';
       runStartTs = Date.now();
       if (window.LOOP) LOOP.emit('play_start', { seed: SEED, mode: 'demo' });
@@ -211,13 +214,6 @@
       startNextRound();
       return;
     }
-  }
-
-  // Demo script: 5 tones in order 0→1→2→3→4 = escalating complexity
-  var demoScript = [0, 1, 2, 3, 4];
-  var demoIdx = 0;
-  function buildDemoToneSeq() {
-    toneSeq = demoScript.slice();
   }
 
   function startNextRound() {
@@ -267,28 +263,30 @@
 
   function completeLock() {
     score++;
-    lockProgress = 1;
+    lockProgress   = 1;
+    alreadyLocking = false; // allow future locks
     zoom = 1.025;
     if (window.J) J.calm(score);
     flash('LOCKED', TEAL, 36);
     if (window.LOOP) LOOP.emit('tone_locked', { tone: activeTone, score: score });
 
-    // In demo/bot: after all 5 tones locked = end
-    if (DEMO && score >= 5) {
-      gameOver();
-      return;
-    }
-    if (BOT && score >= 5) {
-      gameOver();
-      return;
-    }
-    // Human: keep going, generate next random target
-    toneSeq = [];
-    activeTone = -1;
-    holdTimer  = 0;
+    // Always reset active tone so autopilots can proceed
+    activeTone   = -1;
+    holdTimer    = 0;
     lockProgress = 0;
+
+    // After all 5 tones locked → game over
+    if (score >= 5) {
+      gameOver();
+      return;
+    }
+
+    // Keep going (human gets a fresh random round; demo/bot autopilots pick next tone)
+    toneSeq = [];
     if (!DEMO && !BOT) {
       setTimeout(function() { startNextRound(); }, 600);
+    } else {
+      startNextRound();
     }
   }
 
@@ -332,6 +330,9 @@
     botToneQueue   = null;
     botWait        = 0;
     botCurrentTone = -1;
+    demoStep       = 0;
+    demoState      = 'wait';
+    demoWaitF      = 60;
     rng = mulberry32(SEED + botRunsDone);
     initParticles();
     if (window.LOOP) LOOP.emit('restart', {});
@@ -380,28 +381,34 @@
   }
 
   // ---- Demo autopilot ----
-  var demoToneIdx = 0;
-  var demoWait    = 60;    // frames before first tap
-  var demoHolding = false;
+  // States: 'wait' → 'tap' → 'holding' (completeLock fires) → 'wait' (next tone)
+  var demoStep   = 0;   // which tone (0..4)
+  var demoState  = 'wait';
+  var demoWaitF  = 60;  // initial frames to wait
 
   function demoAutopilot(dt) {
     if (phase !== 'play') return;
-    if (demoToneIdx >= 5) return;
+    if (demoStep >= 5) return;
 
-    if (demoWait > 0) { demoWait -= dt; return; }
-
-    if (activeTone !== demoToneIdx) {
-      tapTone(demoToneIdx);
-      demoHolding = true;
+    if (demoState === 'wait') {
+      demoWaitF -= dt;
+      if (demoWaitF <= 0) demoState = 'tap';
       return;
     }
 
-    // holding tone — wait for lock or timeout
-    if (holdTimer > HOLD_NEEDED + 10) {
-      // Move to next tone
-      demoToneIdx++;
-      demoWait = 40 + demoToneIdx * 15; // slight hesitation grows
-      demoHolding = false;
+    if (demoState === 'tap') {
+      tapTone(demoStep);
+      demoState = 'holding';
+      return;
+    }
+
+    if (demoState === 'holding') {
+      // Wait for completeLock to reset activeTone to -1
+      if (activeTone < 0) {
+        demoStep++;
+        demoWaitF = 35 + demoStep * 10; // growing hesitation feels human
+        demoState = 'wait';
+      }
     }
   }
 

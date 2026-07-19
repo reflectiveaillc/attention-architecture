@@ -260,6 +260,7 @@
     state.score = 0; state.combo = 0; state.maxCombo = 0; state.wrongTaps = 0;
     state.lastCorrectAt = 0; state.overAt = 0; state.lastMultAt = 0;
     flashes = []; burst = null; dareBeaten = false; nearMissFlag = false;
+    botMoves = 0; botTarget = null; botWait = 0;
     spawnBadges(START_BADGES);
     if (window.LOOP) LOOP.emit('restart', {});
     startRun();
@@ -301,7 +302,10 @@
   var demoScript = ['good','good','good','good','good','bad','good','bad','good','bad','good','good','good','bad','good','good','fail'];
   var demoIdx = 0, demoWait = 35, demoFailing = false;
   var demoWaits = [32, 28, 44, 32, 38, 48, 36, 52, 42, 60, 28, 34, 40, 48, 32, 30, 240];
-  var botRunsDone = 0, botTarget = null, botWait = 0;
+  var botRunsDone = 0, botTarget = null, botWait = 0, botMoves = 0;
+  // bot plays at most BOT_MAX_MOVES correct taps per run, then goes passive so
+  // periodicMultiply fills the board to MAX_BADGES and gameOver() fires naturally.
+  var BOT_MAX_MOVES = 10;
 
   function autopilot() {
     if (state.phase !== 'play') return;
@@ -331,14 +335,31 @@
       demoIdx++;
       demoWait = demoWaits[Math.min(demoIdx, demoWaits.length - 1)] || 30;
     } else if (BOT) {
-      // reaction delay + occasional skip so badges outrun the bot → runs end
       if (botWait > 0) { botWait -= 1; return; }
+      if (botMoves >= BOT_MAX_MOVES) {
+        // Bot exhausted its budget: deliberately tap a wrong badge every ~20 frames
+        // to spawn 3 badges at a time and quickly reach MAX_BADGES → gameOver fires.
+        var tgt = targetBadge();
+        var wrongIdx = -1;
+        for (var i = state.badges.length - 1; i >= 0; i--) {
+          if (state.badges[i] !== tgt) { wrongIdx = i; break; }
+        }
+        if (wrongIdx >= 0) {
+          doTap(state.badges[wrongIdx].x, state.badges[wrongIdx].y);
+        } else if (tgt) {
+          // Only one badge left — tap off-centre to be wrong, but all are the target
+          // so just wait; periodicMultiply will add more.
+        }
+        botWait = 18 + Math.floor(rng() * 10);
+        return;
+      }
+      // Normal bot play: react with delay + occasional skip
       if (botTarget === null) {
         var t = targetBadge();
         if (t) botTarget = { x: t.x + gauss() * BOT_ERR, y: t.y + gauss() * BOT_ERR };
       }
       if (botTarget) {
-        if (rng() > 0.22) doTap(botTarget.x, botTarget.y); // 22% skipped
+        if (rng() > 0.22) { doTap(botTarget.x, botTarget.y); botMoves++; } // 22% skipped
         botTarget = null;
         botWait = 10 + Math.floor(rng() * 16);
       }
