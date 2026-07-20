@@ -32,6 +32,11 @@
     setTimeout(function () { t.style.opacity = '0'; setTimeout(function () { t.remove(); }, 300); }, 1800);
   }
 
+  function emitShare(channel, score) {
+    emit('share', { channel: channel, score: score });
+    emit('outbound_share', { channel: channel, score: score });
+  }
+
   window.SHARE = {
     dare: (dare !== null && !isNaN(dare)) ? dare : null,
     by: by,
@@ -45,12 +50,12 @@
       var url = challengeUrl(opts.score !== undefined ? opts.score : '');
       if (navigator.share) {
         navigator.share({ title: 'tilt — ' + game, text: text, url: url })
-          .then(function () { emit('share', { channel: 'native', score: opts.score }); })
+          .then(function () { emitShare('native', opts.score); })
           .catch(function () {});
       } else {
         var full = text + ' ' + url;
         (navigator.clipboard ? navigator.clipboard.writeText(full) : Promise.reject())
-          .then(function () { toast('challenge link copied'); emit('share', { channel: 'clipboard', score: opts.score }); })
+          .then(function () { toast('challenge link copied'); emitShare('clipboard', opts.score); })
           .catch(function () { toast(full.slice(0, 60)); });
       }
     }

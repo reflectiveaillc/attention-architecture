@@ -41,7 +41,9 @@ export const DEFAULT_COHORT = {
   d1_prob: 0.12           // landed → returned next day
 };
 
-export async function generateSyntheticCohort({ sinkUrl, clipId, gameId, seed = 99, params = DEFAULT_COHORT }) {
+export async function generateSyntheticCohort({ sinkUrl, clipId, gameId, seed = 99, params = DEFAULT_COHORT, runId = null, variants = [] }) {
+  const { assignVariant } = await import('./experiment.mjs');
+  const activeVariants = [{ id: 'base', status: 'live' }].concat((variants || []).map((v) => typeof v === 'string' ? { id: v, status: 'live' } : v));
   const rng = mulberry32(seed);
   const gauss = () => Math.sqrt(-2 * Math.log(1 - rng())) * Math.cos(2 * Math.PI * rng());
   const post = (e) => fetch(`${sinkUrl}`, { method: 'POST', body: JSON.stringify(e) });
@@ -55,11 +57,13 @@ export async function generateSyntheticCohort({ sinkUrl, clipId, gameId, seed = 
     queue.push({ ...base, event: 'clip_impressions', platform: p.platform, count: p.impressions, ts: Date.now() });
     // binomial via per-impression draw is slow; use expectation + noise
     const n = Math.max(0, Math.round(p.impressions * p.ctr + gauss() * Math.sqrt(p.impressions * p.ctr * (1 - p.ctr))));
+    const prefix = runId ? runId.replace(/[:.]/g, '-') : `r${seed}`;
     for (let i = 0; i < n; i++) {
-      const vid = `syn-${p.platform}-${i}-${seed}`;
-      const sid = `ssyn-${p.platform}-${i}`;
+      const vid = `syn-${prefix}-${p.platform}-${i}-${seed}`;
+      const sid = `ssyn-${prefix}-${p.platform}-${i}`;
+      const variant = assignVariant(vid, gameId, activeVariants, { seed: String(seed) });
       const t0 = Date.now() - Math.floor(rng() * 5 * 24 * 3600e3);
-      const ev = { ...base, vid, sid, src: p.platform };
+      const ev = { ...base, vid, sid, src: p.platform, variant };
       queue.push({ ...ev, event: 'clip_landed', ts: t0 });
       landings++;
       if (rng() < params.play_prob) {

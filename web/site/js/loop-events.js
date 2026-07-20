@@ -1,12 +1,33 @@
-/* LOOP event layer v2 — behavioral analytics for pleasure/dopamine/addiction
- * proxies (docs/game-contract-v2.md).
+/* LOOP event layer v3 — site-wide engagement loop + per-game behavioral analytics.
  *
- * Auto-derived (games just emit their normal events):
- *   restart_latency {ms}   game_over → next play_start/restart gap. THE dopamine
- *                          signature: how fast the "one more" reflex fires.
- *                          after_near_miss flag when the death involved a near-miss.
- *   session_end {...}      on tab-hide: runs, play_s, best, fast_restarts, span_s
- *   visit meta             visit_n, hour, late_night (23:00–04:59) on every event
+ * Contexts: index (home), hub (/g/<id>.html), game (/games/<id>/), variant.
+ * Games just emit their moments (play_start, game_over, near_miss, restart); this
+ * layer auto-derives the dopamine/pleasure/addiction proxies and the site-wide
+ * funnel events.
+ *
+ * Auto-derived:
+ *   restart_latency {ms}    game_over → next play_start/restart gap
+ *   session_end {...}       tab-hide summary
+ *   browse_end {...}          page-hide summary for index/hub
+ *   game_result {...}         standardized summary of a completed run
+ *   difficulty_spike          3 fast deaths signal tuning problem
+ *   calm_moment               idle after completion (calm-engine wind-down)
+ *   clip_play_start / 50pct   hook-video engagement
+ *
+ * Site funnel:
+ *   browse_start {page_type}  index | hub | game
+ *   browse_impression         card seen in viewport
+ *   card_tapped               index → hub
+ *   hub_land                  hub → play intent
+ *   category_switch           filter chip used
+ *   play_source               hub | dare | share | direct | back
+ *   outbound_share {channel}  native share sheet or clipboard
+ *
+ * Identity:
+ *   vid  — visitor id (localStorage), persists until cache clear
+ *   vsid — visit session id (sessionStorage), one per tab visit
+ *   sid  — page session id, kept for backward compatibility with per-game metrics
+ *
  * A/B: ?v=<variant> (or window.LOOP_VARIANT) tags every event; 'base' default.
  * Sink: ?sink=<url> → sendBeacon; else localStorage buffer. PostHog mirror OFF
  * by default (window.LOOP_POSTHOG). Nothing leaves the device unconfigured.
@@ -18,7 +39,16 @@
   var src = qs.get('src') || (document.referrer ? 'referrer:' + document.referrer : 'direct');
   var mode = qs.get('demo') ? 'demo' : qs.get('bot') ? 'bot' : 'human';
   var variant = qs.get('v') || window.LOOP_VARIANT || 'base';
+  var dare = qs.get('dare') ? parseFloat(qs.get('dare')) : null;
 
+  // ---- page context ----
+  var path = location.pathname.replace(/\/$/, '');
+  var pageType = 'game';
+  if (path.indexOf('/games/') !== -1) pageType = 'game';
+  else if (path.indexOf('/g/') !== -1) pageType = 'hub';
+  else if (path === '' || path.endsWith('index.html') || path.split('/').pop() === 'site') pageType = 'index';
+
+  // ---- identity ----
   var vid = null;
   try {
     vid = localStorage.getItem('loop_vid');
@@ -26,10 +56,19 @@
   } catch (_) { vid = 'v-ephemeral'; }
   if (mode !== 'human') vid = mode + '-' + Math.random().toString(36).slice(2, 10);
 
+  var vsid = null;
+  try {
+    vsid = sessionStorage.getItem('loop_vsid');
+    if (!vsid) {
+      vsid = 'vs-' + Math.random().toString(36).slice(2, 10);
+      sessionStorage.setItem('loop_vsid', vsid);
+    }
+  } catch (_) { vsid = 'vs-ephemeral'; }
+
   var sid = 's-' + Math.random().toString(36).slice(2, 10);
   var buffer = [];
 
-  // visit meta
+  // ---- visit meta ----
   var visitN = 1, hour = new Date().getHours();
   try {
     visitN = (+localStorage.getItem('loop_visits') || 0) + 1;
@@ -37,8 +76,14 @@
   } catch (_) {}
   var lateNight = hour >= 23 || hour < 5;
 
-  // session accumulators (for session_end)
-  var S = { runs: 0, play_s: 0, best: 0, fast_restarts: 0, near_misses: 0, t0: Date.now(), lastGameOver: 0, lastDeathHadNearMiss: false, runNearMiss: false };
+  // ---- session accumulators ----
+  var S = {
+    runs: 0, play_s: 0, best: 0, fast_restarts: 0, near_misses: 0,
+    t0: Date.now(), lastGameOver: 0, lastDeathHadNearMiss: false, runNearMiss: false,
+    browse_t0: Date.now(), browse_maxScroll: 0,
+    gameOvers: [], // recent dur_s for difficulty-spike detection
+    lastComplete: 0, calmNoted: false
+  };
 
   function send(e) {
     if (sink) { try { navigator.sendBeacon(sink, JSON.stringify(e)); } catch (_) {} }
@@ -46,18 +91,31 @@
       buffer.push(e);
       try { localStorage.setItem('loop_events', JSON.stringify(buffer.slice(-500))); } catch (_) {}
     }
-    if (window.LOOP_POSTHOG) { try { window.LOOP_POSTHOG.capture(e.event, e); } catch (_) {} }
+    if (window.LOOP_POSTHOG) {
+      try {
+        var ev = Object.assign({}, e);
+        delete ev.ts; // PostHog sets its own timestamp
+        window.LOOP_POSTHOG.capture(e.event, ev);
+      } catch (_) {}
+    }
   }
 
+  // ---- core emit ----
+  var firstPlaySource = null;
   function emit(event, props) {
     var e = Object.assign({
-      event: event, ts: Date.now(), vid: vid, sid: sid,
+      event: event, ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
       game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
-      clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight
+      clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
+      page_type: pageType
     }, props || {});
 
-    // ---- auto-derived dopamine/pleasure signals ----
+    // auto-derived dopamine/pleasure signals
     if (event === 'play_start' || event === 'restart') {
+      if (!firstPlaySource) {
+        firstPlaySource = dare ? 'dare' : (src && src.indexOf('/g/') !== -1 ? 'hub' : 'direct');
+        send(Object.assign({}, e, { event: 'play_source', source: firstPlaySource, dare: dare }));
+      }
       if (S.lastGameOver) {
         var ms = Date.now() - S.lastGameOver;
         if (ms < 60000) {
@@ -72,39 +130,250 @@
     if (event === 'game_over') {
       S.lastGameOver = Date.now();
       S.lastDeathHadNearMiss = S.runNearMiss;
-      if (typeof e.dur_s === 'number') S.play_s += e.dur_s;
+      if (typeof e.dur_s === 'number') {
+        S.play_s += e.dur_s;
+        S.gameOvers.push(e.dur_s);
+        if (S.gameOvers.length > 5) S.gameOvers.shift();
+        // standardized game result summary
+        var engine = window.LOOP_ENGINE || (window.LOOP_CALM ? 'calm' : 'viral');
+        send(Object.assign({}, e, {
+          event: 'game_result',
+          score: e.score, dur_s: e.dur_s, stage: e.stage || null,
+          best: S.best, personal_record: typeof e.score === 'number' && e.score >= S.best,
+          engine: engine
+        }));
+        // difficulty spike: last 3 runs all under 8s or under half median
+        if (S.gameOvers.length >= 3) {
+          var last3 = S.gameOvers.slice(-3);
+          var med = last3.slice().sort(function (a, b) { return a - b; })[1];
+          if (last3.every(function (d) { return d < 8 || d < med * 0.5; })) {
+            send(Object.assign({}, e, { event: 'difficulty_spike', last_3: last3, median_3: med }));
+          }
+        }
+      }
       if (typeof e.score === 'number' && e.score > S.best) S.best = e.score;
     }
     send(e);
   }
 
+  // ---- session / browse end ----
   function sessionEnd() {
-    if (S.runs === 0 && S.play_s === 0) return;
-    send({
-      event: 'session_end', ts: Date.now(), vid: vid, sid: sid,
-      game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
-      clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
-      runs: S.runs, play_s: +S.play_s.toFixed(1), best: S.best,
-      fast_restarts: S.fast_restarts, near_misses: S.near_misses,
-      span_s: +((Date.now() - S.t0) / 1000).toFixed(1)
-    });
+    if (S.runs === 0 && S.play_s === 0 && pageType !== 'game') {
+      // still emit browse_end for index/hub
+      if (pageType === 'index' || pageType === 'hub') {
+        send({
+          event: 'browse_end', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
+          game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
+          clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
+          page_type: pageType, browse_s: +((Date.now() - S.browse_t0) / 1000).toFixed(1),
+          max_scroll: S.browse_maxScroll
+        });
+      }
+      return;
+    }
+    if (S.runs > 0 || S.play_s > 0) {
+      send({
+        event: 'session_end', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
+        game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
+        clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
+        page_type: pageType,
+        runs: S.runs, play_s: +S.play_s.toFixed(1), best: S.best,
+        fast_restarts: S.fast_restarts, near_misses: S.near_misses,
+        span_s: +((Date.now() - S.t0) / 1000).toFixed(1)
+      });
+    }
+    if (pageType === 'index' || pageType === 'hub') {
+      send({
+        event: 'browse_end', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
+        game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
+        clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
+        page_type: pageType, browse_s: +((Date.now() - S.browse_t0) / 1000).toFixed(1),
+        max_scroll: S.browse_maxScroll
+      });
+    }
     S.runs = 0; S.play_s = 0; S.fast_restarts = 0; S.near_misses = 0; S.t0 = Date.now();
+    S.browse_t0 = Date.now(); S.browse_maxScroll = 0;
   }
   document.addEventListener('visibilitychange', function () { if (document.hidden) sessionEnd(); });
   window.addEventListener('pagehide', sessionEnd);
 
-  // D1 return
+  // ---- D1 / D7 / D30 return ----
   try {
     var last = +localStorage.getItem('loop_last_visit') || 0;
     var now = Date.now();
-    if (last && now - last > 20 * 3600e3 && now - last < 48 * 3600e3) emit('d1_return');
+    var gap = last ? now - last : 0;
+    if (gap > 20 * 3600e3 && gap < 48 * 3600e3) emit('d1_return');
+    else if (gap >= 6 * 24 * 3600e3 && gap <= 8 * 24 * 3600e3) emit('d7_return');
+    else if (gap >= 27 * 24 * 3600e3 && gap <= 32 * 24 * 3600e3) emit('d30_return');
     localStorage.setItem('loop_last_visit', String(now));
   } catch (_) {}
 
+  // ---- visit start ----
+  try {
+    var lastVs = sessionStorage.getItem('loop_vs_last');
+    if (!lastVs) {
+      send({ event: 'visit_start', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
+        variant: variant, mode: mode, clip_id: clipId, src: src, visit_n: visitN,
+        hour: hour, late_night: lateNight, page_type: pageType });
+      sessionStorage.setItem('loop_vs_last', String(Date.now()));
+    }
+  } catch (_) {}
+
+  // ---- browse start for index/hub/game ----
+  send({ event: 'browse_start', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
+    game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
+    clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
+    page_type: pageType });
+
+  // ---- clip landed / heartbeat ----
   if (clipId) emit('clip_landed');
 
   var hb = 0;
   setInterval(function () { hb += 5; emit('session_heartbeat', { t: hb }); }, 5000);
 
-  window.LOOP = { emit: emit, mode: mode, vid: vid, sid: sid, variant: variant };
+  // ---- index/hub instrumentation (only when not in an iframe/game) ----
+  if (pageType === 'index' || pageType === 'hub') {
+    // card impressions + taps
+    document.addEventListener('click', function (ev) {
+      var card = ev.target.closest && ev.target.closest('.card');
+      if (card) {
+        var href = card.getAttribute('href') || '';
+        var gameId = extractGameId(href) || (card.querySelector('h2') && card.querySelector('h2').textContent) || 'unknown';
+        send({ event: 'card_tapped', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
+          game: gameId, variant: variant, mode: mode, clip_id: clipId, src: src,
+          visit_n: visitN, hour: hour, late_night: lateNight, page_type: pageType,
+          engine: card.dataset.engine, category: card.dataset.category, position: cardIndex(card) });
+      }
+      var chip = ev.target.closest && ev.target.closest('nav button');
+      if (chip && chip.dataset && (chip.dataset.t || chip.dataset.v)) {
+        send({ event: 'category_switch', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
+          game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
+          clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
+          page_type: pageType, filter_type: chip.dataset.t, filter_value: chip.dataset.v });
+      }
+    });
+
+    // scroll depth
+    window.addEventListener('scroll', function () {
+      S.browse_maxScroll = Math.max(S.browse_maxScroll, window.scrollY || window.pageYOffset || 0);
+    }, { passive: true });
+
+    // video engagement on hook clips
+    function trackVideo(v) {
+      var started = false, half = false;
+      v.addEventListener('play', function () {
+        if (started) return;
+        started = true;
+        var game = clipGameFromSrc(v.dataset.src || v.src || '');
+        send({ event: 'clip_play_start', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
+          game: game, variant: variant, mode: mode, clip_id: clipId, src: src,
+          visit_n: visitN, hour: hour, late_night: lateNight, page_type: pageType });
+      });
+      v.addEventListener('timeupdate', function () {
+        if (half) return;
+        if (v.duration && v.currentTime / v.duration >= 0.5) {
+          half = true;
+          var game = clipGameFromSrc(v.dataset.src || v.src || '');
+          send({ event: 'clip_play_50pct', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
+            game: game, variant: variant, mode: mode, clip_id: clipId, src: src,
+            visit_n: visitN, hour: hour, late_night: lateNight, page_type: pageType });
+        }
+      });
+    }
+    function clipGameFromSrc(src) {
+      if (!src) return 'unknown';
+      var m = src.match(/clips\/([a-z0-9-]+)-hook/);
+      return m ? m[1] : 'unknown';
+    }
+    document.querySelectorAll('video.clip, video').forEach(trackVideo);
+
+    // browse impressions on cards (IntersectionObserver)
+    if ('IntersectionObserver' in window) {
+      var seen = new Set();
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (en) {
+          var card = en.target.closest('.card');
+          if (!en.isIntersecting || !card || seen.has(card)) return;
+          seen.add(card);
+          var href = card.getAttribute('href') || '';
+          var gameId = extractGameId(href) || 'unknown';
+          send({ event: 'browse_impression', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
+            game: gameId, variant: variant, mode: mode, clip_id: clipId, src: src,
+            visit_n: visitN, hour: hour, late_night: lateNight, page_type: pageType,
+            engine: card.dataset.engine, category: card.dataset.category, position: cardIndex(card) });
+        });
+      }, { rootMargin: '0px', threshold: 0.5 });
+      document.querySelectorAll('.card').forEach(function (c) { io.observe(c); });
+    }
+
+    // hub land (if we are on a hub page)
+    if (pageType === 'hub') {
+      var hubGame = extractGameId(path) || 'unknown';
+      send({ event: 'hub_land', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
+        game: hubGame, variant: variant, mode: mode, clip_id: clipId, src: src,
+        visit_n: visitN, hour: hour, late_night: lateNight, page_type: pageType });
+    }
+  }
+
+  function extractGameId(hrefOrPath) {
+    if (!hrefOrPath) return null;
+    var m = hrefOrPath.match(/[/\\]g(?:ames)?[/\\]([a-z0-9-]+)/);
+    if (!m) m = hrefOrPath.match(/[/\\]g\/([a-z0-9-]+)\.html/);
+    return m ? m[1].replace(/\.html$/, '') : null;
+  }
+
+  function cardIndex(card) {
+    var all = document.querySelectorAll('.card');
+    for (var i = 0; i < all.length; i++) if (all[i] === card) return i;
+    return -1;
+  }
+
+  // ---- calm-moment detection (calm games) ----
+  if (pageType === 'game' && window.LOOP_CALM) {
+    setInterval(function () {
+      if (S.lastGameOver && !S.calmNoted && Date.now() - S.lastGameOver > 5000 && S.runs > 0) {
+        S.calmNoted = true;
+        send({ event: 'calm_moment', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
+          game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
+          clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
+          page_type: pageType, after_run: S.runs });
+      }
+    }, 1000);
+  }
+
+  // ---- deterministic variant assignment (mirrors engine/lib/experiment.mjs) ----
+  function assignVariant(vid, gameId, variants, seed) {
+    if (!variants || !variants.length) return 'base';
+    var live = [];
+    for (var i = 0; i < variants.length; i++) if (!variants[i].status || variants[i].status === 'live' || variants[i].status === 'testing') live.push(variants[i]);
+    if (!live.length) return 'base';
+    var s = hashString((seed || '') + '::' + vid + '::' + gameId);
+    return live[s % live.length].id;
+  }
+  function hashString(str) {
+    var h = 5381;
+    for (var i = 0; i < str.length; i++) h = ((h << 5) + h) + str.charCodeAt(i);
+    return Math.abs(h);
+  }
+
+  // ---- public API ----
+  window.LOOP = {
+    emit: emit,
+    mode: mode,
+    vid: vid,
+    vsid: vsid,
+    sid: sid,
+    variant: variant,
+    pageType: pageType,
+    setCalm: function () { window.LOOP_CALM = true; },
+    assignVariant: assignVariant
+  };
+
+  // ---- load shared analytics (Vercel Web Analytics + Hotjar) on every page ----
+  (function () {
+    var s = document.createElement('script');
+    s.src = '/js/analytics.js';
+    s.async = true;
+    document.head.appendChild(s);
+  })();
 })();

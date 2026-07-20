@@ -34,6 +34,32 @@ export async function run(ctx) {
   evidence[concept.mechanic] = ev;
   fs.writeFileSync(evidenceFile, JSON.stringify(evidence, null, 2));
 
+  // experiment recommendations from the full behavioral report
+  let recommended_variants = [];
+  try {
+    const { parseEvents } = await import('../lib/metrics.mjs');
+    const { suggestVariants } = await import('../lib/experiment.mjs');
+    const runEventsFile = path.join(ctx.runDir, 'events.jsonl');
+    const events = fs.existsSync(runEventsFile) ? parseEvents([runEventsFile]) : [];
+    const report = events.length ? { meta: { engine: concept.engine }, game: concept.id, indices: deriveIndicesFromEvents(events, concept.id), behavioral: {}, raw: {} } : null;
+    if (report) {
+      // enrich indices from metrics layer if possible
+      const { computeGameReport } = await import('../lib/metrics.mjs');
+      const fullReport = computeGameReport(events, concept.id, { modes: ['human', 'bot', 'synthetic'] });
+      recommended_variants = suggestVariants(fullReport).slice(0, 3);
+    }
+  } catch (err) {
+    ctx.log('learn: variant suggestion skipped — ' + (err.message || err));
+  }
+  if (recommended_variants.length) {
+    for (const v of recommended_variants) ctx.log(`learn: suggested variant ${v.id} — ${v.hypothesis}`);
+  }
+
   ctx.log(`learn: ${verdict.toUpperCase()} (${checks.length - failed.length}/${checks.length} bars) → ${action}`);
-  return { verdict, checks, action, evidence_written: `evidence.json[${concept.mechanic}] (wins ${ev.wins} / losses ${ev.losses})`, feeds_back_to: 'signal' };
+  return { verdict, checks, action, recommended_variants, evidence_written: `evidence.json[${concept.mechanic}] (wins ${ev.wins} / losses ${ev.losses})`, feeds_back_to: 'signal' };
+}
+
+function deriveIndicesFromEvents(events, gameId) {
+  // minimal fallback so suggestVariants gets plausible shape
+  return { pleasure: 50, dopamine: 50, addiction: 30 };
 }

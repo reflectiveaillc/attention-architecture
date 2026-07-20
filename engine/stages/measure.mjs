@@ -20,7 +20,10 @@ export async function run(ctx) {
   const bot = await runBotSession({ siteUrl: url, sinkUrl, gameId: concept.id, clipId, runs: 3, seed: ctx.seed });
 
   ctx.log('measure: synthetic platform cohort through the same pipe…');
-  const cohort = await generateSyntheticCohort({ sinkUrl, clipId, gameId: concept.id, seed: ctx.seed, params: DEFAULT_COHORT });
+  const registry = fs.existsSync(path.join(ctx.stateDir, 'registry.json')) ? JSON.parse(fs.readFileSync(path.join(ctx.stateDir, 'registry.json'), 'utf8')) : { games: [] };
+  const game = registry.games.find((g) => g.id === concept.id);
+  const variants = (game?.variants || []).map((v) => typeof v === 'string' ? { id: v, status: 'live' } : v);
+  const cohort = await generateSyntheticCohort({ sinkUrl, clipId, gameId: concept.id, seed: ctx.seed, params: DEFAULT_COHORT, runId: ctx.runId, variants });
   await new Promise((r) => setTimeout(r, 300));
   server.close();
 

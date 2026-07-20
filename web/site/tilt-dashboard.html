@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Tilt Dashboard — LOOP analytics</title>
+<script src="js/analytics.js"></script>
+<style>
+  #gate { position:fixed; inset:0; background:var(--ink); display:flex; flex-direction:column; align-items:center; justify-content:center; z-index:100; }
+  #gate input { background:var(--card); border:1px solid rgba(255,255,255,.15); color:#fff; border-radius:12px; padding:14px 18px; font-size:16px; width:260px; text-align:center; }
+  #gate button { margin-top:12px; background:var(--verm); color:#fff; border:none; border-radius:12px; padding:12px 24px; font-size:16px; font-weight:800; cursor:pointer; }
+  #gate p { color:var(--verm); min-height:20px; font-size:13px; }
+  :root { --ink:#0b0d12; --verm:#e8502e; --teal:#2ec5b6; --gold:#f2b134; --card:#12151d; --muted:rgba(255,255,255,.5); }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--ink); color:#fff; font-family:-apple-system,'Helvetica Neue',Arial,sans-serif; min-height:100vh; }
+  a { color:var(--teal); }
+  header { padding:max(24px,env(safe-area-inset-top)) 16px 12px; text-align:center; position:sticky; top:0; background:var(--ink); z-index:5; }
+  header h1 { font-size:32px; font-weight:900; letter-spacing:-1px; margin:0; }
+  header h1 em { font-style:normal; color:var(--verm); }
+  header p { margin:6px 0 0; color:var(--muted); font-size:13px; }
+  .wrap { max-width:980px; margin:0 auto; padding:0 16px 60px; }
+  .grid { display:grid; gap:14px; grid-template-columns:repeat(2, 1fr); }
+  @media (min-width:700px){ .grid { grid-template-columns:repeat(4, 1fr); } }
+  .kpi { background:var(--card); border:1px solid rgba(255,255,255,.07); border-radius:16px; padding:16px; }
+  .kpi .label { font-size:11px; font-weight:800; letter-spacing:1px; color:var(--muted); text-transform:uppercase; }
+  .kpi .num { font-size:28px; font-weight:900; margin:6px 0 2px; }
+  .kpi .sub { font-size:12px; color:var(--muted); }
+  .card { background:var(--card); border:1px solid rgba(255,255,255,.07); border-radius:16px; padding:16px; margin-top:14px; }
+  .card h2 { font-size:15px; font-weight:800; margin:0 0 12px; letter-spacing:.5px; text-transform:uppercase; }
+  .row { display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid rgba(255,255,255,.06); font-size:13px; }
+  .row:last-child { border-bottom:none; }
+  .row .name { font-weight:700; }
+  .row .val { font-family:monospace; color:var(--gold); }
+  .bar { height:6px; background:rgba(255,255,255,.1); border-radius:3px; margin-top:4px; overflow:hidden; }
+  .bar i { display:block; height:100%; border-radius:3px; }
+  .verm { background:var(--verm); }
+  .teal { background:var(--teal); }
+  .gold { background:var(--gold); }
+  .empty { text-align:center; color:var(--muted); padding:30px 10px; font-size:13px; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th { text-align:left; color:var(--muted); font-weight:700; padding:8px 6px; border-bottom:1px solid rgba(255,255,255,.1); }
+  td { padding:8px 6px; border-bottom:1px solid rgba(255,255,255,.05); }
+  .badge { font-size:9px; font-weight:800; padding:2px 6px; border-radius:99px; }
+  .b-win { background:rgba(46,197,182,.15); color:var(--teal); }
+  .b-sus { background:rgba(232,80,46,.15); color:var(--verm); }
+  .b-watch { background:rgba(242,179,52,.15); color:var(--gold); }
+  canvas { width:100%; height:160px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>til<em>t</em> dashboard</h1>
+  <p id="updated">loading…</p>
+</header>
+<div class="wrap">
+  <div class="grid" id="kpis"></div>
+
+  <div class="card">
+    <h2>Attention Yield Trend</h2>
+    <canvas id="tayChart" width="700" height="160"></canvas>
+  </div>
+
+  <div class="grid" style="margin-top:14px;">
+    <div class="card">
+      <h2>Engine Balance</h2>
+      <div id="engineBalance"></div>
+    </div>
+    <div class="card">
+      <h2>Catalog Health</h2>
+      <div id="catalogHealth"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Active Experiments</h2>
+    <table id="expTable"><thead><tr><th>Game</th><th>Variant</th><th>Status</th><th>Hypothesis</th></tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>Top Games by Attention</h2>
+    <table id="topGames"><thead><tr><th>Game</th><th>P</th><th>D</th><th>A</th><th>Grade</th></tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>Suspend Candidates</h2>
+    <table id="bottomGames"><thead><tr><th>Game</th><th>P</th><th>D</th><th>A</th><th>Grade</th></tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>Distribution by Hook Trick</h2>
+    <table id="trickTable"><thead><tr><th>Trick</th><th>Landings</th><th>Plays</th><th>Play Rate</th><th>Attn (min)</th></tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>Game Index Detail</h2>
+    <table id="indexTable"><thead><tr><th>Game</th><th>Variant</th><th>Pleasure</th><th>Dopamine</th><th>Addiction</th><th>Sessions</th></tr></thead><tbody></tbody></table>
+  </div>
+</div>
+
+<script>
+(function () {
+  function fmt(n, d) {
+    if (typeof n !== 'number' || isNaN(n)) return '—';
+    return n.toFixed(d);
+  }
+  function pct(n) { return fmt((n || 0) * 100, 1) + '%'; }
+
+  function render(summary) {
+    if (!summary || !summary.site) return renderEmpty('No analytics data yet. Run: node engine/loop.mjs report');
+    document.getElementById('updated').textContent = 'updated ' + (summary.generated_at ? new Date(summary.generated_at).toLocaleString() : 'now');
+
+    const s = summary.site;
+    const kpis = [
+      { label: 'Attention Yield', num: fmt(s.north_star.total_attention_min, 1) + 'm', sub: 'total minutes captured' },
+      { label: 'Attention / Visit', num: fmt(s.north_star.attention_per_visit_s, 0) + 's', sub: s.visitors.visits + ' visits' },
+      { label: 'Play Visit Rate', num: pct(s.funnel.play_visit_rate), sub: pct(s.funnel.site_bounce_rate) + ' bounce' },
+      { label: 'D1 Retention', num: pct(s.retention.d1), sub: 'D7 ' + pct(s.retention.d7) + ' · D30 ' + pct(s.retention.d30) }
+    ];
+    document.getElementById('kpis').innerHTML = kpis.map(function (k) {
+      return '<div class="kpi"><div class="label">' + k.label + '</div><div class="num">' + k.num + '</div><div class="sub">' + k.sub + '</div></div>';
+    }).join('');
+
+    drawTay(s.north_star.tay_series || []);
+    renderEngine(s.engine_balance);
+    renderCatalog(summary.catalog);
+    renderTable('expTable', (summary.experiments || []), function (ex) {
+      return [ex.game, ex.variant, statusBadge(ex.status), ex.hypothesis];
+    });
+    renderTable('topGames', (summary.catalog.top || []).slice(0, 10), function (g) {
+      return [g.game, g.indices.pleasure, g.indices.dopamine, g.indices.addiction, gradeBadge(g.grade)];
+    });
+    renderTable('bottomGames', (summary.catalog.bottom || []).slice(0, 10), function (g) {
+      return [g.game, g.indices.pleasure, g.indices.dopamine, g.indices.addiction, gradeBadge(g.grade)];
+    });
+    renderTable('trickTable', (summary.distribution.by_trick || []), function (t) {
+      return [t.key, t.landings, t.plays, pct(t.play_rate), fmt(t.attention_min, 1)];
+    });
+    renderTable('indexTable', (summary.indices || []).slice(0, 50), function (r) {
+      return [r.game, r.variant, r.indices.pleasure, r.indices.dopamine, r.indices.addiction, r.raw.sessions];
+    });
+  }
+
+  function gradeBadge(grade) {
+    const cls = grade === 'winner' ? 'b-win' : grade === 'suspend' ? 'b-sus' : 'b-watch';
+    return '<span class="badge ' + cls + '">' + (grade || '—') + '</span>';
+  }
+  function statusBadge(status) {
+    const cls = status === 'approved' ? 'b-win' : status === 'rejected' ? 'b-sus' : 'b-watch';
+    return '<span class="badge ' + cls + '">' + (status || '—') + '</span>';
+  }
+
+  function renderTable(id, rows, fn) {
+    const tbody = document.querySelector('#' + id + ' tbody');
+    if (!rows || !rows.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">no data</td></tr>'; return; }
+    tbody.innerHTML = rows.map(function (r) {
+      return '<tr>' + fn(r).map(function (c) { return '<td>' + c + '</td>'; }).join('') + '</tr>';
+    }).join('');
+  }
+
+  function renderEngine(b) {
+    const total = b.viral_attention_s + b.calm_attention_s;
+    const viral = total ? b.viral_attention_s / total : 0;
+    const calm = total ? b.calm_attention_s / total : 0;
+    document.getElementById('engineBalance').innerHTML =
+      '<div class="row"><span class="name">Viral</span><span class="val">' + pct(viral) + '</span></div>' +
+      '<div class="bar"><i class="verm" style="width:' + (viral * 100) + '%"></i></div>' +
+      '<div class="row" style="margin-top:10px"><span class="name">Calm</span><span class="val">' + pct(calm) + '</span></div>' +
+      '<div class="bar"><i class="teal" style="width:' + (calm * 100) + '%"></i></div>';
+  }
+
+  function renderCatalog(c) {
+    const total = c.total || 1;
+    document.getElementById('catalogHealth').innerHTML =
+      '<div class="row"><span class="name">Winners</span><span class="val">' + c.winners + '</span></div>' +
+      '<div class="bar"><i class="teal" style="width:' + (c.winners / total * 100) + '%"></i></div>' +
+      '<div class="row"><span class="name">Watch</span><span class="val">' + c.watch + '</span></div>' +
+      '<div class="bar"><i class="gold" style="width:' + (c.watch / total * 100) + '%"></i></div>' +
+      '<div class="row"><span class="name">Suspend</span><span class="val">' + c.suspend + '</span></div>' +
+      '<div class="bar"><i class="verm" style="width:' + (c.suspend / total * 100) + '%"></i></div>' +
+      '<div class="row" style="margin-top:10px"><span class="name">Vitality</span><span class="val">' + pct(c.catalog_vitality) + '</span></div>';
+  }
+
+  function drawTay(series) {
+    const c = document.getElementById('tayChart');
+    const ctx = c.getContext('2d');
+    const w = c.width, h = c.height;
+    ctx.clearRect(0, 0, w, h);
+    if (!series || series.length < 2) {
+      ctx.fillStyle = 'rgba(255,255,255,.3)'; ctx.font = '13px sans-serif';
+      ctx.fillText(series.length === 1 ? 'one day of data' : 'no trend data yet', 20, h / 2);
+      return;
+    }
+    const vals = series.map(function (d) { return d.attention_min; });
+    const max = Math.max.apply(null, vals) || 1;
+    const pad = 30;
+    ctx.strokeStyle = 'rgba(255,255,255,.1)'; ctx.lineWidth = 1;
+    for (var i = 0; i <= 4; i++) {
+      const y = pad + (h - 2 * pad) * (1 - i / 4);
+      ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(w - pad, y); ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,.3)'; ctx.font = '10px sans-serif';
+      ctx.fillText(Math.round(max * i / 4) + 'm', 4, y + 3);
+    }
+    ctx.strokeStyle = '#e8502e'; ctx.lineWidth = 2; ctx.beginPath();
+    series.forEach(function (d, i) {
+      const x = pad + (w - 2 * pad) * (i / (series.length - 1));
+      const y = pad + (h - 2 * pad) * (1 - d.attention_min / max);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+
+  function renderEmpty(msg) {
+    document.querySelector('.wrap').innerHTML = '<div class="empty">' + msg + '</div>';
+  }
+
+  fetch('analytics/summary.json').then(function (r) { return r.json(); }).then(render).catch(function (e) {
+    renderEmpty('Could not load analytics/summary.json.<br>Run <code>node engine/loop.mjs report</code> first.');
+  });
+})();
+</script>
+<div id="gate">
+  <h1>til<em>t</em> dashboard</h1>
+  <p style="color:rgba(255,255,255,.5);font-size:13px;">This page is private.</p>
+  <input type="password" id="dpw" placeholder="password" autocomplete="off">
+  <button id="dunlock">Unlock</button>
+  <p id="dmsg"></p>
+</div>
+<script>
+(function(){
+  var HASH='8d0d58e645c8bf5a9a1c959f006f4a853edb6b38ddc537eb3642230690005fdf';
+  function sha(str){return crypto.subtle.digest('SHA-256', new TextEncoder().encode(str)).then(function(b){return Array.from(new Uint8Array(b)).map(function(x){return x.toString(16).padStart(2,'0');}).join('');});}
+  function check(){var pw=document.getElementById('dpw').value; sha(pw).then(function(h){if(h===HASH){document.getElementById('gate').style.display='none'; try{sessionStorage.setItem('loop_dash_ok','1');}catch(_){}} else {document.getElementById('dmsg').textContent='wrong password';}});}
+  if(sessionStorage.getItem('loop_dash_ok')==='1') document.getElementById('gate').style.display='none';
+  document.getElementById('dunlock').onclick=check;
+  document.getElementById('dpw').addEventListener('keydown',function(e){if(e.key==='Enter') check();});
+})();
+</script>
+</body>
+</html>

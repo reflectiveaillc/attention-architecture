@@ -25,9 +25,11 @@ if (cmd === 'site') {
   const registry = JSON.parse(fs.readFileSync(path.join(STATE, 'registry.json'), 'utf8'));
   renderSite(path.join(ROOT, 'web', 'site'), registry);
   console.log(`site regenerated: ${registry.games.length} games, ${registry.games.reduce((a, g) => a + (g.variants?.length || 0), 0)} variants`);
+} else if (cmd === 'experiment') {
+  await runExperimentCLI();
 } else if (cmd === 'report') {
-  // behavioral indices across every event stream (runs + dev)
-  const { parseEvents, computeIndices } = await import('./lib/metrics.mjs');
+  // behavioral indices + site-wide analytics across every event stream (runs + dev)
+  const { parseEvents, computeIndices, computeSiteMetrics, computeDistributionMetrics, computeCatalogHealth } = await import('./lib/metrics.mjs');
   const files = [];
   const runsDir = path.join(STATE, 'runs');
   if (fs.existsSync(runsDir)) for (const d of fs.readdirSync(runsDir)) {
@@ -36,17 +38,79 @@ if (cmd === 'site') {
   }
   const devF = path.join(STATE, 'events', 'dev.jsonl');
   if (fs.existsSync(devF)) files.push(devF);
-  const rows = computeIndices(parseEvents(files));
+
+  const events = parseEvents(files);
+  const rows = computeIndices(events, { modes: ['human', 'bot', 'synthetic'] });
+
+  const registry = fs.existsSync(path.join(STATE, 'registry.json')) ? JSON.parse(fs.readFileSync(path.join(STATE, 'registry.json'), 'utf8')) : { games: [] };
+  const config = JSON.parse(fs.readFileSync(path.join(ROOT, 'engine', 'config.json'), 'utf8'));
+
+  const site = computeSiteMetrics(events, registry);
+  const distribution = computeDistributionMetrics(events, registry);
+  const catalog = computeCatalogHealth(events, registry, config);
+
+  // ---- site summary ----
+  console.log('\n━━━ SITE LOOP ━━━');
+  console.log(`attention yield: ${site.north_star.total_attention_min.toFixed(1)} min · ${site.visitors.visits} visits · ${site.visitors.total} visitors`);
+  console.log(`attention/visit: ${site.north_star.attention_per_visit_s.toFixed(0)}s · games/visit: ${site.discovery.games_tried_per_visit.median}`);
+  console.log(`bounce rate: ${(site.funnel.site_bounce_rate * 100).toFixed(1)}% · play visit rate: ${(site.funnel.play_visit_rate * 100).toFixed(1)}%`);
+  console.log(`D1/D7/D30: ${(site.retention.d1 * 100).toFixed(1)}% / ${(site.retention.d7 * 100).toFixed(1)}% / ${(site.retention.d30 * 100).toFixed(1)}% · repeat: ${(site.retention.repeat_share * 100).toFixed(1)}%`);
+  console.log(`engine balance: ${(site.engine_balance.viral_share * 100).toFixed(0)}% viral · ${((1 - site.engine_balance.viral_share) * 100).toFixed(0)}% calm`);
+  console.log(`catalog vitality: ${(catalog.catalog_vitality * 100).toFixed(1)}% (${catalog.winners} winners / ${catalog.watch} watch / ${catalog.suspend} suspend)`);
+
+  // ---- per-game indices ----
+  console.log('\n━━━ GAME INDICES ━━━');
   console.log('game'.padEnd(22), 'variant'.padEnd(9), 'PLSR', 'DOPA', 'ADDX', ' sessions', 'med_restart', 'nm_pull');
   for (const r of rows) {
     console.log(r.game.padEnd(22), r.variant.padEnd(9),
       String(r.indices.pleasure).padStart(4), String(r.indices.dopamine).padStart(4), String(r.indices.addiction).padStart(4),
       String(r.raw.sessions).padStart(9), String(r.raw.med_restart_ms + 'ms').padStart(11), String(r.raw.near_miss_pull).padStart(7));
   }
+
+  // ---- top/bottom catalog ----
+  if (catalog.top.length) {
+    console.log('\n━━━ TOP GAMES ━━━');
+    for (const g of catalog.top.slice(0, 5)) {
+      console.log(`${g.game.padEnd(22)} P${g.indices.pleasure} D${g.indices.dopamine} A${g.indices.addiction} · ${g.grade}`);
+    }
+  }
+  if (catalog.bottom.length) {
+    console.log('\n━━━ SUSPEND CANDIDATES ━━━');
+    for (const g of catalog.bottom.slice(0, 5)) {
+      console.log(`${g.game.padEnd(22)} P${g.indices.pleasure} D${g.indices.dopamine} A${g.indices.addiction} · ${g.grade}`);
+    }
+  }
+
+  // active experiments (testing/approved variants) for the dashboard
+  const experiments = [];
+  for (const g of (registry.games || [])) {
+    for (const raw of (g.variants || [])) {
+      const v = typeof raw === 'string' ? { id: raw, status: 'live' } : raw;
+      if (v.status === 'testing' || v.status === 'approved') {
+        experiments.push({ game: g.id, game_name: g.name, variant: v.id, status: v.status, hypothesis: v.hypothesis || '' });
+      }
+    }
+  }
+
+  if (experiments.length) {
+    console.log('\n━━━ ACTIVE EXPERIMENTS ━━━');
+    for (const ex of experiments) console.log(`${ex.game.padEnd(22)} ${ex.variant.padEnd(28)} ${ex.status.padEnd(10)} ${ex.hypothesis}`);
+  }
+
+  const summary = {
+    generated_at: new Date().toISOString(),
+    event_files: files,
+    total_events: events.length,
+    site, distribution, catalog, indices: rows, experiments
+  };
   const outF = path.join(STATE, 'analytics', 'summary.json');
   fs.mkdirSync(path.dirname(outF), { recursive: true });
-  fs.writeFileSync(outF, JSON.stringify({ generated_at: new Date().toISOString(), rows }, null, 2));
-  console.log(`\nwritten: ${path.relative(process.cwd(), outF)}`);
+  fs.writeFileSync(outF, JSON.stringify(summary, null, 2));
+  // copy to web/site so the served dashboard can fetch it
+  const siteAnalyticsDir = path.join(ROOT, 'web', 'site', 'analytics');
+  fs.mkdirSync(siteAnalyticsDir, { recursive: true });
+  fs.writeFileSync(path.join(siteAnalyticsDir, 'summary.json'), JSON.stringify(summary, null, 2));
+  console.log(`\nwritten: ${path.relative(process.cwd(), outF)} + web/site/analytics/summary.json`);
 } else if (cmd === 'serve') {
   const { startCollector } = await import('./lib/collector.mjs');
   const eventsFile = path.join(STATE, 'events', 'dev.jsonl');
@@ -61,7 +125,7 @@ if (cmd === 'site') {
   const seed = seedArg > -1 ? +process.argv[seedArg + 1] : 7;
   await runLoop({ seed });
 } else {
-  console.error(`unknown command: ${cmd} (use: run | serve)`);
+  console.error(`unknown command: ${cmd} (use: run | serve | site | report | experiment)`);
   process.exit(1);
 }
 
@@ -114,4 +178,83 @@ async function runLoop({ seed }) {
   console.log(`  action:  ${ctx.results.learn.action}`);
   console.log(`  report:  ${path.relative(process.cwd(), path.join(runDir, 'report.json'))}`);
   console.log(`  events:  ${m.clip_impressions} impressions → ${m.clip_landings} landings → ${m.players} players (real bot events: ${ctx.results.measure.provenance.real_events})`);
+}
+
+async function runExperimentCLI() {
+  const sub = process.argv[3];
+  const registryPath = path.join(STATE, 'registry.json');
+  const { loadExperimentState, addVariant, resolveVariant, evaluateVariant, suggestVariants } = await import('./lib/experiment.mjs');
+  const { parseEvents, computeGameReport } = await import('./lib/metrics.mjs');
+
+  // gather all events
+  const files = [];
+  const runsDir = path.join(STATE, 'runs');
+  if (fs.existsSync(runsDir)) for (const d of fs.readdirSync(runsDir)) {
+    const f = path.join(runsDir, d, 'events.jsonl');
+    if (fs.existsSync(f)) files.push(f);
+  }
+  const devF = path.join(STATE, 'events', 'dev.jsonl');
+  if (fs.existsSync(devF)) files.push(devF);
+  const events = parseEvents(files);
+
+  if (sub === 'list') {
+    const gameId = process.argv[4];
+    const normV = (v) => typeof v === 'string' ? { id: v, status: 'live' } : v;
+    if (!gameId) {
+      const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+      for (const g of registry.games) {
+        if (!g.variants || !g.variants.length) continue;
+        console.log(`\n${g.id}: ${g.name}`);
+        for (const raw of g.variants) {
+          const v = normV(raw);
+          console.log(`  ${v.id.padEnd(32)} ${(v.status || 'live').padEnd(12)} ${v.hypothesis || ''}`);
+        }
+      }
+      return;
+    }
+    const state = loadExperimentState(registryPath, gameId);
+    if (!state) { console.error('game not found'); process.exit(1); }
+    for (const v of state.variants) console.log(`${v.id.padEnd(32)} ${(v.status || 'live').padEnd(12)} ${v.hypothesis || ''}`);
+  } else if (sub === 'suggest') {
+    const gameId = process.argv[4];
+    if (!gameId) { console.error('usage: experiment suggest <gameId>'); process.exit(1); }
+    const report = computeGameReport(events, gameId, { modes: ['human', 'bot', 'synthetic'] });
+    const ideas = suggestVariants(report);
+    console.log(`${gameId} · ${report.indices.pleasure}/${report.indices.dopamine}/${report.indices.addiction} · ideas:`);
+    for (const idea of ideas) console.log(`  - ${idea.id}: ${idea.hypothesis}`);
+  } else if (sub === 'start') {
+    const gameId = process.argv[4];
+    const variantId = process.argv[5];
+    if (!gameId || !variantId) { console.error('usage: experiment start <gameId> <variantId>'); process.exit(1); }
+    const report = computeGameReport(events, gameId, { modes: ['human', 'bot', 'synthetic'] });
+    const ideas = suggestVariants(report);
+    const idea = ideas.find((i) => i.id === variantId);
+    if (!idea) { console.error('unknown variant idea; run `experiment suggest` first'); process.exit(1); }
+    addVariant(registryPath, gameId, idea);
+    console.log(`started ${variantId} on ${gameId}`);
+  } else if (sub === 'evaluate') {
+    const gameId = process.argv[4];
+    if (!gameId) { console.error('usage: experiment evaluate <gameId> [--metric play_rate|d1_retention|avg_session_s|runs_per_session|share_rate]'); process.exit(1); }
+    const metricArg = process.argv.indexOf('--metric');
+    const metric = metricArg > -1 ? process.argv[metricArg + 1] : 'play_rate';
+    const state = loadExperimentState(registryPath, gameId);
+    if (!state) { console.error('game not found'); process.exit(1); }
+    const testing = state.variants.filter((v) => v.status === 'testing');
+    if (!testing.length) { console.log('no testing variants'); return; }
+    for (const v of testing) {
+      const res = evaluateVariant(events, gameId, 'base', v.id, metric);
+      console.log(`\n${gameId} · ${v.id} · ${metric}`);
+      console.log(`  base: ${JSON.stringify(res.base)}`);
+      console.log(`  test: ${JSON.stringify(res.test)}`);
+      console.log(`  lift: ${(res.lift * 100).toFixed(1)}% · p: ${res.p.toFixed(3)} · n: ${res.n_base}/${res.n_test}`);
+      console.log(`  verdict: ${res.verdict}`);
+      if (res.verdict === 'approve' || res.verdict === 'reject') {
+        resolveVariant(registryPath, gameId, v.id, res.verdict === 'approve' ? 'approved' : 'rejected');
+        console.log(`  resolved → ${res.verdict === 'approve' ? 'approved' : 'rejected'}`);
+      }
+    }
+  } else {
+    console.error('usage: experiment [list|suggest|start|evaluate]');
+    process.exit(1);
+  }
 }
