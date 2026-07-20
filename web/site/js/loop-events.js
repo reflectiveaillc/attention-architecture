@@ -110,6 +110,18 @@
       page_type: pageType
     }, props || {});
 
+    // mirror to PostHog with clean event names and game-scoped properties
+    if (window.posthog && window.posthog.capture) {
+      try {
+        var phProps = {};
+        for (var k in e) {
+          if (k === 'ts' || k === 'event') continue;
+          phProps[k] = e[k];
+        }
+        window.posthog.capture(event, phProps);
+      } catch (_) {}
+    }
+
     // auto-derived dopamine/pleasure signals
     if (event === 'play_start' || event === 'restart') {
       if (!firstPlaySource) {
@@ -356,6 +368,24 @@
     return Math.abs(h);
   }
 
+  // ---- PostHog identity + super properties ----
+  function wirePostHog() {
+    var ph = window.posthog;
+    if (!ph || !ph.identify) return;
+    try {
+      ph.identify(vid);
+      ph.register({
+        visit_n: visitN,
+        mode: mode,
+        clip_id: clipId,
+        src: src,
+        late_night: lateNight,
+        game_count: typeof window.LOOP_GAME_COUNT === 'number' ? window.LOOP_GAME_COUNT : 383,
+        site_domain: location.hostname
+      });
+    } catch (_) {}
+  }
+
   // ---- public API ----
   window.LOOP = {
     emit: emit,
@@ -369,11 +399,15 @@
     assignVariant: assignVariant
   };
 
-  // ---- load shared analytics (Vercel Web Analytics + Hotjar) on every page ----
+  // ---- load shared analytics (Vercel Web Analytics + Hotjar + PostHog) on every page ----
   (function () {
     var s = document.createElement('script');
     s.src = '/js/analytics.js';
     s.async = true;
     document.head.appendChild(s);
   })();
+
+  // Hook into PostHog when it finishes loading
+  document.addEventListener('loop_posthog_ready', wirePostHog);
+  if (window.posthog && window.posthog.identify) wirePostHog();
 })();

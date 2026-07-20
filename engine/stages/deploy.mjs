@@ -54,7 +54,10 @@ function analyticsHead() {
     vercel: true,
     hotjar: (process.env.HOTJAR_SITE_ID && process.env.HOTJAR_SNIPPET_VERSION)
       ? { id: +process.env.HOTJAR_SITE_ID, sv: +process.env.HOTJAR_SNIPPET_VERSION }
-      : (process.env.HOTJAR_SITE_ID ? { id: +process.env.HOTJAR_SITE_ID, sv: 6 } : null)
+      : (process.env.HOTJAR_SITE_ID ? { id: +process.env.HOTJAR_SITE_ID, sv: 6 } : null),
+    posthog: (process.env.POSTHOG_API_KEY)
+      ? { apiKey: process.env.POSTHOG_API_KEY, apiHost: process.env.POSTHOG_API_HOST || 'https://us.i.posthog.com' }
+      : null
   };
   return `\n<script>window.LOOP_ANALYTICS = ${JSON.stringify(cfg)};</script>\n<script src="js/analytics.js"></script>`;
 }

@@ -25,4 +25,35 @@
     s.src = 'https://static.hotjar.com/c/hotjar-' + hj.id + '.js?sv=' + window._hjSettings.hjsv;
     document.head.appendChild(s);
   }
+
+  // PostHog — product analytics for platform + per-game engagement.
+  // Set POSTHOG_API_KEY (phc_...) and optionally POSTHOG_API_HOST at deploy time.
+  var ph = cfg.posthog;
+  if (ph && ph.apiKey) {
+    var host = ph.apiHost || 'https://us.i.posthog.com';
+    var phScript = document.createElement('script');
+    phScript.defer = true;
+    phScript.src = 'https://us-assets.i.posthog.com/static/array.js';
+    phScript.onload = function () {
+      if (window.posthog && window.posthog.init) {
+        window.posthog.init(ph.apiKey, {
+          api_host: host,
+          capture_pageview: true,
+          capture_pageleave: true,
+          autocapture: true,
+          person_profiles: 'identified_only',
+          loaded: function (posthog) {
+            window.LOOP_POSTHOG = posthog;
+            // Notify any listener that PostHog is ready
+            try {
+              var ev = document.createEvent('Event');
+              ev.initEvent('loop_posthog_ready', true, true);
+              document.dispatchEvent(ev);
+            } catch (_) {}
+          }
+        });
+      }
+    };
+    document.head.appendChild(phScript);
+  }
 })();
