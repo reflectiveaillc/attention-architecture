@@ -439,3 +439,110 @@ export function computeCatalogHealth(events, registry, config, { modes = ['human
     bottom: gradable.slice().sort((a, b) => (a.indices.pleasure + a.indices.dopamine) - (b.indices.pleasure + b.indices.dopamine)).slice(0, 10)
   };
 }
+
+// Circuit heatmap: how often each designed circuit actually fires.
+export function computeCircuitMetrics(events, registry = null) {
+  const gameEngine = {};
+  if (registry && registry.games) for (const g of registry.games) gameEngine[g.id] = g.engine;
+
+  const circuitStats = {};
+  const human = events.filter((e) => e.mode === 'human');
+  for (const e of human) {
+    const circuits = e.circuits || [];
+    for (const c of circuits) {
+      circuitStats[c] ||= { targets: 0, fired: 0, visitors: new Set(), engine: gameEngine[e.game] || e.features?.engine || 'unknown' };
+      circuitStats[c].targets++;
+    }
+    if (e.event === 'circuit_fired' && e.circuit) {
+      circuitStats[e.circuit] ||= { targets: 0, fired: 0, visitors: new Set(), engine: 'unknown' };
+      circuitStats[e.circuit].fired++;
+      if (e.vid) circuitStats[e.circuit].visitors.add(e.vid);
+    }
+  }
+  return Object.entries(circuitStats).map(([id, o]) => ({
+    circuit: id,
+    engine: o.engine,
+    target_events: o.targets,
+    fired: o.fired,
+    activation_rate: o.targets ? +(o.fired / o.targets).toFixed(3) : 0,
+    unique_visitors: o.visitors.size
+  })).sort((a, b) => b.activation_rate - a.activation_rate);
+}
+
+// Feature comparison matrix: face vs tap, sound vs silent, viral vs calm, etc.
+export function computeFeatureMetrics(events, registry = null) {
+  const human = events.filter((e) => e.mode === 'human');
+  const groups = {};
+  function key(e) {
+    const f = e.features || {};
+    return `${f.engine || 'unknown'}|${f.input || 'tap'}|${f.face_control ? 'face' : 'touch'}|${f.has_sound ? 'sound' : 'silent'}`;
+  }
+  for (const e of human) {
+    const k = key(e);
+    groups[k] ||= { sessions: new Set(), visitors: new Set(), plays: new Set(), attention_s: 0, game: e.game };
+    const g = groups[k];
+    if (e.vsid) g.sessions.add(e.vsid);
+    if (e.vid) g.visitors.add(e.vid);
+    if (e.event === 'play_start' && e.vid) g.plays.add(e.vid);
+    if (e.event === 'session_end' && typeof e.play_s === 'number') g.attention_s += e.play_s;
+  }
+  return Object.entries(groups).map(([k, o]) => {
+    const [engine, input, control, sound] = k.split('|');
+    return { engine, input, control, sound, sessions: o.sessions.size, visitors: o.visitors.size, plays: o.plays.size, attention_min: +(o.attention_s / 60).toFixed(1) };
+  }).sort((a, b) => b.attention_min - a.attention_min);
+}
+
+// Trend signals: time-series P/D/A + recent anomalies + engine balance drift.
+export function computeTrendSignals(events, registry, config) {
+  const human = events.filter((e) => e.mode === 'human');
+  const byDay = {};
+  const gameEngine = {};
+  if (registry && registry.games) for (const g of registry.games) gameEngine[g.id] = g.engine;
+
+  for (const e of human) {
+    const d = dayOf(e.ts);
+    byDay[d] ||= { events: 0, visitors: new Set(), play_starts: 0, sessions: new Set(), attention_s: 0, viral_s: 0, calm_s: 0 };
+    const o = byDay[d];
+    o.events++;
+    if (e.vid) o.visitors.add(e.vid);
+    if (e.event === 'play_start') o.play_starts++;
+    if (e.vsid) o.sessions.add(e.vsid);
+    if (e.event === 'session_end' && typeof e.play_s === 'number') {
+      o.attention_s += e.play_s;
+      if ((gameEngine[e.game] || e.features?.engine) === 'calm') o.calm_s += e.play_s; else o.viral_s += e.play_s;
+    }
+  }
+
+  const series = Object.entries(byDay).sort().map(([day, o]) => ({
+    day,
+    events: o.events,
+    visitors: o.visitors.size,
+    play_starts: o.play_starts,
+    sessions: o.sessions.size,
+    attention_min: +(o.attention_s / 60).toFixed(1),
+    viral_share: o.attention_s ? +(o.viral_s / o.attention_s).toFixed(2) : 0,
+    calm_share: o.attention_s ? +(o.calm_s / o.attention_s).toFixed(2) : 0
+  }));
+
+  const liveWindow = series.length ? { start: series[0].day, end: series[series.length - 1].day, days: series.length } : null;
+
+  // top movers: games with biggest attention change day-over-day
+  const gameDays = {};
+  for (const e of human) {
+    const d = dayOf(e.ts);
+    gameDays[e.game] ||= {};
+    gameDays[e.game][d] ||= { attention_s: 0, visitors: new Set() };
+    if (e.event === 'session_end' && typeof e.play_s === 'number') gameDays[e.game][d].attention_s += e.play_s;
+    if (e.vid) gameDays[e.game][d].visitors.add(e.vid);
+  }
+  const movers = Object.entries(gameDays).map(([game, days]) => {
+    const sorted = Object.entries(days).sort();
+    if (sorted.length < 2) return null;
+    const latest = sorted[sorted.length - 1][1];
+    const prev = sorted[sorted.length - 2][1];
+    const change = prev.attention_s ? (latest.attention_s - prev.attention_s) / prev.attention_s : 0;
+    return { game, attention_change_pct: +(change * 100).toFixed(1), latest_min: +(latest.attention_s / 60).toFixed(1), visitors: latest.visitors.size };
+  }).filter(Boolean).sort((a, b) => b.attention_change_pct - a.attention_change_pct).slice(0, 10);
+
+  return { series, movers, live_window: liveWindow };
+}

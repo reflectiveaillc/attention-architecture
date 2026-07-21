@@ -31,9 +31,13 @@
     master.connect(ctx.destination);
     return true;
   }
+  function emitJuice(event, props) {
+    if (window.LOOP && window.LOOP.emit) window.LOOP.emit(event, props || {});
+  }
   function unlock() {
     if (!ensure()) return;
     if (ctx.state === 'suspended') ctx.resume();
+    emitJuice('audio_unlocked');
   }
   window.addEventListener('pointerdown', unlock, { capture: true });
   window.addEventListener('keydown', unlock, { capture: true });
@@ -78,6 +82,7 @@
       muted = !muted;
       try { localStorage.setItem('loop_muted', muted ? '1' : '0'); } catch (_) {}
       if (master) master.gain.value = muted ? 0 : 0.55;
+      emitJuice('mute_toggle', { muted: muted });
       return muted;
     },
     hit: function (combo) {

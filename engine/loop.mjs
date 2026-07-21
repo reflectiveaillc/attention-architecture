@@ -27,9 +27,24 @@ if (cmd === 'site') {
   console.log(`site regenerated: ${registry.games.length} games, ${registry.games.reduce((a, g) => a + (g.variants?.length || 0), 0)} variants`);
 } else if (cmd === 'experiment') {
   await runExperimentCLI();
+} else if (cmd === 'taxonomy') {
+  const tax = await import('./lib/posthog-taxonomy.mjs');
+  await tax.apply({
+    projectId: process.env.POSTHOG_PROJECT_ID || '521236',
+    apiKey: process.env.POSTHOG_PERSONAL_API_KEY,
+    host: process.env.POSTHOG_APP_HOST || 'https://us.posthog.com'
+  });
+} else if (cmd === 'ingest') {
+  const { run } = await import('./stages/ingest.mjs');
+  await run({ stateDir: STATE, log: (msg) => console.log(`  ${msg}`) });
+} else if (cmd === 'feed') {
+  const { default: runFeed } = await import('./stages/feed.mjs');
+  const countArg = process.argv.indexOf('--count');
+  const feed = await runFeed({ feedCount: countArg > -1 ? +process.argv[countArg + 1] : 6 });
+  console.log(`feed: hot=${feed.hot_circuit}, tilt=${feed.engine_tilt}, rescue=${feed.concepts.find((c) => c.source === 'rescue_bottom')?.id || 'none'}`);
 } else if (cmd === 'report') {
   // behavioral indices + site-wide analytics across every event stream (runs + dev)
-  const { parseEvents, computeIndices, computeSiteMetrics, computeDistributionMetrics, computeCatalogHealth } = await import('./lib/metrics.mjs');
+  const { parseEvents, computeIndices, computeSiteMetrics, computeDistributionMetrics, computeCatalogHealth, computeCircuitMetrics, computeFeatureMetrics, computeTrendSignals } = await import('./lib/metrics.mjs');
   const files = [];
   const runsDir = path.join(STATE, 'runs');
   if (fs.existsSync(runsDir)) for (const d of fs.readdirSync(runsDir)) {
@@ -38,6 +53,8 @@ if (cmd === 'site') {
   }
   const devF = path.join(STATE, 'events', 'dev.jsonl');
   if (fs.existsSync(devF)) files.push(devF);
+  const liveF = path.join(STATE, 'events', 'live.jsonl');
+  if (fs.existsSync(liveF)) files.push(liveF);
 
   const events = parseEvents(files);
   const rows = computeIndices(events, { modes: ['human', 'bot', 'synthetic'] });
@@ -48,6 +65,9 @@ if (cmd === 'site') {
   const site = computeSiteMetrics(events, registry);
   const distribution = computeDistributionMetrics(events, registry);
   const catalog = computeCatalogHealth(events, registry, config);
+  const circuits = computeCircuitMetrics(events, registry);
+  const features = computeFeatureMetrics(events, registry);
+  const trends = computeTrendSignals(events, registry, config);
 
   // ---- site summary ----
   console.log('\n━━━ SITE LOOP ━━━');
@@ -101,7 +121,8 @@ if (cmd === 'site') {
     generated_at: new Date().toISOString(),
     event_files: files,
     total_events: events.length,
-    site, distribution, catalog, indices: rows, experiments
+    live_window: trends.live_window,
+    site, distribution, catalog, circuits, features, trends, indices: rows, experiments
   };
   const outF = path.join(STATE, 'analytics', 'summary.json');
   fs.mkdirSync(path.dirname(outF), { recursive: true });
@@ -125,7 +146,7 @@ if (cmd === 'site') {
   const seed = seedArg > -1 ? +process.argv[seedArg + 1] : 7;
   await runLoop({ seed });
 } else {
-  console.error(`unknown command: ${cmd} (use: run | serve | site | report | experiment)`);
+  console.error(`unknown command: ${cmd} (use: run | serve | site | report | experiment | ingest | feed)`);
   process.exit(1);
 }
 

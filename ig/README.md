@@ -1,6 +1,6 @@
 # IG distribution pipeline — @viral_free_online_games
 
-Site: https://tilt-games.vercel.app (Vercel project `tilt-games`, team reflectiveaillc).
+Site: https://www.viralfreegames.com (custom domain, LIVE; Vercel project `tilt-games`, team reflectiveaillc; old default tilt-games.vercel.app still serves).
 Deploy: `cd web/site && vercel deploy --prod --yes` (project linked via web/site/.vercel/).
 
 Pipeline (all idempotent):
@@ -20,7 +20,7 @@ Pipeline (all idempotent):
 MANUEL GATES (one-time):
 - Log the account in: `cd ~/coo/content-studio/social-autopilot && node post-ig.mjs tilt --check`
   → browser opens on the tilt profile → log into IG as viral_free_online_games → rerun --check until identity confirms.
-- Set the IG bio link to https://tilt-games.vercel.app
+- Set the IG bio link to https://www.viralfreegames.com
 - Arm the drip: `launchctl load ~/Library/LaunchAgents/com.manuel.tilt-post.plist`
 
 Runway (BLITZ, Manuel 2026-07-19): 12/day (cfg maxPerDay, engine hard-ceiling 12 — IG API itself caps 25/24h; more = action-block risk) ≈ 32 days. First night: 7 posts 19:30→23:30 ET.

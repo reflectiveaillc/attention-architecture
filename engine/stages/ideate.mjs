@@ -85,12 +85,29 @@ const CONCEPTS = {
 
 export async function run(ctx) {
   const top = ctx.results.signal.feed[0];
-  const concept = CONCEPTS[top.mechanic] || {
-    id: top.mechanic, name: top.mechanic, engine: 'viral', mechanic: top.mechanic,
-    theme: top.theme || 'minimal', circuits: top.circuits || ['01-rpe'],
-    hook_clip_concept: 'best 3s of the mechanic → near-miss → CTA'
-  };
-  const card = { ...concept, from_trend: { mechanic: top.mechanic, score: top.score }, generator: 'template (R4: LLM)' };
+  let card;
+  if (top.analytics_concept) {
+    const c = top.analytics_concept;
+    card = {
+      id: c.id,
+      name: c.id.replace(/^loop-/, '').replace(/-/g, ' '),
+      engine: c.engine,
+      mechanic: c.input,
+      theme: c.rationale,
+      circuits: [c.primary_circuit],
+      hook_clip_concept: c.prompt_seed,
+      from_trend: { mechanic: c.id, score: top.score },
+      generator: 'analytics_feed',
+      features: { input: c.input, face_control: c.face_control, has_sound: c.has_sound }
+    };
+  } else {
+    const concept = CONCEPTS[top.mechanic] || {
+      id: top.mechanic, name: top.mechanic, engine: 'viral', mechanic: top.mechanic,
+      theme: top.theme || 'minimal', circuits: top.circuits || ['01-rpe'],
+      hook_clip_concept: 'best 3s of the mechanic → near-miss → CTA'
+    };
+    card = { ...concept, from_trend: { mechanic: top.mechanic, score: top.score }, generator: 'template (R4: LLM)' };
+  }
   ctx.log(`ideate: concept = ${card.name} [${card.engine}] circuits ${card.circuits.join(', ')}`);
   return { concept: card };
 }

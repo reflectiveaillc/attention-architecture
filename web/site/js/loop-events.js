@@ -34,8 +34,11 @@
  */
 (function () {
   var qs = new URLSearchParams(location.search);
-  var sink = qs.get('sink') || window.LOOP_SINK || null;
+  var cfg = window.LOOP_ANALYTICS || {};
+  var sink = qs.get('sink') || window.LOOP_SINK || cfg.sink || null;
   var clipId = qs.get('clip') || null;
+  var meta = window.LOOP_GAME_META || {};
+  var gameId = meta.id || window.LOOP_GAME || 'unknown';
   var src = qs.get('src') || (document.referrer ? 'referrer:' + document.referrer : 'direct');
   var mode = qs.get('demo') ? 'demo' : qs.get('bot') ? 'bot' : 'human';
   var variant = qs.get('v') || window.LOOP_VARIANT || 'base';
@@ -82,6 +85,7 @@
     t0: Date.now(), lastGameOver: 0, lastDeathHadNearMiss: false, runNearMiss: false,
     browse_t0: Date.now(), browse_maxScroll: 0,
     gameOvers: [], // recent dur_s for difficulty-spike detection
+    deathTs: [],   // recent death timestamps for rage-quit detection
     lastComplete: 0, calmNoted: false
   };
 
@@ -102,13 +106,31 @@
 
   // ---- core emit ----
   var firstPlaySource = null;
+  function baseProps() {
+    return {
+      game: gameId, variant: variant, mode: mode,
+      clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
+      page_type: pageType,
+      circuits: meta.circuits || [],
+      features: meta.features || {},
+      trick: meta.trick || '',
+      variant_hypothesis: window.LOOP_VARIANT_HYPOTHESIS || ''
+    };
+  }
+
+  var tapNoted = false;
+  function noteFirstTap() {
+    if (tapNoted) return;
+    tapNoted = true;
+    emit('first_tap');
+  }
+  window.addEventListener('pointerdown', noteFirstTap, { once: true, passive: true });
+  window.addEventListener('keydown', noteFirstTap, { once: true, passive: true });
+
   function emit(event, props) {
     var e = Object.assign({
-      event: event, ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
-      game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
-      clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
-      page_type: pageType
-    }, props || {});
+      event: event, ts: Date.now(), vid: vid, vsid: vsid, sid: sid
+    }, baseProps(), props || {});
 
     // mirror to PostHog with clean event names and game-scoped properties
     if (window.posthog && window.posthog.capture) {
@@ -133,27 +155,44 @@
         if (ms < 60000) {
           if (ms < 800) S.fast_restarts++;
           send(Object.assign({}, e, { event: 'restart_latency', ms: ms, after_near_miss: S.lastDeathHadNearMiss }));
+          if (ms < 1000) send(Object.assign({}, e, { event: 'compulsive_return', ms: ms }));
         }
         S.lastGameOver = 0;
       }
-      if (event === 'play_start') { S.runs++; S.runNearMiss = false; }
+      if (event === 'play_start') {
+        S.runs++; S.runNearMiss = false;
+        resetEarlyQuit();
+        earlyQuitTimer = setTimeout(function () {
+          earlyQuitTimer = 0;
+          emit('early_quit', { after_s: 10 });
+        }, 10000);
+      }
     }
     if (event === 'near_miss') { S.near_misses++; S.runNearMiss = true; }
     if (event === 'game_over') {
+      resetEarlyQuit();
       S.lastGameOver = Date.now();
       S.lastDeathHadNearMiss = S.runNearMiss;
       if (typeof e.dur_s === 'number') {
         S.play_s += e.dur_s;
         S.gameOvers.push(e.dur_s);
+        S.deathTs.push(Date.now() / 1000);
         if (S.gameOvers.length > 5) S.gameOvers.shift();
+        if (S.deathTs.length > 5) S.deathTs.shift();
         // standardized game result summary
-        var engine = window.LOOP_ENGINE || (window.LOOP_CALM ? 'calm' : 'viral');
+        var engine = window.LOOP_ENGINE || (meta.engine || 'viral');
+        var pr = typeof e.score === 'number' && e.score >= S.best;
         send(Object.assign({}, e, {
           event: 'game_result',
           score: e.score, dur_s: e.dur_s, stage: e.stage || null,
-          best: S.best, personal_record: typeof e.score === 'number' && e.score >= S.best,
+          best: S.best, personal_record: pr,
           engine: engine
         }));
+        if (pr) {
+          var wm = Object.assign({}, e, { event: 'win_moment', score: e.score });
+          send(wm);
+          fireCircuits('win_moment', wm);
+        }
         // difficulty spike: last 3 runs all under 8s or under half median
         if (S.gameOvers.length >= 3) {
           var last3 = S.gameOvers.slice(-3);
@@ -165,46 +204,68 @@
       }
       if (typeof e.score === 'number' && e.score > S.best) S.best = e.score;
     }
+
+    // circuit activation signals
+    fireCircuits(event, e);
+
     send(e);
   }
 
+  function fireCircuits(event, e) {
+    var circuits = meta.circuits || [];
+    if (!circuits.length) return;
+    var map = {
+      'near_miss': ['04-loss', '06-zeigarnik'],
+      'share': ['03-social'],
+      'outbound_share': ['03-social'],
+      'challenge_landed': ['03-social', '06-zeigarnik'],
+      'challenge_beaten': ['01-rpe', '03-social'],
+      'calm_moment': ['05-ease', '07-timing'],
+      'd1_return': ['08-garden', '06-zeigarnik'],
+      'd7_return': ['08-garden'],
+      'win_moment': ['01-rpe', '03-social']
+    };
+    var list = map[event];
+    if (!list) return;
+    for (var i = 0; i < list.length; i++) {
+      if (circuits.indexOf(list[i]) !== -1) {
+        send(Object.assign({}, e, { event: 'circuit_fired', circuit: list[i], trigger_event: event }));
+      }
+    }
+  }
+
+  // early-quit detection: play_start with no game_over within 10s
+  var earlyQuitTimer = 0;
+  function resetEarlyQuit() { if (earlyQuitTimer) clearTimeout(earlyQuitTimer); earlyQuitTimer = 0; }
+
   // ---- session / browse end ----
   function sessionEnd() {
-    if (S.runs === 0 && S.play_s === 0 && pageType !== 'game') {
-      // still emit browse_end for index/hub
-      if (pageType === 'index' || pageType === 'hub') {
-        send({
-          event: 'browse_end', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
-          game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
-          clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
-          page_type: pageType, browse_s: +((Date.now() - S.browse_t0) / 1000).toFixed(1),
-          max_scroll: S.browse_maxScroll
-        });
-      }
-      return;
-    }
+    var nowTs = Date.now();
+    var span = +((nowTs - S.t0) / 1000).toFixed(1);
+    var browseS = +((nowTs - S.browse_t0) / 1000).toFixed(1);
+
+    // rage-quit: 3+ deaths within 30s before leaving
+    var recentDeaths = S.gameOvers.filter(function (d) { return (nowTs / 1000) - d < 30; });
+    var isRage = recentDeaths.length >= 3;
+
     if (S.runs > 0 || S.play_s > 0) {
-      send({
-        event: 'session_end', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
-        game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
-        clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
-        page_type: pageType,
+      var endProps = {
         runs: S.runs, play_s: +S.play_s.toFixed(1), best: S.best,
         fast_restarts: S.fast_restarts, near_misses: S.near_misses,
-        span_s: +((Date.now() - S.t0) / 1000).toFixed(1)
-      });
+        span_s: span, rage_quit: isRage
+      };
+      if (meta.features && meta.features.engine === 'calm') {
+        endProps.calm_exit = true;
+        emit('calm_exit', { after_run: S.runs, span_s: span });
+      }
+      emit('session_end', endProps);
+      if (isRage) emit('rage_quit', { deaths_30s: recentDeaths.length });
     }
     if (pageType === 'index' || pageType === 'hub') {
-      send({
-        event: 'browse_end', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
-        game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
-        clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
-        page_type: pageType, browse_s: +((Date.now() - S.browse_t0) / 1000).toFixed(1),
-        max_scroll: S.browse_maxScroll
-      });
+      emit('browse_end', { browse_s: browseS, max_scroll: S.browse_maxScroll });
     }
-    S.runs = 0; S.play_s = 0; S.fast_restarts = 0; S.near_misses = 0; S.t0 = Date.now();
-    S.browse_t0 = Date.now(); S.browse_maxScroll = 0;
+    S.runs = 0; S.play_s = 0; S.fast_restarts = 0; S.near_misses = 0; S.t0 = nowTs;
+    S.browse_t0 = nowTs; S.browse_maxScroll = 0; S.deathTs = []; S.calmNoted = false;
   }
   document.addEventListener('visibilitychange', function () { if (document.hidden) sessionEnd(); });
   window.addEventListener('pagehide', sessionEnd);
@@ -224,18 +285,13 @@
   try {
     var lastVs = sessionStorage.getItem('loop_vs_last');
     if (!lastVs) {
-      send({ event: 'visit_start', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
-        variant: variant, mode: mode, clip_id: clipId, src: src, visit_n: visitN,
-        hour: hour, late_night: lateNight, page_type: pageType });
+      emit('visit_start');
       sessionStorage.setItem('loop_vs_last', String(Date.now()));
     }
   } catch (_) {}
 
   // ---- browse start for index/hub/game ----
-  send({ event: 'browse_start', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
-    game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
-    clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
-    page_type: pageType });
+  emit('browse_start');
 
   // ---- clip landed / heartbeat ----
   if (clipId) emit('clip_landed');
@@ -250,24 +306,32 @@
       var card = ev.target.closest && ev.target.closest('.card');
       if (card) {
         var href = card.getAttribute('href') || '';
-        var gameId = extractGameId(href) || (card.querySelector('h2') && card.querySelector('h2').textContent) || 'unknown';
-        send({ event: 'card_tapped', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
-          game: gameId, variant: variant, mode: mode, clip_id: clipId, src: src,
-          visit_n: visitN, hour: hour, late_night: lateNight, page_type: pageType,
-          engine: card.dataset.engine, category: card.dataset.category, position: cardIndex(card) });
+        var cid = extractGameId(href) || (card.querySelector('h2') && card.querySelector('h2').textContent) || 'unknown';
+        emit('card_tapped', {
+          game: cid,
+          engine: card.dataset.engine, category: card.dataset.category, position: cardIndex(card)
+        });
       }
       var chip = ev.target.closest && ev.target.closest('nav button');
       if (chip && chip.dataset && (chip.dataset.t || chip.dataset.v)) {
-        send({ event: 'category_switch', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
-          game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
-          clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
-          page_type: pageType, filter_type: chip.dataset.t, filter_value: chip.dataset.v });
+        emit('category_switch', { filter_type: chip.dataset.t, filter_value: chip.dataset.v });
       }
     });
 
     // scroll depth
+    var depthMarks = { 25: false, 50: false, 75: false, 100: false };
     window.addEventListener('scroll', function () {
-      S.browse_maxScroll = Math.max(S.browse_maxScroll, window.scrollY || window.pageYOffset || 0);
+      var y = window.scrollY || window.pageYOffset || 0;
+      S.browse_maxScroll = Math.max(S.browse_maxScroll, y);
+      var docH = document.documentElement.scrollHeight - window.innerHeight;
+      if (!docH) return;
+      var pct = Math.round((y / docH) * 100);
+      for (var k in depthMarks) {
+        if (!depthMarks[k] && pct >= +k) {
+          depthMarks[k] = true;
+          emit('scroll_' + k, { depth_pct: pct });
+        }
+      }
     }, { passive: true });
 
     // video engagement on hook clips
@@ -276,19 +340,15 @@
       v.addEventListener('play', function () {
         if (started) return;
         started = true;
-        var game = clipGameFromSrc(v.dataset.src || v.src || '');
-        send({ event: 'clip_play_start', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
-          game: game, variant: variant, mode: mode, clip_id: clipId, src: src,
-          visit_n: visitN, hour: hour, late_night: lateNight, page_type: pageType });
+        var cg = clipGameFromSrc(v.dataset.src || v.src || '');
+        emit('clip_play_start', { game: cg, video_src: v.dataset.src || v.src || '' });
       });
       v.addEventListener('timeupdate', function () {
         if (half) return;
         if (v.duration && v.currentTime / v.duration >= 0.5) {
           half = true;
-          var game = clipGameFromSrc(v.dataset.src || v.src || '');
-          send({ event: 'clip_play_50pct', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
-            game: game, variant: variant, mode: mode, clip_id: clipId, src: src,
-            visit_n: visitN, hour: hour, late_night: lateNight, page_type: pageType });
+          var cg = clipGameFromSrc(v.dataset.src || v.src || '');
+          emit('clip_play_50pct', { game: cg, video_src: v.dataset.src || v.src || '' });
         }
       });
     }
@@ -308,11 +368,11 @@
           if (!en.isIntersecting || !card || seen.has(card)) return;
           seen.add(card);
           var href = card.getAttribute('href') || '';
-          var gameId = extractGameId(href) || 'unknown';
-          send({ event: 'browse_impression', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
-            game: gameId, variant: variant, mode: mode, clip_id: clipId, src: src,
-            visit_n: visitN, hour: hour, late_night: lateNight, page_type: pageType,
-            engine: card.dataset.engine, category: card.dataset.category, position: cardIndex(card) });
+          var cid = extractGameId(href) || 'unknown';
+          emit('browse_impression', {
+            game: cid,
+            engine: card.dataset.engine, category: card.dataset.category, position: cardIndex(card)
+          });
         });
       }, { rootMargin: '0px', threshold: 0.5 });
       document.querySelectorAll('.card').forEach(function (c) { io.observe(c); });
@@ -320,10 +380,7 @@
 
     // hub land (if we are on a hub page)
     if (pageType === 'hub') {
-      var hubGame = extractGameId(path) || 'unknown';
-      send({ event: 'hub_land', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
-        game: hubGame, variant: variant, mode: mode, clip_id: clipId, src: src,
-        visit_n: visitN, hour: hour, late_night: lateNight, page_type: pageType });
+      emit('hub_land');
     }
   }
 
@@ -341,14 +398,11 @@
   }
 
   // ---- calm-moment detection (calm games) ----
-  if (pageType === 'game' && window.LOOP_CALM) {
+  if (pageType === 'game' && meta.engine === 'calm') {
     setInterval(function () {
       if (S.lastGameOver && !S.calmNoted && Date.now() - S.lastGameOver > 5000 && S.runs > 0) {
         S.calmNoted = true;
-        send({ event: 'calm_moment', ts: Date.now(), vid: vid, vsid: vsid, sid: sid,
-          game: window.LOOP_GAME || 'unknown', variant: variant, mode: mode,
-          clip_id: clipId, src: src, visit_n: visitN, hour: hour, late_night: lateNight,
-          page_type: pageType, after_run: S.runs });
+        emit('calm_moment', { after_run: S.runs });
       }
     }, 1000);
   }
@@ -381,8 +435,19 @@
         src: src,
         late_night: lateNight,
         game_count: typeof window.LOOP_GAME_COUNT === 'number' ? window.LOOP_GAME_COUNT : 383,
-        site_domain: location.hostname
+        site_domain: location.hostname,
+        game: gameId,
+        engine: meta.engine || 'unknown',
+        variant: variant,
+        features: meta.features || {}
       });
+      if (variant && variant !== 'base' && window.LOOP_VARIANT_HYPOTHESIS) {
+        ph.capture('$experiment_started', {
+          experiment_id: gameId,
+          variant_id: variant,
+          hypothesis: window.LOOP_VARIANT_HYPOTHESIS
+        });
+      }
     } catch (_) {}
   }
 

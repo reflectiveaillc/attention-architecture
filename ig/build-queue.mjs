@@ -42,18 +42,25 @@ function caption(g) {
   return `${base}\n\n🎮 Play FREE in your browser — link in bio\n\n${t} #viralgames #freeonlinegames`;
 }
 
-// ordering: face first, then drop-dodge, then category round-robin
+// ordering: HERO games first (the launch's flagship posts), then face,
+// then drop-dodge, then category round-robin.
+// Heroes = front-of-feed first impression (Manuel 2026-07-21): flappy bird /
+// infinite race / stack game. Override with HEROES=id1,id2,... env var.
+const HEROES = (process.env.HEROES || 'flappy-face,infinite-fall,stack-rush')
+  .split(',').map((s) => s.trim()).filter(Boolean);
 const games = REG.games.filter((g) => fs.existsSync(path.join(CLIPS, `${g.id}.mp4`)));
-const face = games.filter((g) => g.face);
-const dd = games.filter((g) => !g.face && g.id === 'drop-dodge');
-const rest = games.filter((g) => !g.face && g.id !== 'drop-dodge');
+const isHero = (g) => HEROES.includes(g.id);
+const heroes = HEROES.map((id) => games.find((g) => g.id === id)).filter(Boolean);
+const face = games.filter((g) => g.face && !isHero(g));
+const dd = games.filter((g) => !g.face && !isHero(g) && g.id === 'drop-dodge');
+const rest = games.filter((g) => !g.face && !isHero(g) && g.id !== 'drop-dodge');
 const byCat = {};
 for (const g of rest) (byCat[g.category || 'misc'] ||= []).push(g);
 const cats = Object.keys(byCat);
 const interleaved = [];
 for (let i = 0; interleaved.length < rest.length; i++)
   for (const c of cats) { if (byCat[c][i]) interleaved.push(byCat[c][i]); }
-const ordered = [...face, ...dd, ...interleaved];
+const ordered = [...heroes, ...face, ...dd, ...interleaved];
 
 // build the full slot timeline: day 0 may be a partial evening (blitz start)
 const slotTimes = [];
