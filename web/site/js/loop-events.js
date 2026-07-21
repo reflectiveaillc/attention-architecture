@@ -89,18 +89,23 @@
     lastComplete: 0, calmNoted: false
   };
 
+  // Single transport decision point. PostHog SDK is primary (rich sessions,
+  // persons, autocapture); the /api/collect sink is a FALLBACK for when the
+  // SDK is blocked or not yet loaded — never both, so events count once.
   function send(e) {
+    var ph = window.LOOP_POSTHOG || (window.posthog && window.posthog.capture ? window.posthog : null);
+    if (ph) {
+      try {
+        var ev = Object.assign({}, e);
+        delete ev.ts; // PostHog sets its own timestamp
+        ph.capture(e.event, ev);
+        return;
+      } catch (_) {}
+    }
     if (sink) { try { navigator.sendBeacon(sink, JSON.stringify(e)); } catch (_) {} }
     else {
       buffer.push(e);
       try { localStorage.setItem('loop_events', JSON.stringify(buffer.slice(-500))); } catch (_) {}
-    }
-    if (window.LOOP_POSTHOG) {
-      try {
-        var ev = Object.assign({}, e);
-        delete ev.ts; // PostHog sets its own timestamp
-        window.LOOP_POSTHOG.capture(e.event, ev);
-      } catch (_) {}
     }
   }
 
@@ -131,18 +136,6 @@
     var e = Object.assign({
       event: event, ts: Date.now(), vid: vid, vsid: vsid, sid: sid
     }, baseProps(), props || {});
-
-    // mirror to PostHog with clean event names and game-scoped properties
-    if (window.posthog && window.posthog.capture) {
-      try {
-        var phProps = {};
-        for (var k in e) {
-          if (k === 'ts' || k === 'event') continue;
-          phProps[k] = e[k];
-        }
-        window.posthog.capture(event, phProps);
-      } catch (_) {}
-    }
 
     // auto-derived dopamine/pleasure signals
     if (event === 'play_start' || event === 'restart') {

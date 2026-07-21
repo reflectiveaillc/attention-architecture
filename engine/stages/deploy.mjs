@@ -68,7 +68,8 @@ function analyticsConfig() {
 }
 
 function analyticsHead() {
-  return `\n<script>window.LOOP_ANALYTICS = ${JSON.stringify(analyticsConfig())};</script>\n<script src="js/analytics.js"></script>`;
+  // absolute path: pages live at /, /g/<id> and /games/<id>/ depths
+  return `\n<script>window.LOOP_ANALYTICS = ${JSON.stringify(analyticsConfig())};</script>\n<script src="/js/analytics.js"></script>`;
 }
 
 function gameMetaScript(g) {
@@ -104,7 +105,9 @@ function injectHead(html, extra) {
 }
 
 function injectGamePages(siteDir, registry) {
-  const cfgScript = `\n<script>window.LOOP_ANALYTICS = ${JSON.stringify(analyticsConfig())};</script>`;
+  // full analytics head: config + PostHog/Vercel SDK loader (analytics.js),
+  // so game pages get real SDK capture, not just the beacon fallback
+  const cfgScript = analyticsHead();
   for (const g of registry.games) {
     const files = [path.join(siteDir, 'games', g.id, 'index.html')];
     for (const v of g.variants || []) {
