@@ -136,7 +136,8 @@ function hreflangLinks(pagePath) {
     `\n<link rel="alternate" hreflang="en" href="${base}${p}">`
   ];
   for (const t of loadI18n()) {
-    links.push(`\n<link rel="alternate" hreflang="${t.locale}" href="${base}/${t.locale}${p === '/' ? '/' : p}">`);
+    // trailingSlash:false in vercel.json — /de not /de/
+    links.push(`\n<link rel="alternate" hreflang="${t.locale}" href="${base}/${t.locale}${p === '/' ? '' : p}">`);
   }
   return links.join('');
 }
@@ -381,7 +382,7 @@ function renderSite(siteDir, registry) {
 <html lang="${locale}"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>${homeTitle}</title>${metaHead({
-    path: `${prefix}/`,
+    path: prefix || '/',
     title: homeTitle,
     desc: homeDesc,
     ld: [{
@@ -424,7 +425,7 @@ ${cards}
   </nav>
   <nav style="display:block;margin:0 auto 14px" aria-label="Languages">
     <a href="/" style="color:rgba(255,255,255,${locale === 'en' ? '.7' : '.45'});margin:0 8px">English</a>
-    ${loadI18n().map((x) => `<a href="/${x.locale}/" hreflang="${x.locale}" style="color:rgba(255,255,255,${x.locale === locale ? '.7' : '.45'});margin:0 8px">${x.label}</a>`).join('\n    ')}
+    ${loadI18n().map((x) => `<a href="/${x.locale}" hreflang="${x.locale}" style="color:rgba(255,255,255,${x.locale === locale ? '.7' : '.45'});margin:0 8px">${x.label}</a>`).join('\n    ')}
   </nav>
   ${registry.games.length} games · built by the LOOP factory · <a href="/tilt-dashboard" style="color:rgba(255,255,255,.4)">🧪</a>
 </footer>
@@ -656,7 +657,7 @@ function renderSitemapAndRobots(siteDir, registry) {
   const liveCollections = COLLECTIONS.filter((c) => registry.games.some(c.match));
   const urls = [
     { loc: `${base}/`, priority: '1.0' },
-    ...loadI18n().map((t) => ({ loc: `${base}/${t.locale}/`, priority: '0.9' })),
+    ...loadI18n().map((t) => ({ loc: `${base}/${t.locale}`, priority: '0.9' })),
     ...liveCollections.map((c) => ({ loc: `${base}/best/${c.slug}`, priority: '0.8' })),
     ...loadI18n().flatMap((t) => liveCollections
       .filter((c) => t.collections[c.slug])
