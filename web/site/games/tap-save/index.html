@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<!-- LOOP_HEAD_INJECT -->
+<script>window.LOOP_ANALYTICS = {"vercel":true,"hotjar":null,"posthog":{"apiKey":"phc_AfnjMKY2weDNd6qRVQazHjJtJRLYVDCqwP4Pcqm4L35M","apiHost":"https://us.i.posthog.com"},"sink":"/api/collect"};</script>
+<script src="/js/analytics.js"></script>
+<script>window.LOOP_GAME_META = {"id":"tap-save","name":"Save It!","engine":"viral","circuits":["01-rpe","04-loss"],"features":{"engine":"viral","category":"reflexes","trick":"tap-to-like loss aversion","input":"tap","face_control":false,"has_sound":true,"duration_class":"short"},"trick":"tap-to-like loss aversion","category":"reflexes"};</script>
+<link rel="canonical" href="https://www.viralfreegames.com/g/tap-save">
+<!-- LOOP_HEAD_INJECT -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>SAVE IT! — tap to keep him alive</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0f1a;overflow:hidden;touch-action:manipulation;-webkit-user-select:none;user-select:none;font-family:'Arial Black',Arial,sans-serif}
+  #c{display:block;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const P=new URLSearchParams(location.search),DEMO=P.get('demo')==='1';
+let seed=(+P.get('seed')||7)>>>0; const rnd=()=>{seed=(seed*1664525+1013904223)>>>0;return seed/4294967296;};
+let W,H,DPR;
+function fit(){DPR=Math.min(devicePixelRatio||1,2);W=cv.clientWidth;H=cv.clientHeight;cv.width=W*DPR;cv.height=H*DPR;ctx.setTransform(DPR,0,0,DPR,0,0);}
+addEventListener('resize',fit);
+
+// --- game state ---
+let y,vy,alive,saves,best=0,shakeT=0,ripples=[],started=false;
+const GROUND=()=>H-H*0.16; // spikes line
+function reset(){y=H*0.35;vy=0;alive=true;saves=0;started=false;}
+reset();
+function flap(x,yy){ vy=-Math.min(H*0.011,7.6); if(x!=null) ripples.push({x,y:yy,r:0,a:1}); }
+function tap(e){ if(DEMO)return; e&&e.preventDefault(); let px=W/2,py=H*0.5; if(e&&e.touches&&e.touches[0]){px=e.touches[0].clientX;py=e.touches[0].clientY;} else if(e&&e.clientX!=null){px=e.clientX;py=e.clientY;} if(!alive){reset();return;} started=true; flap(px,py); }
+cv.addEventListener('pointerdown',tap); addEventListener('keydown',e=>{if(e.code==='Space')tap();});
+
+// --- demo choreography: endless near-death, "saved" at the last moment ---
+let t0=performance.now(),lastCyc=-1;
+function demoTick(now){
+  const t=(now-t0)/1000;
+  // scripted bob INSIDE the danger zone: dive toward spikes, snap up, repeat.
+  const period=0.62, phase=(t%period)/period;
+  const top=H*0.48, bottomY=GROUND()-H*0.075; // just above the spikes
+  y = phase<0.6 ? top+(bottomY-top)*(phase/0.6)     // dive
+                : bottomY-(bottomY-top)*((phase-0.6)/0.4); // snap up
+  const cyc=Math.floor(t/period);
+  if(cyc>lastCyc){ lastCyc=cyc; if(cyc>0){ saves++; ripples.push({x:W/2,y:bottomY,r:0,a:1}); shakeT=7; } }
+  if(t>8.2 && !window.__demoDone){ window.__demoScore=saves; window.__demoDone=true; }
+}
+
+function drawChar(x,cy){
+  ctx.save();ctx.translate(x,cy);
+  // body
+  ctx.fillStyle='#ffd23f';ctx.beginPath();ctx.arc(0,0,W*0.052,0,7);ctx.fill();
+  ctx.fillStyle='#12203a';ctx.beginPath();ctx.arc(W*0.02,-W*0.012,W*0.012,0,7);ctx.fill();ctx.beginPath();ctx.arc(-W*0.018,-W*0.012,W*0.012,0,7);ctx.fill();
+  // panicked mouth
+  ctx.beginPath();ctx.arc(0,W*0.02,W*0.016,0,Math.PI);ctx.fill();
+  ctx.fillStyle='#ff5252';ctx.beginPath();ctx.moveTo(W*0.04,-W*0.005);ctx.lineTo(W*0.09,-W*0.02);ctx.lineTo(W*0.055,W*0.012);ctx.fill();
+  ctx.restore();
+}
+function frame(now){
+  const dt=1;
+  // physics
+  if(started||DEMO){ vy+=H*0.00058*dt; y+=vy*dt; }
+  if(y<H*0.06){y=H*0.06;vy=0;}
+  const g=GROUND();
+  if(y>g-H*0.05){ if(!DEMO){ if(alive){alive=false;best=Math.max(best,saves);shakeT=12;} y=g-H*0.05; vy=0; } }
+  if(DEMO) demoTick(now);
+
+  // draw
+  ctx.clearRect(0,0,W,H);
+  const grad=ctx.createLinearGradient(0,0,0,H);grad.addColorStop(0,'#101a33');grad.addColorStop(1,'#1b1030');ctx.fillStyle=grad;ctx.fillRect(0,0,W,H);
+  // danger glow near ground
+  const dz=ctx.createLinearGradient(0,g-H*0.22,0,g);dz.addColorStop(0,'rgba(255,60,60,0)');dz.addColorStop(1,'rgba(255,40,40,'+(0.35+0.15*Math.sin(now/120))+')');ctx.fillStyle=dz;ctx.fillRect(0,g-H*0.22,W,H*0.22);
+  // spikes
+  ctx.fillStyle='#ff3b3b';const sw=W/9;for(let i=0;i<10;i++){ctx.beginPath();ctx.moveTo(i*sw,g);ctx.lineTo(i*sw+sw/2,g-H*0.05);ctx.lineTo(i*sw+sw,g);ctx.fill();}
+  ctx.fillStyle='#c62828';ctx.fillRect(0,g,W,H-g);
+  // shake
+  let sx=0,sy=0; if(shakeT>0){shakeT--;sx=(rnd()-.5)*10;sy=(rnd()-.5)*10;}
+  ctx.save();ctx.translate(sx,sy);
+  drawChar(W/2,y);
+  // ripples (tap feedback)
+  for(const r of ripples){r.r+=6;r.a*=0.92;ctx.strokeStyle='rgba(255,255,255,'+r.a+')';ctx.lineWidth=3;ctx.beginPath();ctx.arc(r.x,r.y,r.r,0,7);ctx.stroke();}
+  ripples=ripples.filter(r=>r.a>0.05);
+  ctx.restore();
+
+  // --- overlays (the tap-bait) ---
+  ctx.textAlign='center';
+  const pulse=0.5+0.5*Math.sin(now/90);
+  // big TAP prompt
+  ctx.fillStyle='rgba(255,255,255,'+(0.55+0.45*pulse)+')';
+  ctx.font='900 '+Math.round(W*0.16)+'px Arial Black';
+  ctx.fillText('TAP!',W/2, H*0.2+pulse*4);
+  ctx.font='800 '+Math.round(W*0.07)+'px Arial';
+  ctx.fillStyle='#ffd23f';
+  ctx.fillText("DON'T LET HIM FALL", W/2, H*0.27);
+  // finger cue
+  ctx.font=Math.round(W*0.12)+'px Arial';
+  ctx.fillStyle='rgba(255,255,255,'+(0.6+0.4*pulse)+')';
+  ctx.fillText('👆', W/2, y+H*0.11+pulse*6);
+  // saves counter
+  ctx.fillStyle='#fff';ctx.font='900 '+Math.round(W*0.09)+'px Arial Black';ctx.textAlign='left';
+  ctx.fillText('SAVED ×'+(DEMO?saves:saves), W*0.06, H*0.09);
+  ctx.textAlign='center';
+
+  if(!DEMO && !alive){ ctx.fillStyle='rgba(0,0,0,.55)';ctx.fillRect(0,0,W,H);ctx.fillStyle='#ff5252';ctx.font='900 '+Math.round(W*0.13)+'px Arial Black';ctx.fillText('OOF!',W/2,H*0.44);ctx.fillStyle='#fff';ctx.font='800 '+Math.round(W*0.06)+'px Arial';ctx.fillText('You saved him '+saves+'×',W/2,H*0.52);ctx.fillText('TAP to try again',W/2,H*0.6);}
+
+  requestAnimationFrame(frame);
+}
+fit(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>

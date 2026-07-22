@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<!-- LOOP_HEAD_INJECT -->
+<script>window.LOOP_ANALYTICS = {"vercel":true,"hotjar":null,"posthog":{"apiKey":"phc_AfnjMKY2weDNd6qRVQazHjJtJRLYVDCqwP4Pcqm4L35M","apiHost":"https://us.i.posthog.com"},"sink":"/api/collect"};</script>
+<script src="/js/analytics.js"></script>
+<script>window.LOOP_GAME_META = {"id":"tap-pop","name":"Pop!","engine":"viral","circuits":["01-rpe","04-loss"],"features":{"engine":"viral","category":"reflexes","trick":"tap-to-like reflex, fake-live","input":"tap","face_control":false,"has_sound":true,"duration_class":"short"},"trick":"tap-to-like reflex, fake-live","category":"reflexes"};</script>
+<link rel="canonical" href="https://www.viralfreegames.com/g/tap-pop">
+<!-- LOOP_HEAD_INJECT -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>POP! — tap every dot</title>
+<style>
+  html,body{margin:0;height:100%;background:#071018;overflow:hidden;touch-action:manipulation;-webkit-user-select:none;user-select:none;font-family:'Arial Black',Arial,sans-serif}
+  #c{display:block;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const P=new URLSearchParams(location.search),DEMO=P.get('demo')==='1';
+let seed=(+P.get('seed')||7)>>>0;const rnd=()=>{seed=(seed*1664525+1013904223)>>>0;return seed/4294967296;};
+let W,H,DPR;function fit(){DPR=Math.min(devicePixelRatio||1,2);W=cv.clientWidth;H=cv.clientHeight;cv.width=W*DPR;cv.height=H*DPR;ctx.setTransform(DPR,0,0,DPR,0,0);}addEventListener('resize',fit);
+
+let dots=[],bursts=[],score=0,t0=performance.now(),spawnT=0;
+function spawn(){ const cxr=0.5, r=W*(0.055+rnd()*0.03); dots.push({x:W*(0.16+rnd()*0.68),y:H*(0.22+rnd()*0.56),r,born:performance.now(),life:900+rnd()*500,h:(rnd()*360)|0}); }
+function popAt(x,y){ for(let i=dots.length-1;i>=0;i--){const d=dots[i];if((x-d.x)**2+(y-d.y)**2<(d.r*1.3)**2){burst(d);dots.splice(i,1);score++;return true;}} return false; }
+function burst(d){for(let i=0;i<10;i++){const a=rnd()*7;bursts.push({x:d.x,y:d.y,vx:Math.cos(a)*(2+rnd()*4),vy:Math.sin(a)*(2+rnd()*4),a:1,h:d.h});}}
+function tap(e){ if(DEMO)return; e&&e.preventDefault(); let px=W/2,py=H*0.5; if(e&&e.touches&&e.touches[0]){px=e.touches[0].clientX;py=e.touches[0].clientY;} else if(e&&e.clientX!=null){px=e.clientX;py=e.clientY;} if(!popAt(px,py)){/*miss, no penalty in casual mode*/} }
+cv.addEventListener('pointerdown',tap);
+
+function frame(now){
+  const t=(now-t0)/1000;
+  // spawn dots
+  if(now-spawnT> (DEMO?110:260)){ spawnT=now; if(dots.length< (DEMO?9:5)) spawn(); }
+  // demo: auto-pop dots that are "ripe", score climbs (keep several on screen)
+  if(DEMO){
+    for(let i=dots.length-1;i>=0;i--){ const d=dots[i]; if(now-d.born>430){ burst(d); dots.splice(i,1); score++; } }
+    if(t>8.0 && !window.__demoDone){ window.__demoScore=score; window.__demoDone=true; }
+  } else {
+    // expire dots
+    for(let i=dots.length-1;i>=0;i--){ if(now-dots[i].born>dots[i].life) dots.splice(i,1); }
+  }
+  ctx.clearRect(0,0,W,H);
+  const g=ctx.createLinearGradient(0,0,0,H);g.addColorStop(0,'#0a1826');g.addColorStop(1,'#10233a');ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+  // fake "interactive post" frame (confusion cue)
+  ctx.strokeStyle='rgba(120,200,255,'+(0.5+0.3*Math.sin(now/300))+')';ctx.lineWidth=W*0.012;
+  ctx.strokeRect(W*0.03,H*0.14,W*0.94,H*0.74);
+  ctx.fillStyle='rgba(120,200,255,0.9)';ctx.font='800 '+Math.round(W*0.045)+'px Arial';ctx.textAlign='left';
+  ctx.fillText('● LIVE',W*0.06,H*0.135);
+  // dots
+  for(const d of dots){ const age=(now-d.born)/d.life; const pr=d.r*(1+0.12*Math.sin(now/80+d.x)); const gr=ctx.createRadialGradient(d.x-pr*0.3,d.y-pr*0.3,pr*0.1,d.x,d.y,pr); gr.addColorStop(0,'hsl('+d.h+',95%,72%)');gr.addColorStop(1,'hsl('+d.h+',90%,45%)'); ctx.fillStyle=gr;ctx.beginPath();ctx.arc(d.x,d.y,pr,0,7);ctx.fill(); ctx.fillStyle='rgba(255,255,255,.85)';ctx.beginPath();ctx.arc(d.x-pr*0.28,d.y-pr*0.3,pr*0.22,0,7);ctx.fill(); }
+  // bursts
+  for(const b of bursts){b.x+=b.vx;b.y+=b.vy;b.a*=0.9;ctx.fillStyle='hsla('+b.h+',95%,65%,'+b.a+')';ctx.beginPath();ctx.arc(b.x,b.y,W*0.012,0,7);ctx.fill();}
+  bursts=bursts.filter(b=>b.a>0.06);
+  // overlays
+  ctx.textAlign='center';const pulse=0.5+0.5*Math.sin(now/80);
+  ctx.fillStyle='rgba(255,255,255,'+(0.55+0.45*pulse)+')';ctx.font='900 '+Math.round(W*0.12)+'px Arial Black';
+  ctx.fillText('TAP THEM!',W/2,H*0.115+pulse*3);
+  ctx.fillStyle='#7cffb2';ctx.font='900 '+Math.round(W*0.11)+'px Arial Black';ctx.textAlign='right';
+  ctx.fillText(score+'',W*0.94,H*0.94);
+  ctx.fillStyle='#ffd23f';ctx.font='800 '+Math.round(W*0.055)+'px Arial';ctx.textAlign='left';
+  ctx.fillText('HOW MANY CAN YOU POP?',W*0.06,H*0.94);
+  requestAnimationFrame(frame);
+}
+fit();requestAnimationFrame(frame);
+</script>
+</body>
+</html>

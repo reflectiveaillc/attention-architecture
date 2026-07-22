@@ -46,8 +46,20 @@
       opts = opts || {};
       var game = (window.LOOP_GAME || 'tilt').replace(/-/g, ' ');
       var scoreTxt = opts.score !== undefined ? opts.score + (opts.unit ? ' ' + opts.unit : '') : '';
-      var text = opts.text || ('I hit ' + scoreTxt + ' in ' + game + ' — beat it:');
       var url = challengeUrl(opts.score !== undefined ? opts.score : '');
+
+      // Wordle-grade artifact: spoiler-free session journey grid.
+      // 🟥 run failed · 🟧 near-miss · 🟩 personal record — the effort is the brag.
+      var journey = (window.LOOP_JOURNEY ? window.LOOP_JOURNEY() : []);
+      var daily = new URLSearchParams(location.search).get('daily');
+      var header = daily ? ('Daily Tilt #' + daily + ' · ' + game) : ('tilt · ' + game);
+      var text;
+      if (journey.length >= 2) {
+        text = header + '\n' + journey.join('') + (scoreTxt ? ' ' + scoreTxt : '') + '\nbeat me →';
+      } else {
+        text = opts.text || ('I hit ' + scoreTxt + ' in ' + game + ' — beat it:');
+      }
+
       if (navigator.share) {
         navigator.share({ title: 'tilt — ' + game, text: text, url: url })
           .then(function () { emitShare('native', opts.score); })
@@ -55,7 +67,7 @@
       } else {
         var full = text + ' ' + url;
         (navigator.clipboard ? navigator.clipboard.writeText(full) : Promise.reject())
-          .then(function () { toast('challenge link copied'); emitShare('clipboard', opts.score); })
+          .then(function () { toast('result copied — paste it in the chat'); emitShare('clipboard', opts.score); })
           .catch(function () { toast(full.slice(0, 60)); });
       }
     }

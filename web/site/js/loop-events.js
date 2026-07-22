@@ -86,8 +86,11 @@
     browse_t0: Date.now(), browse_maxScroll: 0,
     gameOvers: [], // recent dur_s for difficulty-spike detection
     deathTs: [],   // recent death timestamps for rage-quit detection
-    lastComplete: 0, calmNoted: false
+    lastComplete: 0, calmNoted: false,
+    journey: []    // one emoji per run this session: 🟥 fail · 🟧 near-miss · 🟩 personal record
   };
+  // spoiler-free session story for the share artifact (Wordle-grid mechanic)
+  window.LOOP_JOURNEY = function () { return S.journey.slice(-10); };
 
   // Single transport decision point. PostHog SDK is primary (rich sessions,
   // persons, autocapture); the /api/collect sink is a FALLBACK for when the
@@ -166,6 +169,10 @@
       resetEarlyQuit();
       S.lastGameOver = Date.now();
       S.lastDeathHadNearMiss = S.runNearMiss;
+      // journey: record this run's story (PR beats near-miss beats fail);
+      // first run is baseline — greens only for beating an earlier run
+      var pr2 = typeof e.score === 'number' && S.journey.length > 0 && e.score > S.best;
+      S.journey.push(pr2 ? '🟩' : (S.runNearMiss ? '🟧' : '🟥'));
       if (typeof e.dur_s === 'number') {
         S.play_s += e.dur_s;
         S.gameOvers.push(e.dur_s);
@@ -285,6 +292,29 @@
 
   // ---- browse start for index/hub/game ----
   emit('browse_start');
+
+  // ---- keyboard → tap shim (school Chromebooks / desktop) ----
+  // one-tap games listen for pointerdown; Space/Enter synthesizes one so the
+  // whole catalog is keyboard-playable without per-game changes. Progressive:
+  // games with native key handling are unaffected (their handler fires first).
+  if (pageType === 'game') {
+    document.addEventListener('keydown', function (ev) {
+      if (ev.code !== 'Space' && ev.code !== 'Enter') return;
+      if (ev.repeat) return;
+      var a = document.activeElement;
+      if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'BUTTON' || a.isContentEditable)) return;
+      ev.preventDefault();
+      var target = document.querySelector('canvas') || document.body;
+      var r = target.getBoundingClientRect ? target.getBoundingClientRect() : { left: 0, top: 0, width: innerWidth, height: innerHeight };
+      var opts = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, pointerId: 999, pointerType: 'touch', isPrimary: true };
+      try {
+        target.dispatchEvent(new PointerEvent('pointerdown', opts));
+        setTimeout(function () {
+          try { target.dispatchEvent(new PointerEvent('pointerup', opts)); } catch (_) {}
+        }, 60);
+      } catch (_) {}
+    });
+  }
 
   // ---- clip landed / heartbeat ----
   if (clipId) emit('clip_landed');
