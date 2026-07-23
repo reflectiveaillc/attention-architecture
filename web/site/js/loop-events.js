@@ -140,6 +140,13 @@
       event: event, ts: Date.now(), vid: vid, vsid: vsid, sid: sid
     }, baseProps(), props || {});
 
+    // Feed relay: when embedded in the swipe feed, tell the parent about the
+    // key moments so it can surface the "swipe up for next game" prompt on death.
+    if (window.parent && window.parent !== window &&
+        (event === 'game_over' || event === 'play_start' || event === 'first_tap' || event === 'restart')) {
+      try { window.parent.postMessage({ __loopFeed: true, type: event, game: gameId, score: (props && props.score) }, '*'); } catch (_) {}
+    }
+
     // auto-derived dopamine/pleasure signals
     if (event === 'play_start' || event === 'restart') {
       if (!firstPlaySource) {
