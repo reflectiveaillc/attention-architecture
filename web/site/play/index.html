@@ -92,14 +92,30 @@ const dead=document.getElementById('dead');
 const hint=document.getElementById('hint');
 let ORDER=[], idx=0, slides={}, animating=false, alive=true;
 
+// ---- A/B: which "chain of games" to present (sticky per visitor) ----
+let VARIANT='ranked', UID='', startTs=Date.now(), maxDepth=0, viewed=new Set();
+function getUid(){ try{ let u=localStorage.getItem('vfg_uid'); if(!u){ u='v-'+Math.random().toString(36).slice(2,10)+Date.now().toString(36); localStorage.setItem('vfg_uid',u); } return u; }catch(e){ return 'v-'+Math.random().toString(36).slice(2,10); } }
+function hstr(s){ let h=5381; for(let i=0;i<s.length;i++) h=((h<<5)+h+s.charCodeAt(i))>>>0; return h; }
+function femit(event,props){ try{ navigator.sendBeacon('/api/collect', JSON.stringify(Object.assign({event,ts:Date.now(),vid:UID,variant:VARIANT,src:'feed',page_type:'feed'},props||{}))); }catch(_){} }
+function viewGame(){ const g=ORDER[idx]; if(g){ viewed.add(idx); if(idx>maxDepth) maxDepth=idx; femit('feed_game_view',{game:g,pos:idx,depth:viewed.size}); } }
+
 async function boot(){
-  try{ const r=await fetch('/feed-order.json',{cache:'no-store'}); ORDER=(await r.json()).order||[]; }catch(e){}
+  UID=getUid();
+  let VAR=null;
+  try{ const r=await fetch('/feed-variants.json',{cache:'no-store'}); VAR=await r.json(); }catch(e){}
+  const arms=(VAR&&VAR.arms)||['ranked'];
+  const forced=new URLSearchParams(location.search).get('v');
+  VARIANT=(forced&&arms.includes(forced))?forced:arms[hstr(UID)%arms.length];
+  ORDER=(VAR&&VAR.variants&&VAR.variants[VARIANT])||[];
+  if(!ORDER.length){ try{ const r=await fetch('/feed-order.json',{cache:'no-store'}); ORDER=(await r.json()).order||[]; VARIANT='ranked'; }catch(e){} }
   if(!ORDER.length) ORDER=['reflex-duel','stack-rush','drop-dodge','tap-save','ten-seconds','tap-pop','plunge','tap-combo','perfect-circle','orb-dodge'];
   const q=new URLSearchParams(location.search).get('g')||location.hash.slice(1);
   if(q){ const i=ORDER.indexOf(q); if(i>=0) idx=i; }
   mount(idx); mount(idx+1); position(false); setName();
+  femit('feed_view',{entry_game:ORDER[idx],arm:VARIANT}); viewGame();
 }
-const gameUrl=id=>'/games/'+id+'/';
+addEventListener('pagehide',()=>femit('feed_exit',{max_depth:maxDepth,games_viewed:viewed.size,session_s:Math.round((Date.now()-startTs)/1000)}));
+const gameUrl=id=>'/games/'+id+'/?v='+encodeURIComponent(VARIANT)+'&src=feed';
 function mount(i){
   if(i<0||i>=ORDER.length||slides[i]) return;
   const d=document.createElement('div'); d.className='slide'; d.dataset.i=i;
@@ -119,9 +135,11 @@ function setName(){ gname.textContent = ORDER[idx]? '· '+clean(ORDER[idx]):''; 
 function go(delta){
   const n=idx+delta;
   if(n<0||n>=ORDER.length||animating) return;
-  animating=true; idx=n; alive=true; dead.classList.remove('on');
+  const from=idx; animating=true; idx=n; alive=true; dead.classList.remove('on');
   mount(idx-1); mount(idx); mount(idx+1);
   position(true); setName();
+  femit('feed_advance',{from_pos:from,to_pos:idx,dir:delta>0?'next':'prev',from_game:ORDER[from],to_game:ORDER[idx]});
+  viewGame();
   setTimeout(()=>{ animating=false; cleanup(); }, 430);
 }
 function cleanup(){ for(const k in slides){ const i=+k; if(Math.abs(i-idx)>1){ slides[i].remove(); delete slides[i]; } } }
@@ -129,9 +147,10 @@ function cleanup(){ for(const k in slides){ const i=+k; if(Math.abs(i-idx)>1){ s
 // jump straight to any game (from the Browse sheet) — no long animation
 function goTo(i){
   if(i<0||i>=ORDER.length) { closeSheet(); return; }
-  if(i!==idx){ animating=true; idx=i; alive=true; dead.classList.remove('on');
+  if(i!==idx){ const from=idx; animating=true; idx=i; alive=true; dead.classList.remove('on');
     for(const k in slides){ slides[k].remove(); delete slides[k]; }
     mount(idx-1); mount(idx); mount(idx+1); position(false); setName();
+    femit('feed_jump',{from_pos:from,to_pos:idx,to_game:ORDER[idx]}); viewGame();
     setTimeout(()=>{ animating=false; },60);
   }
   closeSheet();
