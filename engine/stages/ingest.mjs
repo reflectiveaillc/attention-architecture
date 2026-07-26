@@ -85,10 +85,14 @@ function toLoopEvent(ev) {
     features: p.features || {},
     trick: p.trick || '',
     variant_hypothesis: p.variant_hypothesis || '',
+    // geo + device: the ad-revenue model prices a session by country tier
+    // (a US session is worth ~10x a tier-3 one) and device.
+    country: p.$geoip_country_code || null,
+    device_type: p.$device_type || null,
     posthog_id: ev.id || null
   };
   // copy remaining numeric / string props that are useful
-  for (const k of ['score', 'dur_s', 'stage', 'best', 'personal_record', 'ms', 'after_near_miss', 'runs', 'play_s', 'span_s', 'browse_s', 'max_scroll', 'depth_pct', 'circuit', 'trigger_event', 'dare', 'by', 'channel']) {
+  for (const k of ['score', 'dur_s', 'stage', 'best', 'personal_record', 'ms', 'after_near_miss', 'runs', 'play_s', 'span_s', 'browse_s', 'max_scroll', 'depth_pct', 'circuit', 'trigger_event', 'dare', 'by', 'channel', 't']) {
     if (p[k] !== undefined) out[k] = p[k];
   }
   return out;

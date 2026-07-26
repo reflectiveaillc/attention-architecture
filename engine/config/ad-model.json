@@ -1,0 +1,115 @@
+{
+  "_doc": "Shadow-ads revenue model for viralfreegames.com. NOTHING here renders an ad. The engine replays this placement policy over the real event stream (engine/state/events/live.jsonl) and reports the revenue those placements WOULD have produced. Every number is an assumption you can argue with and tune — change it here and re-run `node engine/loop.mjs revenue` to get a new answer over the same history.",
+  "version": 1,
+  "updated": "2026-07-26",
+  "timezone": "America/New_York",
+
+  "policy": {
+    "_doc": "When an ad would be placed. The core rule is post-loss peak engagement: only on a death the player was still hooked after (they restarted), deep enough into the session that they are invested, and rate-limited so the experience is not destroyed.",
+    "min_run_index": 3,
+    "cooldown_s": 120,
+    "max_ads_per_session": 8,
+    "require_continued_play": true,
+    "continued_play_window_s": 60,
+    "skip_after_difficulty_spike": true,
+    "min_moment_score": 0.3,
+    "feed_swipe_every_n": 4,
+    "banner_refresh_s": 30,
+    "max_banner_impressions_per_session": 20
+  },
+
+  "policy_presets": {
+    "_doc": "How hard we monetize. The default `policy` above is `standard`. These override only the keys they name, so the placement logic stays identical — the difference is purely how often we are willing to interrupt. Run `revenue --policy aggressive` to price a different appetite, and read the number next to the modeled retention cost, never alone.",
+    "conservative": { "cooldown_s": 240, "max_ads_per_session": 3, "min_run_index": 5 },
+    "standard": { "cooldown_s": 120, "max_ads_per_session": 8, "min_run_index": 3 },
+    "aggressive": { "cooldown_s": 60, "max_ads_per_session": 20, "min_run_index": 2 }
+  },
+
+  "moment_score": {
+    "_doc": "0..1 score of how engaged the player was at the instant they lost. Drives both which deaths get an ad and how well that ad is modeled to perform. Weights sum to 1.0.",
+    "weights": {
+      "session_depth": 0.25,
+      "time_invested": 0.15,
+      "after_near_miss": 0.20,
+      "compulsive_restart": 0.25,
+      "personal_record": 0.15
+    },
+    "session_depth_saturate_runs": 8,
+    "time_invested_saturate_s": 120,
+    "compulsive_restart_saturate_ms": 2500
+  },
+
+  "placements": {
+    "interstitial_post_death": {
+      "_doc": "Full-screen interstitial on the death screen, at the peak-engagement moment. The money placement in H5 casual games.",
+      "pricing": "cpm",
+      "ecpm_usd": { "tier1": [4.0, 8.0, 14.0], "tier2": [1.5, 3.0, 5.5], "tier3": [0.4, 0.9, 1.8] },
+      "base_ctr": 0.008,
+      "viewability": 0.85,
+      "fill_rate": 0.9,
+      "cpc_usd": { "tier1": 0.35, "tier2": 0.14, "tier3": 0.05 }
+    },
+    "interstitial_feed_swipe": {
+      "_doc": "Interstitial between games in the swipe feed. Lower intent than a death screen — the player is browsing, not invested.",
+      "pricing": "cpm",
+      "ecpm_usd": { "tier1": [3.0, 6.0, 10.0], "tier2": [1.1, 2.2, 4.0], "tier3": [0.3, 0.7, 1.3] },
+      "base_ctr": 0.005,
+      "viewability": 0.8,
+      "fill_rate": 0.9,
+      "cpc_usd": { "tier1": 0.3, "tier2": 0.12, "tier3": 0.045 }
+    },
+    "rewarded_continue": {
+      "_doc": "Opt-in 'watch to continue / revive' offered on a high-value death. Highest eCPM in the stack, and it is not an interruption — the player asks for it. Counted only when the modeled accept rate says they took it.",
+      "pricing": "cpm",
+      "ecpm_usd": { "tier1": [8.0, 15.0, 25.0], "tier2": [3.0, 6.0, 11.0], "tier3": [1.0, 2.0, 4.0] },
+      "base_accept_rate": 0.25,
+      "base_ctr": 0.0,
+      "viewability": 0.95,
+      "fill_rate": 0.85,
+      "cpc_usd": { "tier1": 0.0, "tier2": 0.0, "tier3": 0.0 }
+    },
+    "banner_sticky": {
+      "_doc": "Anchored bottom banner on game pages, refreshed every banner_refresh_s of page-open time. Small money, but it runs the whole session and never blocks play.",
+      "pricing": "cpm",
+      "ecpm_usd": { "tier1": [0.8, 1.6, 3.0], "tier2": [0.3, 0.7, 1.4], "tier3": [0.1, 0.25, 0.5] },
+      "base_ctr": 0.002,
+      "viewability": 0.7,
+      "fill_rate": 0.95,
+      "cpc_usd": { "tier1": 0.25, "tier2": 0.1, "tier3": 0.04 }
+    }
+  },
+
+  "multipliers": {
+    "_doc": "Modeled, not measured. engagement_ecpm lifts effective payout for a peak moment (better completion/viewability); engagement_ctr is the stronger effect — a player who just lost while chasing a record is far likelier to tap. device is a display-CPM fact of life (desktop > mobile web).",
+    "engagement_ecpm": { "slope": 0.6, "min": 0.8, "max": 1.4 },
+    "engagement_ctr": { "intercept": 0.5, "slope": 1.5, "min": 0.4, "max": 2.2 },
+    "device": { "Desktop": 1.15, "Mobile": 1.0, "Tablet": 1.0, "unknown": 1.0 },
+    "rewarded_accept": { "intercept": 0.4, "slope": 1.2, "min": 0.1, "max": 0.9 }
+  },
+
+  "geo": {
+    "_doc": "eCPM tier by country. Unknown geo falls back to default_tier — keep it pessimistic so estimates never flatter.",
+    "default_tier": "tier2",
+    "tier1": ["US", "CA", "GB", "AU", "NZ", "IE", "CH", "NO", "DK", "SE", "DE", "NL", "SG", "HK", "AE"],
+    "tier2": ["FR", "IT", "ES", "BE", "AT", "FI", "JP", "KR", "IL", "PT", "CZ", "PL", "GR", "TW", "SA", "QA", "KW", "CL", "UY", "CR", "PA", "MY"],
+    "tier3": []
+  },
+
+  "costs": {
+    "_doc": "What the money is NOT. Ad networks pay on a net-30/60 and the platform keeps a cut; treat gross as the ceiling.",
+    "network_revenue_share": 0.68,
+    "_share_doc": "0.68 = what a publisher typically keeps after the ad exchange cut (AdSense-class display is ~0.68; a game mediator with direct demand can beat it)."
+  },
+
+  "quality_gates": {
+    "_doc": "An estimate built on too little traffic is noise. Below these thresholds the report is labeled low-confidence rather than quoted as fact.",
+    "min_sessions_for_confidence": 100,
+    "min_ad_moments_for_confidence": 50
+  },
+
+  "retention_cost": {
+    "_doc": "Ads are not free. Each interstitial is modeled to cost a slice of session length / return rate. Reported as a warning next to the revenue, never silently netted out.",
+    "session_length_loss_per_interstitial": 0.05,
+    "d1_return_loss_per_interstitial": 0.02
+  }
+}

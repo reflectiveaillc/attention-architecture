@@ -34,7 +34,8 @@ attention-architecture/
 │   ├── circuits.md      ← the 8 attention circuits (the framework)
 │   ├── loop-spec.md     ← the 7-stage LOOP pipeline spec + 2 engines
 │   ├── hook-video.md    ← the AI hook-video distribution spec
-│   └── mvp.md           ← minimum viable build path (first thing to actually ship)
+│   ├── mvp.md           ← minimum viable build path (first thing to actually ship)
+│   └── ad-revenue.md    ← shadow ads: what ads WOULD earn, without showing any
 ├── engine/              ← THE LOOP, as real code
 │   ├── loop.mjs         ← orchestrator CLI (run | serve)
 │   ├── config.json      ← the four bars (Manuel's dials)
@@ -57,6 +58,10 @@ attention-architecture/
 cd /Users/manuel/coo/attention-architecture
 npm run loop     # one item end-to-end through all 7 stages → run report + verdict
 npm run serve    # preview the games site at http://127.0.0.1:4620 (events → state/events/dev.jsonl)
+
+# shadow ads — what ads WOULD have earned; nothing is ever rendered (docs/ad-revenue.md)
+set -a; source .env; set +a
+node engine/loop.mjs revenue --day yesterday
 open web/attention-dossier.html     # the framework
 open web/loop-control-room.html     # the LOOP control room (interactive — decisions persist locally)
 ```

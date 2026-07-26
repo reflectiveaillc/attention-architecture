@@ -13,6 +13,15 @@ node engine/loop.mjs ingest
 node engine/loop.mjs report >/dev/null
 node engine/loop.mjs feed
 
+# shadow ads: what the traffic WOULD have earned. No ad is ever rendered — this
+# is a replay of the placement policy over the events we already collect.
+# 7d window so every completed day is covered end-to-end and lands in the daily
+# history file, which is what answers "how much did yesterday make?".
+# Both are non-fatal (set -e is on): a bug in the revenue model must never take
+# down the analytics pipeline that the rest of the loop depends on.
+node scripts/backfill-geo.mjs --days 90 >/dev/null || echo "geo backfill skipped" >&2
+node engine/loop.mjs revenue --since 7d >/dev/null || echo "revenue replay skipped" >&2
+
 # ship only analytics data; nothing else, and never if a private key sneaks in
 git add web/site/analytics/ engine/state/analytics/ engine/state/events/live.jsonl \
         engine/state/next-concepts.json engine/state/trends.json 2>/dev/null || true

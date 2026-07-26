@@ -42,6 +42,8 @@ if (cmd === 'site') {
   const countArg = process.argv.indexOf('--count');
   const feed = await runFeed({ feedCount: countArg > -1 ? +process.argv[countArg + 1] : 6 });
   console.log(`feed: hot=${feed.hot_circuit}, tilt=${feed.engine_tilt}, rescue=${feed.concepts.find((c) => c.source === 'rescue_bottom')?.id || 'none'}`);
+} else if (cmd === 'revenue') {
+  await runRevenueCLI();
 } else if (cmd === 'report') {
   // behavioral indices + site-wide analytics across every event stream (runs + dev)
   const { parseEvents, computeIndices, computeSiteMetrics, computeDistributionMetrics, computeCatalogHealth, computeCircuitMetrics, computeFeatureMetrics, computeTrendSignals } = await import('./lib/metrics.mjs');
@@ -146,8 +148,144 @@ if (cmd === 'site') {
   const seed = seedArg > -1 ? +process.argv[seedArg + 1] : 7;
   await runLoop({ seed });
 } else {
-  console.error(`unknown command: ${cmd} (use: run | serve | site | report | experiment | ingest | feed)`);
+  console.error(`unknown command: ${cmd} (use: run | serve | site | report | revenue | experiment | ingest | feed)`);
   process.exit(1);
+}
+
+// ---------------------------------------------------------------- revenue CLI
+// "How much would ads have made us?" — replays the shadow-ads placement policy
+// over the real event stream. No ad is ever rendered; see engine/lib/ad-revenue.mjs.
+//
+//   node engine/loop.mjs revenue                  last 24h
+//   node engine/loop.mjs revenue --day yesterday  a specific local day
+//   node engine/loop.mjs revenue --since 7d       rolling window
+//   node engine/loop.mjs revenue --since all      whole history + scaling table
+async function runRevenueCLI() {
+  const ar = await import('./lib/ad-revenue.mjs');
+  const { parseEvents } = await import('./lib/metrics.mjs');
+  const model = ar.loadModel();
+  const tz = model.timezone;
+
+  const arg = (name, fallback = null) => {
+    const i = process.argv.indexOf(name);
+    return i > -1 ? process.argv[i + 1] : fallback;
+  };
+  const asJson = process.argv.includes('--json');
+
+  // window resolution
+  const dayArg = arg('--day');
+  const sinceArg = arg('--since', '24h');
+  let from, to, label;
+  if (dayArg) {
+    const dayStr = dayArg === 'yesterday'
+      ? ar.localDay(Date.now() - 86400e3, tz)
+      : dayArg === 'today' ? ar.localDay(Date.now(), tz) : dayArg;
+    const b = ar.dayBounds(dayStr, tz);
+    from = b.start; to = b.end; label = `day ${dayStr}`;
+  } else if (sinceArg === 'all') {
+    from = 0; to = Date.now(); label = 'all time';
+  } else {
+    const m = /^(\d+)([hd])$/.exec(sinceArg);
+    if (!m) { console.error('bad --since (use 24h, 7d, 30d, all)'); process.exit(1); }
+    const ms = +m[1] * (m[2] === 'h' ? 3600e3 : 86400e3);
+    from = Date.now() - ms; to = Date.now(); label = `last ${sinceArg}`;
+  }
+
+  const liveF = path.join(STATE, 'events', 'live.jsonl');
+  if (!fs.existsSync(liveF)) {
+    console.error(`no live events at ${liveF} — run \`node engine/loop.mjs ingest\` first`);
+    process.exit(1);
+  }
+  const all = parseEvents([liveF]);
+  // Pull in a lead-in so a session that started before the window is replayed
+  // with its true run depth, then attribute only in-window impressions.
+  const leadIn = 60 * 60e3;
+  const events = all.filter((e) => e.ts >= from - leadIn && e.ts < to);
+
+  const geoMap = ar.loadGeoMap(STATE);
+  const policyName = arg('--policy', 'standard');
+  const priced = ar.withPolicy(model, policyName);
+  const report = ar.computeRevenue(events, priced, { geoMap, windowLabel: label });
+  report.policy = policyName;
+
+  // Price the other appetites over the same history so the number is never read
+  // without its cost: more ads is always more money and always less session.
+  const scenarios = [];
+  for (const name of Object.keys(model.policy_presets || {}).filter((k) => k !== '_doc')) {
+    const m = ar.withPolicy(model, name);
+    const r = ar.computeRevenue(events, m, { geoMap, windowLabel: name });
+    scenarios.push({
+      policy: name,
+      ads_per_session: m.policy.max_ads_per_session,
+      cooldown_s: m.policy.cooldown_s,
+      impressions: r.totals.impressions,
+      net_mid: r.totals.net_mid,
+      retention_cost: ar.assessRetentionCost(r, model)
+    });
+  }
+  report.scenarios = scenarios;
+  report.window_from = new Date(from).toISOString();
+  report.window_to = new Date(to).toISOString();
+  report.confidence = ar.assessConfidence(report, model);
+  report.retention_cost = ar.assessRetentionCost(report, model);
+  const scaling = ar.scalingTable(report.totals, model);
+  report.scaling = scaling;
+
+  // Mark which days the window covers end-to-end. Partial days are still shown,
+  // but they are never allowed to overwrite a fully-computed day in the history.
+  for (const d of report.days) {
+    const b = ar.dayBounds(d.day, tz);
+    d.partial = !(b.start >= from && b.end <= to);
+  }
+  const inWindow = report.days.filter((d) => {
+    const b = ar.dayBounds(d.day, tz);
+    return b.start >= from - leadIn && b.start < to;
+  });
+
+  if (asJson) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    const usd = (x) => '$' + x.toFixed(x < 10 ? 4 : 2);
+    const T = report.totals;
+    console.log(`\n━━━ SHADOW AD REVENUE — ${label} (${tz}) ━━━`);
+    console.log(`no ads were shown; this is what the placement policy WOULD have earned\n`);
+    console.log(`sessions ${T.sessions} · visitors ${T.visitors} · ad moments ${T.impressions} · geo known ${(report.geo_coverage * 100).toFixed(0)}%`);
+    console.log(`gross   ${usd(T.gross_low)} — ${usd(T.gross_mid)} — ${usd(T.gross_high)}   (low/mid/high CPM band)`);
+    console.log(`NET     ${usd(T.net_low)} — ${usd(T.net_mid)} — ${usd(T.net_high)}   (after ${(model.costs.network_revenue_share * 100).toFixed(0)}% publisher share)`);
+    console.log(`predicted clicks ${T.predicted_clicks} · avg engagement at ad ${T.avg_moment_score} · RPM ${usd(T.rpm_mid)}`);
+
+    console.log('\nby placement');
+    for (const [k, v] of Object.entries(report.by_placement).sort((a, b) => b[1].net_mid - a[1].net_mid)) {
+      console.log(`  ${k.padEnd(26)} ${String(v.impressions).padStart(5)} imp  ${usd(v.net_mid).padStart(10)}  eng ${v.avg_moment_score}`);
+    }
+
+    if (inWindow.length > 1) {
+      console.log('\nby day');
+      for (const d of inWindow) {
+        console.log(`  ${d.day}  ${String(d.impressions).padStart(4)} imp  ${usd(d.net_mid).padStart(10)}  ${d.sessions} sessions`);
+      }
+    }
+
+    console.log('\nappetite scenarios (same history, different willingness to interrupt)');
+    for (const s of report.scenarios) {
+      const mark = s.policy === policyName ? '←' : ' ';
+      console.log(`  ${s.policy.padEnd(13)} ${String(s.ads_per_session).padStart(2)} ads/session · ${String(s.cooldown_s).padStart(3)}s cooldown  ${String(s.impressions).padStart(5)} imp  ${usd(s.net_mid).padStart(10)}  −${(s.retention_cost.modeled_session_length_loss * 100).toFixed(1)}% session ${mark}`);
+    }
+
+    console.log('\nwhat this is worth at scale (same per-session economics)');
+    console.log(`  net per session: ${usd(scaling.net_per_session)}`);
+    for (const r of scaling.rows) {
+      console.log(`  ${String(r.sessions_per_month).padStart(9)} sessions/mo → $${r.net_usd_per_month.toFixed(2)}/mo`);
+    }
+
+    console.log(`\nconfidence: ${report.confidence.level.toUpperCase()} — ${report.confidence.note}`);
+    console.log(`cost of turning it on: ~${(report.retention_cost.modeled_session_length_loss * 100).toFixed(1)}% session length, ~${(report.retention_cost.modeled_d1_return_loss * 100).toFixed(1)}% D1 return (modeled)`);
+  }
+
+  // Local only, on purpose: engine/state/analytics/ is gitignored, and this repo
+  // (and web/site/) is PUBLIC. Revenue modeling does not get published.
+  const { fullPath, histPath } = ar.writeReports({ report, root: ROOT, stateDir: STATE, siteDir: null, model });
+  if (!asJson) console.log(`\nwritten: ${path.relative(ROOT, fullPath)} · ${path.relative(ROOT, histPath)}  (local only — repo is public)`);
 }
 
 async function runLoop({ seed }) {
