@@ -88,12 +88,18 @@ export async function run(ctx) {
   let card;
   if (top.analytics_concept) {
     const c = top.analytics_concept;
+    // Evidence key MUST equal signal.mjs's lookup key: an explicit mechanic_key
+    // (IG-winner variants — the family IS the winning game) or the stable
+    // composite input:primary_circuit. learn.mjs writes evidence[concept.mechanic].
+    const mechKey = c.mechanic_key || `${c.input || 'tap'}:${c.primary_circuit || 'unknown'}`;
     card = {
       id: c.id,
       name: c.id.replace(/^loop-/, '').replace(/-/g, ' '),
       engine: c.engine,
-      mechanic: c.input,
+      mechanic: mechKey,
       theme: c.rationale,
+      rationale: c.rationale,
+      variant_of: c.variant_of || null,
       circuits: [c.primary_circuit],
       hook_clip_concept: c.prompt_seed,
       from_trend: { mechanic: c.id, score: top.score },

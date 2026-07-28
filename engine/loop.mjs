@@ -37,6 +37,17 @@ if (cmd === 'site') {
 } else if (cmd === 'ingest') {
   const { run } = await import('./stages/ingest.mjs');
   await run({ stateDir: STATE, log: (msg) => console.log(`  ${msg}`) });
+} else if (cmd === 'ig-ingest') {
+  const { run } = await import('./stages/ig-ingest.mjs');
+  const r = await run({ stateDir: STATE, log: (msg) => console.log(`  ${msg}`) });
+  console.log(`ig-ingest: ${r.concepts} concepts → engine/state/ig-signals.json`);
+} else if (cmd === 'ig-learn') {
+  const { run } = await import('./stages/ig-learn.mjs');
+  const r = await run({ stateDir: STATE, log: (msg) => console.log(`  ${msg}`) });
+  console.log(`ig-learn: ${r.wins} win(s), ${r.losses} loss(es) → engine/state/evidence.json`);
+} else if (cmd === 'feed-order') {
+  const { run } = await import('./stages/feed-order.mjs');
+  await run({ stateDir: STATE, log: (msg) => console.log(`  ${msg}`) });
 } else if (cmd === 'feed') {
   const { default: runFeed } = await import('./stages/feed.mjs');
   const countArg = process.argv.indexOf('--count');
@@ -148,7 +159,7 @@ if (cmd === 'site') {
   const seed = seedArg > -1 ? +process.argv[seedArg + 1] : 7;
   await runLoop({ seed });
 } else {
-  console.error(`unknown command: ${cmd} (use: run | serve | site | report | revenue | experiment | ingest | feed)`);
+  console.error(`unknown command: ${cmd} (use: run | serve | site | report | revenue | experiment | ingest | ig-ingest | ig-learn | feed-order | feed)`);
   process.exit(1);
 }
 
@@ -331,12 +342,12 @@ async function runLoop({ seed }) {
   for (const c of ctx.results.learn.checks) {
     const val = c.metric === 'avg_session_s' ? c.value + 's' : pct(c.value);
     const bar = c.metric === 'avg_session_s' ? c.bar + 's' : pct(c.bar);
-    console.log(`  ${c.pass ? '✓' : '✗'} ${c.label.padEnd(24)} ${String(val).padStart(8)}  (bar ${bar})`);
+    console.log(`  ${c.na ? '·' : c.pass ? '✓' : '✗'} ${c.label.padEnd(24)} ${String(c.na ? 'na' : val).padStart(8)}  (bar ${bar})`);
   }
   console.log(`  verdict: ${report.verdict.toUpperCase()}`);
   console.log(`  action:  ${ctx.results.learn.action}`);
   console.log(`  report:  ${path.relative(process.cwd(), path.join(runDir, 'report.json'))}`);
-  console.log(`  events:  ${m.clip_impressions} impressions → ${m.clip_landings} landings → ${m.players} players (real bot events: ${ctx.results.measure.provenance.real_events})`);
+  console.log(`  events:  ${m.clip_impressions} IG impressions → ${m.clip_landings} IG landings → ${m.visitors} live visitors → ${m.players} players (${ctx.results.measure.provenance.source})`);
 }
 
 async function runExperimentCLI() {

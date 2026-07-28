@@ -2,6 +2,16 @@
 
 > Source: `/Users/manuel/coo/attention-architecture/docs/loop-spec.md`
 > Companion site: `web/loop-control-room.html`
+>
+> ⚠️ **This is the R4 VISION doc.** For the running reality — actual stage
+> behavior, hard rules learned from failures, runbook, and current state —
+> read [`../CLAUDE.md`](../CLAUDE.md) first. Where they disagree, CLAUDE.md
+> wins. Notable divergences as of 2026-07-28 (see [`audit-2026-07-28.md`](./audit-2026-07-28.md)):
+> Measure grades on REAL live PostHog events (no synthetic cohort in the
+> verdict path); a 5th bar `ig_like_rate` (+ `ig_min_likes`) is the real-IG
+> override; `ig-learn` re-verdicts posted games days later; `insufficient_data`
+> is a distinct verdict (never a loss); deploy is local-only and clip posting
+> is gated on Manuel via the social-autopilot queue.
 
 A self-improving games factory. Discovers, builds, ships, A/B-tests, and scales simple games engineered to hit known circuits (see [`circuits.md`](./circuits.md)). Distributed by AI hook videos (see [`hook-video.md`](./hook-video.md)).
 

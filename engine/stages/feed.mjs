@@ -3,7 +3,11 @@ import path from 'node:path';
 
 const STATE_DIR = path.resolve(import.meta.dirname, '..', 'state');
 const FEED_PATH = path.join(STATE_DIR, 'next-concepts.json');
-const TRENDS_PATH = path.join(STATE_DIR, 'trends.json');
+// NOTE: this stage must NOT write engine/state/trends.json — that file is the
+// hand-curated trend SEED that signal.mjs reads (schema: {trends:[...]}).
+// Writing summary.trends here ({series,movers,live_window}) overwrote it on
+// every refresh and crashed the run pipeline at SIGNAL. The series/movers
+// shape already ships to the dashboard inside summary.json (loop.mjs report).
 const CIRCUITS = ['anticipation_loop', 'near_miss_reward', 'variable_interval', 'progress_pressure', 'loss_aversion', 'social_proof', 'completion_compulsion'];
 const INPUTS = ['tap', 'drag', 'swipe', 'tilt', 'type'];
 const ENGINES = ['viral', 'calm'];
@@ -106,7 +110,7 @@ export default async function feed(config = {}) {
   };
 
   fs.writeFileSync(FEED_PATH, JSON.stringify(feed, null, 2));
-  fs.writeFileSync(TRENDS_PATH, JSON.stringify(trends, null, 2));
+  // (no trends.json write — see note at top; summary.trends ships in summary.json)
   // mirror to web/site so the dashboard can fetch it without an extra build step
   const siteAnalyticsDir = path.resolve(import.meta.dirname, '..', '..', 'web', 'site', 'analytics');
   fs.mkdirSync(siteAnalyticsDir, { recursive: true });

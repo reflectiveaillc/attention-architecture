@@ -10,7 +10,10 @@ export PATH="$HOME/.nvm/versions/node/v22.22.3/bin:/usr/local/bin:/opt/homebrew/
 set -a; source .env; set +a
 
 node engine/loop.mjs ingest
+node engine/loop.mjs ig-ingest || echo "ig-ingest skipped" >&2
+node engine/loop.mjs ig-learn || echo "ig-learn skipped" >&2
 node engine/loop.mjs report >/dev/null
+node engine/loop.mjs feed-order || echo "feed-order skipped" >&2
 node engine/loop.mjs feed
 
 # shadow ads: what the traffic WOULD have earned. No ad is ever rendered — this
@@ -24,7 +27,10 @@ node engine/loop.mjs revenue --since 7d >/dev/null || echo "revenue replay skipp
 
 # ship only analytics data; nothing else, and never if a private key sneaks in
 git add web/site/analytics/ engine/state/analytics/ engine/state/events/live.jsonl \
-        engine/state/next-concepts.json engine/state/trends.json 2>/dev/null || true
+        engine/state/next-concepts.json engine/state/trends.json \
+        engine/state/ig-signals.json engine/state/feed-order.json \
+        engine/state/evidence.json \
+        web/site/feed-order.json 2>/dev/null || true
 if ! git diff --cached --quiet; then
   if git diff --cached | grep -qE 'phx_[A-Za-z0-9]{20,}'; then
     git reset -q
