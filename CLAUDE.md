@@ -37,6 +37,38 @@ Side stages (standalone subcommands, wired into scripts/refresh-analytics.sh):
 7. **This repo is PUBLIC and auto-pushes.** refresh-analytics.sh commits data files every 3h. The `phx_[A-Za-z0-9]{20,}` guard exists; never let secrets, IPs, or personal info into `engine/state/*` or `web/site/*`. PostHog keys in client HTML must be `phc_` project keys only (deploy.mjs enforces).
 8. **Deploy + clip posting are GATED on Manuel.** deploy.mjs publishes to `web/site` locally only; IG posting happens via `content-studio/social-autopilot` queue + launchd (com.manuel.tilt-post). Appending to that queue = WILL post. Never append without explicit approval.
 
+## The distribution loop (second loop, added 2026-07-28)
+
+The game loop makes games; the distribution loop gets them played. Code in
+`engine/distribution/`, design + rationale in `docs/DISTRIBUTION-LOOP.md`.
+
+```
+DISCOVER → QUALIFY → DRAFT → PLACE → VERIFY → MEASURE → LEARN
+```
+
+- **Judgment = Claude Sonnet 5**, via `lib/llm.mjs` (Anthropic SDK when
+  `ANTHROPIC_API_KEY` is set, else headless `claude -p --model sonnet`).
+- **Everything before PLACE is read-only** and always safe to run.
+- **PLACE sends nothing** unless `DIST_ARMED=1`, and nothing on a `human_gate`
+  channel unless it's named in `DIST_APPROVE`. Otherwise drafts go to
+  `engine/state/distribution/outbox/` for review.
+- **Seven gates** in `gates.mjs`, each from a failure that already happened:
+  G0 registry-only targets · G1 no placement without `?src=` · G2 canary aborts a
+  batch when the event pipeline is stale · G3 T+24h logged-out survival re-fetch
+  (ghosted → freeze the channel) · G4 no verdict under 3 placements / 30 visitors ·
+  G5 score = visitors × play_rate × chain_depth (never raw visitors) · G6
+  human/identity/rate locks · G7 weekly kill/scale with a forced exploration slot.
+
+⛔ `engine/state/distribution/` is **gitignored** — it holds third-party usernames,
+post bodies and unsent drafts, and this repo is public and auto-pushes.
+`engine/state/channels.json` IS tracked (our own registry, no personal data).
+
+⛔ Reddit reads use a saved session via `~/Dev/influencer-op/ops/reddit-direct`
+(`REDDIT_READ_ACCOUNT`, default `SatisfactionSea6228` — read-only). The *sending*
+identity is a separate deliberate choice per channel; G6 blocks placement while
+a channel's `identity` is `TBD`. Sessions expire — a "session logged out" error
+is a re-auth step (`cookie_grab.py`), not a dead end.
+
 ## Runbook
 
 ```bash
@@ -66,6 +98,36 @@ node engine/loop.mjs serve        # preview site :4620 (https :4643 for mobile/c
 - **variant-grid-breathe ("Moss Breathe")** built by the loop 2026-07-28; reel queued to post 2026-07-29 10:10 ET — first market test of the full repaired cycle.
 - **lsd-x-* experiment posts** show 3–11% like-rates at tiny views with `engine: null` in ig-signals (not in registry) — possibly a second winning family hiding outside the engine labels.
 - **ig-signals aggregation:** likes/views are cumulative per post so "latest snapshot" is sound, but `posts` counts capture snapshots (inflated ~3×), and `like_rate` can decay as views outgrow likes — `peak_like_rate` is stored but currently unused by learn/feed-order.
+
+## ⛔ Validate the HUMAN path, not just bot/demo (2026-07-30)
+
+Four games shipped completely unplayable — tap-save, breath-filter, fold-perfect,
+pinch-to-fit — and three of them were queued to post to Instagram. Manuel found the
+first one by opening it on his phone. Nothing automated caught any of them, for two
+reasons now fixed in `engine/night/validate-game.mjs`:
+
+1. **The gate only ever loaded `?bot=1` and `?demo=1`.** breath-filter called
+   `initSession()` exclusively when `BOT||DEMO` was set, so the bare player URL ran
+   with uninitialised state and threw on frame 1 — while both validated modes were
+   perfect. **A gate that tests a synthetic mode certifies a code path nobody plays.**
+2. **Nothing could see NaN.** A canvas draw with a NaN coordinate throws nothing and
+   logs nothing; it silently paints no pixels. That is how tap-save drew its character
+   at NaN for a week, and how odd-one shipped a 100% blank clip before it.
+
+`validate-game.mjs` now runs a human pass (bare URL, real taps) with
+`human_no_page_errors` / `human_no_nan_draws` / `human_renders`, plus
+`demo_no_page_errors` (previously collected then discarded). Standalone catalog
+sweep: `node scripts/nan-draw-audit.mjs [game]` (`GAMES_DIR=` to point elsewhere).
+
+**When you change a gate, prove it fails.** Both tools were verified against the
+pre-fix files restored from git before being trusted — a clean result from an
+unproven detector is worthless. 12 known-good games pass with zero false positives.
+
+⬜ Related gap, NOT fixed: `tap-save` / `tap-combo` / `tap-pop` declare `LOOP_GAME`
+but never load `loop-events.js` and have no bot mode, so they cannot pass the gate
+and emit almost no analytics (7 events total, ever). The three games built
+specifically to fix the 0.15% like-rate are invisible to the measurement that would
+judge them — that experiment could never have produced an answer.
 
 ## Known gaps (honest list)
 
